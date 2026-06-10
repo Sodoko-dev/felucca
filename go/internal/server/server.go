@@ -91,6 +91,10 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 
 	default:
 		// Path-segment routes with {id}.
+		if id, ok := matchSuffix(path, "/api/v1/sandboxes/", "/exec"); ok && method == http.MethodPost {
+			srv.execSandbox(w, r, id)
+			return
+		}
 		if id, ok := matchSuffix(path, "/api/v1/sandboxes/", "/fork"); ok && method == http.MethodPost {
 			srv.forkSandbox(w, r, id)
 			return
@@ -611,6 +615,93 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID 
 	writeJSON(w, 201, b)
 }
 
+func (srv *Server) execSandbox(w http.ResponseWriter, r *http.Request, id string) {
+	// Parse request body.
+	var req struct {
+		Cmd       []interface{} `json:"cmd"`
+		TimeoutMs *int64        `json:"timeout_ms"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, []byte(`{"error":"bad json"}`))
+		return
+	}
+	// Validate cmd: must be non-empty array of strings.
+	if len(req.Cmd) == 0 {
+		writeJSON(w, 400, []byte(`{"error":"bad json"}`))
+		return
+	}
+	cmdStrings := make([]string, len(req.Cmd))
+	for i, v := range req.Cmd {
+		s, ok := v.(string)
+		if !ok {
+			writeJSON(w, 400, []byte(`{"error":"bad json"}`))
+			return
+		}
+		cmdStrings[i] = s
+	}
+
+	// Determine timeout_ms: default 30000, cap 300000.
+	timeoutMs := int64(30000)
+	if req.TimeoutMs != nil {
+		timeoutMs = *req.TimeoutMs
+		if timeoutMs > 300000 {
+			timeoutMs = 300000
+		}
+	}
+
+	// Count the attempt before proxying.
+	srv.st.RecordExec()
+
+	// Resolve sandbox and agent address.
+	srv.st.Lock()
+	sb := srv.st.FindSandbox(id)
+	if sb == nil {
+		srv.st.Unlock()
+		writeJSON(w, 404, []byte(`{"error":"not found"}`))
+		return
+	}
+	if sb.State != model.StateRunning {
+		srv.st.Unlock()
+		writeJSON(w, 409, []byte(`{"error":"not running"}`))
+		return
+	}
+	if sb.NodeID == nil {
+		srv.st.Unlock()
+		writeJSON(w, 404, []byte(`{"error":"not found"}`))
+		return
+	}
+	node := srv.st.FindNode(*sb.NodeID)
+	if node == nil {
+		srv.st.Unlock()
+		writeJSON(w, 404, []byte(`{"error":"not found"}`))
+		return
+	}
+	agentAddr := node.Addr
+	srv.st.Unlock()
+
+	// Build forwarded body.
+	agentBody, _ := json.Marshal(struct {
+		Cmd       []string `json:"cmd"`
+		TimeoutMs int64    `json:"timeout_ms"`
+	}{cmdStrings, timeoutMs})
+
+	host, port := agentclient.SplitHostPort(agentAddr)
+	reqTimeout := time.Duration(timeoutMs)*time.Millisecond + 10*time.Second
+	resp, err := agentclient.ExecVM(host, port, id, agentBody, srv.cfg.Token, reqTimeout)
+	if err != nil {
+		writeJSON(w, 502, []byte(`{"error":"agent exec failed"}`))
+		return
+	}
+	switch resp.Status {
+	case 200:
+		writeJSON(w, 200, resp.Body)
+	case 501:
+		writeJSON(w, 501, []byte(`{"error":"guest agent unavailable"}`))
+	default:
+		writeJSON(w, 502, []byte(`{"error":"agent exec failed"}`))
+	}
+}
+
 // resolveAgent returns the agent address for a sandbox's node, writing a 404
 // if the sandbox or its agent is not found.
 func (srv *Server) resolveAgent(w http.ResponseWriter, id string) (string, bool) {
@@ -664,6 +755,7 @@ func (srv *Server) serveMetrics(w http.ResponseWriter) {
 	fmt.Fprintf(&buf, "# HELP hearth_wake_total Total wakes\n# TYPE hearth_wake_total counter\nhearth_wake_total %d\n", srv.st.WakeTotal)
 	fmt.Fprintf(&buf, "# HELP hearth_wake_ms_sum Sum of wake latencies (ms)\n# TYPE hearth_wake_ms_sum counter\nhearth_wake_ms_sum %d\n", srv.st.WakeMsSum)
 	fmt.Fprintf(&buf, "# HELP hearth_forks_total Total forks\n# TYPE hearth_forks_total counter\nhearth_forks_total %d\n", srv.st.ForksTotal)
+	fmt.Fprintf(&buf, "# HELP hearth_execs_total Total exec attempts\n# TYPE hearth_execs_total counter\nhearth_execs_total %d\n", srv.st.ExecsTotal)
 	buf.WriteString("# HELP hearth_pool_size Warm-pool depth per node\n# TYPE hearth_pool_size gauge\n")
 	for _, n := range srv.st.Nodes {
 		fmt.Fprintf(&buf, "hearth_pool_size{node=%q} %d\n", n.Hostname, n.PoolSize)

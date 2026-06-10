@@ -50,6 +50,7 @@ fn reconcile_one(data_dir: &str, dir_name: &str, alloc: Option<&mut Allocator>) 
     let slot = meta.slot;
     let meta_pid = meta.pid;
     let ip = meta.ip.clone();
+    let vsock = meta.vsock;
 
     let mut state: VmState = meta.state.clone();
     let mut pid: Option<i32> = None;
@@ -90,6 +91,7 @@ fn reconcile_one(data_dir: &str, dir_name: &str, alloc: Option<&mut Allocator>) 
         pid,
         slot,
         ip,
+        vsock,
     })
 }
 

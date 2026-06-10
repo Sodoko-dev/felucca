@@ -131,6 +131,22 @@ pub async fn put_machine_config(sock: &str, vcpus: u32, mem_mib: u64) -> Result<
     put(sock, "/machine-config", &body).await
 }
 
+/// PUT /vsock — attach a hybrid-vsock device (guest_cid + host UDS path).
+/// v3: only emitted at cold boot when the guest-agent marker is present.
+pub async fn put_vsock(sock: &str, guest_cid: u32, uds_path: &str) -> Result<()> {
+    let body = build_vsock(guest_cid, uds_path);
+    put(sock, "/vsock", &body).await
+}
+
+/// Build /vsock JSON body — used in tests too.
+pub fn build_vsock(guest_cid: u32, uds_path: &str) -> String {
+    format!(
+        "{{\"guest_cid\":{},\"uds_path\":{}}}",
+        guest_cid,
+        json_str(uds_path)
+    )
+}
+
 /// PUT /actions InstanceStart
 pub async fn put_instance_start(sock: &str) -> Result<()> {
     put(sock, "/actions", "{\"action_type\":\"InstanceStart\"}").await
@@ -161,15 +177,22 @@ pub fn build_snapshot_create(vmstate_path: &str, mem_path: &str) -> String {
     )
 }
 
-/// PUT /snapshot/load {snapshot_path, mem_backend, resume_vm:true, network_overrides?}
+/// PUT /snapshot/load {snapshot_path, mem_backend, resume_vm:true, network_overrides?, vsock_override?}
+///
+/// `vsock_uds` (v3 fork): when the snapshotted VM had a vsock device, the
+/// baked uds_path is the PARENT's absolute path. FC v1.16 re-binds that path on
+/// restore, which collides with a still-running parent (EADDRINUSE). Passing a
+/// `vsock_override` rebinds the device to the child's own UDS path. (Validated
+/// on FC v1.16: load+vsock_override -> 204, child binds its own v.sock.)
 pub async fn put_snapshot_load(
     sock: &str,
     vmstate_path: &str,
     mem_path: &str,
     net_on: bool,
     slot: Option<u32>,
+    vsock_uds: Option<&str>,
 ) -> Result<()> {
-    let body = build_snapshot_load(vmstate_path, mem_path, net_on, slot);
+    let body = build_snapshot_load(vmstate_path, mem_path, net_on, slot, vsock_uds);
     let (status, resp_body) = request_uds(sock, Method::PUT, "/snapshot/load", &body).await?;
     if status >= 300 {
         return Err(FcError(format!("snapshot/load -> {}: {}", status, resp_body)));
@@ -183,6 +206,7 @@ pub fn build_snapshot_load(
     mem_path: &str,
     net_on: bool,
     slot: Option<u32>,
+    vsock_uds: Option<&str>,
 ) -> String {
     let mut body = format!(
         "{{\"snapshot_path\":{},\"mem_backend\":{{\"backend_path\":{},\"backend_type\":\"File\"}}",
@@ -197,6 +221,12 @@ pub fn build_snapshot_load(
                 json_str(&tap)
             ));
         }
+    }
+    if let Some(uds) = vsock_uds {
+        body.push_str(&format!(
+            ",\"vsock_override\":{{\"guest_cid\":3,\"uds_path\":{}}}",
+            json_str(uds)
+        ));
     }
     body.push_str(",\"resume_vm\":true}");
     body
@@ -292,6 +322,7 @@ mod tests {
             "/srv/ignis/instances/vm-1/mem.bin",
             true,
             Some(3),
+            None,
         );
         assert_eq!(
             body,
@@ -305,6 +336,7 @@ mod tests {
             "/srv/ignis/instances/vm-1/vmstate.bin",
             "/srv/ignis/instances/vm-1/mem.bin",
             false,
+            None,
             None,
         );
         assert_eq!(
@@ -321,10 +353,52 @@ mod tests {
             "/a/mem.bin",
             true,
             None,
+            None,
         );
         assert_eq!(
             body,
             r#"{"snapshot_path":"/a/vmstate.bin","mem_backend":{"backend_path":"/a/mem.bin","backend_type":"File"},"resume_vm":true}"#
+        );
+    }
+
+    #[test]
+    fn test_build_vsock() {
+        // Exact body the cold-boot path PUTs to /vsock.
+        let body = build_vsock(3, "/srv/ignis/instances/vm-1/v.sock");
+        assert_eq!(
+            body,
+            r#"{"guest_cid":3,"uds_path":"/srv/ignis/instances/vm-1/v.sock"}"#
+        );
+    }
+
+    #[test]
+    fn test_build_snapshot_load_with_vsock_override() {
+        // Fork restore: vsock_override rebinds the child's own UDS path.
+        let body = build_snapshot_load(
+            "/srv/ignis/instances/child-1/vmstate.bin",
+            "/srv/ignis/instances/child-1/mem.bin",
+            true,
+            Some(3),
+            Some("/srv/ignis/instances/child-1/v.sock"),
+        );
+        assert_eq!(
+            body,
+            r#"{"snapshot_path":"/srv/ignis/instances/child-1/vmstate.bin","mem_backend":{"backend_path":"/srv/ignis/instances/child-1/mem.bin","backend_type":"File"},"network_overrides":[{"iface_id":"eth0","host_dev_name":"hth-3"}],"vsock_override":{"guest_cid":3,"uds_path":"/srv/ignis/instances/child-1/v.sock"},"resume_vm":true}"#
+        );
+    }
+
+    #[test]
+    fn test_build_snapshot_load_vsock_override_no_net() {
+        let body = build_snapshot_load(
+            "/a/vmstate.bin",
+            "/a/mem.bin",
+            false,
+            None,
+            Some("/a/v.sock"),
+        );
+        assert_eq!(
+            body,
+            r#"{"snapshot_path":"/a/vmstate.bin","mem_backend":{"backend_path":"/a/mem.bin","backend_type":"File"},"vsock_override":{"guest_cid":3,"uds_path":"/a/v.sock"},"resume_vm":true}"#
         );
     }
 }

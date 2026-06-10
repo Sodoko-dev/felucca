@@ -33,6 +33,22 @@ pub struct Vm {
     pub pid: Option<i32>,
     pub slot: Option<u32>,
     pub ip: Option<String>,
+    /// v3: VM has a Firecracker vsock device (guest agent reachable).
+    pub vsock: bool,
+}
+
+/// Result of a guest exec attempt; the server handler maps each to a status.
+pub enum ExecOutcome {
+    /// Guest replied — carries the response JSON verbatim (→ 200).
+    Ok(serde_json::Value),
+    /// Unknown VM id (→ 500 {"error":"NotFound"}, consistent with other handlers).
+    NotFound,
+    /// VM exists but is not running (→ 409 {"error":"not running"}).
+    NotRunning,
+    /// VM has no vsock device — pre-v3 or marker absent (→ 501).
+    Unavailable,
+    /// Connect/handshake/round-trip failed (→ 501 {"error":"guest agent unavailable"}).
+    Failed(String),
 }
 
 struct Inner {
@@ -212,6 +228,7 @@ impl Manager {
                 pid: None,
                 slot: None,
                 ip: None,
+                vsock: false,
             });
         }
 
@@ -264,7 +281,7 @@ impl Manager {
             ip_str = Self::ip_for_slot(&g, s);
         }
 
-        let pid = self.spawn_and_configure(id, &dir_path, &rootfs_dst, vcpus, mem_mib, slot, ip_str.as_deref()).await?;
+        let (pid, vsock_on) = self.spawn_and_configure(id, &dir_path, &rootfs_dst, vcpus, mem_mib, slot, ip_str.as_deref()).await?;
 
         // For pool/paused final state: pause now.
         if final_state == VmState::Pooled || final_state == VmState::Paused {
@@ -280,6 +297,7 @@ impl Manager {
                 v.slot = slot;
                 v.state = final_state.clone();
                 v.ip = ip_str.clone();
+                v.vsock = vsock_on;
             }
         }
         self.write_meta(id).await?;
@@ -295,7 +313,7 @@ impl Manager {
         mem_mib: u64,
         slot: Option<u32>,
         ip: Option<&str>,
-    ) -> Result<i32, String> {
+    ) -> Result<(i32, bool), String> {
         let sock = self.sock_path(id).await;
         // Remove stale socket.
         let _ = std::fs::remove_file(&sock);
@@ -337,18 +355,31 @@ impl Manager {
             sleep(Duration::from_millis(50)).await;
         }
 
-        self.configure_guest(&sock, rootfs_path, vcpus, mem_mib, slot, ip).await?;
-        Ok(pid)
+        // Cold boot only attaches a vsock device when the guest-agent marker is
+        // present in the rootfs image; absent marker → exactly the v2 sequence.
+        let vsock_on = self.guest_agent_marker_present();
+        self.configure_guest(&sock, dir_path, rootfs_path, vcpus, mem_mib, slot, ip, vsock_on).await?;
+        Ok((pid, vsock_on))
     }
 
+    /// True when `{data_dir}/images/.hearth-guest-v1` exists: the rootfs has the
+    /// guest agent baked in, so cold boots should attach a vsock device.
+    fn guest_agent_marker_present(&self) -> bool {
+        let marker = format!("{}/images/.hearth-guest-v1", self.data_dir);
+        Path::new(&marker).exists()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn configure_guest(
         &self,
         sock: &str,
+        dir_path: &str,
         rootfs_path: &str,
         vcpus: u32,
         mem_mib: u64,
         slot: Option<u32>,
         ip: Option<&str>,
+        vsock_on: bool,
     ) -> Result<(), String> {
         let kernel = format!("{}/kernels/vmlinux", self.data_dir);
 
@@ -373,6 +404,13 @@ impl Manager {
 
         fc::put_machine_config(sock, vcpus, mem_mib).await
             .map_err(|e| e.to_string())?;
+        // v3: attach the vsock device after /machine-config and before InstanceStart.
+        if vsock_on {
+            let uds_path = format!("{}/v.sock", dir_path);
+            let _ = std::fs::remove_file(&uds_path);
+            fc::put_vsock(sock, 3, &uds_path).await
+                .map_err(|e| e.to_string())?;
+        }
         fc::put_instance_start(sock).await
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -445,6 +483,10 @@ impl Manager {
 
         let sock = self.sock_path(id).await;
         let _ = std::fs::remove_file(&sock);
+        // A SIGKILLed FC (sleep) leaves the vsock host UDS behind; the restore
+        // re-binds the snapshot-baked path and fails with EADDRINUSE if the
+        // stale file is still there.
+        let _ = std::fs::remove_file(format!("{}/v.sock", dir_path));
 
         let log_path = format!("{}/serial.log", dir_path);
         let log_file = std::fs::OpenOptions::new()
@@ -481,7 +523,9 @@ impl Manager {
 
         let vmstate = format!("{}/vmstate.bin", dir_path);
         let mem = format!("{}/mem.bin", dir_path);
-        fc::put_snapshot_load(&sock, &vmstate, &mem, self.net_on, slot).await
+        // Wake restores into the VM's OWN dir, so the baked vsock uds_path is
+        // already correct — no override needed (None re-binds the original path).
+        fc::put_snapshot_load(&sock, &vmstate, &mem, self.net_on, slot, None).await
             .map_err(|e| e.to_string())?;
 
         let elapsed = start.elapsed().as_millis() as u64;
@@ -498,10 +542,10 @@ impl Manager {
     /// spawn child FC and restore. Child inherits parent's guest-internal IP
     /// (v2 documented caveat; fixed in v3).
     pub async fn fork(&self, parent_id: &str, child_id: &str, child_name: &str) -> Result<Option<String>, String> {
-        let (parent_was_running, parent_vcpus, parent_mem_mib) = {
+        let (parent_was_running, parent_vcpus, parent_mem_mib, parent_vsock) = {
             let g = self.inner.lock().await;
             let p = g.vms.iter().find(|v| v.id == parent_id).ok_or("NotFound")?;
-            (p.state == VmState::Running, p.vcpus, p.mem_mib)
+            (p.state == VmState::Running, p.vcpus, p.mem_mib, p.vsock)
         };
 
         let parent_dir = self.instance_dir(parent_id).await;
@@ -557,6 +601,9 @@ impl Manager {
                 pid: None,
                 slot: None,
                 ip: None,
+                // The snapshot carries the parent's vsock device; the child
+                // inherits it (rebound to its own UDS via vsock_override below).
+                vsock: parent_vsock,
             });
         }
 
@@ -617,7 +664,20 @@ impl Manager {
             sleep(Duration::from_millis(50)).await;
         }
 
-        fc::put_snapshot_load(&child_sock, &child_vmstate, &child_mem_file, self.net_on, child_slot).await
+        // If the parent had a vsock device, the snapshot's baked uds_path points
+        // at the PARENT's absolute v.sock. On FC v1.16 that path is re-bound on
+        // restore, which would collide with the still-running parent (EADDRINUSE).
+        // `vsock_override` rebinds the device to the child's own UDS path.
+        // (Validated on FC v1.16: load+vsock_override -> 204, child binds its own
+        // v.sock, parent path untouched.)
+        let child_vsock_uds = format!("{}/v.sock", child_dir);
+        let vsock_override = if parent_vsock {
+            let _ = std::fs::remove_file(&child_vsock_uds);
+            Some(child_vsock_uds.as_str())
+        } else {
+            None
+        };
+        fc::put_snapshot_load(&child_sock, &child_vmstate, &child_mem_file, self.net_on, child_slot, vsock_override).await
             .map_err(|e| { e.to_string() })?;
 
         {
@@ -627,10 +687,51 @@ impl Manager {
                 v.slot = child_slot;
                 v.state = VmState::Running;
                 v.ip = child_ip.clone();
+                v.vsock = parent_vsock;
             }
         }
         self.write_meta(child_id).await?;
+
+        // Fork re-IP: the child restored with the parent's guest-internal IP.
+        // If it has a working vsock, tell the guest to reconfigure eth0 to its
+        // own allocated IP. Best-effort per contract: a failure only warns.
+        if parent_vsock {
+            if let (Some(ip), true) = (child_ip.as_deref(), self.net_on) {
+                let gw = crate::ipalloc::fmt_ip(self.cidr.gateway());
+                match crate::guestclient::set_ip(&child_dir, ip, self.cidr.prefix, &gw).await {
+                    Ok(()) => {}
+                    Err(e) => eprintln!("warn: fork re-IP for {} failed (best-effort): {}", child_id, e),
+                }
+            }
+        }
         Ok(child_ip)
+    }
+
+    // ---- exec (v3 vsock guest agent) ----
+
+    /// Run a command inside the guest via the vsock guest agent.
+    /// Returns the guest's JSON response verbatim on success. Error variants map
+    /// to HTTP statuses in the server handler.
+    pub async fn exec(&self, id: &str, cmd: &[String], timeout_ms: u64) -> ExecOutcome {
+        let (state, vsock, dir_id) = {
+            let g = self.inner.lock().await;
+            match g.vms.iter().find(|v| v.id == id) {
+                Some(v) => (v.state.clone(), v.vsock, v.dir_id.clone()),
+                None => return ExecOutcome::NotFound,
+            }
+        };
+        if state != VmState::Running {
+            return ExecOutcome::NotRunning;
+        }
+        if !vsock {
+            return ExecOutcome::Unavailable;
+        }
+        let dir = format!("{}/instances/{}", self.data_dir, dir_id);
+        match crate::guestclient::exec(&dir, cmd, timeout_ms).await {
+            Ok(v) => ExecOutcome::Ok(v),
+            // Connect/handshake/round-trip failure → guest agent unavailable.
+            Err(e) => ExecOutcome::Failed(e.0),
+        }
     }
 
     // ---- warm pool ----
@@ -721,8 +822,14 @@ impl Manager {
             }
         }
 
-        let pid = self.spawn_and_configure(id, &dir_path, &rootfs_dst, vcpus, mem_mib, slot, ip.as_deref()).await?;
+        let (pid, vsock_on) = self.spawn_and_configure(id, &dir_path, &rootfs_dst, vcpus, mem_mib, slot, ip.as_deref()).await?;
         self.set_pid(id, Some(pid)).await;
+        {
+            let mut g = self.inner.lock().await;
+            if let Some(v) = g.vms.iter_mut().find(|v| v.id == id) {
+                v.vsock = vsock_on;
+            }
+        }
         self.set_state(id, VmState::Running).await;
         self.write_meta(id).await
     }
@@ -790,6 +897,7 @@ impl Manager {
                 slot: v.slot,
                 ip: v.ip.clone(),
                 state: v.state.clone(),
+                vsock: v.vsock,
             }
         };
 

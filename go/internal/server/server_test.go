@@ -2,6 +2,7 @@ package server_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,8 +10,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alpham/infra-saas/hearth/internal/config"
+	"github.com/alpham/infra-saas/hearth/internal/model"
 	"github.com/alpham/infra-saas/hearth/internal/server"
 	"github.com/alpham/infra-saas/hearth/internal/state"
 )
@@ -350,5 +353,232 @@ func TestMetricsAllStates(t *testing.T) {
 		if !strings.Contains(body, `state="`+st+`"`) {
 			t.Errorf("metrics missing state=%q", st)
 		}
+	}
+}
+
+func TestMetricsExecsTotal(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	w := do(srv.Handler(), "GET", "/metrics", "", "")
+	if !strings.Contains(w.Body.String(), "hearth_execs_total") {
+		t.Error("metrics missing hearth_execs_total")
+	}
+}
+
+// ---- Exec endpoint ----
+
+// seedRunningNode registers a node and injects a sandbox in the given state
+// directly into the state store, returning the sandbox id and the fake agent
+// server URL (so the caller can set up stub responses).
+func seedSandboxWithState(t *testing.T, h http.Handler, st *state.State, sbState model.SandboxState) (srvHandler *server.Server, sbID string) {
+	t.Helper()
+	// We need an actual server with the real state already seeded; cast back.
+	// Instead: register node via API, then inject sandbox via state directly.
+	tmp := t.TempDir()
+	cfg := &config.Config{
+		UIDir:     tmp,
+		StatePath: filepath.Join(tmp, "state.json"),
+	}
+	_ = h // unused — caller passes nil to signal "use the returned srv"
+	srv := server.New(cfg, st)
+	return srv, ""
+}
+
+// newServerWithRunningFakeAgent creates a test server with one registered node
+// pointing at a fake agent httptest.Server, and a sandbox in the given state.
+func newServerWithFakeAgent(t *testing.T, agentHandler http.HandlerFunc, sbState model.SandboxState) (*server.Server, *state.State, string, *httptest.Server) {
+	t.Helper()
+	fakeAgent := httptest.NewServer(agentHandler)
+	t.Cleanup(fakeAgent.Close)
+
+	tmp := t.TempDir()
+	cfg := &config.Config{
+		UIDir:     tmp,
+		StatePath: filepath.Join(tmp, "state.json"),
+	}
+	st := state.New()
+	srv := server.New(cfg, st)
+
+	// Register a node pointing at the fake agent.
+	agentURL := fakeAgent.URL // e.g. http://127.0.0.1:PORT
+	now := time.Now().Unix()
+	nodeID := st.RegisterNode("testhost", agentURL, 4, 8192, now)
+
+	// Create sandbox directly in state.
+	st.Lock()
+	sb := st.CreateSandbox("testsb", "default", nodeID, 1, 256, now)
+	sbID := sb.ID
+	st.Unlock()
+	st.SetSandboxState(sbID, sbState)
+
+	return srv, st, sbID, fakeAgent
+}
+
+func TestExecUnknownID(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	w := do(srv.Handler(), "POST", "/api/v1/sandboxes/sb-nonexistent/exec",
+		`{"cmd":["echo","hi"]}`, "")
+	if w.Code != 404 {
+		t.Fatalf("expected 404, got %d body=%s", w.Code, w.Body)
+	}
+	var m map[string]string
+	json.Unmarshal(w.Body.Bytes(), &m)
+	if m["error"] != "not found" {
+		t.Errorf("error body: %v", m)
+	}
+}
+
+func TestExecNonRunning(t *testing.T) {
+	for _, sbState := range []model.SandboxState{model.StateStopped, model.StatePaused, model.StateSleeping, model.StateCreating} {
+		sbState := sbState
+		t.Run(string(sbState), func(t *testing.T) {
+			srv, _, sbID, _ := newServerWithFakeAgent(t, func(w http.ResponseWriter, r *http.Request) {
+				// should never be called
+				t.Error("agent should not be called for non-running sandbox")
+			}, sbState)
+			w := do(srv.Handler(), "POST", fmt.Sprintf("/api/v1/sandboxes/%s/exec", sbID),
+				`{"cmd":["echo","hi"]}`, "")
+			if w.Code != 409 {
+				t.Fatalf("state=%s: expected 409, got %d body=%s", sbState, w.Code, w.Body)
+			}
+			var m map[string]string
+			json.Unmarshal(w.Body.Bytes(), &m)
+			if m["error"] != "not running" {
+				t.Errorf("state=%s error body: %v", sbState, m)
+			}
+		})
+	}
+}
+
+func TestExecHappyPath(t *testing.T) {
+	agentResp := `{"ok":true,"exit_code":0,"stdout":"hello\n","stderr":""}`
+	srv, _, sbID, _ := newServerWithFakeAgent(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("agent: unexpected method %s", r.Method)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(agentResp)))
+		w.WriteHeader(200)
+		io.WriteString(w, agentResp)
+	}, model.StateRunning)
+
+	w := do(srv.Handler(), "POST", fmt.Sprintf("/api/v1/sandboxes/%s/exec", sbID),
+		`{"cmd":["echo","hello"]}`, "")
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body)
+	}
+	// Body must be passed through verbatim.
+	if w.Body.String() != agentResp {
+		t.Errorf("body mismatch: got %q want %q", w.Body.String(), agentResp)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type: %q", ct)
+	}
+	if cl := w.Header().Get("Content-Length"); cl == "" {
+		t.Error("Content-Length not set")
+	}
+}
+
+func TestExecAgent501(t *testing.T) {
+	srv, _, sbID, _ := newServerWithFakeAgent(t, func(w http.ResponseWriter, r *http.Request) {
+		body := `{"error":"guest agent unavailable"}`
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		w.WriteHeader(501)
+		io.WriteString(w, body)
+	}, model.StateRunning)
+
+	w := do(srv.Handler(), "POST", fmt.Sprintf("/api/v1/sandboxes/%s/exec", sbID),
+		`{"cmd":["ls"]}`, "")
+	if w.Code != 501 {
+		t.Fatalf("expected 501, got %d body=%s", w.Code, w.Body)
+	}
+	var m map[string]string
+	json.Unmarshal(w.Body.Bytes(), &m)
+	if m["error"] != "guest agent unavailable" {
+		t.Errorf("error body: %v", m)
+	}
+}
+
+func TestExecAgentDown(t *testing.T) {
+	// Start a fake agent and immediately close it so the connection is refused.
+	fakeAgent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	fakeAgent.Close() // closed before the request arrives
+
+	tmp := t.TempDir()
+	cfg := &config.Config{
+		UIDir:     tmp,
+		StatePath: filepath.Join(tmp, "state.json"),
+	}
+	st := state.New()
+	srv := server.New(cfg, st)
+	now := time.Now().Unix()
+	nodeID := st.RegisterNode("testhost", fakeAgent.URL, 4, 8192, now)
+	st.Lock()
+	sb := st.CreateSandbox("testsb", "default", nodeID, 1, 256, now)
+	sbID := sb.ID
+	st.Unlock()
+	st.SetSandboxState(sbID, model.StateRunning)
+
+	w := do(srv.Handler(), "POST", fmt.Sprintf("/api/v1/sandboxes/%s/exec", sbID),
+		`{"cmd":["ls"]}`, "")
+	if w.Code != 502 {
+		t.Fatalf("expected 502, got %d body=%s", w.Code, w.Body)
+	}
+	var m map[string]string
+	json.Unmarshal(w.Body.Bytes(), &m)
+	if m["error"] != "agent exec failed" {
+		t.Errorf("error body: %v", m)
+	}
+}
+
+func TestExecBadJSON(t *testing.T) {
+	srv, _, sbID, _ := newServerWithFakeAgent(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("agent should not be called for bad json")
+	}, model.StateRunning)
+
+	for _, body := range []string{
+		`not json`,
+		`{"cmd":[]}`,           // empty cmd
+		`{"cmd":123}`,          // cmd not array
+		`{"cmd":[1,2,3]}`,      // cmd elements not strings
+	} {
+		body := body
+		t.Run(body, func(t *testing.T) {
+			w := do(srv.Handler(), "POST", fmt.Sprintf("/api/v1/sandboxes/%s/exec", sbID), body, "")
+			if w.Code != 400 {
+				t.Fatalf("body=%q: expected 400, got %d resp=%s", body, w.Code, w.Body)
+			}
+			var m map[string]string
+			json.Unmarshal(w.Body.Bytes(), &m)
+			if m["error"] != "bad json" {
+				t.Errorf("body=%q error: %v", body, m)
+			}
+		})
+	}
+}
+
+func TestExecTimeoutCap(t *testing.T) {
+	// Verify that timeout_ms > 300000 is capped: the agent receives timeout_ms == 300000.
+	var receivedTimeoutMs int64
+	srv, _, sbID, _ := newServerWithFakeAgent(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			TimeoutMs int64 `json:"timeout_ms"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		receivedTimeoutMs = req.TimeoutMs
+		body := `{"ok":true,"exit_code":0,"stdout":"","stderr":""}`
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		w.WriteHeader(200)
+		io.WriteString(w, body)
+	}, model.StateRunning)
+
+	w := do(srv.Handler(), "POST", fmt.Sprintf("/api/v1/sandboxes/%s/exec", sbID),
+		`{"cmd":["true"],"timeout_ms":999999}`, "")
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if receivedTimeoutMs != 300000 {
+		t.Errorf("agent received timeout_ms=%d, want 300000", receivedTimeoutMs)
 	}
 }

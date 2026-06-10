@@ -25,11 +25,12 @@ type State struct {
 	RequestCount uint64
 	Seq          uint64
 
-	// Wake/fork metrics.
+	// Wake/fork/exec metrics.
 	WakeMsLast uint64
 	WakeTotal  uint64
 	WakeMsSum  uint64
 	ForksTotal uint64
+	ExecsTotal uint64
 
 	rng *rand.Rand
 }
@@ -253,6 +254,13 @@ func (s *State) RecordFork() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ForksTotal++
+}
+
+// RecordExec increments the exec attempt counter.
+func (s *State) RecordExec() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ExecsTotal++
 }
 
 // ---- Persistence ----

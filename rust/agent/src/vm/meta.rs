@@ -1,7 +1,9 @@
 //! meta.json schema — per-instance persisted metadata.
 //!
 //! Keys MUST appear in this declaration order (matching the Zig writeMeta output):
-//! id, name, dir_id, vcpus, mem_mib, pid, slot, ip, state.
+//! id, name, dir_id, vcpus, mem_mib, pid, slot, ip, state, vsock.
+//! `vsock` is the v3 addition: optional, serialized LAST, defaults false when
+//! absent so older meta.json files parse unchanged.
 //! Options serialize as explicit null — NO skip_serializing_if.
 //! State strings: creating|running|paused|stopped|sleeping|error|pooled.
 
@@ -69,6 +71,10 @@ pub struct Meta {
     pub slot: Option<u32>,
     pub ip: Option<String>,
     pub state: VmState,
+    /// v3: VM has a Firecracker vsock device (guest agent reachable). Optional,
+    /// defaults false when absent in older meta.json files. Serialized LAST.
+    #[serde(default)]
+    pub vsock: bool,
 }
 
 impl Meta {
@@ -88,7 +94,7 @@ impl Meta {
             None => "null".to_string(),
         };
         format!(
-            "{{\"id\":{},\"name\":{},\"dir_id\":{},\"vcpus\":{},\"mem_mib\":{},\"pid\":{},\"slot\":{},\"ip\":{},\"state\":{}}}",
+            "{{\"id\":{},\"name\":{},\"dir_id\":{},\"vcpus\":{},\"mem_mib\":{},\"pid\":{},\"slot\":{},\"ip\":{},\"state\":{},\"vsock\":{}}}",
             json_str(&self.id),
             json_str(&self.name),
             json_str(&self.dir_id),
@@ -98,6 +104,7 @@ impl Meta {
             slot_str,
             ip_str,
             json_str(self.state.as_str()),
+            self.vsock,
         )
     }
 }
@@ -180,6 +187,7 @@ mod tests {
             slot: None,
             ip: None,
             state: VmState::Stopped,
+            vsock: false,
         };
         let json = meta.to_json();
         // All Option fields must appear as explicit null.
@@ -200,9 +208,10 @@ mod tests {
             slot: Some(2),
             ip: Some("10.0.0.4".into()),
             state: VmState::Running,
+            vsock: true,
         };
         let json = meta.to_json();
-        // Keys must appear in order: id, name, dir_id, vcpus, mem_mib, pid, slot, ip, state.
+        // Keys must appear in order: id, name, dir_id, vcpus, mem_mib, pid, slot, ip, state, vsock.
         let id_pos = json.find("\"id\"").unwrap();
         let name_pos = json.find("\"name\"").unwrap();
         let dir_id_pos = json.find("\"dir_id\"").unwrap();
@@ -212,6 +221,7 @@ mod tests {
         let slot_pos = json.find("\"slot\"").unwrap();
         let ip_pos = json.find("\"ip\"").unwrap();
         let state_pos = json.find("\"state\"").unwrap();
+        let vsock_pos = json.find("\"vsock\"").unwrap();
         assert!(id_pos < name_pos);
         assert!(name_pos < dir_id_pos);
         assert!(dir_id_pos < vcpus_pos);
@@ -220,6 +230,9 @@ mod tests {
         assert!(pid_pos < slot_pos);
         assert!(slot_pos < ip_pos);
         assert!(ip_pos < state_pos);
+        // vsock is the LAST key.
+        assert!(state_pos < vsock_pos);
+        assert!(json.ends_with("\"vsock\":true}"), "vsock must be last: {}", json);
     }
 
     #[test]
@@ -243,5 +256,54 @@ mod tests {
         assert_eq!(meta.slot, Some(3));
         // ip is stored independently from slot in meta (set at creation time).
         assert_eq!(meta.ip, Some("10.231.0.5".into()));
+    }
+
+    #[test]
+    fn test_old_meta_without_vsock_parses_false() {
+        // Pre-v3 file (no vsock key) must parse with vsock defaulting to false.
+        let fixture = r#"{"id":"vm-old","name":"vm-old","dir_id":"vm-old","vcpus":1,"mem_mib":256,"pid":null,"slot":0,"ip":"10.231.0.2","state":"sleeping"}"#;
+        let meta: Meta = serde_json::from_str(fixture).expect("parse pre-v3 fixture");
+        assert!(!meta.vsock, "absent vsock must default to false");
+    }
+
+    #[test]
+    fn test_vsock_round_trip_true() {
+        let meta = Meta {
+            id: "vm-v3".into(),
+            name: "vm-v3".into(),
+            dir_id: "vm-v3".into(),
+            vcpus: 1,
+            mem_mib: 256,
+            pid: Some(42),
+            slot: Some(0),
+            ip: Some("10.231.0.2".into()),
+            state: VmState::Running,
+            vsock: true,
+        };
+        let json = meta.to_json();
+        assert!(json.contains("\"vsock\":true"), "vsock should serialize true: {}", json);
+        let meta2: Meta = serde_json::from_str(&json).expect("round-trip parse");
+        assert!(meta2.vsock);
+        assert_eq!(meta2.state, VmState::Running);
+    }
+
+    #[test]
+    fn test_vsock_false_serializes_explicit() {
+        let meta = Meta {
+            id: "vm-x".into(),
+            name: "vm-x".into(),
+            dir_id: "vm-x".into(),
+            vcpus: 1,
+            mem_mib: 256,
+            pid: None,
+            slot: None,
+            ip: None,
+            state: VmState::Stopped,
+            vsock: false,
+        };
+        let json = meta.to_json();
+        assert!(json.contains("\"vsock\":false"), "vsock:false must be explicit: {}", json);
+        let meta2: Meta = serde_json::from_str(&json).expect("round-trip parse");
+        assert!(!meta2.vsock);
     }
 }

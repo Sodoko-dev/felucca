@@ -6,6 +6,7 @@
 
 mod config;
 mod fc;
+mod guestclient;
 mod ipalloc;
 mod net;
 mod registration;

@@ -14,7 +14,7 @@ use axum::{
 use std::sync::Arc;
 
 use crate::config::authorized;
-use crate::vm::Manager;
+use crate::vm::{ExecOutcome, Manager};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -56,6 +56,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/vms/:id/sleep", post(sleep_vm))
         .route("/v1/vms/:id/wake", post(wake_vm))
         .route("/v1/vms/:id/fork", post(fork_vm))
+        .route("/v1/vms/:id/exec", post(exec_vm))
         .route("/v1/vms/:id/pause", post(vm_pause))
         .route("/v1/vms/:id/resume", post(vm_resume))
         .route("/v1/vms/:id/stop", post(vm_stop))
@@ -194,6 +195,67 @@ async fn fork_vm(
         Err(e) => {
             let msg = format!("{{\"error\":\"{}\"}}", e);
             json_response(StatusCode::INTERNAL_SERVER_ERROR, &msg)
+        }
+    }
+}
+
+async fn exec_vm(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    req: Request,
+) -> Response {
+    if !check_auth(&state.token, req.headers()) {
+        return json_response(StatusCode::UNAUTHORIZED, "{\"error\":\"unauthorized\"}");
+    }
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 1 << 20).await {
+        Ok(b) => b,
+        Err(_) => return json_response(StatusCode::BAD_REQUEST, "{\"error\":\"bad request\"}"),
+    };
+    let body_str = match std::str::from_utf8(&body_bytes) {
+        Ok(s) => s,
+        Err(_) => return json_response(StatusCode::BAD_REQUEST, "{\"error\":\"bad request\"}"),
+    };
+    let json: serde_json::Value = match serde_json::from_str(body_str) {
+        Ok(v) => v,
+        Err(_) => return json_response(StatusCode::BAD_REQUEST, "{\"error\":\"bad json\"}"),
+    };
+
+    // cmd must be a non-empty array of strings (§1).
+    let cmd: Vec<String> = match json.get("cmd").and_then(|v| v.as_array()) {
+        Some(arr) if !arr.is_empty() && arr.iter().all(|e| e.is_string()) => {
+            arr.iter().map(|e| e.as_str().unwrap().to_string()).collect()
+        }
+        _ => return json_response(StatusCode::BAD_REQUEST, "{\"error\":\"cmd required\"}"),
+    };
+
+    // timeout_ms: default 30000, max 300000 (§1).
+    let timeout_ms = json
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30_000)
+        .min(300_000);
+
+    match state.mgr.exec(&id, &cmd, timeout_ms).await {
+        ExecOutcome::Ok(v) => json_response(StatusCode::OK, &v.to_string()),
+        ExecOutcome::NotRunning => {
+            json_response(StatusCode::CONFLICT, "{\"error\":\"not running\"}")
+        }
+        ExecOutcome::Unavailable => json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "{\"error\":\"guest agent unavailable\"}",
+        ),
+        ExecOutcome::Failed(reason) => {
+            // Connect/handshake failure → same 501 body; log the cause server-side.
+            eprintln!("warn: exec on {} failed (guest unreachable): {}", id, reason);
+            json_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "{\"error\":\"guest agent unavailable\"}",
+            )
+        }
+        // Unknown id → 500 {"error":"NotFound"}, consistent with other handlers
+        // (sleep/wake/etc. surface "NotFound" as a 500 error body).
+        ExecOutcome::NotFound => {
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"NotFound\"}")
         }
     }
 }

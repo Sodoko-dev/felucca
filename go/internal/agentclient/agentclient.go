@@ -4,6 +4,7 @@ package agentclient
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -44,6 +45,42 @@ func Request(host string, port uint16, method, path string, body []byte, token s
 	req.Header.Set("Connection", "close")
 
 	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+
+	return &Response{Status: resp.StatusCode, Body: respBody}, nil
+}
+
+// ExecVM proxies an exec request to the node agent at host:port for the given
+// vm id.  timeout is the per-request HTTP timeout (timeout_ms + 10s); a fresh
+// http.Client is created so the shared client's 30 s timeout is not used.
+func ExecVM(host string, port uint16, id string, body []byte, token string, timeout time.Duration) (*Response, error) {
+	url := fmt.Sprintf("http://%s:%d/v1/vms/%s/exec", host, port, id)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = int64(len(body))
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("Connection", "close")
+
+	// Use a transport without keepalives so the timeout is per-request.
+	c := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("do request: %w", err)
 	}
