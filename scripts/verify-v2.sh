@@ -94,8 +94,32 @@ child=$(cp_curl -X POST $API/api/v1/sandboxes/$id/fork -d '{"name":"v2-verify-ch
 cid=$(printf '%s' "$child" | grep -oE '"id":"[^"]+"' | head -1 | cut -d'"' -f4)
 pid=$(printf '%s' "$child" | grep -oE '"parent_id":"[^"]+"' | head -1 | cut -d'"' -f4)
 cstate=$(printf '%s' "$child" | grep -oE '"state":"[^"]+"' | head -1 | cut -d'"' -f4)
+cip=$(printf '%s' "$child" | grep -oE '"ip":"[0-9.]+"' | head -1 | cut -d'"' -f4)
 [ "$cstate" = "running" ] && ok "fork child $cid running" || bad "fork child state=$cstate: $child"
 [ "$pid" = "$id" ] && ok "parent_id set correctly" || bad "parent_id=$pid expected $id"
+# v3: the child must answer on ITS OWN ip (re-IP via the guest agent), and the
+# parent must keep answering on its ip.
+if [ -n "$worker_vm" ] && [ -n "$cip" ]; then
+  sleep 5  # give the re-IP attempts time to land
+  if limactl shell $worker_vm -- ping -c2 -W2 "$cip" >/dev/null 2>&1; then
+    ok "fork child answers on its own ip $cip"
+  else
+    bad "fork child does not answer on $cip (re-IP failed?)"
+  fi
+  if limactl shell $worker_vm -- ping -c2 -W2 "$ip" >/dev/null 2>&1; then
+    ok "parent still answers on $ip after fork"
+  else
+    bad "parent lost connectivity on $ip after fork"
+  fi
+fi
+
+say "== 7b. exec (vsock guest agent) =="
+eres=$(cp_curl -X POST $API/api/v1/sandboxes/$id/exec -d '{"cmd":["/bin/sh","-c","echo hearth-exec-ok; id -u"]}')
+if printf '%s' "$eres" | grep -q '"exit_code":0' && printf '%s' "$eres" | grep -q 'hearth-exec-ok'; then
+  ok "exec ran in guest (exit 0, output captured)"
+else
+  bad "exec failed: $eres"
+fi
 
 say "== 8. metrics =="
 m=$(limactl shell $CP_VM -- curl -s -m5 $API/metrics)
