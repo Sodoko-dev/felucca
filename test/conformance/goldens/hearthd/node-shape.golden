@@ -1,0 +1,13 @@
+200 application/json
+{
+  "addr": "<ADDR>",
+  "cpus": "<DYN>",
+  "hostname": "<STR>",
+  "id": "<ID>",
+  "last_heartbeat": "<TS>",
+  "mem_free_mib": "<DYN>",
+  "mem_total_mib": "<DYN>",
+  "pool_size": "<DYN>",
+  "status": "ready",
+  "vm_count": "<DYN>"
+}

@@ -1,0 +1,52 @@
+[Unit]
+Description=Hearth control plane (hearthd)
+Documentation=https://github.com/alpham/infra-saas/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Run as a dedicated non-root user.  Create it with:
+#   useradd --system --no-create-home --shell /sbin/nologin hearth
+User=hearth
+Group=hearth
+
+# Config and env
+EnvironmentFile=-/etc/hearth/hearthd.env
+ExecStart=/usr/local/bin/hearthd --config /etc/hearth/hearthd.json
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+
+# Hardening — hearthd needs no special kernel capabilities
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Allow writes only to the paths hearthd needs.
+# /etc/hearth is config (read-only at runtime); writable paths are state + tmp.
+ReadOnlyPaths=/etc/hearth
+ReadWritePaths=/var/lib/hearth /usr/share/hearth
+
+# Resource limits (tune per your node size)
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

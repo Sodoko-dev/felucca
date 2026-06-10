@@ -1,0 +1,59 @@
+[Unit]
+Description=Hearth worker agent (hearth-agent)
+Documentation=https://github.com/alpham/infra-saas/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+# Firecracker must be present before the agent starts.
+ConditionPathExists=/usr/local/bin/firecracker
+
+[Service]
+Type=simple
+
+# The agent MUST run as root: it creates tap interfaces, programs nftables,
+# sets ip_forward, and opens /dev/kvm.  PrivilegeEscalation is constrained by
+# the capability allow-list below instead of DynamicUser / non-root.
+User=root
+Group=root
+
+# Config and env
+EnvironmentFile=-/etc/hearth/agent.env
+ExecStart=/usr/local/bin/hearth-agent --config /etc/hearth/hearth-agent.json
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=60s
+TimeoutStopSec=60s
+
+# Device access — /dev/kvm for Firecracker microVMs
+DeviceAllow=/dev/kvm rw
+DevicePolicy=closed
+
+# Capabilities required for tap/bridge/nftables setup.
+# All others are dropped.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+# Hardening (compatible with root + CAP_NET_ADMIN)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=false
+ProtectKernelModules=true
+ProtectControlGroups=false
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallFilter=@system-service @network-io
+
+# Writable paths for VM instances, kernels, images
+ReadWritePaths=/srv/hearth /etc/hearth /run/hearth
+
+# Resource limits — each Firecracker child needs an FD for its unix socket
+LimitNOFILE=524288
+
+[Install]
+WantedBy=multi-user.target

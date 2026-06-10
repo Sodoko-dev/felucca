@@ -1,0 +1,13 @@
+200 application/json
+{
+  "created_at": "<TS>",
+  "id": "<ID>",
+  "ip": "<ADDR>",
+  "mem_mib": 256,
+  "name": "cf-sb",
+  "namespace": "conformance",
+  "node_id": "<ID>",
+  "parent_id": null,
+  "state": "sleeping",
+  "vcpus": 1
+}

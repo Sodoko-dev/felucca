@@ -1,0 +1,6 @@
+{
+  "bind": "0.0.0.0:8080",
+  "state_path": "/var/lib/hearth/state.json",
+  "ui_dir": "/usr/share/hearth/ui",
+  "token": "REPLACE_WITH_OUTPUT_OF__openssl_rand_-hex_32"
+}

@@ -1,0 +1,14 @@
+200 text/plain; version=0.0.4
+hearth_api_requests_total
+hearth_forks_total
+hearth_nodes_ready
+hearth_pool_size{node=*}
+hearth_sandboxes_total{state="creating"}
+hearth_sandboxes_total{state="error"}
+hearth_sandboxes_total{state="paused"}
+hearth_sandboxes_total{state="running"}
+hearth_sandboxes_total{state="sleeping"}
+hearth_sandboxes_total{state="stopped"}
+hearth_wake_ms_last
+hearth_wake_ms_sum
+hearth_wake_total

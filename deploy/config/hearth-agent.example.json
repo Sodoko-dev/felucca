@@ -1,0 +1,10 @@
+{
+  "bind": "0.0.0.0:9090",
+  "control_plane": "https://hearth.internal.example.com",
+  "advertise_addr": "10.0.1.42",
+  "data_dir": "/srv/hearth",
+  "token": "REPLACE_WITH_SAME_TOKEN_AS_HEARTHD",
+  "pool_size": 2,
+  "net": "on",
+  "net_cidr": "10.231.0.0/24"
+}

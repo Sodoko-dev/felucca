@@ -1,0 +1,10 @@
+200 application/json
+{
+  "id": "<ID>",
+  "ip": "<ADDR>",
+  "mem_mib": 256,
+  "name": "cf-vm-1",
+  "pid": "<DYN>",
+  "state": "running",
+  "vcpus": 1
+}

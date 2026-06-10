@@ -1,0 +1,10 @@
+# Build caches and outputs (real builds run inside the Lima VMs)
+backend/.zig-cache/
+backend/zig-out/
+rust/agent/target/
+
+# Tooling state
+.omc/
+docs/.omc/
+.playwright-mcp/
+.claude/

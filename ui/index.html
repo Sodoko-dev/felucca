@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Hearth — self-hosted Firecracker microVM infrastructure console" />
+  <title>Hearth Console</title>
+
+  <!-- Preload critical font stack via system fonts — no external CDN required -->
+  <link rel="stylesheet" href="styles.css" />
+
+  <style>
+    /* Critical above-fold: prevent FOUC */
+    #app { opacity: 0; transition: opacity 0.15s ease; }
+    #app.ready { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <!-- Header: brand + nav + stats -->
+    <header id="header">
+      <!-- Rendered by app.js -->
+    </header>
+
+    <!-- Main layout -->
+    <div id="main">
+      <!-- Primary content area -->
+      <main id="content" role="main" aria-live="polite">
+        <!-- Rendered by app.js -->
+      </main>
+    </div>
+  </div>
+
+  <!-- Toast notifications -->
+  <div id="toast-container" class="toast-container" aria-live="assertive" aria-atomic="false"></div>
+
+  <!-- Modal portal (populated by app.js) -->
+  <div id="modals"></div>
+
+  <script src="app.js"></script>
+  <script>
+    // Reveal app after JS loads to prevent FOUC
+    document.getElementById('app').classList.add('ready');
+  </script>
+</body>
+</html>
