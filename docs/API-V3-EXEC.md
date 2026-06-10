@@ -58,11 +58,17 @@ exec on them fails gracefully (below).
   `vsock:true`, connect and send `set_ip` with the child's allocated ip/gw
   (gw = cidr `.1`). Up to 3 attempts over ~3s (guest may still be settling).
   Failure logs a warning and does NOT fail the fork (old caveat applies).
-  Snapshot note: vsock UDS path is baked into vmstate; the child's restore
-  must hand Firecracker a working path — validate during implementation
-  (FC v1.16 re-binds the UDS at its configured path on restore; if the baked
-  parent path collides, fall back to documenting exec-after-wake-only for
-  forks and re-IP via a pre-snapshot hook — but validate first).
+  Snapshot semantics — **validated on FC v1.16** (these are now facts, not
+  open questions):
+  - The vsock UDS path is baked into vmstate and FC re-binds it on restore.
+    A fork-style restore into a different directory uses the snapshot/load
+    `vsock` override to re-point the UDS at the child's own `v.sock`.
+  - **Stale-socket trap**: sleep SIGKILLs Firecracker, which leaves the old
+    `v.sock` file on disk; the next restore then fails the whole snapshot
+    load with `VsockUnixBackend: Address in use (EADDRINUSE)`. Wake (and any
+    same-path restore) must `rm` the stale `v.sock` before spawning FC —
+    implemented in `wake_vm`. Symptom if regressed: wake returns an agent
+    error and the VM stays `sleeping`; FC serial log shows the EADDRINUSE.
 - **Sleep**: never snapshot while an exec connection is open (serialize exec
   and sleep per VM, or document that FC refuses snapshots with active vsock
   connections and surface the error).
