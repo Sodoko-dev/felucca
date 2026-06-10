@@ -1,17 +1,20 @@
 # Hearth — Architecture
 
 Hearth is a self-hosted infrastructure SaaS that manages **Firecracker microVMs ("sandboxes") for AI workloads**.
-The backend is two static Zig 0.16 binaries — `hearthd` (control plane) and `hearth-agent` (node agent) —
-with no Kubernetes on the control path. This document reflects **v2 as implemented, verified
-(16/16 end-to-end checks), and running** in the Lima lab: snapshot-based sleep/wake (73 ms measured),
+The backend is two static binaries — `hearthd` (control plane, **Go**) and `hearth-agent` (node agent,
+**Rust**) — with no Kubernetes on the control path (languages per
+[ADR-0003](adr/ADR-0003-go-rust-port.md); the wire and on-disk formats are unchanged from the Zig v2
+implementation and enforced by `test/conformance/`). This document reflects **v2 as implemented, verified
+(17/17 end-to-end checks), and running** in the Lima lab: snapshot-based sleep/wake (~70 ms measured),
 fork, warm pools, guest networking, bearer-token auth, and config-driven deployment — the same
 static binaries (aarch64 + x86_64) run on the local lab and on remote production servers,
 differing only by configuration. Remaining v3 items are listed in §9.
 
 Related docs: [PLAN.md](PLAN.md) (adopted plan), [API-V2.md](API-V2.md) (v2 API/config contract),
-[DEPLOYMENT.md](DEPLOYMENT.md) (production install), [ADR-0000](adr/ADR-0000-original-hearth-plan.md)
-(original baseline), [ADR-0001](adr/ADR-0001-zig-backend.md), [ADR-0002](adr/ADR-0002-no-kubernetes-control-plane.md),
-[backend/README.md](../backend/README.md) (build/deploy/run).
+[DEPLOYMENT.md](DEPLOYMENT.md) (production install + builds), [ADR-0000](adr/ADR-0000-original-hearth-plan.md)
+(original baseline), [ADR-0001](adr/ADR-0001-zig-backend.md) (superseded),
+[ADR-0002](adr/ADR-0002-no-kubernetes-control-plane.md), [ADR-0003](adr/ADR-0003-go-rust-port.md)
+(Go+Rust port and migration record).
 
 ---
 
@@ -24,7 +27,7 @@ flowchart TB
         CLI["curl / scripts"]
     end
 
-    subgraph hearthd["hearthd — control plane (Zig, :8080)"]
+    subgraph hearthd["hearthd — control plane (Go, :8080)"]
         AUTH["Bearer-token guard<br/>(optional, constant-time;<br/>healthz/metrics/UI stay open)"]
         STATIC["Static file server<br/>(serves ui/, index.html fallback)"]
         API["REST API v1+v2<br/>(JSON over HTTP/1.1;<br/>sleep · wake · fork verbs)"]
@@ -34,7 +37,7 @@ flowchart TB
         METRICS["/metrics<br/>(Prometheus text:<br/>wake_ms, forks, pool, states)"]
     end
 
-    subgraph agent["hearth-agent — per worker (Zig, :9090)"]
+    subgraph agent["hearth-agent — per worker (Rust, :9090)"]
         AAPI["Agent REST API<br/>(/v1/vms · sleep · wake · fork)"]
         VMM["VM manager<br/>(spawn firecracker, configure over UDS,<br/>snapshot/restore, track pids)"]
         POOL["Warm pool<br/>(pool_size paused VMs,<br/>claim on create, async refill)"]
@@ -102,8 +105,8 @@ flowchart LR
 
     subgraph lab["Lima VM: infra-saas-lab — 192.168.104.3"]
         HD["hearthd :8080"]
-        ZIG["Zig 0.16.0 toolchain<br/>(only build environment)"]
-        UIDIR[("repo mount<br/>ui/ + backend/")]
+        ZIG["Go 1.26 + Rust 1.96 toolchains<br/>(only build environment)"]
+        UIDIR[("repo mount<br/>ui/ + go/ + rust/")]
     end
 
     subgraph k0["Lima VM: kata-lab-0 — 192.168.104.1"]
@@ -273,7 +276,11 @@ sequenceDiagram
 
 Snapshot hygiene caveats (documented, v3 work): forked children inherit the parent's
 guest-internal IP, and restored guests should re-seed entropy / fix clocks before
-multi-tenant production use.
+multi-tenant production use. **Do not sleep a guest that is still booting**: a snapshot
+taken ~1–2 s after boot captures a guest that panics/reboots on resume (wall-clock jump
+mid-init) — the wake API reports `running` but the Firecracker process exits about a
+second later. Found during the Go/Rust migration and present in every implementation;
+`verify-v2.sh` now pings the guest after wake to keep this visible.
 
 ---
 
@@ -357,11 +364,14 @@ v3 replaces the full rootfs copy with **overlayfs**: shared read-only base + tin
 
 ## 9. v2 status (shipped) and what remains for v3
 
-Shipped in v2 (all verified end-to-end on the lab, 16/16 checks):
+Shipped in v2, then ported to Go (`hearthd`) and Rust (`hearth-agent`) under the frozen
+API-V2 contract — all verified end-to-end on the lab (17/17 system checks +
+`test/conformance/` contract suite, goldens recorded from the Zig reference;
+migration record in [ADR-0003](adr/ADR-0003-go-rust-port.md)):
 
 | Capability | v2 implementation |
 |---|---|
-| `sleep` / `wake` | snapshot/create → kill; snapshot/load resume — **wake_ms=73 measured** |
+| `sleep` / `wake` | snapshot/create → kill; snapshot/load resume — **wake_ms≈70 measured** (67–85 across both implementations) |
 | `fork` | parent snapshot + rootfs/mem copy + own tap via `network_overrides`, `parent_id` set |
 | Warm pool | `pool_size` paused VMs per agent; matching create claims one, async refill |
 | Guest networking | bridge `hearth0` + per-VM tap + sequential IP (`net_cidr`) + nftables masquerade; `ip` populated; host→guest ping verified |
@@ -379,3 +389,6 @@ Remaining for v3:
 | State store | JSON file → SQLite WAL → Postgres at scale-out |
 | Reschedule across nodes | snapshot → ship → restore (needs node-decoupled storage) |
 | OIDC / multi-user auth | token-exchange on top of the bearer layer |
+| Pool-orphan reclaim | a paused pool FC orphaned by an agent restart is reconciled to `stopped` but its process is not reaped (1:1 with v2 behavior) |
+| uffd lazy restore / CoW fork | in-process userfaultfd in the Rust agent (the reason the agent is Rust — rust-vmm territory) |
+| Terraform provider | Go provider against the hearthd API (the reason the control plane is Go) |

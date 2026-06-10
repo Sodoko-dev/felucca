@@ -92,29 +92,42 @@ sudo dmesg | grep -i kvm # should show KVM enabled
 
 ## 3. Build the binaries
 
-Build runs inside the `infra-saas-lab` Lima VM (Zig 0.16.0 toolchain).
+Builds run inside the `infra-saas-lab` Lima VM (Go 1.26 + Rust 1.96 toolchains —
+never on the macOS host). See `docs/adr/ADR-0003-go-rust-port.md` for why the
+control plane is Go and the agent is Rust.
 
 ```sh
-# x86_64 static binaries (typical production target)
-limactl shell infra-saas-lab -- bash -c \
-  'cd /Users/magdy/projects/github.com/alpham/infra-saas/backend && \
-   zig build -Dtarget=x86_64-linux-musl'
+REPO=/Users/magdy/projects/github.com/alpham/infra-saas
 
-# aarch64 static binaries (ARM worker nodes)
+# hearthd (Go, static, cross-compiles to both arches from one box)
 limactl shell infra-saas-lab -- bash -c \
-  'cd /Users/magdy/projects/github.com/alpham/infra-saas/backend && \
-   zig build -Dtarget=aarch64-linux-musl'
+  "export PATH=\$PATH:/usr/local/go/bin && cd $REPO/go && \
+   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' \
+     -o $REPO/deploy/release/x86_64/hearthd ./cmd/hearthd && \
+   CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' \
+     -o $REPO/deploy/release/aarch64/hearthd ./cmd/hearthd"
+
+# hearth-agent (Rust, static musl)
+limactl shell infra-saas-lab -- bash -c \
+  "source ~/.cargo/env && export CARGO_TARGET_DIR=\$HOME/.cargo-target/hearth-agent && \
+   cd $REPO/rust/agent && cargo build --release --target aarch64-unknown-linux-musl && \
+   cp \$CARGO_TARGET_DIR/aarch64-unknown-linux-musl/release/hearth-agent \
+      $REPO/deploy/release/aarch64/hearth-agent"
 ```
 
-Binaries land in `backend/zig-out/bin/`. Stage them for the installer:
+For x86_64 agents, add the target (`rustup target add x86_64-unknown-linux-musl`
+plus a cross linker) or simply build on an x86_64 machine — the agent has no
+non-Rust dependencies, so `cargo build --release --target x86_64-unknown-linux-musl`
+on the target arch is the path of least resistance.
 
-```sh
-ARCH=x86_64   # or aarch64
-mkdir -p deploy/release/${ARCH}
-cp backend/zig-out/bin/{hearthd,hearth-agent} deploy/release/${ARCH}/
-```
+The installer finds binaries at `deploy/release/<arch>/`.
 
-The installer will find them at `deploy/release/<arch>/`.
+> **Systemd note**: the units in `deploy/systemd/` were hardened against the
+> Zig binaries and are not yet soak-tested under the Go/Rust runtimes (the lab
+> runs processes directly). On first production install, watch
+> `journalctl -u hearthd -u hearth-agent` for seccomp kills — in particular
+> `MemoryDenyWriteExecute=true` in `hearthd.service` vs the Go runtime — and
+> relax the specific directive if needed.
 
 ---
 
@@ -408,11 +421,10 @@ the snapshot on disk is untouched by a restart).
 ### Control plane upgrade
 
 ```sh
-# 1. Build new binaries (on the build host / CI)
-#    zig build -Dtarget=x86_64-linux-musl
+# 1. Build new binaries (see §3 — Go build inside the toolchain VM)
 
 # 2. Copy the new binary to the server
-scp backend/zig-out/bin/hearthd root@cp-host:/usr/local/bin/hearthd.new
+scp deploy/release/x86_64/hearthd root@cp-host:/usr/local/bin/hearthd.new
 
 # 3. Atomic replace + restart (state.json is preserved)
 ssh root@cp-host "
@@ -425,10 +437,10 @@ ssh root@cp-host "
 ### Worker upgrade
 
 ```sh
-# 1. Build new hearth-agent binary
+# 1. Build new hearth-agent binary (see §3 — Rust build inside the toolchain VM)
 
 # 2. Copy to worker
-scp backend/zig-out/bin/hearth-agent root@worker-host:/usr/local/bin/hearth-agent.new
+scp deploy/release/x86_64/hearth-agent root@worker-host:/usr/local/bin/hearth-agent.new
 
 # 3. Atomic replace + restart
 #    Running VMs are unaffected — Firecracker children are independent processes.

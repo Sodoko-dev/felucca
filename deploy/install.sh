@@ -8,10 +8,11 @@
 # The script is safe to re-run.  It will not overwrite existing config files.
 # Run as root (or with sudo).
 #
-# Binary resolution order (first match wins):
-#   1. ./release/<arch>/hearthd | hearth-agent      (pre-built static binaries)
-#   2. zig build -Dtarget=<arch>-linux-musl          (if zig is on PATH)
-#   3. Die with a helpful error message
+# Binary resolution:
+#   ./release/<arch>/hearthd | hearth-agent          (pre-built static binaries)
+# Build them inside the toolchain VM (see docs/DEPLOYMENT.md):
+#   hearthd:      cd go && CGO_ENABLED=0 GOOS=linux GOARCH=<arch> go build ./cmd/hearthd
+#   hearth-agent: cd rust/agent && cargo build --release --target <arch>-unknown-linux-musl
 
 set -euo pipefail
 
@@ -29,7 +30,7 @@ require_root() {
     fi
 }
 
-# Detect the host architecture and map it to the Firecracker/zig triple.
+# Detect the host architecture and map it to the Firecracker/musl triple.
 detect_arch() {
     local raw
     raw="$(uname -m)"
@@ -81,21 +82,11 @@ install_binary() {
         return
     fi
 
-    # 2) Build with zig if available
-    if command -v zig >/dev/null 2>&1; then
-        info "No pre-built binary found; building ${name} with zig (target=${ARCH}-linux-musl)"
-        local backend_dir="${SCRIPT_DIR}/../backend"
-        [ -d "${backend_dir}" ] || die "Cannot find backend dir at ${backend_dir}"
-        (cd "${backend_dir}" && zig build -Dtarget="${ARCH}-linux-musl" 2>&1)
-        local built="${backend_dir}/zig-out/bin/${name}"
-        [ -f "${built}" ] || die "zig build succeeded but ${built} not found"
-        install -m 0755 "${built}" "${dest}"
-        ok "${dest}"
-        return
-    fi
-
-    die "Cannot find ${name}: no pre-built binary in ${release_bin} and zig not on PATH.
-Place static binaries in ${SCRIPT_DIR}/release/${ARCH}/ or install zig 0.16."
+    die "Cannot find ${name}: no pre-built binary at ${release_bin}.
+Build static binaries inside the toolchain VM and place them in ${SCRIPT_DIR}/release/${ARCH}/ :
+  hearthd:      cd go && CGO_ENABLED=0 GOOS=linux GOARCH=$([ "${ARCH}" = aarch64 ] && echo arm64 || echo amd64) go build -ldflags='-s -w' -o hearthd ./cmd/hearthd
+  hearth-agent: cd rust/agent && cargo build --release --target ${ARCH}-unknown-linux-musl
+See docs/DEPLOYMENT.md."
 }
 
 # ---------------------------------------------------------------------------

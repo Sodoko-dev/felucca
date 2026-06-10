@@ -77,6 +77,17 @@ if [ -n "$wms" ]; then
 else
   bad "no wake_ms in wake response: $wres"
 fi
+# The restored guest must actually be alive, not just "running" in the API:
+# a snapshot taken mid-guest-boot panics on resume (clock jump) and the FC
+# exits ~1s later while the state still reads running.
+if [ -n "$worker_vm" ] && [ -n "$ip" ]; then
+  sleep 2
+  if limactl shell $worker_vm -- ping -c2 -W2 "$ip" >/dev/null 2>&1; then
+    ok "guest $ip answers ping after wake"
+  else
+    bad "guest $ip does not answer ping after wake (poisoned snapshot?)"
+  fi
+fi
 
 say "== 7. fork =="
 child=$(cp_curl -X POST $API/api/v1/sandboxes/$id/fork -d '{"name":"v2-verify-child"}')

@@ -2,6 +2,7 @@
 backend/.zig-cache/
 backend/zig-out/
 rust/agent/target/
+deploy/release/
 
 # Tooling state
 .omc/
