@@ -43,6 +43,27 @@ req() {
 hd() { req "$HEARTH_API" "$@"; }
 ag() { req "$AGENT_API" "$@"; }
 
+# req_as <key> <base> <method> <path> [json-body]
+# Like req with auth=token but uses <key> as the bearer token instead of
+# $HEARTH_TOKEN. Used by the tenancy suite to send requests as a specific
+# tenant API key without touching the global HEARTH_TOKEN.
+# Sets R_STATUS, R_BODY, R_CT identically to req.
+req_as() {
+  local key="$1" base="$2" method="$3" path="$4" body="${5:-}"
+  local hdr bod
+  hdr=$(mktemp) bod=$(mktemp)
+  local args=(-s -m 30 -X "$method" -D "$hdr" -o "$bod" -w '%{http_code}')
+  args+=(-H "Authorization: Bearer $key")
+  [ -n "$body" ] && args+=(-d "$body")
+  R_STATUS=$(curl "${args[@]}" "$base$path")
+  R_BODY=$(cat "$bod")
+  R_CT=$(grep -i '^content-type:' "$hdr" | head -1 | tr -d '\r' | cut -d' ' -f2-)
+  if grep -qi '^transfer-encoding:' "$hdr"; then
+    bad "$method $path: response uses Transfer-Encoding (must be Content-Length framed)"
+  fi
+  rm -f "$hdr" "$bod"
+}
+
 assert_status() { # <expected> <label>
   if [ "$R_STATUS" = "$1" ]; then ok "$2 -> $1"; else bad "$2: expected $1, got $R_STATUS (body: $R_BODY)"; fi
 }

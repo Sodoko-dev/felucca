@@ -16,7 +16,19 @@ import (
 	"github.com/alpham/infra-saas/hearth/internal/model"
 	"github.com/alpham/infra-saas/hearth/internal/server"
 	"github.com/alpham/infra-saas/hearth/internal/state"
+	"github.com/alpham/infra-saas/hearth/internal/store"
 )
+
+// newTestStore opens a throwaway SQLite store in the test's temp dir.
+func newTestStore(t *testing.T, tmp string) store.Store {
+	t.Helper()
+	db, err := store.OpenSQLite(filepath.Join(tmp, "hearth.db"))
+	if err != nil {
+		t.Fatalf("open test store: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
 
 func newTestServer(t *testing.T, token string) (*server.Server, *state.State) {
 	t.Helper()
@@ -25,9 +37,10 @@ func newTestServer(t *testing.T, token string) (*server.Server, *state.State) {
 		Token:     token,
 		UIDir:     tmp,
 		StatePath: filepath.Join(tmp, "state.json"),
+		DBPath:    filepath.Join(tmp, "hearth.db"),
 	}
 	st := state.New()
-	return server.New(cfg, st), st
+	return server.New(cfg, st, newTestStore(t, tmp)), st
 }
 
 func do(h http.Handler, method, path, body, auth string) *httptest.ResponseRecorder {
@@ -277,7 +290,7 @@ func TestStaticIndexFallback(t *testing.T) {
 		StatePath: filepath.Join(tmp, "state.json"),
 	}
 	os.WriteFile(filepath.Join(tmp, "index.html"), []byte("<html>hi</html>"), 0o644)
-	srv := server.New(cfg, state.New())
+	srv := server.New(cfg, state.New(), newTestStore(t, tmp))
 
 	// Unknown path should fall back to index.html (SPA routing).
 	w := do(srv.Handler(), "GET", "/some/spa/route", "", "")
@@ -320,7 +333,7 @@ func TestMIMETypes(t *testing.T) {
 	for name := range files {
 		os.WriteFile(filepath.Join(tmp, name), []byte("x"), 0o644)
 	}
-	srv := server.New(cfg, state.New())
+	srv := server.New(cfg, state.New(), newTestStore(t, tmp))
 	for name, wantCT := range files {
 		w := do(srv.Handler(), "GET", "/"+name, "", "")
 		got := w.Header().Get("Content-Type")
@@ -379,7 +392,7 @@ func seedSandboxWithState(t *testing.T, h http.Handler, st *state.State, sbState
 		StatePath: filepath.Join(tmp, "state.json"),
 	}
 	_ = h // unused — caller passes nil to signal "use the returned srv"
-	srv := server.New(cfg, st)
+	srv := server.New(cfg, st, newTestStore(t, tmp))
 	return srv, ""
 }
 
@@ -396,7 +409,7 @@ func newServerWithFakeAgent(t *testing.T, agentHandler http.HandlerFunc, sbState
 		StatePath: filepath.Join(tmp, "state.json"),
 	}
 	st := state.New()
-	srv := server.New(cfg, st)
+	srv := server.New(cfg, st, newTestStore(t, tmp))
 
 	// Register a node pointing at the fake agent.
 	agentURL := fakeAgent.URL // e.g. http://127.0.0.1:PORT
@@ -510,7 +523,7 @@ func TestExecAgentDown(t *testing.T) {
 		StatePath: filepath.Join(tmp, "state.json"),
 	}
 	st := state.New()
-	srv := server.New(cfg, st)
+	srv := server.New(cfg, st, newTestStore(t, tmp))
 	now := time.Now().Unix()
 	nodeID := st.RegisterNode("testhost", fakeAgent.URL, 4, 8192, now)
 	st.Lock()

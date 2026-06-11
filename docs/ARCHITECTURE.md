@@ -37,7 +37,7 @@ flowchart TB
         API["REST API v1+v2+v3.1<br/>(JSON over HTTP/1.1;<br/>sleep · wake · fork · exec verbs)"]
         SCHED["Scheduler<br/>(ready node with lowest vm_count)"]
         REG["Node registry<br/>(register / heartbeat + pool_size,<br/>down after 15s silence)"]
-        STATE[("state.json<br/>(atomic tmp+rename,<br/>reloaded on boot)")]
+        STATE[("SQLite WAL (v4)<br/>(snapshot tx per mutation;<br/>tenants · api_keys · usage_events;<br/>one-time state.json import)")]
         METRICS["/metrics<br/>(Prometheus text:<br/>wake_ms, forks, pool, states)"]
     end
 
@@ -214,7 +214,7 @@ sequenceDiagram
         F-->>A: 204 — guest boots (serial.log)
     end
     A-->>H: 201 {state: running, ip: 10.231.0.x}
-    H->>H: persist state.json (atomic)
+    H->>H: persist working set to SQLite (one tx; v4 — was state.json)
     H-->>U: 201 sandbox JSON
     Note over U,H: UI poll picks up the new<br/>sandbox within 3s
 ```
@@ -455,16 +455,28 @@ v3.1 — **live in the lab** (rolled out and verified 2026-06-11: conformance **
 | Asset pipeline | `infra/guest-agent-install.sh` injects binary+unit into the base image and drops the `.hearth-guest-v1` marker that gates the vsock device | idempotent run against an image copy; un-injected images keep exact v2 behavior |
 | Lifecycle hardening | `start` = guarded cold boot (`stopped`/`error` only; 409 `InvalidState` otherwise — start-on-paused used to orphan the live FC); `pause`/`resume` guarded; FC exits detected (spawn reaper + 5 s sweep) → `state:error`; failed spawns reaped; dead pool VM falls through to cold boot | start-on-paused 409 regression cases in conformance (agent/07, hearthd/10); poisoned wake flips to `error` within ~5 s instead of a stale `running` |
 
-Remaining for v3:
+v4 — multi-tenant, deploy-anywhere, product-ready (in progress; plan P0–P6,
+[ADR-0004](adr/ADR-0004-tenancy-and-sqlite.md)):
 
-| Capability | v3 mechanism |
+| Phase | Capability | Status |
+|---|---|---|
+| P0 | Tenancy (API keys, enforced namespaces, quotas, usage metering) + SQLite store (`go/internal/store`, pure-Go driver, one-time state.json import) | **live in the lab 2026-06-12** — conformance **166/0** (new `hearthd/17-tenancy`), verify-v2 **21/0**; contract in API-V2 §3b |
+| P1 | Cross-tenant network isolation (nftables forward-drop + per-tenant sets) | next |
+| P2 | WireGuard overlay, join tokens, TLS, systemd soak (mixed-fleet acceptance) | planned |
+| P3 | Multi-service ingress gateway (`name--id.sb.<domain>`) | planned |
+| P4 | Templates (docker-base, odoo) + bigger guests + per-template pools | planned |
+| P5 | Streaming exec, idle/TTL policies, TS SDK, usage aggregation | planned |
+| P6 | Observability, bench, HA groundwork | planned |
+
+Remaining beyond v4:
+
+| Capability | Mechanism |
 |---|---|
 | `branch` (fork a *running* VM without pausing perception) | diff snapshots + uffd shared-memory CoW (fork currently copies mem.bin) |
-| Cross-tenant network isolation | nftables drop between namespace IP sets |
 | Root-disk dedup | overlayfs shared RO base (today: full rootfs copy per VM) |
-| State store | JSON file → SQLite WAL → Postgres at scale-out |
+| Postgres / HA state | behind the `Store` interface (SQLite done in v4 P0) |
 | Reschedule across nodes | snapshot → ship → restore (needs node-decoupled storage) |
-| OIDC / multi-user auth | token-exchange on top of the bearer layer |
+| OIDC / multi-user auth | token-exchange resolving to the same tenant entities as API keys |
 | Pool-orphan reclaim | a paused pool FC orphaned by an agent restart is reconciled to `stopped` but its process is not reaped (1:1 with v2 behavior) |
 | uffd lazy restore / CoW fork | in-process userfaultfd in the Rust agent (the reason the agent is Rust — rust-vmm territory) |
 | Terraform provider | Go provider against the hearthd API (the reason the control plane is Go) |

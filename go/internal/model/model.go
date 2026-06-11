@@ -38,6 +38,8 @@ func ParseSandboxState(s string) SandboxState {
 
 // Sandbox is the in-memory representation. Pointer fields serialize as explicit
 // null when nil (no omitempty). Field order matches the Zig struct declaration.
+// TenantID is deliberately excluded from JSON: the v2 wire shape is frozen by
+// the conformance goldens; tenancy lives in the store and in auth scoping.
 type Sandbox struct {
 	ID        string       `json:"id"`
 	Name      string       `json:"name"`
@@ -49,6 +51,7 @@ type Sandbox struct {
 	IP        *string      `json:"ip"`
 	CreatedAt int64        `json:"created_at"`
 	ParentID  *string      `json:"parent_id"`
+	TenantID  string       `json:"-"`
 }
 
 // Node is the in-memory representation of an agent node.

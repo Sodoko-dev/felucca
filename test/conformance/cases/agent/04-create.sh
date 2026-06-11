@@ -2,6 +2,9 @@
 # production): 201 {"ok":true,"ip":<str|null>}, then the VM lists as running
 # with a live pid. Uses a hearthd-shaped id so normalize.jq applies.
 CF_VM1="sb-cf000001-90001"
+# Self-cleaning entry: a crashed previous run can leave cf-vm-1 adopted on the
+# node; DELETE is idempotent (204 either way) so this is contract-safe.
+ag DELETE "/v1/vms/$CF_VM1"
 ag POST /v1/vms "{\"id\":\"$CF_VM1\",\"name\":\"cf-vm-1\",\"vcpus\":1,\"mem_mib\":256}"
 assert_status 201 "POST /v1/vms"
 assert_jq '.ok == true' "create ok:true"

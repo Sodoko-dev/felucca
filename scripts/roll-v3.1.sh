@@ -63,12 +63,14 @@ roll_hearthd() {
   limactl shell $CP_VM -- bash -c '
     export PATH=$PATH:/usr/local/go/bin GOCACHE=$HOME/.cache/go-build
     cd '"$REPO"'/go && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o /tmp/hearthd-v31 ./cmd/hearthd
-    cp /tmp/hearth/state.json /tmp/hearth/state.json.pre-v31'
+    # Back up whichever durable state exists (JSON pre-v4, SQLite from v4 on).
+    cp /tmp/hearth/state.json /tmp/hearth/state.json.pre-roll 2>/dev/null || true
+    cp /tmp/hearth/hearth.db /tmp/hearth/hearth.db.pre-roll 2>/dev/null || true'
   limactl shell $CP_VM -- pkill -f '[h]earthd-go'
   sleep 1
   limactl shell $CP_VM -- bash -c '
     mv /tmp/hearthd-v31 ~/bin/hearthd-go
-    nohup ~/bin/hearthd-go --state /tmp/hearth/state.json --ui-dir '"$REPO"'/ui --token '"$TOKEN"' \
+    nohup ~/bin/hearthd-go --state /tmp/hearth/state.json --db /tmp/hearth/hearth.db --ui-dir '"$REPO"'/ui --token '"$TOKEN"' \
       > /tmp/hearth/hearthd-go.log 2>&1 < /dev/null &
     disown
     for i in $(seq 1 50); do curl -s -m1 http://127.0.0.1:8080/healthz 2>/dev/null | grep -q ok && { echo up; break; }; sleep 0.2; done

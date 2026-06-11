@@ -51,6 +51,7 @@ fn reconcile_one(data_dir: &str, dir_name: &str, alloc: Option<&mut Allocator>) 
     let meta_pid = meta.pid;
     let ip = meta.ip.clone();
     let vsock = meta.vsock;
+    let tenant_id = meta.tenant_id.clone();
 
     let mut state: VmState = meta.state.clone();
     let mut pid: Option<i32> = None;
@@ -92,6 +93,7 @@ fn reconcile_one(data_dir: &str, dir_name: &str, alloc: Option<&mut Allocator>) 
         slot,
         ip,
         vsock,
+        tenant_id,
     })
 }
 
@@ -142,6 +144,7 @@ mod tests {
         // pid 999999 is almost certainly dead → sleeping (vmstate.bin present).
         assert_eq!(vm.state, VmState::Sleeping, "should be sleeping with vmstate.bin");
         assert_eq!(vm.pid, None);
+        assert_eq!(vm.tenant_id, None);
     }
 
     #[test]
@@ -159,6 +162,7 @@ mod tests {
         let vm = vms.iter().find(|v| v.id == "vm-2").expect("vm-2");
         assert_eq!(vm.state, VmState::Stopped);
         assert_eq!(vm.pid, None);
+        assert_eq!(vm.tenant_id, None);
     }
 
     #[test]
@@ -193,6 +197,7 @@ mod tests {
         // Slot 2 should be reserved — next claim should skip it.
         let claimed = alloc.claim().unwrap();
         assert_ne!(claimed, 2, "slot 2 should be reserved");
+        let _ = vms;
     }
 
     #[test]
@@ -227,5 +232,37 @@ mod tests {
         let vms = reconcile(data_dir, None);
         let vm = vms.iter().find(|v| v.id == "sb-real-id").expect("sb-real-id");
         assert_eq!(vm.dir_id, "pool-xyz");
+    }
+
+    #[test]
+    fn test_tenant_id_carried_through_reconcile() {
+        let tmp = make_temp_dir();
+        let data_dir = tmp.path().to_str().unwrap();
+        let instances_dir = tmp.path().join("instances");
+        fs::create_dir_all(&instances_dir).unwrap();
+
+        // v4 meta with tenant_id set.
+        let meta = r#"{"id":"vm-t","name":"vm-t","dir_id":"vm-t","vcpus":1,"mem_mib":256,"pid":null,"slot":1,"ip":"10.231.0.3","state":"sleeping","vsock":false,"tenant_id":"acme"}"#;
+        write_meta(&instances_dir, "vm-t", meta);
+
+        let vms = reconcile(data_dir, None);
+        let vm = vms.iter().find(|v| v.id == "vm-t").expect("vm-t");
+        assert_eq!(vm.tenant_id, Some("acme".to_string()), "tenant_id must be carried through reconcile");
+    }
+
+    #[test]
+    fn test_tenant_id_absent_in_old_meta() {
+        let tmp = make_temp_dir();
+        let data_dir = tmp.path().to_str().unwrap();
+        let instances_dir = tmp.path().join("instances");
+        fs::create_dir_all(&instances_dir).unwrap();
+
+        // Old meta without tenant_id key.
+        let meta = r#"{"id":"vm-old","name":"vm-old","dir_id":"vm-old","vcpus":1,"mem_mib":256,"pid":null,"slot":1,"ip":"10.231.0.3","state":"sleeping","vsock":true}"#;
+        write_meta(&instances_dir, "vm-old", meta);
+
+        let vms = reconcile(data_dir, None);
+        let vm = vms.iter().find(|v| v.id == "vm-old").expect("vm-old");
+        assert_eq!(vm.tenant_id, None, "absent tenant_id must default to None");
     }
 }

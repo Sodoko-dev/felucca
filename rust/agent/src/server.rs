@@ -101,8 +101,9 @@ async fn create_vm(State(state): State<AppState>, req: Request) -> Response {
     let name = json.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
     let vcpus = json.get("vcpus").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
     let mem_mib = json.get("mem_mib").and_then(|v| v.as_u64()).unwrap_or(256);
+    let tenant_id = json.get("tenant_id").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    match state.mgr.create(&id, &name, vcpus, mem_mib).await {
+    match state.mgr.create(&id, &name, vcpus, mem_mib, tenant_id).await {
         Ok(_) => {
             let ip = state.mgr.ip_of(&id).await;
             let ip_str = match ip {

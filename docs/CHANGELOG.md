@@ -154,6 +154,43 @@ any worker restart. Goldens re-recorded against the fixed stack:
 `metrics-names` gains `hearth_execs_total`; new `hearthd/exec` and
 `agent/vm-exec` goldens carry real 200 bodies.
 
+## v4 P0 — tenancy, SQLite store, usage metering (2026-06-12; lab live — conformance 166/0, verify-v2 21/0)
+
+First phase of the v4 "multi-tenant, deploy-anywhere, product-ready" plan
+([ADR-0004](adr/ADR-0004-tenancy-and-sqlite.md); contract in API-V2 §3b):
+
+- **Tenants + API keys**: `hearth_sk_…` bearer keys (sha256-at-rest, shown
+  once, instant revocation); the legacy configured token is now the admin
+  credential — pre-v4 deployments work unchanged. Admin-only CRUD under
+  `/api/v1/tenants*`; tenant keys get 404 on infra routes.
+- **Enforced scoping**: every sandbox route filters by the key's tenant;
+  foreign and unknown ids are indistinguishable (404). Fork children inherit
+  the parent's tenant. `tenant_id` never appears on the wire (goldens frozen);
+  the agent records it in `meta.json` for P1's nftables isolation.
+- **Quotas**: per-tenant max sandboxes/vcpus/mem checked at create+fork → 429.
+- **Usage metering**: append-only `usage_events` row per lifecycle transition
+  (shape + timestamps) from day one; aggregation lands in P5.
+- **SQLite (WAL) storage** behind a new `Store` interface (`go/internal/store`,
+  pure-Go `modernc.org/sqlite` — static CGO_ENABLED=0 build preserved):
+  whole-snapshot transactions at the same granularity as the old JSON persist,
+  plus row-level tenants/keys/usage. One-time `state.json` import (renamed
+  `*.imported`) — verified live on the lab. DB file is 0600.
+- Conformance grew to **166 checks**: new `hearthd/17-tenancy` (scoping,
+  cross-tenant 404s, revocation, quota 429) with per-run-unique tenant names,
+  a `req_as` helper in lib.sh, and self-cleaning agent cases (a crashed prior
+  run can no longer cascade `AlreadyExists` failures into the next).
+
+Operational notes: kata-lab-0's Lima VM died at the hypervisor level again
+(`VZErrorDomain Code=3`, second occurrence, both during the agent suite's
+rapid sleep/wake/fork) — with the duplicate-FC bug fixed since v3.1, this now
+reads as a macOS Virtualization.framework nested-virt limitation, not a Hearth
+bug (kata-lab-1 runs the identical binary clean). Documented as a lab
+constraint; production bare-metal workers (v4 P2) are unaffected by vz.
+Security review notes: tenant-name length capped; quota check has a benign
+one-sandbox TOCTOU burst window (row-level counting will close it);
+`usage_events` retention is deferred to P5; P1 must allowlist-sanitize
+`tenant_id` before any nft shell-out.
+
 ## Backlog (v3+, in order)
 
 branch (uffd CoW fork of running VMs) → cross-tenant nftables isolation →

@@ -17,6 +17,7 @@ type Config struct {
 	Bind      string
 	UIDir     string
 	StatePath string
+	DBPath    string
 	Token     string
 	Port      uint16
 }
@@ -28,6 +29,7 @@ func Load(args []string) (*Config, error) {
 		Bind:      "0.0.0.0:8080",
 		UIDir:     "/usr/share/hearth/ui",
 		StatePath: "/var/lib/hearth/state.json",
+		DBPath:    "/var/lib/hearth/hearth.db",
 		Token:     "",
 		Port:      8080,
 	}
@@ -57,6 +59,9 @@ func Load(args []string) (*Config, error) {
 	if v := os.Getenv("HEARTH_STATE"); v != "" {
 		cfg.StatePath = v
 	}
+	if v := os.Getenv("HEARTH_DB"); v != "" {
+		cfg.DBPath = v
+	}
 	if v := os.Getenv("HEARTH_TOKEN"); v != "" {
 		cfg.Token = v
 	}
@@ -71,6 +76,7 @@ func Load(args []string) (*Config, error) {
 	bind := fs.String("bind", cfg.Bind, "")
 	uiDir := fs.String("ui-dir", cfg.UIDir, "")
 	statePath := fs.String("state", cfg.StatePath, "")
+	dbPath := fs.String("db", cfg.DBPath, "")
 	token := fs.String("token", cfg.Token, "")
 	port := fs.Uint("port", uint(cfg.Port), "")
 	// --config is consumed above; define it here so flag parsing doesn't fail.
@@ -89,6 +95,8 @@ func Load(args []string) (*Config, error) {
 			cfg.UIDir = *uiDir
 		case "state":
 			cfg.StatePath = *statePath
+		case "db":
+			cfg.DBPath = *dbPath
 		case "token":
 			cfg.Token = *token
 		case "port":
@@ -113,6 +121,7 @@ type fileConfig struct {
 	Bind      *string `json:"bind"`
 	UIDir     *string `json:"ui_dir"`
 	StatePath *string `json:"state_path"`
+	DBPath    *string `json:"db_path"`
 	Token     *string `json:"token"`
 	Port      *int64  `json:"port"`
 }
@@ -134,6 +143,9 @@ func applyFile(cfg *Config, path string) error {
 	}
 	if fc.StatePath != nil {
 		cfg.StatePath = *fc.StatePath
+	}
+	if fc.DBPath != nil {
+		cfg.DBPath = *fc.DBPath
 	}
 	if fc.Token != nil {
 		cfg.Token = *fc.Token

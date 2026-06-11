@@ -1,10 +1,12 @@
 //! meta.json schema — per-instance persisted metadata.
 //!
 //! Keys MUST appear in this declaration order (matching the Zig writeMeta output):
-//! id, name, dir_id, vcpus, mem_mib, pid, slot, ip, state, vsock.
-//! `vsock` is the v3 addition: optional, serialized LAST, defaults false when
-//! absent so older meta.json files parse unchanged.
-//! Options serialize as explicit null — NO skip_serializing_if.
+//! id, name, dir_id, vcpus, mem_mib, pid, slot, ip, state, vsock[, tenant_id].
+//! `vsock` is the v3 addition: optional, serialized LAST for mandatory keys,
+//! defaults false when absent so older meta.json files parse unchanged.
+//! `tenant_id` is the v4 addition: optional, serialized only when Some (after vsock),
+//! absent in older meta.json files → None.
+//! Options serialize as explicit null — NO skip_serializing_if (except tenant_id).
 //! State strings: creating|running|paused|stopped|sleeping|error|pooled.
 
 use serde::{Deserialize, Serialize};
@@ -72,9 +74,14 @@ pub struct Meta {
     pub ip: Option<String>,
     pub state: VmState,
     /// v3: VM has a Firecracker vsock device (guest agent reachable). Optional,
-    /// defaults false when absent in older meta.json files. Serialized LAST.
+    /// defaults false when absent in older meta.json files. Serialized LAST of
+    /// mandatory keys.
     #[serde(default)]
     pub vsock: bool,
+    /// v4: optional tenant identifier for nftables isolation. Absent in older
+    /// meta.json files → None. Serialized only when Some (after vsock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 impl Meta {
@@ -93,8 +100,12 @@ impl Meta {
             Some(ip) => format!("\"{}\"", ip),
             None => "null".to_string(),
         };
+        let tenant_suffix = match &self.tenant_id {
+            Some(t) => format!(",\"tenant_id\":{}", json_str(t)),
+            None => String::new(),
+        };
         format!(
-            "{{\"id\":{},\"name\":{},\"dir_id\":{},\"vcpus\":{},\"mem_mib\":{},\"pid\":{},\"slot\":{},\"ip\":{},\"state\":{},\"vsock\":{}}}",
+            "{{\"id\":{},\"name\":{},\"dir_id\":{},\"vcpus\":{},\"mem_mib\":{},\"pid\":{},\"slot\":{},\"ip\":{},\"state\":{},\"vsock\":{}{}}}",
             json_str(&self.id),
             json_str(&self.name),
             json_str(&self.dir_id),
@@ -105,6 +116,7 @@ impl Meta {
             ip_str,
             json_str(self.state.as_str()),
             self.vsock,
+            tenant_suffix,
         )
     }
 }
@@ -148,6 +160,7 @@ mod tests {
         assert_eq!(meta.slot, Some(3));
         assert_eq!(meta.ip, Some("10.231.0.5".to_string()));
         assert_eq!(meta.state, VmState::Sleeping);
+        assert_eq!(meta.tenant_id, None);
 
         // Round-trip: to_json → parse → same values.
         let json = meta.to_json();
@@ -156,6 +169,7 @@ mod tests {
         assert_eq!(meta2.state, VmState::Sleeping);
         assert_eq!(meta2.pid, None);
         assert_eq!(meta2.slot, Some(3));
+        assert_eq!(meta2.tenant_id, None);
     }
 
     #[test]
@@ -168,11 +182,13 @@ mod tests {
         assert_eq!(meta.slot, Some(1));
         assert_eq!(meta.ip, Some("10.231.0.3".to_string()));
         assert_eq!(meta.state, VmState::Pooled);
+        assert_eq!(meta.tenant_id, None);
 
         let json = meta.to_json();
         let meta2: Meta = serde_json::from_str(&json).expect("round-trip parse");
         assert_eq!(meta2.pid, Some(12345));
         assert_eq!(meta2.state, VmState::Pooled);
+        assert_eq!(meta2.tenant_id, None);
     }
 
     #[test]
@@ -188,12 +204,15 @@ mod tests {
             ip: None,
             state: VmState::Stopped,
             vsock: false,
+            tenant_id: None,
         };
         let json = meta.to_json();
         // All Option fields must appear as explicit null.
         assert!(json.contains("\"pid\":null"), "pid should be null, got: {}", json);
         assert!(json.contains("\"slot\":null"), "slot should be null, got: {}", json);
         assert!(json.contains("\"ip\":null"), "ip should be null, got: {}", json);
+        // tenant_id absent when None.
+        assert!(!json.contains("tenant_id"), "tenant_id must be absent when None, got: {}", json);
     }
 
     #[test]
@@ -209,6 +228,7 @@ mod tests {
             ip: Some("10.0.0.4".into()),
             state: VmState::Running,
             vsock: true,
+            tenant_id: None,
         };
         let json = meta.to_json();
         // Keys must appear in order: id, name, dir_id, vcpus, mem_mib, pid, slot, ip, state, vsock.
@@ -230,9 +250,32 @@ mod tests {
         assert!(pid_pos < slot_pos);
         assert!(slot_pos < ip_pos);
         assert!(ip_pos < state_pos);
-        // vsock is the LAST key.
+        // vsock is LAST when tenant_id is None.
         assert!(state_pos < vsock_pos);
-        assert!(json.ends_with("\"vsock\":true}"), "vsock must be last: {}", json);
+        assert!(json.ends_with("\"vsock\":true}"), "vsock must be last when no tenant: {}", json);
+    }
+
+    #[test]
+    fn test_key_order_with_tenant_id() {
+        let meta = Meta {
+            id: "x".into(),
+            name: "y".into(),
+            dir_id: "x".into(),
+            vcpus: 1,
+            mem_mib: 256,
+            pid: Some(99),
+            slot: Some(2),
+            ip: Some("10.0.0.4".into()),
+            state: VmState::Running,
+            vsock: true,
+            tenant_id: Some("acme".into()),
+        };
+        let json = meta.to_json();
+        let vsock_pos = json.find("\"vsock\"").unwrap();
+        let tenant_pos = json.find("\"tenant_id\"").unwrap();
+        // tenant_id must come after vsock.
+        assert!(vsock_pos < tenant_pos, "tenant_id must be after vsock: {}", json);
+        assert!(json.ends_with("\"tenant_id\":\"acme\"}"), "tenant_id must be last: {}", json);
     }
 
     #[test]
@@ -264,6 +307,7 @@ mod tests {
         let fixture = r#"{"id":"vm-old","name":"vm-old","dir_id":"vm-old","vcpus":1,"mem_mib":256,"pid":null,"slot":0,"ip":"10.231.0.2","state":"sleeping"}"#;
         let meta: Meta = serde_json::from_str(fixture).expect("parse pre-v3 fixture");
         assert!(!meta.vsock, "absent vsock must default to false");
+        assert_eq!(meta.tenant_id, None, "absent tenant_id must default to None");
     }
 
     #[test]
@@ -279,12 +323,14 @@ mod tests {
             ip: Some("10.231.0.2".into()),
             state: VmState::Running,
             vsock: true,
+            tenant_id: None,
         };
         let json = meta.to_json();
         assert!(json.contains("\"vsock\":true"), "vsock should serialize true: {}", json);
         let meta2: Meta = serde_json::from_str(&json).expect("round-trip parse");
         assert!(meta2.vsock);
         assert_eq!(meta2.state, VmState::Running);
+        assert_eq!(meta2.tenant_id, None);
     }
 
     #[test]
@@ -300,10 +346,82 @@ mod tests {
             ip: None,
             state: VmState::Stopped,
             vsock: false,
+            tenant_id: None,
         };
         let json = meta.to_json();
         assert!(json.contains("\"vsock\":false"), "vsock:false must be explicit: {}", json);
         let meta2: Meta = serde_json::from_str(&json).expect("round-trip parse");
         assert!(!meta2.vsock);
+    }
+
+    #[test]
+    fn test_tenant_id_serialized_when_some() {
+        let meta = Meta {
+            id: "vm-t".into(),
+            name: "vm-t".into(),
+            dir_id: "vm-t".into(),
+            vcpus: 1,
+            mem_mib: 256,
+            pid: None,
+            slot: None,
+            ip: None,
+            state: VmState::Running,
+            vsock: false,
+            tenant_id: Some("acme-corp".into()),
+        };
+        let json = meta.to_json();
+        assert!(json.contains("\"tenant_id\":\"acme-corp\""), "tenant_id must appear: {}", json);
+        let meta2: Meta = serde_json::from_str(&json).expect("round-trip parse");
+        assert_eq!(meta2.tenant_id, Some("acme-corp".into()));
+    }
+
+    #[test]
+    fn test_tenant_id_absent_when_none() {
+        let meta = Meta {
+            id: "vm-nt".into(),
+            name: "vm-nt".into(),
+            dir_id: "vm-nt".into(),
+            vcpus: 1,
+            mem_mib: 256,
+            pid: None,
+            slot: None,
+            ip: None,
+            state: VmState::Running,
+            vsock: false,
+            tenant_id: None,
+        };
+        let json = meta.to_json();
+        assert!(!json.contains("tenant_id"), "tenant_id must not appear when None: {}", json);
+    }
+
+    #[test]
+    fn test_old_meta_without_tenant_parses_none() {
+        // Pre-v4 file (no tenant_id key) must parse with tenant_id defaulting to None.
+        let fixture = r#"{"id":"vm-v3","name":"vm-v3","dir_id":"vm-v3","vcpus":1,"mem_mib":256,"pid":null,"slot":0,"ip":"10.231.0.2","state":"running","vsock":true}"#;
+        let meta: Meta = serde_json::from_str(fixture).expect("parse pre-v4 fixture");
+        assert!(meta.vsock);
+        assert_eq!(meta.tenant_id, None, "absent tenant_id must default to None");
+    }
+
+    #[test]
+    fn test_tenant_id_round_trip() {
+        let meta = Meta {
+            id: "vm-tr".into(),
+            name: "vm-tr".into(),
+            dir_id: "vm-tr".into(),
+            vcpus: 2,
+            mem_mib: 512,
+            pid: Some(1234),
+            slot: Some(3),
+            ip: Some("10.231.0.5".into()),
+            state: VmState::Running,
+            vsock: true,
+            tenant_id: Some("tenant-42".into()),
+        };
+        let json = meta.to_json();
+        let meta2: Meta = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(meta2.tenant_id, Some("tenant-42".into()));
+        assert_eq!(meta2.vsock, true);
+        assert_eq!(meta2.state, VmState::Running);
     }
 }

@@ -1,6 +1,8 @@
 # Agent fork: child id+name supplied by the caller, 201 {"ok":true,"ip":...},
 # child lists as running.
 CF_VM2="sb-cf000002-90002"
+# Self-cleaning entry (see 04-create.sh).
+ag DELETE "/v1/vms/$CF_VM2"
 ag POST "/v1/vms/$CF_VM1/fork" "{\"id\":\"$CF_VM2\",\"name\":\"cf-vm-2\"}"
 assert_status 201 "POST /v1/vms/{id}/fork"
 assert_jq '.ok == true' "fork ok:true"

@@ -4,6 +4,8 @@ package server
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -17,17 +19,81 @@ import (
 	"github.com/alpham/infra-saas/hearth/internal/config"
 	"github.com/alpham/infra-saas/hearth/internal/model"
 	"github.com/alpham/infra-saas/hearth/internal/state"
+	"github.com/alpham/infra-saas/hearth/internal/store"
 )
+
+// adminTenant is the tenant context value for the configured admin token
+// (and for open mode when no token is configured): unrestricted access.
+const adminTenant = ""
 
 // Server holds the application state and configuration.
 type Server struct {
 	cfg *config.Config
 	st  *state.State
+	db  store.Store
 }
 
 // New creates a new Server.
-func New(cfg *config.Config, st *state.State) *Server {
-	return &Server{cfg: cfg, st: st}
+func New(cfg *config.Config, st *state.State, db store.Store) *Server {
+	return &Server{cfg: cfg, st: st, db: db}
+}
+
+// persist writes the in-memory working set through to the store.
+func (srv *Server) persist() error {
+	return srv.db.SaveSnapshot(srv.st)
+}
+
+// authenticate resolves the Authorization header to a tenant context.
+// The configured admin token (or open mode) yields adminTenant; otherwise a
+// non-revoked API key (sha256 match in the store) yields its tenant id.
+func (srv *Server) authenticate(authHeader string) (string, bool) {
+	if config.Authorized(srv.cfg.Token, authHeader) {
+		return adminTenant, true
+	}
+	const prefix = "Bearer "
+	if !strings.HasPrefix(authHeader, prefix) {
+		return "", false
+	}
+	key := authHeader[len(prefix):]
+	if !strings.HasPrefix(key, "hearth_sk_") {
+		return "", false
+	}
+	sum := sha256.Sum256([]byte(key))
+	tenantID, err := srv.db.LookupKeyByHash(hex.EncodeToString(sum[:]))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "key lookup: %v\n", err)
+		return "", false
+	}
+	if tenantID == "" {
+		return "", false
+	}
+	return tenantID, true
+}
+
+// tenantOwns reports whether the tenant context may act on the sandbox.
+// Admin owns everything; tenants own only their sandboxes. Callers translate
+// false into 404 so cross-tenant existence is never leaked.
+func tenantOwns(tenant string, sb *model.Sandbox) bool {
+	return tenant == adminTenant || sb.TenantID == tenant
+}
+
+// recordUsage appends a metering event (best-effort; metering must never
+// fail the request path).
+func (srv *Server) recordUsage(sb *model.Sandbox, event string) {
+	if sb == nil {
+		return
+	}
+	e := store.UsageEvent{
+		TenantID:  sb.TenantID,
+		SandboxID: sb.ID,
+		Event:     event,
+		Vcpus:     sb.VCPUs,
+		MemMiB:    sb.MemMiB,
+		TS:        time.Now().Unix(),
+	}
+	if err := srv.db.AppendUsage(e); err != nil {
+		fmt.Fprintf(os.Stderr, "usage event: %v\n", err)
+	}
 }
 
 // Handler returns an http.Handler for use with net/http.
@@ -52,14 +118,16 @@ func (srv *Server) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// API routes — bearer-guarded when token configured.
+	// API routes — bearer-guarded when token configured. The admin token (or
+	// open mode) gets the admin context; tenant API keys get their tenant.
 	if strings.HasPrefix(path, "/api/") {
 		authHeader := r.Header.Get("Authorization")
-		if !config.Authorized(srv.cfg.Token, authHeader) {
+		tenant, ok := srv.authenticate(authHeader)
+		if !ok {
 			writeJSON(w, 401, []byte(`{"error":"unauthorized"}`))
 			return
 		}
-		srv.serveAPI(w, r)
+		srv.serveAPI(w, r, tenant)
 		return
 	}
 
@@ -69,9 +137,22 @@ func (srv *Server) handle(w http.ResponseWriter, r *http.Request) {
 
 // ---- Routing ----
 
-func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
+func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request, tenant string) {
 	path := r.URL.Path
 	method := r.Method
+
+	// Infrastructure and tenant-administration routes are admin-only. Tenant
+	// keys get 404 (not 403) so the surface doesn't advertise what exists.
+	if tenant != adminTenant {
+		switch {
+		case path == "/api/v1/nodes",
+			strings.HasPrefix(path, "/api/v1/agents/"),
+			strings.HasPrefix(path, "/api/v1/tenants"),
+			strings.HasPrefix(path, "/api/v1/keys/"):
+			writeJSON(w, 404, []byte(`{"error":"not found"}`))
+			return
+		}
+	}
 
 	switch {
 	case path == "/api/v1/nodes" && method == http.MethodGet:
@@ -83,42 +164,56 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 	case path == "/api/v1/agents/heartbeat" && method == http.MethodPost:
 		srv.agentHeartbeat(w, r)
 
+	case path == "/api/v1/tenants" && method == http.MethodPost:
+		srv.createTenant(w, r)
+
+	case path == "/api/v1/tenants" && method == http.MethodGet:
+		srv.listTenants(w)
+
 	case path == "/api/v1/sandboxes" && method == http.MethodGet:
-		srv.listSandboxes(w)
+		srv.listSandboxes(w, tenant)
 
 	case path == "/api/v1/sandboxes" && method == http.MethodPost:
-		srv.createSandbox(w, r)
+		srv.createSandbox(w, r, tenant)
 
 	default:
 		// Path-segment routes with {id}.
+		if id, ok := matchSuffix(path, "/api/v1/tenants/", "/keys"); ok && method == http.MethodPost {
+			srv.createTenantKey(w, id)
+			return
+		}
+		if id, ok := matchExact(path, "/api/v1/keys/"); ok && method == http.MethodDelete {
+			srv.revokeTenantKey(w, id)
+			return
+		}
 		if id, ok := matchSuffix(path, "/api/v1/sandboxes/", "/exec"); ok && method == http.MethodPost {
-			srv.execSandbox(w, r, id)
+			srv.execSandbox(w, r, id, tenant)
 			return
 		}
 		if id, ok := matchSuffix(path, "/api/v1/sandboxes/", "/fork"); ok && method == http.MethodPost {
-			srv.forkSandbox(w, r, id)
+			srv.forkSandbox(w, r, id, tenant)
 			return
 		}
 		if id, ok := matchSuffix(path, "/api/v1/sandboxes/", "/sleep"); ok && method == http.MethodPost {
-			srv.sleepSandbox(w, id)
+			srv.sleepSandbox(w, id, tenant)
 			return
 		}
 		if id, ok := matchSuffix(path, "/api/v1/sandboxes/", "/wake"); ok && method == http.MethodPost {
-			srv.wakeSandbox(w, id)
+			srv.wakeSandbox(w, id, tenant)
 			return
 		}
 		for _, action := range []string{"stop", "start", "pause", "resume"} {
 			if id, ok := matchSuffix(path, "/api/v1/sandboxes/", "/"+action); ok && method == http.MethodPost {
-				srv.sandboxAction(w, id, action)
+				srv.sandboxAction(w, id, action, tenant)
 				return
 			}
 		}
 		if id, ok := matchExact(path, "/api/v1/sandboxes/"); ok {
 			switch method {
 			case http.MethodGet:
-				srv.getSandbox(w, id)
+				srv.getSandbox(w, id, tenant)
 			case http.MethodDelete:
-				srv.deleteSandbox(w, id)
+				srv.deleteSandbox(w, id, tenant)
 			default:
 				writeJSON(w, 404, []byte(`{"error":"not found"}`))
 			}
@@ -193,7 +288,7 @@ func (srv *Server) agentRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now().Unix()
 	id := srv.st.RegisterNode(req.Hostname, req.Addr, req.CPUs, req.MemTotal, now)
-	if err := srv.st.Persist(srv.cfg.StatePath); err != nil {
+	if err := srv.persist(); err != nil {
 		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
 	}
 	idJSON, _ := json.Marshal(id)
@@ -225,16 +320,21 @@ func (srv *Server) agentHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 // ---- Sandbox endpoints ----
 
-func (srv *Server) listSandboxes(w http.ResponseWriter) {
+func (srv *Server) listSandboxes(w http.ResponseWriter, tenant string) {
 	srv.st.Lock()
 	defer srv.st.Unlock()
 
 	var buf bytes.Buffer
 	buf.WriteString(`{"sandboxes":[`)
-	for i, sb := range srv.st.Sandboxes {
-		if i > 0 {
+	first := true
+	for _, sb := range srv.st.Sandboxes {
+		if !tenantOwns(tenant, sb) {
+			continue
+		}
+		if !first {
 			buf.WriteByte(',')
 		}
+		first = false
 		b, _ := json.Marshal(sb)
 		buf.Write(b)
 	}
@@ -242,11 +342,11 @@ func (srv *Server) listSandboxes(w http.ResponseWriter) {
 	writeJSON(w, 200, buf.Bytes())
 }
 
-func (srv *Server) getSandbox(w http.ResponseWriter, id string) {
+func (srv *Server) getSandbox(w http.ResponseWriter, id, tenant string) {
 	srv.st.Lock()
 	defer srv.st.Unlock()
 	sb := srv.st.FindSandbox(id)
-	if sb == nil {
+	if sb == nil || !tenantOwns(tenant, sb) {
 		writeJSON(w, 404, []byte(`{"error":"not found"}`))
 		return
 	}
@@ -254,7 +354,7 @@ func (srv *Server) getSandbox(w http.ResponseWriter, id string) {
 	writeJSON(w, 200, b)
 }
 
-func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
+func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant string) {
 	var req struct {
 		Name      string `json:"name"`
 		Namespace string `json:"namespace"`
@@ -284,6 +384,14 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().Unix()
 
+	// Tenant quota gate (admin is unmetered).
+	if tenant != adminTenant {
+		if msg := srv.quotaExceeded(tenant, vcpus, memMiB); msg != "" {
+			writeJSON(w, 429, []byte(`{"error":"quota exceeded: `+msg+`"}`))
+			return
+		}
+	}
+
 	// Schedule: pick ready node with lowest vm_count. Create sandbox record in
 	// "creating" state under the lock, capturing agent address.
 	var agentAddr, sbID string
@@ -296,26 +404,28 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 	agentAddr = node.Addr
 	sb := srv.st.CreateSandbox(req.Name, namespace, node.ID, vcpus, memMiB, now)
+	sb.TenantID = tenant
 	sbID = sb.ID
 	srv.st.Unlock()
 
-	if err := srv.st.Persist(srv.cfg.StatePath); err != nil {
+	if err := srv.persist(); err != nil {
 		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
 	}
 
-	// Build agent create request body.
+	// Build agent create request body (tenant_id feeds nft isolation on the node).
 	agentBody, _ := json.Marshal(struct {
-		ID     string `json:"id"`
-		Name   string `json:"name"`
-		VCPUs  uint32 `json:"vcpus"`
-		MemMiB uint64 `json:"mem_mib"`
-	}{sbID, req.Name, vcpus, memMiB})
+		ID       string `json:"id"`
+		Name     string `json:"name"`
+		VCPUs    uint32 `json:"vcpus"`
+		MemMiB   uint64 `json:"mem_mib"`
+		TenantID string `json:"tenant_id,omitempty"`
+	}{sbID, req.Name, vcpus, memMiB, tenant})
 
 	host, port := agentclient.SplitHostPort(agentAddr)
 	resp, err := agentclient.Request(host, port, http.MethodPost, "/v1/vms", agentBody, srv.cfg.Token)
 	if err != nil {
 		srv.st.SetSandboxState(sbID, model.StateError)
-		if perr := srv.st.Persist(srv.cfg.StatePath); perr != nil {
+		if perr := srv.persist(); perr != nil {
 			fmt.Fprintf(os.Stderr, "persist: %v\n", perr)
 		}
 		writeJSON(w, 502, []byte(`{"error":"agent unreachable"}`))
@@ -323,7 +433,7 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 	if resp.Status >= 300 {
 		srv.st.SetSandboxState(sbID, model.StateError)
-		if perr := srv.st.Persist(srv.cfg.StatePath); perr != nil {
+		if perr := srv.persist(); perr != nil {
 			fmt.Fprintf(os.Stderr, "persist: %v\n", perr)
 		}
 		writeJSON(w, 502, []byte(`{"error":"agent create failed"}`))
@@ -338,7 +448,7 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
 		srv.st.SetSandboxIP(sbID, agentResp.IP)
 	}
 	srv.st.SetSandboxState(sbID, model.StateRunning)
-	if err := srv.st.Persist(srv.cfg.StatePath); err != nil {
+	if err := srv.persist(); err != nil {
 		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
 	}
 
@@ -349,15 +459,16 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, []byte(`{"error":"lost sandbox"}`))
 		return
 	}
+	srv.recordUsage(sb, "created")
 	b, _ := json.Marshal(sb)
 	writeJSON(w, 201, b)
 }
 
-func (srv *Server) sandboxAction(w http.ResponseWriter, id, action string) {
+func (srv *Server) sandboxAction(w http.ResponseWriter, id, action, tenant string) {
 	var agentAddr string
 	srv.st.Lock()
 	sb := srv.st.FindSandbox(id)
-	if sb == nil {
+	if sb == nil || !tenantOwns(tenant, sb) {
 		srv.st.Unlock()
 		writeJSON(w, 404, []byte(`{"error":"not found"}`))
 		return
@@ -395,6 +506,9 @@ func (srv *Server) sandboxAction(w http.ResponseWriter, id, action string) {
 	}
 
 	var newState model.SandboxState
+	usageEvent := map[string]string{
+		"stop": "stopped", "start": "started", "pause": "paused", "resume": "resumed",
+	}[action]
 	switch action {
 	case "stop":
 		newState = model.StateStopped
@@ -407,22 +521,29 @@ func (srv *Server) sandboxAction(w http.ResponseWriter, id, action string) {
 	}
 	if newState != "" {
 		srv.st.SetSandboxState(id, newState)
-		if err := srv.st.Persist(srv.cfg.StatePath); err != nil {
+		if err := srv.persist(); err != nil {
 			fmt.Fprintf(os.Stderr, "persist: %v\n", err)
 		}
+		srv.st.Lock()
+		srv.recordUsage(srv.st.FindSandbox(id), usageEvent)
+		srv.st.Unlock()
 	}
 	writeEmpty(w, 200)
 }
 
-func (srv *Server) deleteSandbox(w http.ResponseWriter, id string) {
+func (srv *Server) deleteSandbox(w http.ResponseWriter, id, tenant string) {
 	var agentAddr string
 	srv.st.Lock()
 	sb := srv.st.FindSandbox(id)
-	if sb == nil {
+	if sb == nil || !tenantOwns(tenant, sb) {
 		srv.st.Unlock()
+		// Unknown and foreign ids are indistinguishable: 404, per the v2
+		// contract (and no cross-tenant existence leak).
 		writeJSON(w, 404, []byte(`{"error":"not found"}`))
 		return
 	}
+	// Capture the usage shape before removal.
+	usage := *sb
 	if sb.NodeID != nil {
 		node := srv.st.FindNode(*sb.NodeID)
 		if node != nil {
@@ -439,14 +560,15 @@ func (srv *Server) deleteSandbox(w http.ResponseWriter, id string) {
 	}
 
 	srv.st.RemoveSandbox(id)
-	if err := srv.st.Persist(srv.cfg.StatePath); err != nil {
+	if err := srv.persist(); err != nil {
 		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
 	}
+	srv.recordUsage(&usage, "deleted")
 	writeEmpty(w, 204)
 }
 
-func (srv *Server) sleepSandbox(w http.ResponseWriter, id string) {
-	agentAddr, ok := srv.resolveAgent(w, id)
+func (srv *Server) sleepSandbox(w http.ResponseWriter, id, tenant string) {
+	agentAddr, ok := srv.resolveAgent(w, id, tenant)
 	if !ok {
 		return
 	}
@@ -463,7 +585,7 @@ func (srv *Server) sleepSandbox(w http.ResponseWriter, id string) {
 	}
 
 	srv.st.SetSandboxState(id, model.StateSleeping)
-	if err := srv.st.Persist(srv.cfg.StatePath); err != nil {
+	if err := srv.persist(); err != nil {
 		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
 	}
 
@@ -474,12 +596,13 @@ func (srv *Server) sleepSandbox(w http.ResponseWriter, id string) {
 		writeJSON(w, 500, []byte(`{"error":"lost sandbox"}`))
 		return
 	}
+	srv.recordUsage(sb, "slept")
 	b, _ := json.Marshal(sb)
 	writeJSON(w, 200, b)
 }
 
-func (srv *Server) wakeSandbox(w http.ResponseWriter, id string) {
-	agentAddr, ok := srv.resolveAgent(w, id)
+func (srv *Server) wakeSandbox(w http.ResponseWriter, id, tenant string) {
+	agentAddr, ok := srv.resolveAgent(w, id, tenant)
 	if !ok {
 		return
 	}
@@ -506,7 +629,7 @@ func (srv *Server) wakeSandbox(w http.ResponseWriter, id string) {
 
 	srv.st.SetSandboxState(id, model.StateRunning)
 	srv.st.RecordWake(wakeMs)
-	if err := srv.st.Persist(srv.cfg.StatePath); err != nil {
+	if err := srv.persist(); err != nil {
 		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
 	}
 
@@ -517,6 +640,7 @@ func (srv *Server) wakeSandbox(w http.ResponseWriter, id string) {
 		writeJSON(w, 500, []byte(`{"error":"lost sandbox"}`))
 		return
 	}
+	srv.recordUsage(sb, "woken")
 	// Append "wake_ms" as the final key before the closing brace (Zig behavior).
 	sbJSON, _ := json.Marshal(sb)
 	// Drop trailing '}'
@@ -526,7 +650,7 @@ func (srv *Server) wakeSandbox(w http.ResponseWriter, id string) {
 	writeJSON(w, 200, body)
 }
 
-func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID string) {
+func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID, tenant string) {
 	// Parse optional "name" from request body.
 	childName := "fork"
 	var reqBody struct {
@@ -541,10 +665,29 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID 
 	var agentAddr, childID string
 	srv.st.Lock()
 	parent := srv.st.FindSandbox(parentID)
-	if parent == nil {
+	if parent == nil || !tenantOwns(tenant, parent) {
 		srv.st.Unlock()
 		writeJSON(w, 404, []byte(`{"error":"not found"}`))
 		return
+	}
+	// The child counts against the owning tenant's quota (admin parents are
+	// unmetered). Checked before any state is created.
+	childTenant := parent.TenantID
+	if childTenant != adminTenant {
+		vcpus, memMiB := parent.VCPUs, parent.MemMiB
+		srv.st.Unlock()
+		if msg := srv.quotaExceeded(childTenant, vcpus, memMiB); msg != "" {
+			writeJSON(w, 429, []byte(`{"error":"quota exceeded: `+msg+`"}`))
+			return
+		}
+		srv.st.Lock()
+		// Re-validate under the re-acquired lock.
+		parent = srv.st.FindSandbox(parentID)
+		if parent == nil || !tenantOwns(tenant, parent) {
+			srv.st.Unlock()
+			writeJSON(w, 404, []byte(`{"error":"not found"}`))
+			return
+		}
 	}
 	switch parent.State {
 	case model.StateRunning, model.StatePaused, model.StateSleeping:
@@ -567,10 +710,11 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID 
 	}
 	agentAddr = node.Addr
 	child := srv.st.CreateForkChild(childName, parent.Namespace, node.ID, parent.VCPUs, parent.MemMiB, parentID, now)
+	child.TenantID = parent.TenantID
 	childID = child.ID
 	srv.st.Unlock()
 
-	if err := srv.st.Persist(srv.cfg.StatePath); err != nil {
+	if err := srv.persist(); err != nil {
 		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
 	}
 
@@ -583,7 +727,7 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID 
 	resp, err := agentclient.Request(host, port, http.MethodPost, agentPath, agentBody, srv.cfg.Token)
 	if err != nil {
 		srv.st.SetSandboxState(childID, model.StateError)
-		if perr := srv.st.Persist(srv.cfg.StatePath); perr != nil {
+		if perr := srv.persist(); perr != nil {
 			fmt.Fprintf(os.Stderr, "persist: %v\n", perr)
 		}
 		writeJSON(w, 502, []byte(`{"error":"agent unreachable"}`))
@@ -591,7 +735,7 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID 
 	}
 	if resp.Status >= 300 {
 		srv.st.SetSandboxState(childID, model.StateError)
-		if perr := srv.st.Persist(srv.cfg.StatePath); perr != nil {
+		if perr := srv.persist(); perr != nil {
 			fmt.Fprintf(os.Stderr, "persist: %v\n", perr)
 		}
 		writeJSON(w, 502, []byte(`{"error":"agent fork failed"}`))
@@ -606,7 +750,7 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID 
 	}
 	srv.st.SetSandboxState(childID, model.StateRunning)
 	srv.st.RecordFork()
-	if err := srv.st.Persist(srv.cfg.StatePath); err != nil {
+	if err := srv.persist(); err != nil {
 		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
 	}
 
@@ -617,11 +761,12 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID 
 		writeJSON(w, 500, []byte(`{"error":"lost child"}`))
 		return
 	}
+	srv.recordUsage(sb, "forked")
 	b, _ := json.Marshal(sb)
 	writeJSON(w, 201, b)
 }
 
-func (srv *Server) execSandbox(w http.ResponseWriter, r *http.Request, id string) {
+func (srv *Server) execSandbox(w http.ResponseWriter, r *http.Request, id, tenant string) {
 	// Parse request body.
 	var req struct {
 		Cmd       []interface{} `json:"cmd"`
@@ -661,7 +806,7 @@ func (srv *Server) execSandbox(w http.ResponseWriter, r *http.Request, id string
 	// Resolve sandbox and agent address.
 	srv.st.Lock()
 	sb := srv.st.FindSandbox(id)
-	if sb == nil {
+	if sb == nil || !tenantOwns(tenant, sb) {
 		srv.st.Unlock()
 		writeJSON(w, 404, []byte(`{"error":"not found"}`))
 		return
@@ -709,12 +854,13 @@ func (srv *Server) execSandbox(w http.ResponseWriter, r *http.Request, id string
 }
 
 // resolveAgent returns the agent address for a sandbox's node, writing a 404
-// if the sandbox or its agent is not found.
-func (srv *Server) resolveAgent(w http.ResponseWriter, id string) (string, bool) {
+// if the sandbox or its agent is not found — or if the tenant context does
+// not own the sandbox (no cross-tenant existence leak).
+func (srv *Server) resolveAgent(w http.ResponseWriter, id, tenant string) (string, bool) {
 	srv.st.Lock()
 	defer srv.st.Unlock()
 	sb := srv.st.FindSandbox(id)
-	if sb == nil {
+	if sb == nil || !tenantOwns(tenant, sb) {
 		writeJSON(w, 404, []byte(`{"error":"not found"}`))
 		return "", false
 	}

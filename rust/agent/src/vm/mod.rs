@@ -35,6 +35,8 @@ pub struct Vm {
     pub ip: Option<String>,
     /// v3: VM has a Firecracker vsock device (guest agent reachable).
     pub vsock: bool,
+    /// v4: optional tenant identifier for nftables isolation.
+    pub tenant_id: Option<String>,
 }
 
 /// Result of a guest exec attempt; the server handler maps each to a status.
@@ -195,12 +197,12 @@ impl Manager {
 
     // ---- create ----
 
-    pub async fn create(self: &Arc<Self>, id: &str, name: &str, vcpus: u32, mem_mib: u64) -> Result<(), String> {
+    pub async fn create(self: &Arc<Self>, id: &str, name: &str, vcpus: u32, mem_mib: u64, tenant_id: Option<String>) -> Result<(), String> {
         // Try to claim a warm-pool VM for a matching shape (1 vCPU / 256 MiB).
         if self.pool_target > 0 && vcpus == 1 && mem_mib == 256 {
-            if self.claim_from_pool(id, name).await? { return Ok(()); }
+            if self.claim_from_pool(id, name, tenant_id.clone()).await? { return Ok(()); }
         }
-        self.cold_create(id, name, vcpus, mem_mib, VmState::Running, None).await
+        self.cold_create(id, name, vcpus, mem_mib, VmState::Running, None, tenant_id).await
     }
 
     /// Cold-boot a fresh VM. `force_slot` reuses a specific slot (pool refill).
@@ -212,6 +214,7 @@ impl Manager {
         mem_mib: u64,
         final_state: VmState,
         force_slot: Option<u32>,
+        tenant_id: Option<String>,
     ) -> Result<(), String> {
         {
             let mut g = self.inner.lock().await;
@@ -229,6 +232,7 @@ impl Manager {
                 slot: None,
                 ip: None,
                 vsock: false,
+                tenant_id: tenant_id.clone(),
             });
         }
 
@@ -580,10 +584,10 @@ impl Manager {
     /// spawn child FC and restore. Child inherits parent's guest-internal IP
     /// (v2 documented caveat; fixed in v3).
     pub async fn fork(self: &Arc<Self>, parent_id: &str, child_id: &str, child_name: &str) -> Result<Option<String>, String> {
-        let (parent_was_running, parent_vcpus, parent_mem_mib, parent_vsock) = {
+        let (parent_was_running, parent_vcpus, parent_mem_mib, parent_vsock, parent_tenant_id) = {
             let g = self.inner.lock().await;
             let p = g.vms.iter().find(|v| v.id == parent_id).ok_or("NotFound")?;
-            (p.state == VmState::Running, p.vcpus, p.mem_mib, p.vsock)
+            (p.state == VmState::Running, p.vcpus, p.mem_mib, p.vsock, p.tenant_id.clone())
         };
 
         let parent_dir = self.instance_dir(parent_id).await;
@@ -642,6 +646,8 @@ impl Manager {
                 // The snapshot carries the parent's vsock device; the child
                 // inherits it (rebound to its own UDS via vsock_override below).
                 vsock: parent_vsock,
+                // Child inherits parent's tenant_id.
+                tenant_id: parent_tenant_id.clone(),
             });
         }
 
@@ -803,7 +809,7 @@ impl Manager {
             if count >= self.pool_target { break; }
 
             let id = format!("pool-{:x}", now_ms());
-            match self.cold_create(&id, "pool", 1, 256, VmState::Pooled, None).await {
+            match self.cold_create(&id, "pool", 1, 256, VmState::Pooled, None, None).await {
                 Ok(_) => {
                     let mut g = self.inner.lock().await;
                     g.pool.push(id.clone());
@@ -817,7 +823,7 @@ impl Manager {
     }
 
     /// Claim a parked pool VM and retag it to the real id/name. Returns true if claimed.
-    async fn claim_from_pool(&self, id: &str, name: &str) -> Result<bool, String> {
+    async fn claim_from_pool(&self, id: &str, name: &str, tenant_id: Option<String>) -> Result<bool, String> {
         let pooled_id = {
             let mut g = self.inner.lock().await;
             if g.pool.is_empty() { return Ok(false); }
@@ -825,11 +831,13 @@ impl Manager {
         };
 
         // Retag the in-memory record to the real id/name but KEEP dir_id (the pool dir).
+        // Also set tenant_id at claim time.
         {
             let mut g = self.inner.lock().await;
             if let Some(v) = g.vms.iter_mut().find(|v| v.id == pooled_id) {
                 v.id = id.to_string();
                 v.name = name.to_string();
+                v.tenant_id = tenant_id;
                 // dir_id already points at the pool dir; leave it.
             } else {
                 return Ok(false);
@@ -846,6 +854,7 @@ impl Manager {
                 if let Some(v) = g.vms.iter_mut().find(|v| v.id == id) {
                     v.id = pooled_id.clone();
                     v.name = "pool".to_string();
+                    v.tenant_id = None;
                     v.pid
                 } else {
                     None
@@ -1045,6 +1054,7 @@ impl Manager {
                 ip: v.ip.clone(),
                 state: v.state.clone(),
                 vsock: v.vsock,
+                tenant_id: v.tenant_id.clone(),
             }
         };
 

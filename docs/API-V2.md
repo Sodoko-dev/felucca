@@ -36,6 +36,40 @@ Sandbox JSON gains no new required fields; `ip` is now populated when networking
 
 New, mirroring the control plane: `POST /v1/vms/{id}/sleep`, `POST /v1/vms/{id}/wake`,
 `POST /v1/vms/{id}/fork` (body `{"id","name"}` for the child). Existing endpoints unchanged.
+v4: `POST /v1/vms` accepts an optional `"tenant_id"` (recorded in `meta.json`, inherited by
+fork children and pool claims; feeds per-tenant network isolation). The `/v1/vms` list shape
+is unchanged — tenancy is never exposed on the wire.
+
+## 3b. Tenancy & API keys (v4, hearthd)
+
+States and sandbox JSON are unchanged; tenancy is enforced purely through scoping.
+
+- **Admin**: the configured bearer token (`HEARTH_TOKEN`/`--token`) — unrestricted,
+  unmetered; required for all `/api/v1/tenants*`, `/api/v1/keys/*`, `/api/v1/nodes`,
+  and `/api/v1/agents/*` routes (tenant keys get **404** on those, not 403).
+- **Tenant API keys**: `hearth_sk_<48 hex>`; only the SHA-256 is stored. Sent as a
+  normal bearer token. Unknown/revoked keys → 401.
+
+| Method | Path | Body | Result |
+|---|---|---|---|
+| POST | `/api/v1/tenants` | `{"name", "max_sandboxes", "max_vcpus", "max_mem_mib", "max_disk_gb"}` (0 = unlimited) | 201 `{"tenant":{...},"api_key":"hearth_sk_…","key_id":"key-…"}` — the key is shown **once**. Duplicate name → 409. |
+| GET | `/api/v1/tenants` | — | 200 `{"tenants":[...]}` |
+| POST | `/api/v1/tenants/{id}/keys` | — | 201 `{"api_key":"hearth_sk_…","key_id":"key-…"}` (rotation: mint new, then revoke old) |
+| DELETE | `/api/v1/keys/{id}` | — | 204; revocation is immediate. Unknown/already-revoked → 404. |
+
+Scoping rules (apply to every sandbox route): a tenant key sees and acts on only its
+own sandboxes; foreign and unknown ids are indistinguishable (**404**, body
+`{"error":"not found"}`). Creates and forks count against the owning tenant's quotas →
+**429** `{"error":"quota exceeded: <sandboxes|vcpus|mem_mib>"}`. Fork children inherit
+the parent's tenant. Every lifecycle transition appends a row to the append-only
+`usage_events` metering table (created/started/stopped/paused/resumed/slept/woken/
+forked/deleted, with the sandbox shape) — aggregation endpoints arrive in a later phase.
+
+Durable state moved from `state.json` to **SQLite (WAL)** at `--db`/`HEARTH_DB`/`db_path`
+(default `/var/lib/hearth/hearth.db`). On first boot with an empty store, a legacy
+`state.json` (from `--state`) is imported once and renamed `*.imported`. Wire formats
+are unchanged; the conformance suite passes unmodified, plus new `hearthd/17-tenancy`
+cases pin the scoping/quota behavior.
 
 ## 4. Warm pool (agent-internal, Tier A wake)
 
