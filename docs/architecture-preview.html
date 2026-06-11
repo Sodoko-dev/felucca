@@ -30,7 +30,11 @@ Hearth is a self-hosted infrastructure SaaS that manages **Firecracker microVMs 
 The backend is two static binaries — `hearthd` (control plane, **Go**) and `hearth-agent` (node agent,
 **Rust**) — with no Kubernetes on the control path (languages per
 [ADR-0003](adr/ADR-0003-go-rust-port.md); the wire and on-disk formats are unchanged from the Zig v2
-implementation and enforced by `test/conformance/`). This document reflects **v2 as implemented, verified
+implementation and enforced by `test/conformance/`). A third component arrived with v3.1:
+**`hearth-guest`** (Rust), a vsock agent baked into the guest image that gives the platform
+in-guest command execution (`exec`) and fork re-IP — code-complete and scratch-validated
+end-to-end, lab rollout pending ([API-V3-EXEC.md](API-V3-EXEC.md) is its contract).
+This document reflects **v2 as implemented, verified
 (17/17 end-to-end checks), and running** in the Lima lab: snapshot-based sleep/wake (~70 ms measured),
 fork, warm pools, guest networking, bearer-token auth, and config-driven deployment — the same
 static binaries (aarch64 + x86_64) run on the local lab and on remote production servers,
@@ -56,7 +60,7 @@ flowchart TB
     subgraph hearthd["hearthd — control plane (Go, :8080)"]
         AUTH["Bearer-token guard<br/>(optional, constant-time;<br/>healthz/metrics/UI stay open)"]
         STATIC["Static file server<br/>(serves ui/, index.html fallback)"]
-        API["REST API v1+v2<br/>(JSON over HTTP/1.1;<br/>sleep · wake · fork verbs)"]
+        API["REST API v1+v2+v3.1<br/>(JSON over HTTP/1.1;<br/>sleep · wake · fork · exec verbs)"]
         SCHED["Scheduler<br/>(ready node with lowest vm_count)"]
         REG["Node registry<br/>(register / heartbeat + pool_size,<br/>down after 15s silence)"]
         STATE[("state.json<br/>(atomic tmp+rename,<br/>reloaded on boot)")]
@@ -64,8 +68,9 @@ flowchart TB
     end
 
     subgraph agent["hearth-agent — per worker (Rust, :9090)"]
-        AAPI["Agent REST API<br/>(/v1/vms · sleep · wake · fork)"]
+        AAPI["Agent REST API<br/>(/v1/vms · sleep · wake · fork · exec)"]
         VMM["VM manager<br/>(spawn firecracker, configure over UDS,<br/>snapshot/restore, track pids)"]
+        GC["Guest client (v3.1)<br/>(hybrid vsock: CONNECT 52,<br/>exec + set_ip on fork)"]
         POOL["Warm pool<br/>(pool_size paused VMs,<br/>claim on create, async refill)"]
         NET["Networking<br/>(bridge hearth0 + tap per VM,<br/>sequential IP, nft masquerade)"]
         HB["Heartbeat loop<br/>(every 5s: mem_free,<br/>vm_count, pool_size)"]
@@ -73,10 +78,12 @@ flowchart TB
 
     subgraph fc["Firecracker (one process per running sandbox)"]
         FCAPI["REST over unix socket<br/>fc.sock"]
+        VSOCK["vsock device<br/>(host UDS v.sock,<br/>attached when image marker present)"]
         UVM["microVM guest<br/>(vmlinux + rootfs.ext4 copy,<br/>ip= boot-arg networking)"]
+        HG["hearth-guest (v3.1)<br/>(vsock port 52, systemd unit:<br/>exec + set_ip ops)"]
     end
 
-    ASSETS[("/srv/ignis<br/>kernels/vmlinux<br/>images/ubuntu-base.ext4<br/>instances/&lt;id&gt;/<br/>(+ vmstate.bin/mem.bin<br/>when sleeping)")]
+    ASSETS[("/srv/ignis<br/>kernels/vmlinux<br/>images/ubuntu-base.ext4<br/>(+ .hearth-guest-v1 marker)<br/>instances/&lt;id&gt;/<br/>(+ vmstate.bin/mem.bin<br/>when sleeping)")]
 
     UI -->|"GET /  +  /api/v1/*<br/>Authorization: Bearer"| AUTH
     CLI --> AUTH
@@ -90,9 +97,13 @@ flowchart TB
     API <--> STATE
     AAPI --> VMM
     AAPI --> POOL
+    AAPI --> GC
     VMM --> NET
-    VMM -->|"PUT /boot-source, /drives,<br/>/machine-config, /actions,<br/>/snapshot/create, /snapshot/load"| FCAPI
+    VMM -->|"PUT /boot-source, /drives,<br/>/machine-config, /vsock, /actions,<br/>/snapshot/create, /snapshot/load"| FCAPI
     FCAPI --> UVM
+    GC -->|"v.sock UDS"| VSOCK
+    VSOCK --- HG
+    HG --- UVM
     VMM --> ASSETS
 ```
 
@@ -300,13 +311,60 @@ sequenceDiagram
     end
 ```
 
-Snapshot hygiene caveats (documented, v3 work): forked children inherit the parent's
-guest-internal IP, and restored guests should re-seed entropy / fix clocks before
-multi-tenant production use. **Do not sleep a guest that is still booting**: a snapshot
-taken ~1–2 s after boot captures a guest that panics/reboots on resume (wall-clock jump
-mid-init) — the wake API reports `running` but the Firecracker process exits about a
-second later. Found during the Go/Rust migration and present in every implementation;
-`verify-v2.sh` now pings the guest after wake to keep this visible.
+Snapshot hygiene caveats: the fork child's inherited guest-internal IP is **fixed in v3.1**
+(automatic re-IP via the guest agent, §5c — rollout pending); restored guests should still
+re-seed entropy / fix clocks before multi-tenant production use. **Do not sleep a guest that
+is still booting**: a snapshot taken ~1–2 s after boot captures a guest that panics/reboots
+on resume (wall-clock jump mid-init) — the wake API reports `running` but the Firecracker
+process exits about a second later. Found during the Go/Rust migration and present in every
+implementation; `verify-v2.sh` now pings the guest after wake to keep this visible.
+A related v3.1 trap: sleep's SIGKILL leaves the vsock UDS file behind, and the next restore
+fails with EADDRINUSE unless wake removes the stale `v.sock` first (it does).
+
+---
+
+## 5c. User flow — exec and fork re-IP (v3.1, via the guest agent)
+
+Both v3.1 features ride the same channel: a Firecracker **vsock** device (host side: `v.sock`
+in the instance dir) connected to **hearth-guest**, a small Rust server baked into the base
+image and started by systemd inside every guest. The device is attached at cold boot only when
+the image carries the `.hearth-guest-v1` marker, so un-injected images keep exact v2 behavior.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User (UI / curl)
+    participant H as hearthd
+    participant A as owning hearth-agent
+    participant F as firecracker vsock (v.sock)
+    participant G as hearth-guest (in guest, port 52)
+
+    rect rgb(30,38,46)
+    Note over U,G: EXEC — run a command inside the sandbox
+    U->>H: POST /api/v1/sandboxes/{id}/exec {cmd, timeout_ms}
+    H->>A: POST /v1/vms/{id}/exec (per-request timeout)
+    A->>F: connect v.sock, CONNECT 52
+    F-->>A: OK (guest accepted)
+    A->>G: {"op":"exec","cmd":[...],"timeout_ms":N}
+    G->>G: spawn cmd, capture stdout/stderr,<br/>SIGKILL on timeout (exit 124)
+    G-->>A: {"ok":true,"exit_code":0,"stdout":...,"stderr":...}
+    A-->>H: 200 (guest JSON verbatim)
+    H-->>U: 200 {exit_code, stdout, stderr}
+    Note over H,A: pre-v3.1 VM or no marker → 501 guest agent unavailable
+    end
+
+    rect rgb(40,35,30)
+    Note over U,G: FORK RE-IP — child stops squatting the parent's IP
+    U->>H: POST /api/v1/sandboxes/{id}/fork {"name"}
+    H->>A: POST /v1/vms/{id}/fork
+    A->>A: restore child from parent snapshot<br/>(own tap + own v.sock via vsock override)
+    A->>G: {"op":"set_ip","ip":child_ip,"prefix":24,"gw":...}<br/>(up to 3 attempts, best-effort)
+    G->>G: ip addr flush + add, route replace default
+    G-->>A: {"ok":true}
+    A-->>H: 201 child {parent_id, ip: child_ip}
+    Note over A,G: child now answers on ITS ip — parent unaffected
+    end
+```
 
 ---
 
@@ -367,12 +425,14 @@ structural changes rebuild the DOM; volatile values are patched into existing el
 flowchart LR
     subgraph srv["/srv/ignis"]
         K["kernels/vmlinux<br/>(shared guest kernel, firecracker-ci)"]
-        B["images/ubuntu-base.ext4<br/>(2 GB shared base rootfs)"]
+        B["images/ubuntu-base.ext4<br/>(2 GB shared base rootfs,<br/>hearth-guest baked in by installer)"]
+        MK["images/.hearth-guest-v1<br/>(marker: agent attaches vsock<br/>to new cold boots)"]
         subgraph inst["instances/&lt;sandbox-id&gt;/"]
             RF["rootfs.ext4 (private copy of base)"]
             SK["fc.sock (Firecracker API)"]
+            VS["v.sock (vsock host UDS, v3.1 —<br/>wake removes the stale one)"]
             SL["serial.log (guest console)"]
-            MJ["meta.json (state, ip, snapshot paths —<br/>survives agent restarts)"]
+            MJ["meta.json (state, ip, vsock flag —<br/>survives agent restarts)"]
             SN["vmstate.bin + mem.bin<br/>(present while sleeping /<br/>as fork parent snapshot)"]
         end
         subgraph pool["instances/pool-&lt;rand&gt;/"]
@@ -388,7 +448,7 @@ v3 replaces the full rootfs copy with **overlayfs**: shared read-only base + tin
 
 ---
 
-## 9. v2 status (shipped) and what remains for v3
+## 9. Status — shipped (v2), validated (v3.1), and what remains
 
 Shipped in v2, then ported to Go (`hearthd`) and Rust (`hearth-agent`) under the frozen
 API-V2 contract — all verified end-to-end on the lab (17/17 system checks +
@@ -404,12 +464,20 @@ migration record in [ADR-0003](adr/ADR-0003-go-rust-port.md)):
 | Auth | optional bearer token (`HEARTH_TOKEN`/config/flag); 401 without; constant-time compare; UI `?token=` support |
 | Production config | flags > env (`HEARTH_*`) > `--config` JSON > defaults; no hardcoded paths; static binaries for **aarch64 + x86_64**; systemd units + installer in `deploy/`, guide in `DEPLOYMENT.md` |
 
+v3.1 — **code-complete and scratch-validated end-to-end** (contract: [API-V3-EXEC.md](API-V3-EXEC.md));
+lab rollout pending (`scripts/roll-v3.1.sh`):
+
+| Capability | v3.1 implementation | Validation |
+|---|---|---|
+| `exec` (run commands in guests) | `POST .../exec` → agent → FC hybrid vsock (`CONNECT 52`) → `hearth-guest` in the image (systemd unit); 501 for pre-v3.1 VMs | exit code + output round-trip on cold-booted and woken guests; wake still 66 ms with vsock attached |
+| Fork guest re-IP | agent sends `set_ip` over vsock after child restore (best-effort, 3 attempts); child's `eth0` + default route reconfigured in-guest | fork child answers on its own IP, parent unaffected, `ip addr` inside the guest confirms |
+| Asset pipeline | `infra/guest-agent-install.sh` injects binary+unit into the base image and drops the `.hearth-guest-v1` marker that gates the vsock device | idempotent run against an image copy; un-injected images keep exact v2 behavior |
+
 Remaining for v3:
 
 | Capability | v3 mechanism |
 |---|---|
 | `branch` (fork a *running* VM without pausing perception) | diff snapshots + uffd shared-memory CoW (fork currently copies mem.bin) |
-| Fork guest-IP uniqueness | re-IP child guests (vsock agent or DHCP) — today the child inherits the parent's IP |
 | Cross-tenant network isolation | nftables drop between namespace IP sets |
 | Root-disk dedup | overlayfs shared RO base (today: full rootfs copy per VM) |
 | State store | JSON file → SQLite WAL → Postgres at scale-out |

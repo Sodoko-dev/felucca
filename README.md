@@ -26,8 +26,10 @@ and [Sprites](https://sprites.dev) (see `docs/research/`), self-hosted on your o
 
 ## Docs
 
+- `docs/CHANGELOG.md` — full project history: v1 → v2 → Go+Rust migration → v3.1, with findings
 - `docs/PLAN.md` — adopted architecture + phased milestones (source of truth)
 - `docs/API-V2.md` — the frozen wire/config contract; `test/conformance/` enforces it
+- `docs/API-V3-EXEC.md` — v3.1 contract: vsock exec + fork re-IP (guest agent protocol)
 - `docs/ARCHITECTURE.md` — full architecture with diagrams (`docs/architecture-preview.html` to view)
 - `docs/DEPLOYMENT.md` — production deployment, builds, upgrades
 - `docs/adr/` — ADR-0000 (original plan), ADR-0001 (Zig, superseded), ADR-0002 (no k8s), ADR-0003 (Go+Rust port)
