@@ -58,6 +58,12 @@ exec on them fails gracefully (below).
   `vsock:true`, connect and send `set_ip` with the child's allocated ip/gw
   (gw = cidr `.1`). Up to 3 attempts over ~3s (guest may still be settling).
   Failure logs a warning and does NOT fail the fork (old caveat applies).
+  **Re-MAC first (added 2026-06-11)**: the memory-clone child also inherits
+  the parent's guest MAC, and two bridge ports with one MAC flap the FDB
+  until one guest goes dark. Before `set_ip` the agent sends a plain `exec`
+  of `ip link set dev eth0 address <mac>` with a fresh locally-administered
+  MAC (`0a:68:` + clock salt + tap slot) — same best-effort rules, and no
+  guest-protocol change since it rides the existing `exec` op.
   Snapshot semantics — **validated on FC v1.16** (these are now facts, not
   open questions):
   - The vsock UDS path is baked into vmstate and FC re-binds it on restore.

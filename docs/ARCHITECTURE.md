@@ -6,10 +6,10 @@ The backend is two static binaries — `hearthd` (control plane, **Go**) and `he
 [ADR-0003](adr/ADR-0003-go-rust-port.md); the wire and on-disk formats are unchanged from the Zig v2
 implementation and enforced by `test/conformance/`). A third component arrived with v3.1:
 **`hearth-guest`** (Rust), a vsock agent baked into the guest image that gives the platform
-in-guest command execution (`exec`) and fork re-IP — code-complete and scratch-validated
-end-to-end, lab rollout pending ([API-V3-EXEC.md](API-V3-EXEC.md) is its contract).
-This document reflects **v2 as implemented, verified
-(17/17 end-to-end checks), and running** in the Lima lab: snapshot-based sleep/wake (~70 ms measured),
+in-guest command execution (`exec`) and fork re-IP/re-MAC — **rolled out to the lab and
+verified green on 2026-06-11** (conformance 132/0, verify-v2 21/0;
+[API-V3-EXEC.md](API-V3-EXEC.md) is its contract).
+This document reflects **v2 + v3.1 as implemented, verified, and running** in the Lima lab: snapshot-based sleep/wake (~70 ms measured),
 fork, warm pools, guest networking, bearer-token auth, and config-driven deployment — the same
 static binaries (aarch64 + x86_64) run on the local lab and on remote production servers,
 differing only by configuration. Remaining v3 items are listed in §9.
@@ -170,9 +170,13 @@ stateDiagram-v2
 mem.bin in the instance dir) → kill the Firecracker process (RAM freed). `wake` = fresh process →
 `PUT /snapshot/load {resume_vm:true, network_overrides:[tap]}` → guest resumes mid-execution
 (**measured wake_ms=73** on this lab). `fork` snapshots the parent (reusing snapshot files if
-sleeping), copies rootfs + mem, restores the child with its own tap, sets `parent_id` — caveat:
-the child inherits the parent's guest-internal IP until v3. `stopped` vs `sleeping`: cold boot
-vs warm resume.
+sleeping), copies rootfs + mem, restores the child with its own tap, sets `parent_id`; since
+v3.1 the child is then re-MAC'd and re-IP'd in-guest over vsock, so it stops squatting the
+parent's IP (and MAC — a memory-clone inherits both). `stopped` vs `sleeping`: cold boot
+vs warm resume. Lifecycle guards (2026-06-11): `start` is a cold boot, valid only from
+`stopped`/`error` — on a `paused` VM it answers 409 instead of spawning a second Firecracker
+over the live instance; `pause`/`resume` are guarded the same way, and an unexpected
+Firecracker exit flips the VM to `error` within seconds (exit reaper + 5s liveness sweep).
 
 ---
 
@@ -285,13 +289,15 @@ sequenceDiagram
     end
 ```
 
-Snapshot hygiene caveats: the fork child's inherited guest-internal IP is **fixed in v3.1**
-(automatic re-IP via the guest agent, §5c — rollout pending); restored guests should still
-re-seed entropy / fix clocks before multi-tenant production use. **Do not sleep a guest that
-is still booting**: a snapshot taken ~1–2 s after boot captures a guest that panics/reboots
-on resume (wall-clock jump mid-init) — the wake API reports `running` but the Firecracker
-process exits about a second later. Found during the Go/Rust migration and present in every
-implementation; `verify-v2.sh` now pings the guest after wake to keep this visible.
+Snapshot hygiene caveats: the fork child's inherited guest-internal IP **and MAC** are
+**fixed in v3.1** (automatic re-MAC + re-IP via the guest agent, §5c — live in the lab);
+restored guests should still re-seed entropy / fix clocks before multi-tenant production use.
+**Do not sleep a guest that is still booting**: a snapshot taken ~1–2 s after boot captures a
+guest that panics/reboots on resume (wall-clock jump mid-init) — the wake API reports `running`
+and the Firecracker process exits seconds later (since 2026-06-11 the agent detects the exit
+and flips the VM to `error` instead of leaving a stale `running`). Found during the Go/Rust
+migration and present in every implementation; `verify-v2.sh` pings the guest after wake, and
+both suites now wait for guest-agent readiness (`wait_guest_ready` exec poll) before sleeping.
 A related v3.1 trap: sleep's SIGKILL leaves the vsock UDS file behind, and the next restore
 fails with EADDRINUSE unless wake removes the stale `v.sock` first (it does).
 
@@ -332,11 +338,12 @@ sequenceDiagram
     U->>H: POST /api/v1/sandboxes/{id}/fork {"name"}
     H->>A: POST /v1/vms/{id}/fork
     A->>A: restore child from parent snapshot<br/>(own tap + own v.sock via vsock override)
+    A->>G: {"op":"exec","cmd":["ip","link","set","dev","eth0","address",child_mac]}<br/>(fresh locally-administered MAC — the memory-clone shares the parent's)
     A->>G: {"op":"set_ip","ip":child_ip,"prefix":24,"gw":...}<br/>(up to 3 attempts, best-effort)
     G->>G: ip addr flush + add, route replace default
     G-->>A: {"ok":true}
     A-->>H: 201 child {parent_id, ip: child_ip}
-    Note over A,G: child now answers on ITS ip — parent unaffected
+    Note over A,G: child now answers on ITS ip/MAC — parent keeps its connectivity
     end
 ```
 
@@ -422,7 +429,7 @@ v3 replaces the full rootfs copy with **overlayfs**: shared read-only base + tin
 
 ---
 
-## 9. Status — shipped (v2), validated (v3.1), and what remains
+## 9. Status — shipped (v2), live (v3.1), and what remains
 
 Shipped in v2, then ported to Go (`hearthd`) and Rust (`hearth-agent`) under the frozen
 API-V2 contract — all verified end-to-end on the lab (17/17 system checks +
@@ -438,14 +445,15 @@ migration record in [ADR-0003](adr/ADR-0003-go-rust-port.md)):
 | Auth | optional bearer token (`HEARTH_TOKEN`/config/flag); 401 without; constant-time compare; UI `?token=` support |
 | Production config | flags > env (`HEARTH_*`) > `--config` JSON > defaults; no hardcoded paths; static binaries for **aarch64 + x86_64**; systemd units + installer in `deploy/`, guide in `DEPLOYMENT.md` |
 
-v3.1 — **code-complete and scratch-validated end-to-end** (contract: [API-V3-EXEC.md](API-V3-EXEC.md));
-lab rollout pending (`scripts/roll-v3.1.sh`):
+v3.1 — **live in the lab** (rolled out and verified 2026-06-11: conformance **132/0** + verify-v2
+**21/0**; contract: [API-V3-EXEC.md](API-V3-EXEC.md)):
 
 | Capability | v3.1 implementation | Validation |
 |---|---|---|
-| `exec` (run commands in guests) | `POST .../exec` → agent → FC hybrid vsock (`CONNECT 52`) → `hearth-guest` in the image (systemd unit); 501 for pre-v3.1 VMs | exit code + output round-trip on cold-booted and woken guests; wake still 66 ms with vsock attached |
-| Fork guest re-IP | agent sends `set_ip` over vsock after child restore (best-effort, 3 attempts); child's `eth0` + default route reconfigured in-guest | fork child answers on its own IP, parent unaffected, `ip addr` inside the guest confirms |
+| `exec` (run commands in guests) | `POST .../exec` → agent → FC hybrid vsock (`CONNECT 52`) → `hearth-guest` in the image (systemd unit); 501 for pre-v3.1 VMs | exit code + output round-trip on cold-booted and woken guests; wake still ~69 ms with vsock attached |
+| Fork guest re-IP + re-MAC | agent first sets a fresh locally-administered MAC on the child (plain `exec` — the memory-clone shares the parent's MAC), then `set_ip` over vsock (best-effort, 3 attempts) | fork child answers on its own IP **and the parent keeps its connectivity** (shared-MAC bridge-FDB flap found and fixed in lab verification) |
 | Asset pipeline | `infra/guest-agent-install.sh` injects binary+unit into the base image and drops the `.hearth-guest-v1` marker that gates the vsock device | idempotent run against an image copy; un-injected images keep exact v2 behavior |
+| Lifecycle hardening | `start` = guarded cold boot (`stopped`/`error` only; 409 `InvalidState` otherwise — start-on-paused used to orphan the live FC); `pause`/`resume` guarded; FC exits detected (spawn reaper + 5 s sweep) → `state:error`; failed spawns reaped; dead pool VM falls through to cold boot | start-on-paused 409 regression cases in conformance (agent/07, hearthd/10); poisoned wake flips to `error` within ~5 s instead of a stale `running` |
 
 Remaining for v3:
 

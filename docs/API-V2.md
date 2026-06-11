@@ -14,6 +14,12 @@ running|paused --sleep--> sleeping --wake--> running
 
 `stopped` (cold, boots fresh) and `sleeping` (warm, resumes mid-execution) are distinct.
 
+**`start` semantics (tightened in v3.1):** `start` is a cold boot and is only valid
+from `stopped` or `error` (`running` → 200 no-op). From `paused` use `resume`, from
+`sleeping` use `wake`; the agent answers **409** `{"error":"InvalidState: ..."}` and
+hearthd forwards the 409 body. (Previously `start` on a paused VM spawned a second
+Firecracker over the live instance, orphaning it — that path is now refused.)
+
 ## 2. New/changed control-plane endpoints (hearthd :8080)
 
 All v1 endpoints unchanged. New:
@@ -22,7 +28,7 @@ All v1 endpoints unchanged. New:
 |---|---|---|---|
 | POST | `/api/v1/sandboxes/{id}/sleep` | — | 200 sandbox JSON, state=`sleeping`. Pause → `/snapshot/create` (Full) → kill FC process. Snapshot lives in the instance dir (`vmstate.bin`, `mem.bin`). |
 | POST | `/api/v1/sandboxes/{id}/wake` | — | 200 `{...sandbox, "wake_ms": <int>}`, state=`running`. Spawn FC → `/snapshot/load` (File backend, `resume_vm:true`). |
-| POST | `/api/v1/sandboxes/{id}/fork` | `{"name": "..."}` | 201 child sandbox JSON with `parent_id` set (replaces the v1 501 stub). Parent must be `running`, `paused`, or `sleeping`; parent is briefly paused if running. Child restores from the parent's snapshot with its own tap (`network_overrides`) and a copy (reflink when possible) of the parent rootfs. **Known caveat: child inherits the parent's guest-internal IP** (memory state); duplicate-IP isolation is documented, fixed in v3. |
+| POST | `/api/v1/sandboxes/{id}/fork` | `{"name": "..."}` | 201 child sandbox JSON with `parent_id` set (replaces the v1 501 stub). Parent must be `running`, `paused`, or `sleeping`; parent is briefly paused if running. Child restores from the parent's snapshot with its own tap (`network_overrides`) and a copy (reflink when possible) of the parent rootfs. **Fixed in v3.1**: right after restore the agent re-MACs and re-IPs the child in-guest over vsock (best-effort — [API-V3-EXEC.md](API-V3-EXEC.md) §3), so the child answers on its own `ip` and the parent keeps its connectivity. |
 
 Sandbox JSON gains no new required fields; `ip` is now populated when networking is on (string, e.g. `"10.231.0.12"`), still `null` when `--net off`.
 

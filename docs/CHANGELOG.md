@@ -75,7 +75,7 @@ boundary), wire and on-disk formats frozen.
   - The Zig agent leaked FC zombies; the Rust agent reaps via detached wait
     tasks.
 
-## v3.1 — vsock exec + fork re-IP (2026-06-10/11; code-complete, scratch-validated; lab rollout pending)
+## v3.1 — vsock exec + fork re-IP (2026-06-10/11; code-complete, scratch-validated)
 
 Contract: [API-V3-EXEC.md](API-V3-EXEC.md). Three components, built in
 parallel against the frozen contract:
@@ -107,12 +107,52 @@ Defects found by validating against real Firecracker (not mocks):
 - A same-minute intermediate cargo build masqueraded as final (`ls` minute
   precision) — binaries are now compared by sha256, not mtime.
 
-Remaining for v3.1: the live lab rollout (`scripts/roll-v3.1.sh`: inject →
-roll agents → roll hearthd → re-record goldens → extended verify) — gated on
-explicit operator approval because it bakes an exec-capable agent into the
-shared base images. verify-v2 already carries the v3.1 checks (fork-child
-ping, parent continuity, exec round-trip) and conformance has `16-exec` /
-`10-exec` cases ready.
+## v3.1 rollout + lifecycle hardening (2026-06-11; lab live — conformance 132/0, verify-v2 21/0)
+
+The live rollout (`scripts/roll-v3.1.sh`: inject → roll agents → roll hearthd
+→ goldens → verify) surfaced four defects. All were fixed, re-rolled, and
+verified green the same day:
+
+- **start-on-paused destroyed the VM** (user-reported: "paused a microVM,
+  couldn't start it back"): `start()` deleted the *live* `fc.sock` and spawned
+  a second Firecracker over the same instance dir — the paused FC was orphaned
+  forever (resume → connect error from then on) and each retry leaked another
+  FC. `start` is now a guarded cold boot: valid only from `stopped`/`error`,
+  409 `InvalidState` otherwise, with a pid-liveness check so it can never
+  spawn over a live process. `pause`/`resume` got matching guards, hearthd
+  forwards agent 409s (with the real reason) instead of a blanket 502, and
+  the UI dropped the Start button on paused rows. Regression cases pin the
+  path shut (`agent/07-actions`, `hearthd/10-actions`).
+- **Firecracker death was invisible**: a guest panic (e.g. resume from a
+  mid-boot snapshot) exits FC cleanly, but the VM stayed `running` with a
+  stale pid and every subsequent op returned an opaque `FcError: Connect`.
+  Every spawn's reaper now flags unexpected exits → `state:error` + warn
+  (deliberate kills clear the recorded pid under the lock *before*
+  signalling, so they no-op the reaper); a 5 s liveness sweep covers FCs
+  adopted after an agent restart; failed spawns reap their half-configured
+  FC instead of leaking it; a dead pool VM is retagged to `error` and the
+  create falls through to a cold boot.
+- **The suites slept mid-boot guests**: post-inject boots are slower (the
+  hearth-guest unit), so the cases' create-then-sleep pattern and fixed 3 s
+  exec waits became systematic failures — poisoned snapshots (guest panics on
+  wake, FC exits) or a guest agent not yet listening. `wait_guest_ready`
+  (conformance `lib.sh`) and `wait_exec_ready` (verify-v2) poll
+  `exec(["true"])` before sleeping or exec'ing.
+- **Fork child cloned the parent's MAC** — exposed only once re-IP worked:
+  two bridge ports sharing one MAC flap the FDB and the parent goes dark.
+  Fork now gives the child a fresh locally-administered MAC (`0a:68:…`,
+  clock salt + tap slot) via plain `exec` before `set_ip`; no guest-protocol
+  change.
+
+Operational notes: during the first (pre-fix) conformance record run the
+kata-lab-0 Lima VM died at the hypervisor level (`VZErrorDomain Code=3`,
+"no longer live"; guest journald stalled ~80 s before death, no panic
+captured) — recovered with `limactl stop -f` + start + agent redeploy; not
+reproduced after the fixes, with the duplicate-FC pile-up as prime suspect.
+Worker agent binaries live in `/tmp` and vanish on reboot — redeploy after
+any worker restart. Goldens re-recorded against the fixed stack:
+`metrics-names` gains `hearth_execs_total`; new `hearthd/exec` and
+`agent/vm-exec` goldens carry real 200 bodies.
 
 ## Backlog (v3+, in order)
 
