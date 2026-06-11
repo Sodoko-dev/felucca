@@ -12,6 +12,11 @@ ag POST "/v1/vms/$CF_VM1/pause"
 assert_status 200 "POST /v1/vms/{id}/pause"
 assert_body_empty "pause response"
 cf_agent_state "$CF_VM1" paused "paused after pause"
+# v3.1 regression: start on a paused VM must be refused (409) — the pre-v3.1
+# behavior spawned a second FC over the live instance and orphaned it.
+ag POST "/v1/vms/$CF_VM1/start"
+assert_status 409 "POST /v1/vms/{id}/start on paused refused"
+cf_agent_state "$CF_VM1" paused "still paused after refused start"
 ag POST "/v1/vms/$CF_VM1/resume"
 assert_status 200 "POST /v1/vms/{id}/resume"
 assert_body_empty "resume response"

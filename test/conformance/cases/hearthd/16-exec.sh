@@ -6,7 +6,7 @@ if [ "$R_STATUS" != "201" ]; then
   bad "exec-case sandbox create failed: $R_STATUS $R_BODY"
 else
   cf_exec_id=$(printf '%s' "$R_BODY" | jq -r .id)
-  sleep 3  # let the guest agent come up
+  wait_guest_ready hd "$cf_exec_id"  # cold boots need >3s for hearth-guest
   hd POST "/api/v1/sandboxes/$cf_exec_id/exec" '{"cmd":["/bin/sh","-c","echo cf-exec-ok"],"timeout_ms":15000}'
   assert_status 200 "POST .../exec"
   assert_jq '.ok == true and .exit_code == 0 and (.stdout | contains("cf-exec-ok"))' "exec output round-trip"

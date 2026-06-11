@@ -939,7 +939,9 @@ function renderSandboxRow(sb) {
   const nodeLabel = node ? node.hostname : sb.node_id.slice(0, 12);
   const hasFork = sb.parent_id !== null;
 
-  const canStart  = sb.state === 'stopped' || sb.state === 'paused';
+  /* v3.1: start is a cold boot, only valid from stopped/error — a paused
+     sandbox is resumed, never started (the agent 409s otherwise). */
+  const canStart  = sb.state === 'stopped' || sb.state === 'error';
   const canStop   = sb.state === 'running' || sb.state === 'creating';
   const canPause  = sb.state === 'running';
   const canResume = sb.state === 'paused';

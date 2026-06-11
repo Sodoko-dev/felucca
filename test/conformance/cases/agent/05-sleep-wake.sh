@@ -1,5 +1,8 @@
 # Agent sleep/wake: exact ok bodies; sleeping VM has no pid; wake reports
 # integer wake_ms and the VM runs again.
+# Never sleep a mid-boot guest: the snapshot would be poisoned (guest panics
+# on resume) — wait until the guest agent answers first.
+wait_guest_ready ag "$CF_VM1"
 ag POST "/v1/vms/$CF_VM1/sleep"
 assert_status 200 "POST /v1/vms/{id}/sleep"
 assert_body_exact '{"ok":true}' "sleep body exact"

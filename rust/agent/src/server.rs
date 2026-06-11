@@ -270,6 +270,10 @@ async fn vm_pause(
     }
     match state.mgr.pause(&id).await {
         Ok(_) => empty_response(StatusCode::OK),
+        Err(e) if e.starts_with("InvalidState") => {
+            let msg = format!("{{\"error\":\"{}\"}}", e);
+            json_response(StatusCode::CONFLICT, &msg)
+        }
         Err(e) => {
             let msg = format!("{{\"error\":\"{}\"}}", e);
             json_response(StatusCode::INTERNAL_SERVER_ERROR, &msg)
@@ -287,6 +291,10 @@ async fn vm_resume(
     }
     match state.mgr.resume(&id).await {
         Ok(_) => empty_response(StatusCode::OK),
+        Err(e) if e.starts_with("InvalidState") => {
+            let msg = format!("{{\"error\":\"{}\"}}", e);
+            json_response(StatusCode::CONFLICT, &msg)
+        }
         Err(e) => {
             let msg = format!("{{\"error\":\"{}\"}}", e);
             json_response(StatusCode::INTERNAL_SERVER_ERROR, &msg)
@@ -321,6 +329,12 @@ async fn vm_start(
     }
     match state.mgr.start(&id).await {
         Ok(_) => empty_response(StatusCode::OK),
+        // Wrong lifecycle state (e.g. start on a paused VM) → 409, matching
+        // the exec contract's 409 "not running" convention.
+        Err(e) if e.starts_with("InvalidState") => {
+            let msg = format!("{{\"error\":\"{}\"}}", e);
+            json_response(StatusCode::CONFLICT, &msg)
+        }
         Err(e) => {
             let msg = format!("{{\"error\":\"{}\"}}", e);
             json_response(StatusCode::INTERNAL_SERVER_ERROR, &msg)

@@ -15,3 +15,13 @@ pub async fn pool_loop(mgr: Arc<Manager>) {
         sleep(Duration::from_secs(5)).await;
     }
 }
+
+/// FC liveness sweep every 5 seconds. In-process reapers already catch child
+/// exits; this covers FCs adopted after an agent restart (reparented to init,
+/// no reaper task exists for them). Runs regardless of pool size.
+pub async fn liveness_loop(mgr: Arc<Manager>) {
+    loop {
+        mgr.sweep_dead().await;
+        sleep(Duration::from_secs(5)).await;
+    }
+}

@@ -5,7 +5,7 @@ ag POST /v1/vms "{\"id\":\"$CF_VM3\",\"name\":\"cf-vm-3\",\"vcpus\":1,\"mem_mib\
 if [ "$R_STATUS" != "201" ]; then
   bad "exec-case VM create failed: $R_STATUS $R_BODY"
 else
-  sleep 3  # guest agent startup
+  wait_guest_ready ag "$CF_VM3"  # cold boots need >3s for hearth-guest
   ag POST "/v1/vms/$CF_VM3/exec" '{"cmd":["/bin/sh","-c","echo agent-exec-ok"],"timeout_ms":15000}'
   assert_status 200 "POST /v1/vms/{id}/exec"
   assert_jq '.ok == true and .exit_code == 0 and (.stdout | contains("agent-exec-ok"))' "agent exec output round-trip"

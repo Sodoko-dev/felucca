@@ -16,7 +16,7 @@ mod vm;
 use crate::ipalloc::Cidr;
 use crate::registration::{detect_advertise_addr, heartbeat_loop, NodeId};
 use crate::server::{build_router, AppState};
-use crate::vm::{pool::pool_loop, Manager};
+use crate::vm::{pool::{liveness_loop, pool_loop}, Manager};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
@@ -71,6 +71,14 @@ async fn main() {
         let mgr3 = Arc::clone(&mgr);
         tokio::spawn(async move {
             pool_loop(mgr3).await;
+        });
+    }
+
+    // FC liveness sweep (adopted FCs have no in-process reaper).
+    {
+        let mgr4 = Arc::clone(&mgr);
+        tokio::spawn(async move {
+            liveness_loop(mgr4).await;
         });
     }
 

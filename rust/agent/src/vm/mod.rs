@@ -195,7 +195,7 @@ impl Manager {
 
     // ---- create ----
 
-    pub async fn create(&self, id: &str, name: &str, vcpus: u32, mem_mib: u64) -> Result<(), String> {
+    pub async fn create(self: &Arc<Self>, id: &str, name: &str, vcpus: u32, mem_mib: u64) -> Result<(), String> {
         // Try to claim a warm-pool VM for a matching shape (1 vCPU / 256 MiB).
         if self.pool_target > 0 && vcpus == 1 && mem_mib == 256 {
             if self.claim_from_pool(id, name).await? { return Ok(()); }
@@ -205,7 +205,7 @@ impl Manager {
 
     /// Cold-boot a fresh VM. `force_slot` reuses a specific slot (pool refill).
     async fn cold_create(
-        &self,
+        self: &Arc<Self>,
         id: &str,
         name: &str,
         vcpus: u32,
@@ -241,7 +241,7 @@ impl Manager {
     }
 
     async fn cold_create_inner(
-        &self,
+        self: &Arc<Self>,
         id: &str,
         _name: &str,
         vcpus: u32,
@@ -305,7 +305,7 @@ impl Manager {
     }
 
     async fn spawn_and_configure(
-        &self,
+        self: &Arc<Self>,
         id: &str,
         dir_path: &str,
         rootfs_path: &str,
@@ -338,18 +338,25 @@ impl Manager {
 
         let pid = child.id().ok_or("NoPid")? as i32;
         // Detached reaper: collects the exit status whenever FC dies (our
-        // SIGKILL on sleep, guest shutdown, crash) so it never zombies.
+        // SIGKILL on sleep, guest shutdown, crash) so it never zombies, and
+        // flags unexpected exits (pid still recorded) as state=error.
         // kill_on_drop is false, so dropping after wait never kills anything.
-        tokio::spawn(async move {
-            let mut child = child;
-            let _ = child.wait().await;
-        });
+        {
+            let mgr = Arc::clone(self);
+            let rid = id.to_string();
+            tokio::spawn(async move {
+                let mut child = child;
+                let _ = child.wait().await;
+                mgr.on_fc_exit(&rid, pid).await;
+            });
+        }
 
         // Poll the API socket up to 3000ms in 50ms steps.
         let deadline = Instant::now() + Duration::from_millis(3000);
         loop {
             if Path::new(&sock).exists() { break; }
             if Instant::now() >= deadline {
+                kill_and_reap(pid); // don't leak the half-spawned FC
                 return Err("SocketNeverAppeared".into());
             }
             sleep(Duration::from_millis(50)).await;
@@ -358,7 +365,10 @@ impl Manager {
         // Cold boot only attaches a vsock device when the guest-agent marker is
         // present in the rootfs image; absent marker → exactly the v2 sequence.
         let vsock_on = self.guest_agent_marker_present();
-        self.configure_guest(&sock, dir_path, rootfs_path, vcpus, mem_mib, slot, ip, vsock_on).await?;
+        if let Err(e) = self.configure_guest(&sock, dir_path, rootfs_path, vcpus, mem_mib, slot, ip, vsock_on).await {
+            kill_and_reap(pid); // don't leak the half-configured FC
+            return Err(e);
+        }
         Ok((pid, vsock_on))
     }
 
@@ -419,6 +429,15 @@ impl Manager {
     // ---- pause / resume ----
 
     pub async fn pause(&self, id: &str) -> Result<(), String> {
+        {
+            let g = self.inner.lock().await;
+            let v = g.vms.iter().find(|v| v.id == id).ok_or("NotFound")?;
+            match v.state {
+                VmState::Paused => return Ok(()), // idempotent
+                VmState::Running => {}
+                _ => return Err(format!("InvalidState: {}", v.state.as_str())),
+            }
+        }
         let sock = self.sock_path(id).await;
         fc::patch_vm_state(&sock, "Paused").await.map_err(|e| e.to_string())?;
         self.set_state(id, VmState::Paused).await;
@@ -426,6 +445,15 @@ impl Manager {
     }
 
     pub async fn resume(&self, id: &str) -> Result<(), String> {
+        {
+            let g = self.inner.lock().await;
+            let v = g.vms.iter().find(|v| v.id == id).ok_or("NotFound")?;
+            match v.state {
+                VmState::Running => return Ok(()), // idempotent
+                VmState::Paused => {}
+                _ => return Err(format!("InvalidState: {}", v.state.as_str())),
+            }
+        }
         let sock = self.sock_path(id).await;
         fc::patch_vm_state(&sock, "Resumed").await.map_err(|e| e.to_string())?;
         self.set_state(id, VmState::Running).await;
@@ -452,17 +480,19 @@ impl Manager {
         fc::put_snapshot_create(&sock, &vmstate, &mem).await
             .map_err(|e| e.to_string())?;
 
+        // Clear the pid BEFORE killing so the exit reaper sees a pid mismatch
+        // and treats this as a deliberate kill (no error transition).
+        self.set_pid(id, None).await;
         if let Some(p) = pid {
             kill_and_reap(p);
         }
 
         self.set_state(id, VmState::Sleeping).await;
-        self.set_pid(id, None).await;
         self.write_meta(id).await
     }
 
     /// Spawn firecracker → snapshot/load. Returns wake latency in ms.
-    pub async fn wake_vm(&self, id: &str) -> Result<u64, String> {
+    pub async fn wake_vm(self: &Arc<Self>, id: &str) -> Result<u64, String> {
         let slot = {
             let g = self.inner.lock().await;
             let v = g.vms.iter().find(|v| v.id == id).ok_or("NotFound")?;
@@ -506,16 +536,22 @@ impl Manager {
             .map_err(|e| format!("spawn firecracker: {}", e))?;
 
         let pid = child.id().ok_or("NoPid")? as i32;
-        tokio::spawn(async move {
-            let mut child = child;
-            let _ = child.wait().await;
-        });
+        {
+            let mgr = Arc::clone(self);
+            let rid = id.to_string();
+            tokio::spawn(async move {
+                let mut child = child;
+                let _ = child.wait().await;
+                mgr.on_fc_exit(&rid, pid).await;
+            });
+        }
 
         // Poll socket.
         let deadline = Instant::now() + Duration::from_millis(3000);
         loop {
             if Path::new(&sock).exists() { break; }
             if Instant::now() >= deadline {
+                kill_and_reap(pid); // don't leak the half-spawned FC
                 return Err("SocketNeverAppeared".into());
             }
             sleep(Duration::from_millis(50)).await;
@@ -525,8 +561,10 @@ impl Manager {
         let mem = format!("{}/mem.bin", dir_path);
         // Wake restores into the VM's OWN dir, so the baked vsock uds_path is
         // already correct — no override needed (None re-binds the original path).
-        fc::put_snapshot_load(&sock, &vmstate, &mem, self.net_on, slot, None).await
-            .map_err(|e| e.to_string())?;
+        if let Err(e) = fc::put_snapshot_load(&sock, &vmstate, &mem, self.net_on, slot, None).await {
+            kill_and_reap(pid); // don't leak the FC that failed to restore
+            return Err(e.to_string());
+        }
 
         let elapsed = start.elapsed().as_millis() as u64;
 
@@ -541,7 +579,7 @@ impl Manager {
     /// Fork the parent: ensure snapshot exists, reflink rootfs + copy mem.bin,
     /// spawn child FC and restore. Child inherits parent's guest-internal IP
     /// (v2 documented caveat; fixed in v3).
-    pub async fn fork(&self, parent_id: &str, child_id: &str, child_name: &str) -> Result<Option<String>, String> {
+    pub async fn fork(self: &Arc<Self>, parent_id: &str, child_id: &str, child_name: &str) -> Result<Option<String>, String> {
         let (parent_was_running, parent_vcpus, parent_mem_mib, parent_vsock) = {
             let g = self.inner.lock().await;
             let p = g.vms.iter().find(|v| v.id == parent_id).ok_or("NotFound")?;
@@ -649,15 +687,21 @@ impl Manager {
             .map_err(|e| format!("spawn child firecracker: {}", e))?;
 
         let child_pid = child_proc.id().ok_or("NoPid")? as i32;
-        tokio::spawn(async move {
-            let mut child_proc = child_proc;
-            let _ = child_proc.wait().await;
-        });
+        {
+            let mgr = Arc::clone(self);
+            let rid = child_id.to_string();
+            tokio::spawn(async move {
+                let mut child_proc = child_proc;
+                let _ = child_proc.wait().await;
+                mgr.on_fc_exit(&rid, child_pid).await;
+            });
+        }
 
         let deadline = Instant::now() + Duration::from_millis(3000);
         loop {
             if Path::new(&child_sock).exists() { break; }
             if Instant::now() >= deadline {
+                kill_and_reap(child_pid); // don't leak the half-spawned child FC
                 self.set_state(child_id, VmState::Error).await;
                 return Err("SocketNeverAppeared".into());
             }
@@ -677,8 +721,11 @@ impl Manager {
         } else {
             None
         };
-        fc::put_snapshot_load(&child_sock, &child_vmstate, &child_mem_file, self.net_on, child_slot, vsock_override).await
-            .map_err(|e| { e.to_string() })?;
+        if let Err(e) = fc::put_snapshot_load(&child_sock, &child_vmstate, &child_mem_file, self.net_on, child_slot, vsock_override).await {
+            kill_and_reap(child_pid); // don't leak the child FC that failed to restore
+            self.set_state(child_id, VmState::Error).await;
+            return Err(e.to_string());
+        }
 
         {
             let mut g = self.inner.lock().await;
@@ -697,6 +744,19 @@ impl Manager {
         // own allocated IP. Best-effort per contract: a failure only warns.
         if parent_vsock {
             if let (Some(ip), true) = (child_ip.as_deref(), self.net_on) {
+                // The child is a memory-clone, so it also inherits the parent's
+                // guest MAC. Two ports with one MAC make the bridge FDB flap
+                // and one guest goes dark — give the child its own
+                // locally-administered MAC BEFORE re-IPing (plain exec; no
+                // guest-agent contract change needed).
+                let mac = child_mac(child_slot, now_ms());
+                let cmd: Vec<String> = ["ip", "link", "set", "dev", "eth0", "address", mac.as_str()]
+                    .iter().map(|s| s.to_string()).collect();
+                match crate::guestclient::exec(&child_dir, &cmd, 5_000).await {
+                    Ok(v) if v.get("exit_code").and_then(|c| c.as_i64()) == Some(0) => {}
+                    Ok(v) => eprintln!("warn: fork re-MAC for {} failed (best-effort): {}", child_id, v),
+                    Err(e) => eprintln!("warn: fork re-MAC for {} failed (best-effort): {}", child_id, e),
+                }
                 let gw = crate::ipalloc::fmt_ip(self.cidr.gateway());
                 match crate::guestclient::set_ip(&child_dir, ip, self.cidr.prefix, &gw).await {
                     Ok(()) => {}
@@ -777,7 +837,25 @@ impl Manager {
         }
 
         let sock = self.sock_path(id).await;
-        fc::patch_vm_state(&sock, "Resumed").await.map_err(|e| e.to_string())?;
+        if let Err(e) = fc::patch_vm_state(&sock, "Resumed").await {
+            // Pool VM is unusable (FC likely dead). Retag the record back,
+            // mark it error, and let the caller fall through to a cold boot.
+            eprintln!("warn: pool claim of {} for {} failed: {}", pooled_id, id, e);
+            let dead_pid = {
+                let mut g = self.inner.lock().await;
+                if let Some(v) = g.vms.iter_mut().find(|v| v.id == id) {
+                    v.id = pooled_id.clone();
+                    v.name = "pool".to_string();
+                    v.pid
+                } else {
+                    None
+                }
+            };
+            if let Some(p) = dead_pid {
+                self.on_fc_exit(&pooled_id, p).await;
+            }
+            return Ok(false);
+        }
         self.set_state(id, VmState::Running).await;
         self.write_meta(id).await?;
         Ok(true)
@@ -791,6 +869,10 @@ impl Manager {
             let v = g.vms.iter().find(|v| v.id == id).ok_or("NotFound")?;
             v.pid
         };
+        // Clear the record BEFORE signalling so the exit reaper sees a pid
+        // mismatch and treats this as a deliberate kill (no error transition).
+        self.set_state(id, VmState::Stopped).await;
+        self.set_pid(id, None).await;
         if let Some(p) = pid {
             use nix::sys::signal::{kill, Signal};
             use nix::unistd::Pid;
@@ -799,16 +881,32 @@ impl Manager {
                 Err(e) => return Err(e.to_string()),
             }
         }
-        self.set_state(id, VmState::Stopped).await;
-        self.set_pid(id, None).await;
         Ok(())
     }
 
-    pub async fn start(&self, id: &str) -> Result<(), String> {
+    pub async fn start(self: &Arc<Self>, id: &str) -> Result<(), String> {
         let (vcpus, mem_mib, slot, ip) = {
             let g = self.inner.lock().await;
             let v = g.vms.iter().find(|v| v.id == id).ok_or("NotFound")?;
-            if v.state == VmState::Running { return Ok(()); }
+            // start is a cold boot: only valid when no FC owns the instance.
+            // paused/sleeping VMs have live state to lose — spawning over them
+            // would orphan the FC holding it (use resume/wake instead).
+            match v.state {
+                VmState::Running => return Ok(()),
+                VmState::Stopped | VmState::Error => {}
+                VmState::Paused => return Err("InvalidState: paused (use resume)".into()),
+                VmState::Sleeping => return Err("InvalidState: sleeping (use wake)".into()),
+                VmState::Creating | VmState::Pooled => {
+                    return Err(format!("InvalidState: {}", v.state.as_str()));
+                }
+            }
+            if let Some(p) = v.pid {
+                use nix::sys::signal::kill;
+                use nix::unistd::Pid;
+                if kill(Pid::from_raw(p), None).is_ok() {
+                    return Err(format!("InvalidState: process {} still attached", p));
+                }
+            }
             (v.vcpus, v.mem_mib, v.slot, v.ip.clone())
         };
 
@@ -882,6 +980,55 @@ impl Manager {
         }
     }
 
+    /// React to an FC process exit (reaper task or liveness sweep). Acts ONLY
+    /// when `pid` is still the recorded pid and the state implies a live
+    /// process; deliberate kills (sleep/stop/delete) clear the pid under the
+    /// lock before signalling, so they no-op here.
+    async fn on_fc_exit(&self, id: &str, pid: i32) {
+        let transitioned = {
+            let mut g = self.inner.lock().await;
+            let hit = match g.vms.iter_mut().find(|v| v.id == id) {
+                Some(v) if v.pid == Some(pid)
+                    && matches!(v.state, VmState::Creating | VmState::Running | VmState::Paused | VmState::Pooled) =>
+                {
+                    v.state = VmState::Error;
+                    v.pid = None;
+                    true
+                }
+                _ => false,
+            };
+            if hit {
+                // A dead pool VM must leave the queue or it would be claimed.
+                g.pool.retain(|p| p != id);
+            }
+            hit
+        };
+        if transitioned {
+            eprintln!("warn: firecracker for {} (pid {}) exited unexpectedly; state -> error", id, pid);
+            // Best-effort: the instance dir may be mid-delete.
+            let _ = self.write_meta(id).await;
+        }
+    }
+
+    /// Mark VMs whose FC process is gone (ESRCH) as error. Covers FCs adopted
+    /// after an agent restart, which have no in-process reaper task.
+    pub async fn sweep_dead(&self) {
+        let candidates: Vec<(String, i32)> = {
+            let g = self.inner.lock().await;
+            g.vms.iter()
+                .filter(|v| matches!(v.state, VmState::Creating | VmState::Running | VmState::Paused | VmState::Pooled))
+                .filter_map(|v| v.pid.map(|p| (v.id.clone(), p)))
+                .collect()
+        };
+        for (id, pid) in candidates {
+            use nix::sys::signal::kill;
+            use nix::unistd::Pid;
+            if kill(Pid::from_raw(pid), None) == Err(nix::errno::Errno::ESRCH) {
+                self.on_fc_exit(&id, pid).await;
+            }
+        }
+    }
+
     /// Write the current in-memory record for `id` to its meta.json.
     async fn write_meta(&self, id: &str) -> Result<(), String> {
         let meta = {
@@ -948,6 +1095,18 @@ fn kill_and_reap(pid: i32) {
     unsafe {
         libc::waitpid(pid, std::ptr::null_mut(), 0);
     }
+}
+
+/// Locally-administered unicast MAC for a fork child (0a:68:…): three salt
+/// bytes from the clock plus the tap slot, unique enough per bridge.
+fn child_mac(slot: Option<u32>, salt: u64) -> String {
+    format!(
+        "0a:68:{:02x}:{:02x}:{:02x}:{:02x}",
+        (salt >> 16) as u8,
+        (salt >> 8) as u8,
+        salt as u8,
+        slot.unwrap_or(0) as u8
+    )
 }
 
 fn now_ms() -> u64 {

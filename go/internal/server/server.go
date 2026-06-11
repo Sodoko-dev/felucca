@@ -383,6 +383,12 @@ func (srv *Server) sandboxAction(w http.ResponseWriter, id, action string) {
 		writeJSON(w, 502, []byte(`{"error":"agent unreachable"}`))
 		return
 	}
+	if resp.Status == 409 {
+		// Lifecycle conflict from the agent (e.g. start on a paused VM):
+		// forward status and body so the caller learns why.
+		writeJSON(w, 409, resp.Body)
+		return
+	}
 	if resp.Status >= 300 {
 		writeJSON(w, 502, []byte(`{"error":"agent action failed"}`))
 		return

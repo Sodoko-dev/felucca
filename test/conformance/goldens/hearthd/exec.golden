@@ -1,0 +1,8 @@
+200 application/json
+{
+  "exit_code": 0,
+  "ok": true,
+  "stderr": "",
+  "stdout": "cf-exec-ok\n",
+  "truncated": false
+}

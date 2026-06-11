@@ -1,5 +1,6 @@
 200 text/plain; version=0.0.4
 hearth_api_requests_total
+hearth_execs_total
 hearth_forks_total
 hearth_nodes_ready
 hearth_pool_size{node=*}

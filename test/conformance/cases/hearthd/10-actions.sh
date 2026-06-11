@@ -6,6 +6,13 @@ assert_body_empty "pause response"
 hd GET "/api/v1/sandboxes/$CF_SB_ID"
 assert_jq '.state == "paused"' "paused after pause"
 
+# v3.1 regression: start on a paused sandbox is refused; hearthd forwards the
+# agent's 409 instead of mapping it to 502.
+hd POST "/api/v1/sandboxes/$CF_SB_ID/start"
+assert_status 409 "POST .../start on paused refused"
+hd GET "/api/v1/sandboxes/$CF_SB_ID"
+assert_jq '.state == "paused"' "still paused after refused start"
+
 hd POST "/api/v1/sandboxes/$CF_SB_ID/resume"
 assert_status 200 "POST .../resume"
 assert_body_empty "resume response"

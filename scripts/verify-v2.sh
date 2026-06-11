@@ -17,6 +17,18 @@ cp_curl() { # cp_curl <curl args...> — curl from inside the control-plane VM w
   limactl shell $CP_VM -- curl -s -m 30 -H "Authorization: Bearer $TOKEN" "$@"
 }
 
+wait_exec_ready() { # <id> [timeout-s] — poll exec until the guest agent answers.
+  # Sleeping a mid-boot guest poisons the snapshot (panic on resume), and exec
+  # needs hearth-guest listening — polling exec(["true"]) covers both.
+  local i=0 t="${2:-45}"
+  while [ "$i" -lt "$t" ]; do
+    cp_curl -X POST "$API/api/v1/sandboxes/$1/exec" -d '{"cmd":["true"],"timeout_ms":2000}' 2>/dev/null \
+      | grep -q '"ok":true' && return 0
+    sleep 1; i=$((i+1))
+  done
+  return 1
+}
+
 say "== 1. auth =="
 code=$(limactl shell $CP_VM -- curl -s -o /dev/null -w '%{http_code}' -m5 $API/api/v1/nodes)
 [ "$code" = "401" ] && ok "request without token rejected (401)" || bad "expected 401 without token, got $code"
@@ -56,6 +68,11 @@ else
 fi
 
 say "== 5. sleep =="
+if wait_exec_ready "$id"; then
+  ok "guest agent ready (safe to sleep)"
+else
+  bad "guest agent never became ready before sleep (poisoned-snapshot risk)"
+fi
 cp_curl -X POST $API/api/v1/sandboxes/$id/sleep >/dev/null
 state=$(cp_curl $API/api/v1/sandboxes/$id | grep -oE '"state":"[^"]+"' | head -1 | cut -d'"' -f4)
 [ "$state" = "sleeping" ] && ok "state=sleeping" || bad "expected sleeping, got $state"
@@ -114,6 +131,7 @@ if [ -n "$worker_vm" ] && [ -n "$cip" ]; then
 fi
 
 say "== 7b. exec (vsock guest agent) =="
+wait_exec_ready "$id" 15 || true  # absorb post-wake/fork re-listen latency
 eres=$(cp_curl -X POST $API/api/v1/sandboxes/$id/exec -d '{"cmd":["/bin/sh","-c","echo hearth-exec-ok; id -u"]}')
 if printf '%s' "$eres" | grep -q '"exit_code":0' && printf '%s' "$eres" | grep -q 'hearth-exec-ok'; then
   ok "exec ran in guest (exit 0, output captured)"

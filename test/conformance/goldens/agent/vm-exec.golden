@@ -1,0 +1,8 @@
+200 application/json
+{
+  "exit_code": 0,
+  "ok": true,
+  "stderr": "",
+  "stdout": "agent-exec-ok\n",
+  "truncated": false
+}

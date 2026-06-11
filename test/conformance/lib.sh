@@ -61,6 +61,33 @@ assert_jq() { # <jq-expr> <label>  (evaluated against R_BODY, must be truthy)
 
 normalize() { jq -S -f "$CONF_DIR/normalize.jq"; }
 
+# wait_guest_ready <hd|ag> <id> [timeout-s] — poll exec(["true"]) until the
+# guest agent answers (default 45s). Two contract constraints at once: the
+# guest must finish booting (snapshots of mid-boot guests are poisoned — the
+# guest panics on resume) and hearth-guest must be listening before
+# sleep/exec/fork are exercised. Raw curl on purpose: must not clobber the
+# caller's R_STATUS/R_BODY from a previous req.
+wait_guest_ready() {
+  local suite="$1" id="$2" timeout="${3:-45}"
+  local base path
+  case "$suite" in
+    hd) base="$HEARTH_API"; path="/api/v1/sandboxes/$id/exec" ;;
+    ag) base="$AGENT_API";  path="/v1/vms/$id/exec" ;;
+    *)  bad "wait_guest_ready: unknown suite '$suite'"; return 1 ;;
+  esac
+  local i=0
+  while [ "$i" -lt "$timeout" ]; do
+    if curl -s -m 5 -X POST -H "Authorization: Bearer ${HEARTH_TOKEN:-}" \
+        -d '{"cmd":["true"],"timeout_ms":2000}' "$base$path" 2>/dev/null \
+        | jq -e '.ok == true' >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1; i=$((i+1))
+  done
+  bad "guest $id not ready after ${timeout}s (guest agent never answered exec)"
+  return 1
+}
+
 # _golden_cmp <suite/name> <content> — record or diff a golden.
 _golden_cmp() {
   local name="$1" cur="$2"
