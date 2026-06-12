@@ -56,6 +56,26 @@ type Sandbox struct {
 	// sandboxes that never used ingress (the conformance goldens).
 	Exposes           []Expose `json:"exposes,omitempty"`
 	AllowDynamicPorts bool     `json:"allow_dynamic_ports,omitempty"`
+	// Templates & disk (v4 P4). omitempty again: sandboxes created without a
+	// template or custom disk keep the frozen wire shape. DiskGB == 0 means
+	// "the image's own size" (the 2 GiB base image) — quota accounting uses
+	// EffectiveDiskGB, never the raw field.
+	Template string `json:"template,omitempty"`
+	DiskGB   uint32 `json:"disk_gb,omitempty"`
+}
+
+// BaseImageDiskGB is the size of the stock base rootfs (ubuntu-base.ext4,
+// built as a 2 GiB ext4 by deploy/firecracker-assets.sh). Sandboxes with
+// DiskGB == 0 run on an unresized copy of their image, so this is what they
+// count against disk quotas.
+const BaseImageDiskGB = 2
+
+// EffectiveDiskGB is the disk footprint used for quota accounting.
+func (sb *Sandbox) EffectiveDiskGB() uint32 {
+	if sb.DiskGB > 0 {
+		return sb.DiskGB
+	}
+	return BaseImageDiskGB
 }
 
 // Expose is one published service port on a sandbox (v4 P3 ingress): the

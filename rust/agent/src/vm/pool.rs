@@ -1,7 +1,9 @@
 //! Warm pool management — port of Manager.refillPool / Manager.claimFromPool in vm.zig.
 //!
-//! Background task every 5s tops the pool up to pool_size paused generic VMs
-//! (1 vcpu/256 MiB, base rootfs, state "pooled" on disk, names pool-<hex-ts>).
+//! Background task every 5s tops every pool up to its target: the legacy
+//! config pool (pool_size generic 1 vcpu/256 MiB ubuntu-base VMs) plus the
+//! hearthd-managed template pools (v4 P4, PUT /v1/pools). All pooled VMs are
+//! state "pooled" on disk with names pool-<hex-ts>.
 
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};

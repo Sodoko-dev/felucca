@@ -51,6 +51,30 @@ type WgPeer struct {
 	CreatedAt int64  `json:"created_at"`
 }
 
+// Template is a reusable sandbox recipe (v4 P4): a rootfs image plus the
+// default shape sandboxes created from it get. Image is an image name — the
+// file images/<image>.ext4 in hearthd's images dir. Captured templates have
+// Image == Name; registered ones may reference a pre-provisioned image like
+// "ubuntu-base". PoolSize is the per-node warm-pool target for this template
+// (0 = no warm pool).
+type Template struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Image       string `json:"image"`
+	ImageSHA256 string `json:"image_sha256"`
+	Vcpus       uint32 `json:"vcpus"`
+	MemMiB      uint64 `json:"mem_mib"`
+	// DiskGB is the default sandbox disk; always >= ImageSizeGB (enforced at
+	// template creation — the agent cannot shrink an image, and disk quota
+	// accounting relies on DiskGB being the real footprint).
+	DiskGB uint32 `json:"disk_gb"`
+	// ImageSizeGB is the image file's size rounded up to whole GiB — the
+	// floor for any per-sandbox disk_gb override.
+	ImageSizeGB uint32 `json:"image_size_gb"`
+	PoolSize    uint32 `json:"pool_size"`
+	CreatedAt   int64  `json:"created_at"`
+}
+
 // UsageEvent is one append-only row per sandbox lifecycle transition —
 // the raw material for any future metering/billing aggregation.
 type UsageEvent struct {
@@ -59,6 +83,7 @@ type UsageEvent struct {
 	Event     string
 	Vcpus     uint32
 	MemMiB    uint64
+	DiskGB    uint32
 	TS        int64
 }
 
@@ -102,6 +127,14 @@ type Store interface {
 	// GetWgPeerByPubKey returns nil, nil when the peer is absent.
 	GetWgPeerByPubKey(pub string) (*WgPeer, error)
 	ListWgPeers() ([]*WgPeer, error)
+
+	// Templates (v4 P4).
+	CreateTemplate(t *Template) error
+	// GetTemplateByName returns nil, nil when the template is absent.
+	GetTemplateByName(name string) (*Template, error)
+	ListTemplates() ([]*Template, error)
+	// DeleteTemplate returns false when the template was absent.
+	DeleteTemplate(name string) (bool, error)
 
 	// Usage events (append-only).
 	AppendUsage(e UsageEvent) error

@@ -95,6 +95,10 @@ fn reconcile_one(data_dir: &str, dir_name: &str, alloc: Option<&mut Allocator>) 
         vsock,
         tenant_id,
         exposes: meta.exposes.clone(),
+        // v4 P4: absent in pre-P4 metas → the default image / no resize.
+        image: meta.image.clone().unwrap_or_else(|| super::DEFAULT_IMAGE.to_string()),
+        image_sha256: meta.image_sha256.clone(),
+        disk_gb: meta.disk_gb.unwrap_or(0),
     })
 }
 
@@ -265,5 +269,39 @@ mod tests {
         let vms = reconcile(data_dir, None);
         let vm = vms.iter().find(|v| v.id == "vm-old").expect("vm-old");
         assert_eq!(vm.tenant_id, None, "absent tenant_id must default to None");
+    }
+
+    #[test]
+    fn test_image_disk_gb_carried_through_reconcile() {
+        let tmp = make_temp_dir();
+        let data_dir = tmp.path().to_str().unwrap();
+        let instances_dir = tmp.path().join("instances");
+        fs::create_dir_all(&instances_dir).unwrap();
+
+        // v4 P4 meta with image + disk_gb set.
+        let meta = r#"{"id":"vm-img","name":"vm-img","dir_id":"vm-img","vcpus":2,"mem_mib":2048,"pid":null,"slot":1,"ip":"10.231.0.3","state":"sleeping","vsock":true,"image":"odoo-v18","disk_gb":8}"#;
+        write_meta(&instances_dir, "vm-img", meta);
+
+        let vms = reconcile(data_dir, None);
+        let vm = vms.iter().find(|v| v.id == "vm-img").expect("vm-img");
+        assert_eq!(vm.image, "odoo-v18");
+        assert_eq!(vm.disk_gb, 8);
+    }
+
+    #[test]
+    fn test_image_disk_gb_default_in_pre_p4_meta() {
+        let tmp = make_temp_dir();
+        let data_dir = tmp.path().to_str().unwrap();
+        let instances_dir = tmp.path().join("instances");
+        fs::create_dir_all(&instances_dir).unwrap();
+
+        // Pre-P4 meta (no image/disk_gb keys) → defaults.
+        let meta = r#"{"id":"vm-pre","name":"vm-pre","dir_id":"vm-pre","vcpus":1,"mem_mib":256,"pid":null,"slot":1,"ip":"10.231.0.3","state":"sleeping","vsock":true}"#;
+        write_meta(&instances_dir, "vm-pre", meta);
+
+        let vms = reconcile(data_dir, None);
+        let vm = vms.iter().find(|v| v.id == "vm-pre").expect("vm-pre");
+        assert_eq!(vm.image, "ubuntu-base", "absent image must default to ubuntu-base");
+        assert_eq!(vm.disk_gb, 0, "absent disk_gb must default to 0");
     }
 }

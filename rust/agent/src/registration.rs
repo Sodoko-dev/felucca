@@ -66,7 +66,12 @@ async fn register_once(
         return Err(format!("register rejected: {}", resp.status));
     }
 
-    // Parse {"id":"..."} from response.
+    // Parse {"id":"..."} from the response. The register response is the
+    // frozen pre-P4 shape on purpose: warm-pool specs have exactly ONE
+    // delivery channel (PUT /v1/pools — hearthd pushes to a node right
+    // after it registers), so empty-list teardown semantics stay
+    // unambiguous and this tolerant substring parse keeps working against
+    // any hearthd vintage.
     let id = extract_json_str(&resp.body, "id")
         .ok_or("no id in register response")?;
     {
@@ -225,9 +230,9 @@ fn json_str(s: &str) -> String {
     out
 }
 
-/// Extract a string value from a JSON object by key (minimal, no deps).
+/// Extract a string value from a JSON object by key (minimal, no deps —
+/// deliberately tolerant of anything around the `"key":"value"` pair).
 fn extract_json_str(json: &str, key: &str) -> Option<String> {
-    // Find `"key":"value"` pattern.
     let needle = format!("\"{}\":", key);
     let start = json.find(&needle)?;
     let rest = &json[start + needle.len()..].trim_start();
@@ -253,4 +258,21 @@ pub fn detect_advertise_addr(control_plane: &str) -> Option<String> {
     sock.connect(&addr).ok()?;
     let local = sock.local_addr().ok()?;
     Some(local.ip().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_id_from_register_response() {
+        // The register response is the frozen {"id":...} shape; the
+        // substring parse tolerates extra fields and surrounding noise.
+        assert_eq!(extract_json_str(r#"{"id":"node-1"}"#, "id").as_deref(), Some("node-1"));
+        assert_eq!(
+            extract_json_str(r#"{"id":"node-1","extra":true}"#, "id").as_deref(),
+            Some("node-1")
+        );
+        assert!(extract_json_str(r#"{"other":"x"}"#, "id").is_none());
+    }
 }

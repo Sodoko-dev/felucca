@@ -343,6 +343,10 @@ type loadSandbox struct {
 	// silently drop these (dead routes + orphaned DNAT rules on restart).
 	Exposes           []model.Expose `json:"exposes"`
 	AllowDynamicPorts bool           `json:"allow_dynamic_ports"`
+	// Templates & disk (v4 P4) — same rule: dropping these on load would
+	// corrupt disk-quota accounting after a restart.
+	Template string `json:"template"`
+	DiskGB   uint32 `json:"disk_gb"`
 }
 
 // loadFile is the shape used when reading the persisted JSON.
@@ -428,6 +432,8 @@ func (s *State) Load(path string) error {
 			ParentID:  ls.ParentID,
 			Exposes:           ls.Exposes,
 			AllowDynamicPorts: ls.AllowDynamicPorts,
+			Template:          ls.Template,
+			DiskGB:            ls.DiskGB,
 		}
 		s.Sandboxes = append(s.Sandboxes, sb)
 	}

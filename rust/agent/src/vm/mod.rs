@@ -4,6 +4,7 @@
 //! Data layout: {data_dir}/instances/{dir_id}/ with rootfs.ext4, fc.sock,
 //! serial.log, meta.json, vmstate.bin, mem.bin.
 
+pub mod image;
 pub mod meta;
 pub mod pool;
 pub mod reconcile;
@@ -12,6 +13,7 @@ use crate::fc;
 use crate::ipalloc::{Allocator, Cidr};
 use crate::net;
 use meta::{ExposeEntry, Meta, VmState};
+use serde::Deserialize;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::path::Path;
 use std::sync::Arc;
@@ -39,6 +41,176 @@ pub struct Vm {
     pub tenant_id: Option<String>,
     /// v4 P3: ingress DNAT mappings (node_port → this VM's ip:guest_port).
     pub exposes: Vec<ExposeEntry>,
+    /// v4 P4: template image the rootfs was copied from ("ubuntu-base" default).
+    pub image: String,
+    /// v4 P4: rootfs grow size in GiB (0 = image size, no resize).
+    pub disk_gb: u32,
+    /// v4 P4: sha256 the image was verified against at create/prewarm time
+    /// (None = trusted local file). Part of the pool match shape, so a pooled
+    /// VM prewarmed from an old capture is never claimed for a new sha.
+    pub image_sha256: Option<String>,
+}
+
+/// Default template image; pre-P4 metas and requests without `image` map here.
+pub const DEFAULT_IMAGE: &str = "ubuntu-base";
+
+/// All create parameters in one place (v4 P4 grew the list past comfortable
+/// positional args). `image` is pre-validated by the server handler;
+/// `image_sha256` is None for "trust the local file".
+#[derive(Debug, Clone)]
+pub struct CreateSpec {
+    pub id: String,
+    pub name: String,
+    pub vcpus: u32,
+    pub mem_mib: u64,
+    pub tenant_id: Option<String>,
+    pub image: String,
+    pub image_sha256: Option<String>,
+    pub disk_gb: u32,
+}
+
+/// One hearthd-managed warm-pool template (v4 P4). `image_sha256` may be
+/// empty ("trust the local file"); `count` is the refill target.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PoolSpec {
+    pub image: String,
+    #[serde(default)]
+    pub image_sha256: String,
+    pub vcpus: u32,
+    pub mem_mib: u64,
+    #[serde(default)]
+    pub disk_gb: u32,
+    pub count: u32,
+}
+
+impl PoolSpec {
+    /// The sha in matching form: empty string ("trust the local file") is None.
+    fn sha_opt(&self) -> Option<&str> {
+        if self.image_sha256.is_empty() { None } else { Some(&self.image_sha256) }
+    }
+}
+
+/// Backoff-map key for one pool spec: every matched dimension, so editing a
+/// spec (e.g. a fixed sha) retries immediately instead of inheriting the
+/// broken spec's backoff.
+fn spec_key(s: &PoolSpec) -> String {
+    format!("{}|{}|{}|{}|{}", s.image, s.image_sha256, s.vcpus, s.mem_mib, s.disk_gb)
+}
+
+/// Per-spec refill backoff: true when `key` may not be retried at `now`.
+/// Expired entries are removed (the map only ever holds failing specs).
+fn backoff_active(map: &mut std::collections::HashMap<String, Instant>, key: &str, now: Instant) -> bool {
+    match map.get(key) {
+        Some(&next) if next > now => true,
+        Some(_) => {
+            map.remove(key);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Wait this long after a failed prewarm before retrying the same spec
+/// (a bad sha must not re-download gigabytes every 5s tick).
+const REFILL_BACKOFF: Duration = Duration::from_secs(300);
+
+/// Validate one PoolSpec before it can reach paths/curl/ext4 tooling.
+/// Bounds mirror the create endpoint's caps; image name shares the create
+/// validation (it becomes a path component and a URL segment).
+pub fn validate_pool_spec(s: &PoolSpec) -> Result<(), String> {
+    if !image::valid_image_name(&s.image) {
+        return Err(format!("invalid image name: {:?}", s.image));
+    }
+    if !s.image_sha256.is_empty() && !image::valid_sha256(&s.image_sha256) {
+        return Err(format!("invalid image_sha256 for {}", s.image));
+    }
+    if !(1..=16).contains(&s.vcpus) {
+        return Err(format!("vcpus out of range (1..=16): {}", s.vcpus));
+    }
+    if !(64..=32768).contains(&s.mem_mib) {
+        return Err(format!("mem_mib out of range (64..=32768): {}", s.mem_mib));
+    }
+    if s.disk_gb > 128 {
+        return Err(format!("disk_gb above cap (128): {}", s.disk_gb));
+    }
+    if s.count > 8 {
+        return Err(format!("count above cap (8): {}", s.count));
+    }
+    Ok(())
+}
+
+/// THE pool shape predicate — claim, refill counting and drain all share it.
+/// A pooled FC's machine config and rootfs are baked at prewarm time, so a
+/// VM matches only on exactly (image, image_sha256, vcpus, mem, disk); a
+/// re-captured template (same name, new sha) never matches old pooled VMs.
+fn pooled_shape_matches(
+    v: &Vm,
+    img: &str,
+    image_sha256: Option<&str>,
+    vcpus: u32,
+    mem_mib: u64,
+    disk_gb: u32,
+) -> bool {
+    v.state == VmState::Pooled
+        && v.image == img
+        && v.image_sha256.as_deref() == image_sha256
+        && v.vcpus == vcpus
+        && v.mem_mib == mem_mib
+        && v.disk_gb == disk_gb
+}
+
+/// Index of the first parked pool VM matching the requested shape.
+fn find_pooled_match(
+    vms: &[Vm],
+    img: &str,
+    image_sha256: Option<&str>,
+    vcpus: u32,
+    mem_mib: u64,
+    disk_gb: u32,
+) -> Option<usize> {
+    vms.iter().position(|v| pooled_shape_matches(v, img, image_sha256, vcpus, mem_mib, disk_gb))
+}
+
+/// Ids of pooled VMs no current spec wants: shape matches no spec at all, or
+/// the VM is in excess of its spec's count (the first `count` matches, in
+/// list order, are kept). The refill loop drains these — an empty
+/// PUT /v1/pools genuinely tears pools down.
+fn surplus_pooled_ids(vms: &[Vm], specs: &[PoolSpec]) -> Vec<String> {
+    let mut kept: Vec<u32> = vec![0; specs.len()];
+    let mut out = Vec::new();
+    for v in vms {
+        if v.state != VmState::Pooled {
+            continue;
+        }
+        let mut keep = false;
+        for (i, s) in specs.iter().enumerate() {
+            if pooled_shape_matches(v, &s.image, s.sha_opt(), s.vcpus, s.mem_mib, s.disk_gb) {
+                if kept[i] < s.count {
+                    kept[i] += 1;
+                    keep = true;
+                }
+                // First matching spec governs this VM (duplicated shapes
+                // count against the earliest spec only).
+                break;
+            }
+        }
+        if !keep {
+            out.push(v.id.clone());
+        }
+    }
+    out
+}
+
+/// Errors from the rootfs capture lookup; the server handler maps each to a status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootfsError {
+    /// Unknown VM id (→ 404).
+    NotFound,
+    /// VM exists but is not Stopped (→ 409 {"error":"not stopped"}).
+    NotStopped,
+    /// Another capture is already streaming this VM's rootfs
+    /// (→ 409 {"error":"capture in progress"}).
+    CaptureInProgress,
 }
 
 /// Errors from expose/unexpose; the server handler maps each to a status.
@@ -78,8 +250,14 @@ pub enum ExecOutcome {
 struct Inner {
     vms: Vec<Vm>,
     allocator: Option<Allocator>,
-    /// ids of parked pool VMs (ordered queue).
-    pool: Vec<String>,
+    /// v4 P4: hearthd-managed warm-pool templates (set via PUT /v1/pools or
+    /// the register response). The legacy config pool (pool_target) is NOT in
+    /// this list — it is a separate always-present default spec.
+    template_pools: Vec<PoolSpec>,
+    /// VM ids whose rootfs is being streamed to a capture right now: start()
+    /// must not spawn an FC over the file mid-stream. Entries are removed by
+    /// the capture stream's drop guard (covers client disconnects too).
+    capturing: std::collections::HashSet<String>,
 }
 
 pub struct Manager {
@@ -87,25 +265,48 @@ pub struct Manager {
     net_on: bool,
     cidr: Cidr,
     pool_target: u32,
+    /// v4 P4: control-plane base URL + bearer token for image pulls.
+    control_plane: String,
+    token: String,
     inner: Mutex<Inner>,
     // Serializes nft ruleset rebuilds (isolation + ingress): never held
     // together with `inner`.
     ruleset_lock: Mutex<()>,
+    // Per-image download locks (downloads of ONE image must not race on its
+    // cache files, but a multi-GB pull of one image must never block creates
+    // whose image is already cached). The map mutex is held only to fetch an
+    // entry; the per-image mutex is NEVER held together with `inner`.
+    image_locks: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
+    // Per-spec prewarm failure backoff (REFILL_BACKOFF): a broken spec must
+    // not re-attempt (and possibly re-download gigabytes) every 5s tick.
+    pool_backoff: Mutex<std::collections::HashMap<String, Instant>>,
 }
 
 impl Manager {
-    pub fn new(data_dir: String, net_on: bool, cidr: Cidr, pool_target: u32) -> Arc<Self> {
+    pub fn new(
+        data_dir: String,
+        net_on: bool,
+        cidr: Cidr,
+        pool_target: u32,
+        control_plane: String,
+        token: String,
+    ) -> Arc<Self> {
         Arc::new(Manager {
             data_dir,
             net_on,
             cidr,
             pool_target,
+            control_plane,
+            token,
             inner: Mutex::new(Inner {
                 vms: Vec::new(),
                 allocator: None,
-                pool: Vec::new(),
+                template_pools: Vec::new(),
+                capturing: std::collections::HashSet::new(),
             }),
             ruleset_lock: Mutex::new(()),
+            image_locks: Mutex::new(std::collections::HashMap::new()),
+            pool_backoff: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -230,9 +431,24 @@ impl Manager {
         g.vms.iter().filter(|v| v.state == VmState::Running || v.state == VmState::Paused).count() as u32
     }
 
+    /// Total parked pool VMs across every shape (heartbeat's pool_size).
+    /// Derived from VM state — there is no separate claim queue anymore.
     pub async fn pool_count(&self) -> u32 {
         let g = self.inner.lock().await;
-        g.pool.len() as u32
+        g.vms.iter().filter(|v| v.state == VmState::Pooled).count() as u32
+    }
+
+    /// Replace the hearthd-managed template pools (PUT /v1/pools / register
+    /// response). Applied atomically or not at all: every spec is validated
+    /// before any state changes. The legacy config pool (pool_target) is
+    /// unaffected. The 5s refill loop picks the new set up on its next tick.
+    pub async fn set_pools(&self, specs: Vec<PoolSpec>) -> Result<(), String> {
+        for s in &specs {
+            validate_pool_spec(s)?;
+        }
+        let mut g = self.inner.lock().await;
+        g.template_pools = specs;
+        Ok(())
     }
 
     /// Build the /v1/vms JSON response. Exactly 7 keys per element, ip/pid explicit null.
@@ -268,6 +484,30 @@ impl Manager {
     pub async fn ip_of(&self, id: &str) -> Option<String> {
         let g = self.inner.lock().await;
         g.vms.iter().find(|v| v.id == id).and_then(|v| v.ip.clone())
+    }
+
+    /// Begin a rootfs capture (v4 P4): only a Stopped VM may be captured
+    /// (any live FC could still be writing the file), only one capture per
+    /// VM at a time, and `start()` refuses while the id is captured. The
+    /// caller MUST pair this with `end_capture` (the server wraps the
+    /// response stream in a drop guard so disconnects release it too).
+    pub async fn begin_capture(&self, id: &str) -> Result<String, RootfsError> {
+        let mut g = self.inner.lock().await;
+        let v = g.vms.iter().find(|v| v.id == id).ok_or(RootfsError::NotFound)?;
+        if v.state != VmState::Stopped {
+            return Err(RootfsError::NotStopped);
+        }
+        let path = format!("{}/instances/{}/rootfs.ext4", self.data_dir, v.dir_id);
+        if !g.capturing.insert(id.to_string()) {
+            return Err(RootfsError::CaptureInProgress);
+        }
+        Ok(path)
+    }
+
+    /// Release a capture begun with `begin_capture`. Idempotent.
+    pub async fn end_capture(&self, id: &str) {
+        let mut g = self.inner.lock().await;
+        g.capturing.remove(id);
     }
 
     // ---- paths ----
@@ -316,15 +556,14 @@ impl Manager {
 
     // ---- create ----
 
-    pub async fn create(self: &Arc<Self>, id: &str, name: &str, vcpus: u32, mem_mib: u64, tenant_id: Option<String>) -> Result<(), String> {
-        // Try to claim a warm-pool VM for a matching shape (1 vCPU / 256 MiB).
-        if self.pool_target > 0 && vcpus == 1 && mem_mib == 256 {
-            if self.claim_from_pool(id, name, tenant_id.clone()).await? {
-                self.refresh_isolation().await;
-                return Ok(());
-            }
+    pub async fn create(self: &Arc<Self>, spec: &CreateSpec) -> Result<(), String> {
+        // Try to claim a warm-pool VM of the exact requested shape
+        // (image + vcpus + mem + disk); else cold boot.
+        if self.claim_from_pool(spec).await? {
+            self.refresh_isolation().await;
+            return Ok(());
         }
-        self.cold_create(id, name, vcpus, mem_mib, VmState::Running, None, tenant_id).await?;
+        self.cold_create(spec, VmState::Running, None).await?;
         self.refresh_isolation().await;
         Ok(())
     }
@@ -332,37 +571,37 @@ impl Manager {
     /// Cold-boot a fresh VM. `force_slot` reuses a specific slot (pool refill).
     async fn cold_create(
         self: &Arc<Self>,
-        id: &str,
-        name: &str,
-        vcpus: u32,
-        mem_mib: u64,
+        spec: &CreateSpec,
         final_state: VmState,
         force_slot: Option<u32>,
-        tenant_id: Option<String>,
     ) -> Result<(), String> {
+        let id = spec.id.as_str();
         {
             let mut g = self.inner.lock().await;
             if g.vms.iter().any(|v| v.id == id) {
                 return Err("AlreadyExists".into());
             }
             g.vms.push(Vm {
-                id: id.to_string(),
-                name: name.to_string(),
-                dir_id: id.to_string(),
-                vcpus,
-                mem_mib,
+                id: spec.id.clone(),
+                name: spec.name.clone(),
+                dir_id: spec.id.clone(),
+                vcpus: spec.vcpus,
+                mem_mib: spec.mem_mib,
                 state: VmState::Creating,
                 pid: None,
                 slot: None,
                 ip: None,
                 vsock: false,
-                tenant_id: tenant_id.clone(),
+                tenant_id: spec.tenant_id.clone(),
                 exposes: Vec::new(),
+                image: spec.image.clone(),
+                image_sha256: spec.image_sha256.clone(),
+                disk_gb: spec.disk_gb,
             });
         }
 
         // On error, mark as error state.
-        let result = self.cold_create_inner(id, name, vcpus, mem_mib, final_state, force_slot).await;
+        let result = self.cold_create_inner(spec, final_state, force_slot).await;
         if result.is_err() {
             self.set_state(id, VmState::Error).await;
         }
@@ -371,19 +610,26 @@ impl Manager {
 
     async fn cold_create_inner(
         self: &Arc<Self>,
-        id: &str,
-        _name: &str,
-        vcpus: u32,
-        mem_mib: u64,
+        spec: &CreateSpec,
         final_state: VmState,
         force_slot: Option<u32>,
     ) -> Result<(), String> {
+        let id = spec.id.as_str();
+        let (vcpus, mem_mib) = (spec.vcpus, spec.mem_mib);
         let dir_path = self.instance_dir(id).await;
         std::fs::create_dir_all(&dir_path).map_err(|e| e.to_string())?;
 
+        // Pull-and-cache the template image first (no-op when already local).
+        self.ensure_image(&spec.image, spec.image_sha256.as_deref()).await?;
+
         let rootfs_dst = format!("{}/rootfs.ext4", dir_path);
-        let rootfs_src = format!("{}/images/ubuntu-base.ext4", self.data_dir);
+        let rootfs_src = format!("{}/images/{}.ext4", self.data_dir, spec.image);
         copy_rootfs(&rootfs_src, &rootfs_dst)?;
+
+        // Grow the per-instance copy when a bigger disk was requested.
+        if spec.disk_gb > 0 {
+            self.grow_rootfs(&rootfs_dst, spec.disk_gb as u64).await?;
+        }
 
         // Networking: claim a slot, derive IP + tap, bring the tap up.
         let mut ip_str: Option<String> = None;
@@ -430,6 +676,125 @@ impl Manager {
             }
         }
         self.write_meta(id).await?;
+        Ok(())
+    }
+
+    // ---- image cache (v4 P4) ----
+
+    /// Ensure `{data_dir}/images/{image}.ext4` is present and (when a sha is
+    /// given) matches it, pulling from the control plane otherwise. The whole
+    /// operation holds `image_lock` so concurrent creates/refills never race
+    /// a download; it NEVER touches `inner`, so VM state stays responsive
+    /// during a long pull. `image` is pre-validated by the caller's entry
+    /// point (server handler / pool spec validation).
+    pub async fn ensure_image(&self, image_name: &str, expected_sha: Option<&str>) -> Result<(), String> {
+        let path = format!("{}/images/{}.ext4", self.data_dir, image_name);
+        // Fast path, no lock: cached-and-trusted is pure filesystem reads
+        // (a racing self-heal sidecar write is tmp+rename of identical
+        // content — benign).
+        if image::decide(&path, expected_sha, image_name).await? == image::ImageDecision::UseExisting {
+            return Ok(());
+        }
+        // Slow path: serialize per image, then re-check under the lock —
+        // another task may have completed the pull while we waited.
+        let lock = {
+            let mut m = self.image_locks.lock().await;
+            Arc::clone(m.entry(image_name.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))))
+        };
+        let _guard = lock.lock().await;
+        match image::decide(&path, expected_sha, image_name).await? {
+            image::ImageDecision::UseExisting => Ok(()),
+            image::ImageDecision::Pull => {
+                // decide() only returns Pull when an expected sha exists.
+                let want = expected_sha.ok_or("pull without sha256 (internal)")?;
+                self.pull_image(image_name, want, &path).await
+            }
+        }
+    }
+
+    /// Download the image to a dot-prefixed partial file, verify its sha256,
+    /// then atomically move it (and its sidecar) into place. Token goes to
+    /// curl via config-on-stdin — never argv.
+    async fn pull_image(&self, image_name: &str, want_sha: &str, path: &str) -> Result<(), String> {
+        let images_dir = format!("{}/images", self.data_dir);
+        std::fs::create_dir_all(&images_dir).map_err(|e| e.to_string())?;
+        let tmp = format!("{}/.{}.partial", images_dir, image_name);
+        let _ = std::fs::remove_file(&tmp);
+
+        let url = format!(
+            "{}/api/v1/images/{}",
+            self.control_plane.trim_end_matches('/'),
+            image_name
+        );
+        eprintln!("info: pulling image {} from control plane", image_name);
+        image::curl_download(&url, &self.token, &tmp).await?;
+
+        let got = image::sha256_of(&tmp).await?;
+        if got != want_sha {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "image {} sha256 mismatch: got {} want {}",
+                image_name, got, want_sha
+            ));
+        }
+
+        // Verified: publish the sidecar FIRST (temp+rename), then move the
+        // image into place. A crash between the two leaves sidecar-without-
+        // image, which the missing-file path simply repulls; the reverse
+        // order would leave image-without-sidecar — a state that used to pin
+        // a stale image forever.
+        image::write_sidecar(path, want_sha)?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| format!("rename {} -> {}: {}", tmp, path, e))?;
+        eprintln!("info: image {} cached ({})", image_name, want_sha);
+        Ok(())
+    }
+
+    /// Grow the per-instance rootfs copy to `disk_gb` GiB: extend the file
+    /// with set_len (sparse, never truncates), repair with `e2fsck -fp`
+    /// (exit 0 clean, 1/2 mean errors were fixed — acceptable), then
+    /// `resize2fs` to fill the new size. Shrinks are rejected.
+    async fn grow_rootfs(&self, path: &str, disk_gb: u64) -> Result<(), String> {
+        let current = std::fs::metadata(path)
+            .map_err(|e| format!("stat {}: {}", path, e))?
+            .len();
+        let Some(target) = image::resize_target(disk_gb, current)? else {
+            return Ok(());
+        };
+
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("open {}: {}", path, e))?;
+        f.set_len(target)
+            .map_err(|e| format!("set_len {}: {}", path, e))?;
+        drop(f);
+
+        let status = tokio::process::Command::new("e2fsck")
+            .arg("-fp")
+            .arg(path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .map_err(|e| format!("e2fsck spawn: {}", e))?;
+        match status.code() {
+            // 0 = clean, 1/2 = errors found and fixed — all safe to resize.
+            Some(0) | Some(1) | Some(2) => {}
+            c => return Err(format!("e2fsck {} failed (exit {:?})", path, c)),
+        }
+
+        let ok = tokio::process::Command::new("resize2fs")
+            .arg(path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return Err(format!("resize2fs {} failed", path));
+        }
         Ok(())
     }
 
@@ -709,10 +1074,10 @@ impl Manager {
     /// spawn child FC and restore. Child inherits parent's guest-internal IP
     /// (v2 documented caveat; fixed in v3).
     pub async fn fork(self: &Arc<Self>, parent_id: &str, child_id: &str, child_name: &str) -> Result<Option<String>, String> {
-        let (parent_was_running, parent_vcpus, parent_mem_mib, parent_vsock, parent_tenant_id) = {
+        let (parent_was_running, parent_vcpus, parent_mem_mib, parent_vsock, parent_tenant_id, parent_image, parent_image_sha256, parent_disk_gb) = {
             let g = self.inner.lock().await;
             let p = g.vms.iter().find(|v| v.id == parent_id).ok_or("NotFound")?;
-            (p.state == VmState::Running, p.vcpus, p.mem_mib, p.vsock, p.tenant_id.clone())
+            (p.state == VmState::Running, p.vcpus, p.mem_mib, p.vsock, p.tenant_id.clone(), p.image.clone(), p.image_sha256.clone(), p.disk_gb)
         };
 
         let parent_dir = self.instance_dir(parent_id).await;
@@ -776,6 +1141,11 @@ impl Manager {
                 // Exposes are NOT inherited: the parent's node ports keep
                 // pointing at the parent; hearthd re-exposes the child.
                 exposes: Vec::new(),
+                // The child's rootfs is a reflink of the parent's — same
+                // image and disk size for accounting (no image interaction).
+                image: parent_image.clone(),
+                image_sha256: parent_image_sha256.clone(),
+                disk_gb: parent_disk_gb,
             });
         }
 
@@ -933,47 +1303,122 @@ impl Manager {
 
     // ---- warm pool ----
 
-    pub async fn refill_pool(self: &Arc<Self>) {
-        if self.pool_target == 0 { return; }
-        loop {
-            let count = self.pool_count().await;
-            if count >= self.pool_target { break; }
+    /// The full refill plan: the legacy config pool (always present when
+    /// pool_target > 0, exactly the pre-P4 shape) plus the hearthd-managed
+    /// template pools.
+    async fn pool_specs(&self) -> Vec<PoolSpec> {
+        let mut specs = Vec::new();
+        if self.pool_target > 0 {
+            specs.push(PoolSpec {
+                image: DEFAULT_IMAGE.to_string(),
+                image_sha256: String::new(),
+                vcpus: 1,
+                mem_mib: 256,
+                disk_gb: 0,
+                count: self.pool_target,
+            });
+        }
+        let g = self.inner.lock().await;
+        specs.extend(g.template_pools.iter().cloned());
+        specs
+    }
 
-            let id = format!("pool-{:x}", now_ms());
-            match self.cold_create(&id, "pool", 1, 256, VmState::Pooled, None, None).await {
-                Ok(_) => {
-                    let mut g = self.inner.lock().await;
-                    g.pool.push(id.clone());
+    /// Parked pool VMs matching one spec's shape.
+    async fn pooled_count_matching(&self, s: &PoolSpec) -> u32 {
+        let g = self.inner.lock().await;
+        g.vms.iter()
+            .filter(|v| {
+                v.state == VmState::Pooled
+                    && v.image == s.image
+                    && v.vcpus == s.vcpus
+                    && v.mem_mib == s.mem_mib
+                    && v.disk_gb == s.disk_gb
+            })
+            .count() as u32
+    }
+
+    pub async fn refill_pool(self: &Arc<Self>) {
+        let specs = self.pool_specs().await;
+
+        // Drain BEFORE topping up: pooled VMs that match no current spec
+        // (deleted templates, re-captured shas) or exceed their spec's count
+        // are deleted — an empty PUT /v1/pools genuinely tears pools down,
+        // and a stale-image pool VM can never linger claimable.
+        let surplus = {
+            let g = self.inner.lock().await;
+            surplus_pooled_ids(&g.vms, &specs)
+        };
+        for sid in surplus {
+            eprintln!("info: draining surplus pool vm {}", sid);
+            if let Err(e) = self.delete(&sid).await {
+                eprintln!("warn: pool drain {}: {}", sid, e);
+            }
+        }
+
+        for spec in specs {
+            // Skip specs in failure backoff.
+            {
+                let mut bo = self.pool_backoff.lock().await;
+                if backoff_active(&mut bo, &spec_key(&spec), Instant::now()) {
+                    continue;
                 }
-                Err(e) => {
-                    eprintln!("warn: pool prewarm {} failed: {}", id, e);
+            }
+            loop {
+                let count = self.pooled_count_matching(&spec).await;
+                if count >= spec.count { break; }
+
+                let id = format!("pool-{:x}", now_ms());
+                let cs = CreateSpec {
+                    id: id.clone(),
+                    name: "pool".to_string(),
+                    vcpus: spec.vcpus,
+                    mem_mib: spec.mem_mib,
+                    tenant_id: None,
+                    image: spec.image.clone(),
+                    image_sha256: if spec.image_sha256.is_empty() {
+                        None
+                    } else {
+                        Some(spec.image_sha256.clone())
+                    },
+                    disk_gb: spec.disk_gb,
+                };
+                if let Err(e) = self.cold_create(&cs, VmState::Pooled, None).await {
+                    eprintln!("warn: pool prewarm {} ({}) failed: {}", id, spec.image, e);
+                    // Remove the failed record + instance dir (each tick
+                    // would otherwise leak one Error VM) and back the spec
+                    // off so a broken sha doesn't retry every 5s.
+                    if let Err(de) = self.delete(&id).await {
+                        eprintln!("warn: pool prewarm cleanup {}: {}", id, de);
+                    }
+                    let mut bo = self.pool_backoff.lock().await;
+                    bo.insert(spec_key(&spec), Instant::now() + REFILL_BACKOFF);
                     break;
                 }
             }
         }
     }
 
-    /// Claim a parked pool VM and retag it to the real id/name. Returns true if claimed.
-    async fn claim_from_pool(&self, id: &str, name: &str, tenant_id: Option<String>) -> Result<bool, String> {
+    /// Claim a parked pool VM of the requested shape and retag it to the real
+    /// id/name. Returns true if claimed. The find-and-retag happens under one
+    /// lock acquisition (state Pooled → Creating marks the claim), so two
+    /// concurrent creates can never grab the same pool VM.
+    async fn claim_from_pool(&self, spec: &CreateSpec) -> Result<bool, String> {
+        let id = spec.id.as_str();
         let pooled_id = {
             let mut g = self.inner.lock().await;
-            if g.pool.is_empty() { return Ok(false); }
-            g.pool.remove(0)
-        };
-
-        // Retag the in-memory record to the real id/name but KEEP dir_id (the pool dir).
-        // Also set tenant_id at claim time.
-        {
-            let mut g = self.inner.lock().await;
-            if let Some(v) = g.vms.iter_mut().find(|v| v.id == pooled_id) {
-                v.id = id.to_string();
-                v.name = name.to_string();
-                v.tenant_id = tenant_id;
-                // dir_id already points at the pool dir; leave it.
-            } else {
+            let Some(idx) = find_pooled_match(&g.vms, &spec.image, spec.image_sha256.as_deref(), spec.vcpus, spec.mem_mib, spec.disk_gb) else {
                 return Ok(false);
-            }
-        }
+            };
+            let v = &mut g.vms[idx];
+            let old = v.id.clone();
+            // Retag to the real id/name but KEEP dir_id (the pool dir).
+            // Creating marks the record as claimed until the resume lands.
+            v.id = id.to_string();
+            v.name = spec.name.clone();
+            v.tenant_id = spec.tenant_id.clone();
+            v.state = VmState::Creating;
+            old
+        };
 
         let sock = self.sock_path(id).await;
         if let Err(e) = fc::patch_vm_state(&sock, "Resumed").await {
@@ -1020,6 +1465,27 @@ impl Manager {
                 Ok(_) | Err(nix::errno::Errno::ESRCH) => {}
                 Err(e) => return Err(e.to_string()),
             }
+            // Wait for the FC process to actually exit: "stopped" gates the
+            // rootfs capture endpoint, and a dying FC may still be flushing
+            // rootfs.ext4. Escalate to SIGKILL at 5s, give up at 10s (the
+            // reaper owns whatever is left).
+            let start = Instant::now();
+            let mut killed = false;
+            loop {
+                if kill(Pid::from_raw(p), None).is_err() {
+                    break; // ESRCH — gone (reaper collected it)
+                }
+                let waited = start.elapsed();
+                if !killed && waited >= Duration::from_secs(5) {
+                    let _ = kill(Pid::from_raw(p), Signal::SIGKILL);
+                    killed = true;
+                }
+                if waited >= Duration::from_secs(10) {
+                    eprintln!("warn: stop {}: pid {} still present after 10s", id, p);
+                    break;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
         }
         Ok(())
     }
@@ -1027,6 +1493,11 @@ impl Manager {
     pub async fn start(self: &Arc<Self>, id: &str) -> Result<(), String> {
         let (vcpus, mem_mib, slot, ip) = {
             let g = self.inner.lock().await;
+            // A capture stream is reading this instance's rootfs: spawning
+            // an FC over it would corrupt the published template bytes.
+            if g.capturing.contains(id) {
+                return Err("InvalidState: capture in progress".into());
+            }
             let v = g.vms.iter().find(|v| v.id == id).ok_or("NotFound")?;
             // start is a cold boot: only valid when no FC owns the instance.
             // paused/sleeping VMs have live state to lose — spawning over them
@@ -1132,7 +1603,9 @@ impl Manager {
     async fn on_fc_exit(&self, id: &str, pid: i32) {
         let transitioned = {
             let mut g = self.inner.lock().await;
-            let hit = match g.vms.iter_mut().find(|v| v.id == id) {
+            // A dead pool VM leaves the claimable set by this very transition:
+            // claims match on state == Pooled, and Error is not claimable.
+            match g.vms.iter_mut().find(|v| v.id == id) {
                 Some(v) if v.pid == Some(pid)
                     && matches!(v.state, VmState::Creating | VmState::Running | VmState::Paused | VmState::Pooled) =>
                 {
@@ -1141,12 +1614,7 @@ impl Manager {
                     true
                 }
                 _ => false,
-            };
-            if hit {
-                // A dead pool VM must leave the queue or it would be claimed.
-                g.pool.retain(|p| p != id);
             }
-            hit
         };
         if transitioned {
             eprintln!("warn: firecracker for {} (pid {}) exited unexpectedly; state -> error", id, pid);
@@ -1192,6 +1660,10 @@ impl Manager {
                 vsock: v.vsock,
                 tenant_id: v.tenant_id.clone(),
                 exposes: v.exposes.clone(),
+                // Default shape stays None so pre-P4 meta bytes are identical.
+                image: if v.image == DEFAULT_IMAGE { None } else { Some(v.image.clone()) },
+                disk_gb: if v.disk_gb == 0 { None } else { Some(v.disk_gb) },
+                image_sha256: v.image_sha256.clone(),
             }
         };
 
@@ -1299,5 +1771,168 @@ mod tests {
         // allocator, but the set is just u16s).
         let used: HashSet<u16> = [80, 8069, 30000].into_iter().collect();
         assert_eq!(lowest_free_node_port(&used), Some(20000));
+    }
+
+    // ---- v4 P4: pool specs + matching ----
+
+    fn good_spec() -> PoolSpec {
+        PoolSpec {
+            image: "odoo-v18".into(),
+            image_sha256: "a".repeat(64),
+            vcpus: 2,
+            mem_mib: 2048,
+            disk_gb: 8,
+            count: 2,
+        }
+    }
+
+    #[test]
+    fn test_pool_spec_validation_accepts_good() {
+        assert!(validate_pool_spec(&good_spec()).is_ok());
+        // Empty sha means "trust the local file".
+        let mut s = good_spec();
+        s.image_sha256 = String::new();
+        assert!(validate_pool_spec(&s).is_ok());
+        // count 0 drains the pool — valid.
+        let mut s = good_spec();
+        s.count = 0;
+        assert!(validate_pool_spec(&s).is_ok());
+        // Boundary values.
+        let mut s = good_spec();
+        s.vcpus = 16;
+        s.mem_mib = 32768;
+        s.disk_gb = 128;
+        s.count = 8;
+        assert!(validate_pool_spec(&s).is_ok());
+        let mut s = good_spec();
+        s.vcpus = 1;
+        s.mem_mib = 64;
+        s.disk_gb = 0;
+        assert!(validate_pool_spec(&s).is_ok());
+    }
+
+    #[test]
+    fn test_pool_spec_validation_rejects_bad() {
+        let mut s = good_spec();
+        s.image = "../etc".into();
+        assert!(validate_pool_spec(&s).is_err());
+        let mut s = good_spec();
+        s.image = "UPPER".into();
+        assert!(validate_pool_spec(&s).is_err());
+        let mut s = good_spec();
+        s.image_sha256 = "xyz".into();
+        assert!(validate_pool_spec(&s).is_err());
+        let mut s = good_spec();
+        s.vcpus = 0;
+        assert!(validate_pool_spec(&s).is_err());
+        let mut s = good_spec();
+        s.vcpus = 17;
+        assert!(validate_pool_spec(&s).is_err());
+        let mut s = good_spec();
+        s.mem_mib = 63;
+        assert!(validate_pool_spec(&s).is_err());
+        let mut s = good_spec();
+        s.mem_mib = 32769;
+        assert!(validate_pool_spec(&s).is_err());
+        let mut s = good_spec();
+        s.disk_gb = 129;
+        assert!(validate_pool_spec(&s).is_err());
+        let mut s = good_spec();
+        s.count = 9;
+        assert!(validate_pool_spec(&s).is_err());
+    }
+
+    #[test]
+    fn test_pool_spec_wire_shape() {
+        // The pinned two-sided contract: hearthd sends this exact shape.
+        let body = r#"[{"image":"odoo-v18","image_sha256":"","vcpus":2,"mem_mib":2048,"disk_gb":8,"count":2}]"#;
+        let specs: Vec<PoolSpec> = serde_json::from_str(body).expect("parse pool specs");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].image, "odoo-v18");
+        assert_eq!(specs[0].image_sha256, "");
+        assert_eq!(specs[0].vcpus, 2);
+        assert_eq!(specs[0].mem_mib, 2048);
+        assert_eq!(specs[0].disk_gb, 8);
+        assert_eq!(specs[0].count, 2);
+        // image_sha256/disk_gb may be omitted; they default.
+        let body = r#"[{"image":"ubuntu-base","vcpus":1,"mem_mib":256,"count":1}]"#;
+        let specs: Vec<PoolSpec> = serde_json::from_str(body).expect("parse minimal spec");
+        assert_eq!(specs[0].image_sha256, "");
+        assert_eq!(specs[0].disk_gb, 0);
+    }
+
+    fn pooled_vm(id: &str, image: &str, vcpus: u32, mem_mib: u64, disk_gb: u32) -> Vm {
+        Vm {
+            id: id.into(),
+            name: "pool".into(),
+            dir_id: id.into(),
+            vcpus,
+            mem_mib,
+            state: VmState::Pooled,
+            pid: Some(1),
+            slot: Some(0),
+            ip: Some("10.231.0.2".into()),
+            vsock: true,
+            tenant_id: None,
+            exposes: Vec::new(),
+            image: image.into(),
+            image_sha256: None,
+            disk_gb,
+        }
+    }
+
+    #[test]
+    fn test_pool_match_picks_only_matching_shape() {
+        let vms = vec![
+            pooled_vm("pool-1", "ubuntu-base", 1, 256, 0),
+            pooled_vm("pool-2", "odoo-v18", 2, 2048, 8),
+        ];
+        // Exact match on each shape.
+        assert_eq!(find_pooled_match(&vms, "ubuntu-base", None, 1, 256, 0), Some(0));
+        assert_eq!(find_pooled_match(&vms, "odoo-v18", None, 2, 2048, 8), Some(1));
+        // Any differing dimension misses.
+        assert_eq!(find_pooled_match(&vms, "odoo-v18", None, 1, 256, 0), None);
+        assert_eq!(find_pooled_match(&vms, "ubuntu-base", None, 2, 256, 0), None);
+        assert_eq!(find_pooled_match(&vms, "ubuntu-base", None, 1, 512, 0), None);
+        assert_eq!(find_pooled_match(&vms, "ubuntu-base", None, 1, 256, 8), None);
+        assert_eq!(find_pooled_match(&vms, "docker-base", None, 2, 2048, 8), None);
+    }
+
+    #[test]
+    fn test_pool_match_requires_same_sha() {
+        // A re-captured template (same name, new sha) must NEVER be served a
+        // pooled VM prewarmed from the old image.
+        let old_sha = "a".repeat(64);
+        let new_sha = "b".repeat(64);
+        let mut warm = pooled_vm("pool-1", "odoo-v18", 2, 2048, 8);
+        warm.image_sha256 = Some(old_sha.clone());
+        let vms = vec![warm];
+        assert_eq!(find_pooled_match(&vms, "odoo-v18", Some(&old_sha), 2, 2048, 8), Some(0));
+        assert_eq!(find_pooled_match(&vms, "odoo-v18", Some(&new_sha), 2, 2048, 8), None);
+        // Sha-less request never claims a sha-pinned pool VM and vice versa.
+        assert_eq!(find_pooled_match(&vms, "odoo-v18", None, 2, 2048, 8), None);
+        let bare = vec![pooled_vm("pool-2", "odoo-v18", 2, 2048, 8)];
+        assert_eq!(find_pooled_match(&bare, "odoo-v18", Some(&old_sha), 2, 2048, 8), None);
+    }
+
+    #[test]
+    fn test_pool_match_skips_non_pooled_states() {
+        let mut running = pooled_vm("vm-1", "ubuntu-base", 1, 256, 0);
+        running.state = VmState::Running;
+        let mut errored = pooled_vm("pool-x", "ubuntu-base", 1, 256, 0);
+        errored.state = VmState::Error;
+        let mut claimed = pooled_vm("pool-y", "ubuntu-base", 1, 256, 0);
+        claimed.state = VmState::Creating; // mid-claim marker
+        let vms = vec![running, errored, claimed];
+        assert_eq!(find_pooled_match(&vms, "ubuntu-base", None, 1, 256, 0), None);
+    }
+
+    #[test]
+    fn test_pool_match_first_in_order_wins() {
+        let vms = vec![
+            pooled_vm("pool-a", "ubuntu-base", 1, 256, 0),
+            pooled_vm("pool-b", "ubuntu-base", 1, 256, 0),
+        ];
+        assert_eq!(find_pooled_match(&vms, "ubuntu-base", None, 1, 256, 0), Some(0));
     }
 }

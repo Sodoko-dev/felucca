@@ -112,6 +112,7 @@ func (srv *Server) recordUsage(sb *model.Sandbox, event string) {
 		Event:     event,
 		Vcpus:     sb.VCPUs,
 		MemMiB:    sb.MemMiB,
+		DiskGB:    sb.EffectiveDiskGB(),
 		TS:        time.Now().Unix(),
 	}
 	if err := srv.db.AppendUsage(e); err != nil {
@@ -181,7 +182,8 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request, tenant strin
 			strings.HasPrefix(path, "/api/v1/keys/"),
 			strings.HasPrefix(path, "/api/v1/join-tokens"),
 			path == "/api/v1/routes",
-			strings.HasPrefix(path, "/api/v1/routes/"):
+			strings.HasPrefix(path, "/api/v1/routes/"),
+			strings.HasPrefix(path, "/api/v1/images/"):
 			writeJSON(w, 404, []byte(`{"error":"not found"}`))
 			return
 		}
@@ -218,6 +220,15 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request, tenant strin
 	case path == "/api/v1/routes/ensure" && method == http.MethodPost:
 		srv.ensureRoute(w, r)
 
+	// Template catalog: GET is tenant-visible (tenants must be able to
+	// discover what they can create from); mutations are admin-only via
+	// handler-level guards.
+	case path == "/api/v1/templates" && method == http.MethodGet:
+		srv.listTemplates(w)
+
+	case path == "/api/v1/templates" && method == http.MethodPost:
+		srv.createTemplate(w, r, tenant)
+
 	default:
 		// Path-segment routes with {id}.
 		if id, ok := matchSuffix(path, "/api/v1/tenants/", "/keys"); ok && method == http.MethodPost {
@@ -226,6 +237,14 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request, tenant strin
 		}
 		if id, ok := matchExact(path, "/api/v1/keys/"); ok && method == http.MethodDelete {
 			srv.revokeTenantKey(w, id)
+			return
+		}
+		if name, ok := matchExact(path, "/api/v1/templates/"); ok && method == http.MethodDelete {
+			srv.deleteTemplate(w, name, tenant)
+			return
+		}
+		if name, ok := matchExact(path, "/api/v1/images/"); ok && method == http.MethodGet {
+			srv.serveImage(w, r, name)
 			return
 		}
 		if id, ok := matchSuffix(path, "/api/v1/sandboxes/", "/exec"); ok && method == http.MethodPost {
@@ -346,6 +365,11 @@ func (srv *Server) agentRegister(w http.ResponseWriter, r *http.Request) {
 	if err := srv.persist(); err != nil {
 		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
 	}
+	// Push the current warm-pool specs to the (re)registering node off the
+	// response path (v4 P4). The response shape itself stays the frozen
+	// {"id":...} — pools have exactly one delivery channel (PUT /v1/pools),
+	// so empty-list teardown semantics are unambiguous.
+	go srv.pushPoolsTo(req.Addr)
 	idJSON, _ := json.Marshal(id)
 	writeJSON(w, 200, []byte(`{"id":`+string(idJSON)+`}`))
 }
@@ -416,6 +440,8 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 		VCPUs             *uint32 `json:"vcpus"`
 		MemMiB            *uint64 `json:"mem_mib"`
 		AllowDynamicPorts bool    `json:"allow_dynamic_ports"`
+		Template          string  `json:"template"`
+		DiskGB            *uint32 `json:"disk_gb"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, []byte(`{"error":"bad json"}`))
@@ -429,20 +455,55 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 	if namespace == "" {
 		namespace = "default"
 	}
+
+	// Template resolution (v4 P4): the template supplies the image and the
+	// default shape; explicit request fields override the shape. diskFloor
+	// is the image's size — the agent cannot shrink a rootfs, so a smaller
+	// disk_gb could never boot (and would under-count quota).
 	vcpus := uint32(1)
+	memMiB := uint64(256)
+	var diskGB uint32
+	var image, imageSHA string
+	diskFloor := uint32(model.BaseImageDiskGB)
+	if req.Template != "" {
+		tpl, err := srv.db.GetTemplateByName(req.Template)
+		if err != nil {
+			writeJSON(w, 500, []byte(`{"error":"store error"}`))
+			return
+		}
+		if tpl == nil {
+			writeJSON(w, 400, []byte(`{"error":"unknown template"}`))
+			return
+		}
+		vcpus, memMiB, diskGB = tpl.Vcpus, tpl.MemMiB, tpl.DiskGB
+		image, imageSHA = tpl.Image, tpl.ImageSHA256
+		diskFloor = tpl.ImageSizeGB
+	}
 	if req.VCPUs != nil {
 		vcpus = *req.VCPUs
 	}
-	memMiB := uint64(256)
 	if req.MemMiB != nil {
 		memMiB = *req.MemMiB
+	}
+	// disk_gb: 0 (or absent) means "the template's default / the unresized
+	// base image", never "override to zero".
+	if req.DiskGB != nil && *req.DiskGB > 0 {
+		if *req.DiskGB < diskFloor {
+			writeJSON(w, 400, []byte(`{"error":"disk_gb smaller than the image"}`))
+			return
+		}
+		diskGB = *req.DiskGB
+	}
+	if vcpus < 1 || vcpus > maxVcpus || memMiB < minMemMiB || memMiB > maxMemMiB || diskGB > maxDiskGB {
+		writeJSON(w, 400, []byte(`{"error":"shape out of range"}`))
+		return
 	}
 
 	now := time.Now().Unix()
 
 	// Tenant quota gate (admin is unmetered).
 	if tenant != adminTenant {
-		if msg := srv.quotaExceeded(tenant, vcpus, memMiB); msg != "" {
+		if msg := srv.quotaExceeded(tenant, vcpus, memMiB, diskGB); msg != "" {
 			writeJSON(w, 429, []byte(`{"error":"quota exceeded: `+msg+`"}`))
 			return
 		}
@@ -462,6 +523,8 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 	sb := srv.st.CreateSandbox(req.Name, namespace, node.ID, vcpus, memMiB, now)
 	sb.TenantID = tenant
 	sb.AllowDynamicPorts = req.AllowDynamicPorts
+	sb.Template = req.Template
+	sb.DiskGB = diskGB
 	sbID = sb.ID
 	srv.st.Unlock()
 
@@ -469,14 +532,19 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
 	}
 
-	// Build agent create request body (tenant_id feeds nft isolation on the node).
+	// Build agent create request body (tenant_id feeds nft isolation on the
+	// node; image/sha/disk are omitted for plain base-image sandboxes so the
+	// pre-P4 wire bytes are unchanged).
 	agentBody, _ := json.Marshal(struct {
-		ID       string `json:"id"`
-		Name     string `json:"name"`
-		VCPUs    uint32 `json:"vcpus"`
-		MemMiB   uint64 `json:"mem_mib"`
-		TenantID string `json:"tenant_id,omitempty"`
-	}{sbID, req.Name, vcpus, memMiB, tenant})
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		VCPUs       uint32 `json:"vcpus"`
+		MemMiB      uint64 `json:"mem_mib"`
+		TenantID    string `json:"tenant_id,omitempty"`
+		Image       string `json:"image,omitempty"`
+		ImageSHA256 string `json:"image_sha256,omitempty"`
+		DiskGB      uint32 `json:"disk_gb,omitempty"`
+	}{sbID, req.Name, vcpus, memMiB, tenant, image, imageSHA, diskGB})
 
 	host, port := agentclient.SplitHostPort(agentAddr)
 	resp, err := agentclient.Request(host, port, http.MethodPost, "/v1/vms", agentBody, srv.cfg.Token)
@@ -731,9 +799,9 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID,
 	// unmetered). Checked before any state is created.
 	childTenant := parent.TenantID
 	if childTenant != adminTenant {
-		vcpus, memMiB := parent.VCPUs, parent.MemMiB
+		vcpus, memMiB, diskGB := parent.VCPUs, parent.MemMiB, parent.DiskGB
 		srv.st.Unlock()
-		if msg := srv.quotaExceeded(childTenant, vcpus, memMiB); msg != "" {
+		if msg := srv.quotaExceeded(childTenant, vcpus, memMiB, diskGB); msg != "" {
 			writeJSON(w, 429, []byte(`{"error":"quota exceeded: `+msg+`"}`))
 			return
 		}
@@ -773,6 +841,10 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID,
 	child := srv.st.CreateForkChild(childName, parent.Namespace, node.ID, parent.VCPUs, parent.MemMiB, parentID, now)
 	child.TenantID = parent.TenantID
 	child.AllowDynamicPorts = parent.AllowDynamicPorts
+	// The child runs on a reflink of the parent's (possibly resized,
+	// template-built) rootfs — inherit both for accounting.
+	child.Template = parent.Template
+	child.DiskGB = parent.DiskGB
 	childID = child.ID
 	srv.st.Unlock()
 
@@ -877,6 +949,14 @@ func (srv *Server) execSandbox(w http.ResponseWriter, r *http.Request, id, tenan
 			timeoutMs = 300000
 		}
 	}
+
+	// Exec's cap (300s) outlives the server's global 60s WriteTimeout —
+	// without a per-connection extension, any guest command over ~60s gets
+	// its connection killed mid-wait (latent since the P2.3 hardening,
+	// surfaced by P4 template provisioning). Sized to THIS request's
+	// timeout (body already parsed), not the capture-sized 30 minutes:
+	// this route is tenant-reachable and must stay slow-loris-resistant.
+	deadlineFor(w, time.Duration(timeoutMs)*time.Millisecond+60*time.Second)
 
 	// Count the attempt before proxying.
 	srv.st.RecordExec()

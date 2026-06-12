@@ -261,6 +261,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
+ "futures-core",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -271,6 +272,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tower 0.4.13",
 ]
 

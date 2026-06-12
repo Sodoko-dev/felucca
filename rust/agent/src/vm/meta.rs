@@ -8,6 +8,9 @@
 //! absent in older meta.json files → None.
 //! `exposes` is the v4 P3 addition: ingress DNAT mappings, serialized only when
 //! non-empty (after tenant_id), absent in older meta.json files → empty.
+//! `image`/`disk_gb` are the v4 P4 additions: template image name and rootfs
+//! grow size, serialized only when Some (after exposes). The default shape
+//! (ubuntu-base, no resize) writes None so pre-P4 bytes stay identical.
 //! Options serialize as explicit null — NO skip_serializing_if (except tenant_id).
 //! State strings: creating|running|paused|stopped|sleeping|error|pooled.
 
@@ -96,6 +99,21 @@ pub struct Meta {
     /// Serialized only when non-empty (after tenant_id).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exposes: Vec<ExposeEntry>,
+    /// v4 P4: template image the rootfs was copied from. None means the
+    /// default "ubuntu-base" (kept None so pre-P4 meta bytes stay identical).
+    /// Serialized only when Some (after exposes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// v4 P4: rootfs grow size in GiB. None means 0 / no resize (kept None so
+    /// pre-P4 meta bytes stay identical). Serialized only when Some (after image).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_gb: Option<u32>,
+    /// v4 P4: sha256 the image was verified against at create/prewarm time.
+    /// None = trusted local file. Part of the pool match shape, so a pooled
+    /// VM prewarmed from an old capture is never claimed for a new sha.
+    /// Serialized only when Some (after disk_gb) — pre-P4 bytes stay identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_sha256: Option<String>,
 }
 
 impl Meta {
@@ -126,8 +144,20 @@ impl Meta {
                 .collect();
             format!(",\"exposes\":[{}]", elems.join(","))
         };
+        let image_suffix = match &self.image {
+            Some(im) => format!(",\"image\":{}", json_str(im)),
+            None => String::new(),
+        };
+        let disk_suffix = match self.disk_gb {
+            Some(d) => format!(",\"disk_gb\":{}", d),
+            None => String::new(),
+        };
+        let sha_suffix = match &self.image_sha256 {
+            Some(s) => format!(",\"image_sha256\":{}", json_str(s)),
+            None => String::new(),
+        };
         format!(
-            "{{\"id\":{},\"name\":{},\"dir_id\":{},\"vcpus\":{},\"mem_mib\":{},\"pid\":{},\"slot\":{},\"ip\":{},\"state\":{},\"vsock\":{}{}{}}}",
+            "{{\"id\":{},\"name\":{},\"dir_id\":{},\"vcpus\":{},\"mem_mib\":{},\"pid\":{},\"slot\":{},\"ip\":{},\"state\":{},\"vsock\":{}{}{}{}{}{}}}",
             json_str(&self.id),
             json_str(&self.name),
             json_str(&self.dir_id),
@@ -140,6 +170,9 @@ impl Meta {
             self.vsock,
             tenant_suffix,
             exposes_suffix,
+            image_suffix,
+            disk_suffix,
+            sha_suffix,
         )
     }
 }
@@ -228,6 +261,9 @@ mod tests {
             state: VmState::Stopped,
             vsock: false,
             tenant_id: None,
+            image: None,
+            disk_gb: None,
+            image_sha256: None,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -253,6 +289,9 @@ mod tests {
             state: VmState::Running,
             vsock: true,
             tenant_id: None,
+            image: None,
+            disk_gb: None,
+            image_sha256: None,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -294,6 +333,9 @@ mod tests {
             state: VmState::Running,
             vsock: true,
             tenant_id: Some("acme".into()),
+            image: None,
+            disk_gb: None,
+            image_sha256: None,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -350,6 +392,9 @@ mod tests {
             state: VmState::Running,
             vsock: true,
             tenant_id: None,
+            image: None,
+            disk_gb: None,
+            image_sha256: None,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -374,6 +419,9 @@ mod tests {
             state: VmState::Stopped,
             vsock: false,
             tenant_id: None,
+            image: None,
+            disk_gb: None,
+            image_sha256: None,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -396,6 +444,9 @@ mod tests {
             state: VmState::Running,
             vsock: false,
             tenant_id: Some("acme-corp".into()),
+            image: None,
+            disk_gb: None,
+            image_sha256: None,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -418,6 +469,9 @@ mod tests {
             state: VmState::Running,
             vsock: false,
             tenant_id: None,
+            image: None,
+            disk_gb: None,
+            image_sha256: None,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -447,6 +501,9 @@ mod tests {
             state: VmState::Running,
             vsock: true,
             tenant_id: Some("tenant-42".into()),
+            image: None,
+            disk_gb: None,
+            image_sha256: None,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -478,6 +535,9 @@ mod tests {
             state: VmState::Running,
             vsock: false,
             tenant_id: None,
+            image: None,
+            disk_gb: None,
+            image_sha256: None,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -498,6 +558,9 @@ mod tests {
             state: VmState::Running,
             vsock: true,
             tenant_id: None,
+            image: None,
+            disk_gb: None,
+            image_sha256: None,
             exposes: vec![
                 ExposeEntry { guest_port: 8069, node_port: 20000 },
                 ExposeEntry { guest_port: 443, node_port: 20001 },
@@ -511,5 +574,112 @@ mod tests {
         );
         let meta2: Meta = serde_json::from_str(&json).expect("round-trip parse");
         assert_eq!(meta2.exposes, meta.exposes);
+    }
+
+    #[test]
+    fn test_old_meta_without_image_disk_parses_none() {
+        // Pre-P4 file (no image/disk_gb keys) must parse with both None.
+        let fixture = r#"{"id":"vm-p3","name":"vm-p3","dir_id":"vm-p3","vcpus":1,"mem_mib":256,"pid":null,"slot":0,"ip":"10.231.0.2","state":"running","vsock":true,"tenant_id":"acme","exposes":[{"guest_port":8069,"node_port":20000}]}"#;
+        let meta: Meta = serde_json::from_str(fixture).expect("parse pre-P4 fixture");
+        assert_eq!(meta.image, None, "absent image must default to None");
+        assert_eq!(meta.disk_gb, None, "absent disk_gb must default to None");
+    }
+
+    #[test]
+    fn test_default_image_serializes_byte_identical_to_pre_p4() {
+        // A default-shape VM (ubuntu-base, no resize → both None) must emit
+        // EXACTLY the pre-P4 bytes — no image/disk_gb keys at all.
+        let meta = Meta {
+            id: "vm-d".into(),
+            name: "vm-d".into(),
+            dir_id: "vm-d".into(),
+            vcpus: 1,
+            mem_mib: 256,
+            pid: Some(42),
+            slot: Some(0),
+            ip: Some("10.231.0.2".into()),
+            state: VmState::Running,
+            vsock: true,
+            tenant_id: None,
+            exposes: vec![],
+            image: None,
+            disk_gb: None,
+            image_sha256: None,
+        };
+        assert_eq!(
+            meta.to_json(),
+            r#"{"id":"vm-d","name":"vm-d","dir_id":"vm-d","vcpus":1,"mem_mib":256,"pid":42,"slot":0,"ip":"10.231.0.2","state":"running","vsock":true}"#,
+        );
+    }
+
+    #[test]
+    fn test_image_disk_gb_round_trip() {
+        let meta = Meta {
+            id: "vm-i".into(),
+            name: "vm-i".into(),
+            dir_id: "vm-i".into(),
+            vcpus: 2,
+            mem_mib: 2048,
+            pid: Some(7),
+            slot: Some(1),
+            ip: Some("10.231.0.3".into()),
+            state: VmState::Running,
+            vsock: true,
+            tenant_id: Some("acme".into()),
+            exposes: vec![ExposeEntry { guest_port: 8069, node_port: 20000 }],
+            image: Some("odoo-v18".into()),
+            disk_gb: Some(8),
+            image_sha256: None,
+        };
+        let json = meta.to_json();
+        // image and disk_gb serialize AFTER exposes, in that order.
+        let exposes_pos = json.find("\"exposes\"").unwrap();
+        let image_pos = json.find("\"image\"").unwrap();
+        let disk_pos = json.find("\"disk_gb\"").unwrap();
+        assert!(exposes_pos < image_pos, "image must come after exposes: {}", json);
+        assert!(image_pos < disk_pos, "disk_gb must come after image: {}", json);
+        assert!(json.ends_with("\"image\":\"odoo-v18\",\"disk_gb\":8}"), "got: {}", json);
+        let meta2: Meta = serde_json::from_str(&json).expect("round-trip parse");
+        assert_eq!(meta2.image, Some("odoo-v18".into()));
+        assert_eq!(meta2.disk_gb, Some(8));
+        assert_eq!(meta2.exposes, meta.exposes);
+        assert_eq!(meta2.tenant_id, Some("acme".into()));
+    }
+
+    #[test]
+    fn test_image_sha256_round_trip_and_order() {
+        let sha = "a".repeat(64);
+        let meta = Meta {
+            id: "vm-s".into(),
+            name: "vm-s".into(),
+            dir_id: "vm-s".into(),
+            vcpus: 2,
+            mem_mib: 2048,
+            pid: Some(7),
+            slot: Some(1),
+            ip: Some("10.231.0.3".into()),
+            state: VmState::Pooled,
+            vsock: true,
+            tenant_id: None,
+            exposes: vec![],
+            image: Some("odoo-v18".into()),
+            disk_gb: Some(8),
+            image_sha256: Some(sha.clone()),
+        };
+        let json = meta.to_json();
+        // image_sha256 serializes LAST, after disk_gb.
+        assert!(json.ends_with(&format!("\"disk_gb\":8,\"image_sha256\":\"{}\"}}", sha)), "got: {}", json);
+        let meta2: Meta = serde_json::from_str(&json).expect("round-trip parse");
+        assert_eq!(meta2.image_sha256, Some(sha));
+    }
+
+    #[test]
+    fn test_image_sha256_absent_when_none_and_pre_p4_parse() {
+        // Pre-P4 fixture (no image_sha256 key) must parse to None.
+        let fixture = r#"{"id":"vm-p","name":"vm-p","dir_id":"vm-p","vcpus":1,"mem_mib":256,"pid":null,"slot":0,"ip":"10.231.0.2","state":"running","vsock":true}"#;
+        let meta: Meta = serde_json::from_str(fixture).expect("parse pre-P4 fixture");
+        assert_eq!(meta.image_sha256, None);
+        // And a None field must not appear in the output (bytes stay pre-P4).
+        assert_eq!(meta.to_json(), fixture);
     }
 }

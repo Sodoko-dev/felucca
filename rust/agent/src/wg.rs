@@ -242,7 +242,8 @@ fn https_api_port(join_url: &str) -> u16 {
 
 /// Escape a value for a double-quoted curl config string: backslash and
 /// double quote (backslash first, or the quote escape would be re-escaped).
-fn curl_config_escape(s: &str) -> String {
+/// Shared with the image-pull config (vm/image.rs).
+pub(crate) fn curl_config_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 

@@ -36,6 +36,11 @@ type Config struct {
 	// Only used to render public URLs in expose responses; empty means URLs
 	// are omitted (labels still route via the gateway's own domain config).
 	IngressDomain string
+
+	// Templates (v4 P4): where hearthd keeps template rootfs images
+	// (<name>.ext4 + captured uploads). Workers pull from
+	// GET /api/v1/images/{name} and cache locally.
+	ImagesDir string
 }
 
 // Load builds a Config from the four layers (defaults < file < env < flags).
@@ -59,6 +64,8 @@ func Load(args []string) (*Config, error) {
 		TLSCacheDir: "/var/lib/hearth/autocert",
 
 		IngressDomain: "",
+
+		ImagesDir: "/var/lib/hearth/images",
 	}
 
 	// --- Layer 1: JSON config file (lowest above defaults) ---
@@ -125,6 +132,9 @@ func Load(args []string) (*Config, error) {
 	if v := os.Getenv("HEARTH_INGRESS_DOMAIN"); v != "" {
 		cfg.IngressDomain = v
 	}
+	if v := os.Getenv("HEARTH_IMAGES_DIR"); v != "" {
+		cfg.ImagesDir = v
+	}
 
 	// --- Layer 3: Command-line flags (highest precedence) ---
 	fs := flag.NewFlagSet("hearthd", flag.ContinueOnError)
@@ -142,6 +152,7 @@ func Load(args []string) (*Config, error) {
 	tlsDomain := fs.String("tls-domain", cfg.TLSDomain, "")
 	tlsCache := fs.String("tls-cache", cfg.TLSCacheDir, "")
 	ingressDomain := fs.String("ingress-domain", cfg.IngressDomain, "")
+	imagesDir := fs.String("images-dir", cfg.ImagesDir, "")
 	// --config is consumed above; define it here so flag parsing doesn't fail.
 	_ = fs.String("config", "", "")
 
@@ -185,6 +196,8 @@ func Load(args []string) (*Config, error) {
 			cfg.TLSCacheDir = *tlsCache
 		case "ingress-domain":
 			cfg.IngressDomain = *ingressDomain
+		case "images-dir":
+			cfg.ImagesDir = *imagesDir
 		}
 	})
 
@@ -219,6 +232,8 @@ type fileConfig struct {
 	TLSCacheDir *string `json:"tls_cache_dir"`
 
 	IngressDomain *string `json:"ingress_domain"`
+
+	ImagesDir *string `json:"images_dir"`
 }
 
 func applyFile(cfg *Config, path string) error {
@@ -272,6 +287,9 @@ func applyFile(cfg *Config, path string) error {
 	}
 	if fc.IngressDomain != nil {
 		cfg.IngressDomain = *fc.IngressDomain
+	}
+	if fc.ImagesDir != nil {
+		cfg.ImagesDir = *fc.ImagesDir
 	}
 	return nil
 }

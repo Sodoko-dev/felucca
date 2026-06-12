@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alpham/infra-saas/hearth/internal/model"
 	"github.com/alpham/infra-saas/hearth/internal/store"
 )
 
@@ -156,8 +157,10 @@ func (srv *Server) revokeTenantKey(w http.ResponseWriter, keyID string) {
 
 // quotaExceeded checks whether adding one sandbox of the given shape would
 // exceed the tenant's quotas. Returns "" when allowed, otherwise the name of
-// the exceeded quota. Zero quota values mean unlimited.
-func (srv *Server) quotaExceeded(tenantID string, vcpus uint32, memMiB uint64) string {
+// the exceeded quota. Zero quota values mean unlimited. diskGB is the new
+// sandbox's requested disk (0 = unresized base image); existing sandboxes
+// count their EffectiveDiskGB so pre-P4 rows aren't free.
+func (srv *Server) quotaExceeded(tenantID string, vcpus uint32, memMiB uint64, diskGB uint32) string {
 	t, err := srv.db.GetTenant(tenantID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "quota lookup: %v\n", err)
@@ -167,9 +170,13 @@ func (srv *Server) quotaExceeded(tenantID string, vcpus uint32, memMiB uint64) s
 		return "" // unknown tenant row (e.g. deleted): nothing to enforce
 	}
 
+	if diskGB == 0 {
+		diskGB = model.BaseImageDiskGB
+	}
 	var count int64
 	var sumVcpus int64
 	var sumMem int64
+	var sumDisk int64
 	srv.st.Lock()
 	for _, sb := range srv.st.Sandboxes {
 		if sb.TenantID != tenantID {
@@ -178,6 +185,7 @@ func (srv *Server) quotaExceeded(tenantID string, vcpus uint32, memMiB uint64) s
 		count++
 		sumVcpus += int64(sb.VCPUs)
 		sumMem += int64(sb.MemMiB)
+		sumDisk += int64(sb.EffectiveDiskGB())
 	}
 	srv.st.Unlock()
 
@@ -188,6 +196,8 @@ func (srv *Server) quotaExceeded(tenantID string, vcpus uint32, memMiB uint64) s
 		return "vcpus"
 	case t.MaxMemMiB > 0 && sumMem+int64(memMiB) > t.MaxMemMiB:
 		return "mem_mib"
+	case t.MaxDiskGb > 0 && sumDisk+int64(diskGB) > t.MaxDiskGb:
+		return "disk_gb"
 	}
 	return ""
 }

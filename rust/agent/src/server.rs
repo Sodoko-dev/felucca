@@ -8,13 +8,13 @@ use axum::{
     extract::{Path, Request, State},
     http::{HeaderMap, StatusCode},
     response::Response,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use std::sync::Arc;
 
 use crate::config::authorized;
-use crate::vm::{ExecOutcome, ExposeError, Manager};
+use crate::vm::{image, CreateSpec, ExecOutcome, ExposeError, Manager, PoolSpec, RootfsError, DEFAULT_IMAGE};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -53,6 +53,9 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/vms", get(list_vms).post(create_vm))
+        .route("/v1/vms/:id/rootfs", get(vm_rootfs))
+        .route("/v1/pools", put(put_pools))
+        .route("/v1/images/prefetch", post(prefetch_image))
         .route("/v1/vms/:id/sleep", post(sleep_vm))
         .route("/v1/vms/:id/wake", post(wake_vm))
         .route("/v1/vms/:id/fork", post(fork_vm))
@@ -104,7 +107,44 @@ async fn create_vm(State(state): State<AppState>, req: Request) -> Response {
     let mem_mib = json.get("mem_mib").and_then(|v| v.as_u64()).unwrap_or(256);
     let tenant_id = json.get("tenant_id").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    match state.mgr.create(&id, &name, vcpus, mem_mib, tenant_id).await {
+    // v4 P4: optional template image, expected sha and disk size. The image
+    // name is interpolated into a filesystem path and a control-plane URL —
+    // anything outside the strict class is rejected here, before it can move.
+    let image_name = json.get("image").and_then(|v| v.as_str()).unwrap_or(DEFAULT_IMAGE).to_string();
+    if !image::valid_image_name(&image_name) {
+        return json_response(StatusCode::BAD_REQUEST, "{\"error\":\"invalid image\"}");
+    }
+    let image_sha256 = match json.get("image_sha256") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if image::valid_sha256(s) => Some(s.clone()),
+        _ => return json_response(StatusCode::BAD_REQUEST, "{\"error\":\"invalid image_sha256\"}"),
+    };
+    let disk_gb = json.get("disk_gb").and_then(|v| v.as_u64()).unwrap_or(0);
+    if disk_gb > 128 {
+        return json_response(StatusCode::BAD_REQUEST, "{\"error\":\"disk_gb above cap (128)\"}");
+    }
+
+    let spec = CreateSpec {
+        id: id.clone(),
+        name,
+        vcpus,
+        mem_mib,
+        tenant_id,
+        image: image_name,
+        image_sha256,
+        disk_gb: disk_gb as u32,
+    };
+    // tokio::spawn detaches the create from this request future: if the
+    // client times out and drops the connection (e.g. hearthd's 30s cap
+    // during a first image pull), the create still converges to
+    // running/error instead of leaving the record stuck in Creating.
+    let mgr = Arc::clone(&state.mgr);
+    let create_spec = spec.clone();
+    let result = match tokio::spawn(async move { mgr.create(&create_spec).await }).await {
+        Ok(r) => r,
+        Err(e) => Err(format!("create task: {}", e)),
+    };
+    match result {
         Ok(_) => {
             let ip = state.mgr.ip_of(&id).await;
             let ip_str = match ip {
@@ -185,7 +225,15 @@ async fn fork_vm(
     };
     let child_name = json.get("name").and_then(|v| v.as_str()).unwrap_or(&child_id).to_string();
 
-    match state.mgr.fork(&parent_id, &child_id, &child_name).await {
+    // Same cancellation shield as create_vm: a dropped connection must not
+    // abandon a half-built child record.
+    let mgr = Arc::clone(&state.mgr);
+    let (pid2, cid2, cname2) = (parent_id.clone(), child_id.clone(), child_name.clone());
+    let result = match tokio::spawn(async move { mgr.fork(&pid2, &cid2, &cname2).await }).await {
+        Ok(r) => r,
+        Err(e) => Err(format!("fork task: {}", e)),
+    };
+    match result {
         Ok(ip) => {
             let ip_str = match ip {
                 Some(ref s) => format!("\"{}\"", s),
@@ -428,4 +476,145 @@ async fn delete_vm(
     // delete is idempotent — unknown id also 204.
     let _ = state.mgr.delete(&id).await;
     empty_response(StatusCode::NO_CONTENT)
+}
+
+/// GET /v1/vms/:id/rootfs (v4 P4): stream the instance's rootfs.ext4 for
+/// template capture. Only a Stopped VM may be captured — a live FC could
+/// still be writing the file mid-stream.
+async fn vm_rootfs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    req: Request,
+) -> Response {
+    if !check_auth(&state.token, req.headers()) {
+        return json_response(StatusCode::UNAUTHORIZED, "{\"error\":\"unauthorized\"}");
+    }
+    let path = match state.mgr.begin_capture(&id).await {
+        Ok(p) => p,
+        Err(RootfsError::NotFound) => {
+            return json_response(StatusCode::NOT_FOUND, "{\"error\":\"not found\"}")
+        }
+        Err(RootfsError::NotStopped) => {
+            return json_response(StatusCode::CONFLICT, "{\"error\":\"not stopped\"}")
+        }
+        Err(RootfsError::CaptureInProgress) => {
+            return json_response(StatusCode::CONFLICT, "{\"error\":\"capture in progress\"}")
+        }
+    };
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("warn: rootfs capture for {} failed to open {}: {}", id, path, e);
+            state.mgr.end_capture(&id).await;
+            return json_response(StatusCode::NOT_FOUND, "{\"error\":\"not found\"}");
+        }
+    };
+    let len = match file.metadata().await {
+        Ok(m) => m.len(),
+        Err(e) => {
+            eprintln!("warn: rootfs capture for {} failed to stat {}: {}", id, path, e);
+            state.mgr.end_capture(&id).await;
+            return json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"stat failed\"}");
+        }
+    };
+    // The capture registration lives exactly as long as the stream: normal
+    // completion and client disconnect both drop CaptureStream, which
+    // releases the id so start() may run again.
+    let stream = CaptureStream {
+        inner: tokio_util::io::ReaderStream::new(file),
+        mgr: Arc::clone(&state.mgr),
+        id,
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/octet-stream")
+        .header("Content-Length", len.to_string())
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// ReaderStream wrapper whose Drop releases the VM's capture registration —
+/// the only reliable hook that fires on BOTH stream completion and client
+/// disconnect.
+struct CaptureStream {
+    inner: tokio_util::io::ReaderStream<tokio::fs::File>,
+    mgr: Arc<Manager>,
+    id: String,
+}
+
+impl futures_core::Stream for CaptureStream {
+    type Item = std::io::Result<bytes::Bytes>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl Drop for CaptureStream {
+    fn drop(&mut self) {
+        let mgr = Arc::clone(&self.mgr);
+        let id = std::mem::take(&mut self.id);
+        tokio::spawn(async move { mgr.end_capture(&id).await });
+    }
+}
+
+/// PUT /v1/pools (v4 P4): replace the hearthd-managed warm-pool templates.
+/// Body is a JSON array of PoolSpec; validation failure rejects the whole
+/// set (applied atomically or not at all). The 5s refill loop converges.
+async fn put_pools(State(state): State<AppState>, req: Request) -> Response {
+    if !check_auth(&state.token, req.headers()) {
+        return json_response(StatusCode::UNAUTHORIZED, "{\"error\":\"unauthorized\"}");
+    }
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 1 << 20).await {
+        Ok(b) => b,
+        Err(_) => return json_response(StatusCode::BAD_REQUEST, "{\"error\":\"bad request\"}"),
+    };
+    let specs: Vec<PoolSpec> = match serde_json::from_slice(&body_bytes) {
+        Ok(s) => s,
+        Err(_) => return json_response(StatusCode::BAD_REQUEST, "{\"error\":\"bad json\"}"),
+    };
+    match state.mgr.set_pools(specs).await {
+        Ok(()) => json_response(StatusCode::OK, "{\"ok\":true}"),
+        Err(e) => {
+            // Validation messages embed user input ({:?} quotes included) —
+            // build the body with the serializer, never format!.
+            let msg = serde_json::json!({ "error": e }).to_string();
+            json_response(StatusCode::BAD_REQUEST, &msg)
+        }
+    }
+}
+
+/// POST /v1/images/prefetch (v4 P4): warm the image cache in the background
+/// so the first create from a fresh template doesn't pull inside a create
+/// request. Validation mirrors create_vm exactly; the sha is mandatory
+/// (a prefetch without one could never pull anything).
+async fn prefetch_image(State(state): State<AppState>, req: Request) -> Response {
+    if !check_auth(&state.token, req.headers()) {
+        return json_response(StatusCode::UNAUTHORIZED, "{\"error\":\"unauthorized\"}");
+    }
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 1 << 20).await {
+        Ok(b) => b,
+        Err(_) => return json_response(StatusCode::BAD_REQUEST, "{\"error\":\"bad request\"}"),
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(_) => return json_response(StatusCode::BAD_REQUEST, "{\"error\":\"bad json\"}"),
+    };
+    let image_name = match json.get("image").and_then(|v| v.as_str()) {
+        Some(s) if image::valid_image_name(s) => s.to_string(),
+        _ => return json_response(StatusCode::BAD_REQUEST, "{\"error\":\"invalid image\"}"),
+    };
+    let sha = match json.get("image_sha256").and_then(|v| v.as_str()) {
+        Some(s) if image::valid_sha256(s) => s.to_string(),
+        _ => return json_response(StatusCode::BAD_REQUEST, "{\"error\":\"invalid image_sha256\"}"),
+    };
+    let mgr = Arc::clone(&state.mgr);
+    tokio::spawn(async move {
+        if let Err(e) = mgr.ensure_image(&image_name, Some(&sha)).await {
+            eprintln!("warn: prefetch {} failed: {}", image_name, e);
+        }
+    });
+    json_response(StatusCode::ACCEPTED, "{\"ok\":true}")
 }

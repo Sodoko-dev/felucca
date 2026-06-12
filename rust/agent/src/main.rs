@@ -139,7 +139,16 @@ async fn main() {
         if !cfg.token.is_empty() { "on" } else { "off" },
     );
 
-    let mgr = Manager::new(cfg.data_dir.clone(), cfg.net, cidr, cfg.pool_size);
+    // control_plane/token also drive image pulls (v4 P4); cfg.control_plane
+    // is final here (the wg overlay rewrite above already happened).
+    let mgr = Manager::new(
+        cfg.data_dir.clone(),
+        cfg.net,
+        cidr,
+        cfg.pool_size,
+        cfg.control_plane.clone(),
+        cfg.token.clone(),
+    );
 
     // Host networking + IP allocator.
     mgr.setup_host().await;
@@ -165,8 +174,9 @@ async fn main() {
         });
     }
 
-    // Async pool refill.
-    if cfg.pool_size > 0 {
+    // Async pool refill. Always spawned (v4 P4): even with pool_size == 0,
+    // hearthd can push template pools at runtime via PUT /v1/pools.
+    {
         let mgr3 = Arc::clone(&mgr);
         tokio::spawn(async move {
             pool_loop(mgr3).await;

@@ -42,7 +42,9 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   parent_id  TEXT,
   tenant_id  TEXT NOT NULL DEFAULT '',
   exposes    TEXT NOT NULL DEFAULT '',
-  allow_dynamic_ports INTEGER NOT NULL DEFAULT 0
+  allow_dynamic_ports INTEGER NOT NULL DEFAULT 0,
+  template   TEXT NOT NULL DEFAULT '',
+  disk_gb    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sandboxes_tenant ON sandboxes(tenant_id);
 CREATE TABLE IF NOT EXISTS tenants (
@@ -70,9 +72,22 @@ CREATE TABLE IF NOT EXISTS usage_events (
   event      TEXT NOT NULL,
   vcpus      INTEGER NOT NULL,
   mem_mib    INTEGER NOT NULL,
-  ts         INTEGER NOT NULL
+  ts         INTEGER NOT NULL,
+  disk_gb    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_usage_tenant_ts ON usage_events(tenant_id, ts);
+CREATE TABLE IF NOT EXISTS templates (
+  id            TEXT PRIMARY KEY,
+  name          TEXT NOT NULL UNIQUE,
+  image         TEXT NOT NULL,
+  image_sha256  TEXT NOT NULL,
+  vcpus         INTEGER NOT NULL,
+  mem_mib       INTEGER NOT NULL,
+  disk_gb       INTEGER NOT NULL,
+  image_size_gb INTEGER NOT NULL DEFAULT 0,
+  pool_size     INTEGER NOT NULL,
+  created_at    INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS join_tokens (
   id         TEXT PRIMARY KEY,
   token_hash TEXT NOT NULL UNIQUE,
@@ -117,17 +132,22 @@ func OpenSQLite(path string) (*SQLite, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
-	// v4 P3 migration for pre-P3 databases: CREATE TABLE IF NOT EXISTS never
-	// adds columns to an existing table. "duplicate column" is the
-	// already-migrated case; anything else is fatal (a snapshot written
-	// without these columns would silently drop ingress state).
+	// Column migrations for pre-existing databases: CREATE TABLE IF NOT
+	// EXISTS never adds columns to an existing table. "duplicate column" is
+	// the already-migrated case; anything else is fatal (a snapshot written
+	// without these columns would silently drop the corresponding state).
 	for _, alter := range []string{
+		// v4 P3 (ingress).
 		`ALTER TABLE sandboxes ADD COLUMN exposes TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sandboxes ADD COLUMN allow_dynamic_ports INTEGER NOT NULL DEFAULT 0`,
+		// v4 P4 (templates & disk).
+		`ALTER TABLE sandboxes ADD COLUMN template TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sandboxes ADD COLUMN disk_gb INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_events ADD COLUMN disk_gb INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
-			return nil, fmt.Errorf("migrate sandboxes: %w", err)
+			return nil, fmt.Errorf("migrate: %w", err)
 		}
 	}
 	// The db holds key hashes and tenant data: owner-only (also covers the
@@ -187,11 +207,11 @@ func (s *SQLite) SaveSnapshot(st *state.State) error {
 			exposes = string(b)
 		}
 		if _, err := tx.Exec(
-			`INSERT INTO sandboxes (id, name, namespace, node_id, state, vcpus, mem_mib, ip, created_at, parent_id, tenant_id, exposes, allow_dynamic_ports)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			`INSERT INTO sandboxes (id, name, namespace, node_id, state, vcpus, mem_mib, ip, created_at, parent_id, tenant_id, exposes, allow_dynamic_ports, template, disk_gb)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			sb.ID, sb.Name, sb.Namespace, nullable(sb.NodeID), string(sb.State),
 			sb.VCPUs, sb.MemMiB, nullable(sb.IP), sb.CreatedAt, nullable(sb.ParentID), sb.TenantID,
-			exposes, sb.AllowDynamicPorts,
+			exposes, sb.AllowDynamicPorts, sb.Template, sb.DiskGB,
 		); err != nil {
 			return err
 		}
@@ -248,7 +268,7 @@ func (s *SQLite) LoadInto(st *state.State) error {
 	}
 	rows.Close()
 
-	rows, err = s.db.Query(`SELECT id, name, namespace, node_id, state, vcpus, mem_mib, ip, created_at, parent_id, tenant_id, exposes, allow_dynamic_ports FROM sandboxes`)
+	rows, err = s.db.Query(`SELECT id, name, namespace, node_id, state, vcpus, mem_mib, ip, created_at, parent_id, tenant_id, exposes, allow_dynamic_ports, template, disk_gb FROM sandboxes`)
 	if err != nil {
 		return err
 	}
@@ -256,7 +276,7 @@ func (s *SQLite) LoadInto(st *state.State) error {
 		sb := &model.Sandbox{}
 		var nodeID, ip, parentID sql.NullString
 		var stateStr, exposes string
-		if err := rows.Scan(&sb.ID, &sb.Name, &sb.Namespace, &nodeID, &stateStr, &sb.VCPUs, &sb.MemMiB, &ip, &sb.CreatedAt, &parentID, &sb.TenantID, &exposes, &sb.AllowDynamicPorts); err != nil {
+		if err := rows.Scan(&sb.ID, &sb.Name, &sb.Namespace, &nodeID, &stateStr, &sb.VCPUs, &sb.MemMiB, &ip, &sb.CreatedAt, &parentID, &sb.TenantID, &exposes, &sb.AllowDynamicPorts, &sb.Template, &sb.DiskGB); err != nil {
 			rows.Close()
 			return err
 		}
@@ -437,12 +457,62 @@ func (s *SQLite) ListWgPeers() ([]*WgPeer, error) {
 	return out, rows.Err()
 }
 
+// ---- Templates ----
+
+func (s *SQLite) CreateTemplate(t *Template) error {
+	_, err := s.db.Exec(
+		`INSERT INTO templates (id, name, image, image_sha256, vcpus, mem_mib, disk_gb, image_size_gb, pool_size, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		t.ID, t.Name, t.Image, t.ImageSHA256, t.Vcpus, t.MemMiB, t.DiskGB, t.ImageSizeGB, t.PoolSize, t.CreatedAt,
+	)
+	return err
+}
+
+func (s *SQLite) GetTemplateByName(name string) (*Template, error) {
+	t := &Template{}
+	err := s.db.QueryRow(
+		`SELECT id, name, image, image_sha256, vcpus, mem_mib, disk_gb, image_size_gb, pool_size, created_at FROM templates WHERE name=?`, name,
+	).Scan(&t.ID, &t.Name, &t.Image, &t.ImageSHA256, &t.Vcpus, &t.MemMiB, &t.DiskGB, &t.ImageSizeGB, &t.PoolSize, &t.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+func (s *SQLite) ListTemplates() ([]*Template, error) {
+	rows, err := s.db.Query(`SELECT id, name, image, image_sha256, vcpus, mem_mib, disk_gb, image_size_gb, pool_size, created_at FROM templates ORDER BY created_at, name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Template
+	for rows.Next() {
+		t := &Template{}
+		if err := rows.Scan(&t.ID, &t.Name, &t.Image, &t.ImageSHA256, &t.Vcpus, &t.MemMiB, &t.DiskGB, &t.ImageSizeGB, &t.PoolSize, &t.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) DeleteTemplate(name string) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM templates WHERE name=?`, name)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 // ---- Usage events ----
 
 func (s *SQLite) AppendUsage(e UsageEvent) error {
 	_, err := s.db.Exec(
-		`INSERT INTO usage_events (tenant_id, sandbox_id, event, vcpus, mem_mib, ts) VALUES (?,?,?,?,?,?)`,
-		e.TenantID, e.SandboxID, e.Event, e.Vcpus, e.MemMiB, e.TS,
+		`INSERT INTO usage_events (tenant_id, sandbox_id, event, vcpus, mem_mib, ts, disk_gb) VALUES (?,?,?,?,?,?,?)`,
+		e.TenantID, e.SandboxID, e.Event, e.Vcpus, e.MemMiB, e.TS, e.DiskGB,
 	)
 	return err
 }

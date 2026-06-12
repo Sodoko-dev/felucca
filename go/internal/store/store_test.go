@@ -42,6 +42,8 @@ func TestSnapshotRoundTrip(t *testing.T) {
 		CreatedAt: 123, TenantID: "tn-aa",
 		Exposes:           []model.Expose{{Name: "odoo", GuestPort: 8069, NodePort: 20001}},
 		AllowDynamicPorts: true,
+		Template:          "odoo-v18",
+		DiskGB:            8,
 	}, &model.Sandbox{
 		ID: "sb-2", Name: "two", Namespace: "ns", NodeID: nil,
 		State: model.StateSleeping, VCPUs: 1, MemMiB: 256, IP: nil,
@@ -88,6 +90,14 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	}
 	if sb2 != nil && (len(sb2.Exposes) != 0 || sb2.AllowDynamicPorts) {
 		t.Errorf("sb-2 ingress should be empty: %+v", sb2.Exposes)
+	}
+	// Template/disk state must survive too (dropping it corrupts disk-quota
+	// accounting after a restart).
+	if sb1 != nil && (sb1.Template != "odoo-v18" || sb1.DiskGB != 8) {
+		t.Errorf("sb-1 template/disk: %q/%d", sb1.Template, sb1.DiskGB)
+	}
+	if sb2 != nil && (sb2.Template != "" || sb2.DiskGB != 0) {
+		t.Errorf("sb-2 template/disk should be zero: %q/%d", sb2.Template, sb2.DiskGB)
 	}
 	if sb2 == nil || sb2.TenantID != "" || sb2.IP != nil || sb2.ParentID == nil || *sb2.ParentID != "sb-1" {
 		t.Errorf("sb-2: %+v", sb2)
