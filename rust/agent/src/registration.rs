@@ -113,7 +113,7 @@ async fn heartbeat_once(
 
 // ---- host info readers ----
 
-fn read_hostname() -> String {
+pub(crate) fn read_hostname() -> String {
     match std::fs::read_to_string("/etc/hostname") {
         Ok(s) => {
             let t = s.trim().to_string();
@@ -151,12 +151,12 @@ fn read_meminfo_key(key: &str) -> u64 {
 
 // ---- minimal HTTP client (TCP, Connection: close) ----
 
-struct Response {
-    status: u16,
-    body: String,
+pub(crate) struct Response {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
-async fn tcp_request(
+pub(crate) async fn tcp_request(
     host: &str,
     port: u16,
     method: &str,

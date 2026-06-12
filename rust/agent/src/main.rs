@@ -12,6 +12,7 @@ mod net;
 mod registration;
 mod server;
 mod vm;
+mod wg;
 
 use crate::ipalloc::Cidr;
 use crate::registration::{detect_advertise_addr, heartbeat_loop, NodeId};
@@ -27,6 +28,90 @@ async fn main() {
     let env: HashMap<String, String> = std::env::vars().collect();
 
     let mut cfg = config::load(&args, &env);
+
+    // WireGuard overlay (v4 P2): a persisted enrollment reconfigures the
+    // tunnel on every boot; --join + --join-token performs first enrollment.
+    if cfg.join_url.is_empty() != cfg.join_token.is_empty() {
+        // Half-configured join is an operator mistake — silently skipping it
+        // would register this node off-overlay while they believe it joined.
+        eprintln!("fatal: --join and --join-token must be set together");
+        std::process::exit(1);
+    }
+    let wg_state = wg::load_state(&cfg.data_dir);
+    let joined: Option<wg::JoinInfo> = if let Some(info) = wg_state {
+        if !cfg.join_url.is_empty() {
+            eprintln!(
+                "warn: persisted wg enrollment ({}) takes precedence over --join; \
+                 delete it to re-enroll with a fresh token",
+                wg::state_path(&cfg.data_dir)
+            );
+        }
+        Some(info)
+    } else if !cfg.join_url.is_empty() && !cfg.join_token.is_empty() {
+        // First join: ensure a keypair, enroll, persist the grant.
+        let pubkey = match wg::ensure_key(&wg::key_path(&cfg.data_dir)) {
+            Ok(pk) => pk,
+            Err(e) => {
+                eprintln!("fatal: wg key: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let hostname = registration::read_hostname();
+        // Bounded: a hub that accepts the TCP connection but stalls must not
+        // wedge boot forever (no API server, no heartbeat, no diagnostics).
+        let join_result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            wg::join(&cfg.join_url, &cfg.join_token, &pubkey, &hostname),
+        )
+        .await
+        .unwrap_or_else(|_| Err("timed out after 30s".into()));
+        match join_result {
+            Ok(info) => {
+                if let Err(e) = wg::save_state(&cfg.data_dir, &info) {
+                    // Fail NOW, while the operator is watching: the token is
+                    // consumed, and without wg.json the next boot would
+                    // crash-loop on a burned token weeks later instead.
+                    eprintln!("fatal: wg joined but state not persisted: {}", e);
+                    std::process::exit(1);
+                }
+                Some(info)
+            }
+            Err(e) => {
+                if e.contains("status 401") {
+                    eprintln!(
+                        "fatal: wg join: {} (this node's key file may already be \
+                         enrolled — mint a fresh token, or restore wg.json)",
+                        e
+                    );
+                } else {
+                    eprintln!("fatal: wg join: {}", e);
+                }
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(info) = &joined {
+        wg::validate_join_info(info).unwrap_or_else(|e| {
+            eprintln!("fatal: wg state invalid: {}", e);
+            std::process::exit(1);
+        });
+        if let Err(e) = wg::ensure_interface(info, &wg::key_path(&cfg.data_dir)) {
+            eprintln!("fatal: wg interface: {}", e);
+            std::process::exit(1);
+        }
+        // Route control-plane traffic over the overlay; advertise our overlay
+        // IP so hearthd reaches this agent through the tunnel. The hub's API
+        // port was recorded in wg.json at enrollment (from the join URL), so
+        // it survives reboots after the one-time join flags are removed.
+        cfg.control_plane = format!("http://{}:{}", info.server_overlay_ip, info.api_port);
+        cfg.advertise_addr = info.overlay_ip.clone();
+        eprintln!(
+            "info: wg overlay joined: {} -> {} ({})",
+            info.overlay_ip, info.server_overlay_ip, info.server_endpoint
+        );
+    }
 
     // Auto-detect advertise_addr when unset.
     if cfg.advertise_addr.is_empty() {

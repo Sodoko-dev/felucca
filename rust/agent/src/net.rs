@@ -11,8 +11,8 @@ use std::process::Command;
 pub const BRIDGE_NAME: &str = "hearth0";
 
 /// Run `argv`, trying unprivileged first, then `sudo -n` fallback.
-/// Returns true if exit code 0.
-fn run(argv: &[&str]) -> bool {
+/// Returns true if exit code 0. Shared with wg.rs (same shell-out idiom).
+pub(crate) fn run(argv: &[&str]) -> bool {
     if run_once(argv, false) { return true; }
     run_once(argv, true)
 }

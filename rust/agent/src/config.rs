@@ -4,7 +4,8 @@
 //! Keys: bind/HEARTH_AGENT_BIND/--bind, control_plane/HEARTH_CONTROL_PLANE/--control-plane,
 //! advertise_addr/HEARTH_ADVERTISE_ADDR/--advertise-addr, data_dir/HEARTH_DATA_DIR/--data-dir,
 //! token/HEARTH_TOKEN/--token, pool_size/HEARTH_POOL_SIZE/--pool-size,
-//! net/HEARTH_NET/--net (on/off/true/false/1/0), net_cidr/HEARTH_NET_CIDR/--net-cidr.
+//! net/HEARTH_NET/--net (on/off/true/false/1/0), net_cidr/HEARTH_NET_CIDR/--net-cidr,
+//! join_url/HEARTH_JOIN_URL/--join, join_token/HEARTH_JOIN_TOKEN/--join-token.
 //! bind→port quirk: trailing :N in bind overrides port.
 
 use serde::Deserialize;
@@ -17,6 +18,9 @@ pub struct Config {
     pub advertise_addr: String,
     pub data_dir: String,
     pub token: String,
+    /// WireGuard overlay join (v4 P2): hearthd join URL + single-use token.
+    pub join_url: String,
+    pub join_token: String,
     pub net: bool,
     pub net_cidr: String,
     pub pool_size: u32,
@@ -32,6 +36,8 @@ impl Default for Config {
             advertise_addr: String::new(),
             data_dir: "/srv/ignis".into(),
             token: String::new(),
+            join_url: String::new(),
+            join_token: String::new(),
             net: true,
             net_cidr: "10.231.0.0/24".into(),
             pool_size: 0,
@@ -48,6 +54,8 @@ struct FileConfig {
     advertise_addr: Option<String>,
     data_dir: Option<String>,
     token: Option<String>,
+    join_url: Option<String>,
+    join_token: Option<String>,
     net: Option<serde_json::Value>,
     net_cidr: Option<String>,
     pool_size: Option<u64>,
@@ -89,6 +97,8 @@ pub fn load(args: &[String], env: &HashMap<String, String>) -> Config {
                 if let Some(v) = fc.advertise_addr { cfg.advertise_addr = v; }
                 if let Some(v) = fc.data_dir { cfg.data_dir = v; }
                 if let Some(v) = fc.token { cfg.token = v; }
+                if let Some(v) = fc.join_url { cfg.join_url = v; }
+                if let Some(v) = fc.join_token { cfg.join_token = v; }
                 if let Some(v) = fc.net {
                     match &v {
                         serde_json::Value::Bool(b) => cfg.net = *b,
@@ -111,6 +121,8 @@ pub fn load(args: &[String], env: &HashMap<String, String>) -> Config {
     if let Some(v) = env.get("HEARTH_ADVERTISE_ADDR") { cfg.advertise_addr = v.clone(); }
     if let Some(v) = env.get("HEARTH_DATA_DIR") { cfg.data_dir = v.clone(); }
     if let Some(v) = env.get("HEARTH_TOKEN") { cfg.token = v.clone(); }
+    if let Some(v) = env.get("HEARTH_JOIN_URL") { cfg.join_url = v.clone(); }
+    if let Some(v) = env.get("HEARTH_JOIN_TOKEN") { cfg.join_token = v.clone(); }
     if let Some(v) = env.get("HEARTH_NET") {
         if let Some(b) = parse_bool(v) { cfg.net = b; }
     }
@@ -131,6 +143,8 @@ pub fn load(args: &[String], env: &HashMap<String, String>) -> Config {
             "--advertise-addr" => { if i + 1 < args.len() { cfg.advertise_addr = args[i+1].clone(); i += 2; continue; } }
             "--data-dir" => { if i + 1 < args.len() { cfg.data_dir = args[i+1].clone(); i += 2; continue; } }
             "--token" => { if i + 1 < args.len() { cfg.token = args[i+1].clone(); i += 2; continue; } }
+            "--join" => { if i + 1 < args.len() { cfg.join_url = args[i+1].clone(); i += 2; continue; } }
+            "--join-token" => { if i + 1 < args.len() { cfg.join_token = args[i+1].clone(); i += 2; continue; } }
             "--net" => {
                 if i + 1 < args.len() {
                     if let Some(b) = parse_bool(&args[i+1]) { cfg.net = b; }
@@ -254,6 +268,38 @@ mod tests {
         let args: Vec<String> = vec!["hearth-agent".into(), "--net".into(), "on".into()];
         let cfg = load(&args, &env);
         assert!(cfg.net);
+    }
+
+    #[test]
+    fn test_join_defaults_empty() {
+        let cfg = load(&["hearth-agent".into()], &HashMap::new());
+        assert!(cfg.join_url.is_empty());
+        assert!(cfg.join_token.is_empty());
+    }
+
+    #[test]
+    fn test_join_env_overrides_default() {
+        let mut env = HashMap::new();
+        env.insert("HEARTH_JOIN_URL".into(), "http://hub.example.com:8080".into());
+        env.insert("HEARTH_JOIN_TOKEN".into(), "hearth_jt_abc".into());
+        let cfg = load(&["hearth-agent".into()], &env);
+        assert_eq!(cfg.join_url, "http://hub.example.com:8080");
+        assert_eq!(cfg.join_token, "hearth_jt_abc");
+    }
+
+    #[test]
+    fn test_join_flag_overrides_env() {
+        let mut env = HashMap::new();
+        env.insert("HEARTH_JOIN_URL".into(), "http://env-host:1111".into());
+        env.insert("HEARTH_JOIN_TOKEN".into(), "env-token".into());
+        let args: Vec<String> = vec![
+            "hearth-agent".into(),
+            "--join".into(), "http://flag-host:2222".into(),
+            "--join-token".into(), "flag-token".into(),
+        ];
+        let cfg = load(&args, &env);
+        assert_eq!(cfg.join_url, "http://flag-host:2222");
+        assert_eq!(cfg.join_token, "flag-token");
     }
 
     #[test]
