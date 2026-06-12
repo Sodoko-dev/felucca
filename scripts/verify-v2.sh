@@ -55,6 +55,9 @@ worker_vm=""
 case "$node_addr" in
   192.168.104.1*) worker_vm=kata-lab-0 ;;
   192.168.104.4*) worker_vm=kata-lab-1 ;;
+  # v4 P2: a worker joined to the wg overlay advertises its overlay IP.
+  # kata-lab-1 is the lab's overlay-joined worker (kata-lab-0 stays direct).
+  10.100.0.*) worker_vm=kata-lab-1 ;;
 esac
 if [ -n "$worker_vm" ] && [ -n "$ip" ]; then
   sleep 3  # give the guest a moment to finish boot
