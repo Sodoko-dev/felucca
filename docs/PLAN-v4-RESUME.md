@@ -74,7 +74,12 @@ e2e, TLS code, fleet migrated to systemd. Remaining:
    journalctl -u hearthd -u hearth-agent` on all 3 VMs for restarts/SIGSYS/
    MDWE kills (`systemctl show -p NRestarts`), then drop the MDWE
    soak-experiment comment in hearthd.service if clean. Release binaries for
-   both arches still unaddressed (P2 close-out or P2.6).
+   both arches: BUILT 2026-06-12, staged in deploy/release/{aarch64,x86_64}/
+   (gitignored; rebuilt in the infra-saas-lab VM — x86_64 agent cross-built
+   with rust-lld, Go via GOARCH; x86_64 pair untested until P2.6's real
+   worker). ADR-0006 + API-V2 §3c + ARCHITECTURE row + CHANGELOG P2 entry
+   committed (`2e9fdf0`) — phase close-out docs are DONE; the phase itself
+   closes on soak verdict + P2.6.
 2. **P2.6 mixed-fleet acceptance — BLOCKED on user hand-off**: public hearthd
    host SSH, ≥1 external worker, domain, DNS-01 API creds. ASK THE USER.
    verify-v2 must pass unmodified against the real mixed fleet; live TLS
