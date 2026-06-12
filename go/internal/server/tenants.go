@@ -26,15 +26,22 @@ func newSecret(n int) string {
 	return hex.EncodeToString(b)
 }
 
+// hashSecret is THE secret-hashing scheme for stored credentials (API keys,
+// join tokens): sha256, hex-encoded. Mint and lookup sites must all use this
+// one helper so the scheme can never diverge between issue and verify.
+func hashSecret(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
 // mintKey creates an API key record for a tenant and returns (record, full
 // secret). The secret is shown exactly once; only its sha256 is stored.
 func mintKey(tenantID string, now int64) (*store.APIKey, string) {
 	secret := "hearth_sk_" + newSecret(24)
-	sum := sha256.Sum256([]byte(secret))
 	return &store.APIKey{
 		ID:        "key-" + newSecret(6),
 		TenantID:  tenantID,
-		KeyHash:   hex.EncodeToString(sum[:]),
+		KeyHash:   hashSecret(secret),
 		Prefix:    secret[:14], // "hearth_sk_" + 4 chars: enough to identify, useless to guess
 		CreatedAt: now,
 	}, secret

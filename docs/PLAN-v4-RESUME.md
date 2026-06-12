@@ -18,9 +18,12 @@ fresh session (after `/clear`) can continue without the in-memory task list.
   0 FAIL + a live repro of the phase's headline behavior; (4) docs — API-V2.md,
   ARCHITECTURE.md, CHANGELOG.md, + new/amended ADR; (5) one commit per phase.
 - **All builds run inside the Lima VMs, never the macOS host** (see CLAUDE/memory).
-- **Run /ultraqa after every step** (user directive 2026-06-12), scoped to that
-  step's verifiable goal; /ultrawork for parallelizable independent work
-  (fable-model executors only).
+- **After each step and before every commit: loop /code-review → /ultraqa until
+  both are green** (user directive 2026-06-12). Fix all review findings, re-run
+  the QA cycle, repeat until a clean pass; only then commit. /ultrawork for
+  parallelizable independent work (fable-model executors only).
+- **After each phase commit: prompt the user to run /compact** (user directive
+  2026-06-12; Claude can't invoke the built-in command itself).
 - **Lab quirk**: kata-lab-0 (vz nested-virt) has twice crashed at the hypervisor
   level during rapid sleep/wake/fork bursts. Recovery: `limactl stop -f kata-lab-0`
   + `limactl start kata-lab-0`, then re-copy the agent binary (it lives in /tmp,

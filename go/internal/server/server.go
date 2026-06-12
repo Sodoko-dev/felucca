@@ -4,8 +4,6 @@ package server
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alpham/infra-saas/hearth/internal/agentclient"
@@ -20,6 +19,7 @@ import (
 	"github.com/alpham/infra-saas/hearth/internal/model"
 	"github.com/alpham/infra-saas/hearth/internal/state"
 	"github.com/alpham/infra-saas/hearth/internal/store"
+	"github.com/alpham/infra-saas/hearth/internal/wg"
 )
 
 // adminTenant is the tenant context value for the configured admin token
@@ -31,12 +31,23 @@ type Server struct {
 	cfg *config.Config
 	st  *state.State
 	db  store.Store
+	// WireGuard overlay (v4 P2): hearthd's public key, set at startup when
+	// the overlay is configured; joinMu serializes overlay IP allocation.
+	// addPeer is the live-kernel install hook — wg.AddPeer in production,
+	// swappable in tests (the binary isn't present there).
+	wgPubKey string
+	joinMu   sync.Mutex
+	addPeer  func(pubKey, overlayIP string) error
 }
 
 // New creates a new Server.
 func New(cfg *config.Config, st *state.State, db store.Store) *Server {
-	return &Server{cfg: cfg, st: st, db: db}
+	return &Server{cfg: cfg, st: st, db: db, addPeer: wg.AddPeer}
 }
+
+// SetWgPubKey records hearthd's WireGuard public key (returned to joining
+// workers). Called once at startup, before the listener starts.
+func (srv *Server) SetWgPubKey(pub string) { srv.wgPubKey = pub }
 
 // persist writes the in-memory working set through to the store.
 func (srv *Server) persist() error {
@@ -58,8 +69,7 @@ func (srv *Server) authenticate(authHeader string) (string, bool) {
 	if !strings.HasPrefix(key, "hearth_sk_") {
 		return "", false
 	}
-	sum := sha256.Sum256([]byte(key))
-	tenantID, err := srv.db.LookupKeyByHash(hex.EncodeToString(sum[:]))
+	tenantID, err := srv.db.LookupKeyByHash(hashSecret(key))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "key lookup: %v\n", err)
 		return "", false
@@ -118,6 +128,13 @@ func (srv *Server) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Node join — authenticated by the one-time join token itself (the
+	// joining worker has no API key yet), so it bypasses the bearer gate.
+	if path == "/api/v1/nodes/join" && r.Method == http.MethodPost {
+		srv.nodeJoin(w, r)
+		return
+	}
+
 	// API routes — bearer-guarded when token configured. The admin token (or
 	// open mode) gets the admin context; tenant API keys get their tenant.
 	if strings.HasPrefix(path, "/api/") {
@@ -148,7 +165,8 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request, tenant strin
 		case path == "/api/v1/nodes",
 			strings.HasPrefix(path, "/api/v1/agents/"),
 			strings.HasPrefix(path, "/api/v1/tenants"),
-			strings.HasPrefix(path, "/api/v1/keys/"):
+			strings.HasPrefix(path, "/api/v1/keys/"),
+			strings.HasPrefix(path, "/api/v1/join-tokens"):
 			writeJSON(w, 404, []byte(`{"error":"not found"}`))
 			return
 		}
@@ -163,6 +181,9 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request, tenant strin
 
 	case path == "/api/v1/agents/heartbeat" && method == http.MethodPost:
 		srv.agentHeartbeat(w, r)
+
+	case path == "/api/v1/join-tokens" && method == http.MethodPost:
+		srv.createJoinToken(w, r)
 
 	case path == "/api/v1/tenants" && method == http.MethodPost:
 		srv.createTenant(w, r)

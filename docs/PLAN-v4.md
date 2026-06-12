@@ -115,6 +115,13 @@ Users must reach the Odoo UI inside a sandbox from the internet.
 
 Sodoko can integrate after **Phases 0–4** (keys → isolation → reachable from anywhere → odoo template + ingress). Phases 0+1 are the first milestone (security base; everything else builds on tenant identity). Suggested cut points for releases: v4.0 = P0+P1, v4.1 = P2, v4.2 = P3+P4 (Sodoko alpha), v4.3 = P5.
 
+## Per-step review loop (applies to every remaining phase, P2–P6)
+
+After each implementation step and ALWAYS before a commit: loop
+**/code-review → fix findings → /ultraqa (test-verify-fix cycle)** until both
+come back green in the same iteration (user directive 2026-06-12). The phase
+gates below remain the per-phase exit bar on top of this per-step loop.
+
 ## Phase gates (checked after EVERY phase, in order)
 
 1. **Unit & build gate** — all inside the toolchain VM, never the host:

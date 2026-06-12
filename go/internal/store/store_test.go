@@ -156,6 +156,97 @@ func TestUsageEvents(t *testing.T) {
 	}
 }
 
+func TestJoinTokens(t *testing.T) {
+	db := open(t)
+
+	tok := &store.JoinToken{ID: "jt-1", TokenHash: "deadbeef", CreatedAt: 1, NodeHint: "hetzner-1"}
+	if err := db.CreateJoinToken(tok); err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+	if err := db.CreateJoinToken(&store.JoinToken{ID: "jt-2", TokenHash: "deadbeef", CreatedAt: 2}); err == nil {
+		t.Error("duplicate token hash accepted")
+	}
+
+	// Peek does not consume.
+	if ok, err := db.CheckJoinToken("deadbeef", 50); err != nil || !ok {
+		t.Fatalf("check: %v, %v", ok, err)
+	}
+	ok, err := db.ConsumeJoinToken("deadbeef", 50)
+	if err != nil || !ok {
+		t.Fatalf("consume: %v, %v", ok, err)
+	}
+	if ok, _ := db.CheckJoinToken("deadbeef", 51); ok {
+		t.Error("check after consume should return false")
+	}
+	if ok, _ := db.ConsumeJoinToken("deadbeef", 51); ok {
+		t.Error("second consume should return false")
+	}
+	if ok, _ := db.ConsumeJoinToken("nope", 52); ok {
+		t.Error("unknown hash should return false")
+	}
+
+	// Expiry: a token older than JoinTokenTTL is neither checkable nor
+	// consumable.
+	old := &store.JoinToken{ID: "jt-old", TokenHash: "oldhash", CreatedAt: 100}
+	if err := db.CreateJoinToken(old); err != nil {
+		t.Fatalf("create old token: %v", err)
+	}
+	expiredNow := 100 + store.JoinTokenTTL + 1
+	if ok, _ := db.CheckJoinToken("oldhash", expiredNow); ok {
+		t.Error("expired token should not check")
+	}
+	if ok, _ := db.ConsumeJoinToken("oldhash", expiredNow); ok {
+		t.Error("expired token should not consume")
+	}
+	// Just inside the TTL it still works.
+	if ok, _ := db.ConsumeJoinToken("oldhash", 100+store.JoinTokenTTL-1); !ok {
+		t.Error("unexpired token should consume")
+	}
+}
+
+func TestWgPeers(t *testing.T) {
+	db := open(t)
+
+	if missing, err := db.GetWgPeerByPubKey("absent"); err != nil || missing != nil {
+		t.Fatalf("GetWgPeerByPubKey absent = %+v, %v; want nil, nil", missing, err)
+	}
+
+	p1 := &store.WgPeer{PubKey: "pkB=", OverlayIP: "10.100.0.2", Hostname: "w1", CreatedAt: 1}
+	if err := db.CreateWgPeer(p1); err != nil {
+		t.Fatalf("create peer: %v", err)
+	}
+	p2 := &store.WgPeer{PubKey: "pkA=", OverlayIP: "10.100.0.3", Hostname: "w2", CreatedAt: 2}
+	if err := db.CreateWgPeer(p2); err != nil {
+		t.Fatalf("create peer 2: %v", err)
+	}
+
+	// Re-join with same pubkey: keeps overlay IP, updates hostname.
+	rejoin := &store.WgPeer{PubKey: "pkB=", OverlayIP: "10.100.0.99", Hostname: "w1-renamed", CreatedAt: 9}
+	if err := db.CreateWgPeer(rejoin); err != nil {
+		t.Fatalf("rejoin upsert: %v", err)
+	}
+	got, err := db.GetWgPeerByPubKey("pkB=")
+	if err != nil || got == nil {
+		t.Fatalf("get peer: %+v, %v", got, err)
+	}
+	if got.OverlayIP != "10.100.0.2" || got.Hostname != "w1-renamed" || got.CreatedAt != 1 {
+		t.Errorf("upsert: %+v; want IP 10.100.0.2, hostname w1-renamed, created_at 1", got)
+	}
+
+	// Distinct pubkey claiming an allocated IP must fail (unique overlay_ip).
+	if err := db.CreateWgPeer(&store.WgPeer{PubKey: "pkC=", OverlayIP: "10.100.0.2", CreatedAt: 3}); err == nil {
+		t.Error("duplicate overlay_ip accepted")
+	}
+
+	peers, err := db.ListWgPeers()
+	if err != nil || len(peers) != 2 {
+		t.Fatalf("list peers: %d, %v", len(peers), err)
+	}
+	if peers[0].PubKey != "pkB=" || peers[1].PubKey != "pkA=" {
+		t.Errorf("list order: [%s %s]; want created_at then pubkey", peers[0].PubKey, peers[1].PubKey)
+	}
+}
+
 func TestMigrationFromJSON(t *testing.T) {
 	// Build a State, persist as legacy JSON, then import via Load + SaveSnapshot.
 	tmp := t.TempDir()

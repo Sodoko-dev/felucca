@@ -69,6 +69,19 @@ CREATE TABLE IF NOT EXISTS usage_events (
   ts         INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_usage_tenant_ts ON usage_events(tenant_id, ts);
+CREATE TABLE IF NOT EXISTS join_tokens (
+  id         TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL,
+  used_at    INTEGER,
+  node_hint  TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS wg_peers (
+  pubkey     TEXT PRIMARY KEY,
+  overlay_ip TEXT NOT NULL UNIQUE,
+  hostname   TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
 `
 
 // SQLite implements Store on a single SQLite database (WAL mode).
@@ -303,6 +316,93 @@ func (s *SQLite) RevokeKey(id string, now int64) (bool, error) {
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+// ---- Join tokens ----
+
+func (s *SQLite) CreateJoinToken(t *JoinToken) error {
+	_, err := s.db.Exec(
+		`INSERT INTO join_tokens (id, token_hash, created_at, used_at, node_hint) VALUES (?,?,?,NULL,?)`,
+		t.ID, t.TokenHash, t.CreatedAt, t.NodeHint,
+	)
+	return err
+}
+
+// CheckJoinToken reports whether the token is currently redeemable (unused
+// and within TTL) WITHOUT consuming it — the join endpoint peeks first so a
+// failed enrollment doesn't burn the one-time token.
+func (s *SQLite) CheckJoinToken(hash string, now int64) (bool, error) {
+	var one int
+	err := s.db.QueryRow(
+		`SELECT 1 FROM join_tokens WHERE token_hash=? AND used_at IS NULL AND created_at > ?`,
+		hash, now-JoinTokenTTL,
+	).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ConsumeJoinToken atomically marks the token used; the single conditional
+// UPDATE is the race-free check-and-set (SQLite single writer, ADR-0002).
+// Expired tokens (older than JoinTokenTTL) are never consumable.
+func (s *SQLite) ConsumeJoinToken(hash string, now int64) (bool, error) {
+	res, err := s.db.Exec(
+		`UPDATE join_tokens SET used_at=? WHERE token_hash=? AND used_at IS NULL AND created_at > ?`,
+		now, hash, now-JoinTokenTTL,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// ---- WireGuard peers ----
+
+// CreateWgPeer upserts by pubkey: re-join with the same key keeps its
+// overlay IP and only refreshes the hostname.
+func (s *SQLite) CreateWgPeer(p *WgPeer) error {
+	_, err := s.db.Exec(
+		`INSERT INTO wg_peers (pubkey, overlay_ip, hostname, created_at) VALUES (?,?,?,?)
+		 ON CONFLICT(pubkey) DO UPDATE SET hostname=excluded.hostname`,
+		p.PubKey, p.OverlayIP, p.Hostname, p.CreatedAt,
+	)
+	return err
+}
+
+func (s *SQLite) GetWgPeerByPubKey(pub string) (*WgPeer, error) {
+	p := &WgPeer{}
+	err := s.db.QueryRow(
+		`SELECT pubkey, overlay_ip, hostname, created_at FROM wg_peers WHERE pubkey=?`, pub,
+	).Scan(&p.PubKey, &p.OverlayIP, &p.Hostname, &p.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+func (s *SQLite) ListWgPeers() ([]*WgPeer, error) {
+	rows, err := s.db.Query(`SELECT pubkey, overlay_ip, hostname, created_at FROM wg_peers ORDER BY created_at, pubkey`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*WgPeer
+	for rows.Next() {
+		p := &WgPeer{}
+		if err := rows.Scan(&p.PubKey, &p.OverlayIP, &p.Hostname, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 // ---- Usage events ----

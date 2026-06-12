@@ -29,6 +29,28 @@ type APIKey struct {
 	RevokedAt *int64 `json:"revoked_at"`
 }
 
+// JoinTokenTTL is how long (seconds) an unused join token stays redeemable.
+// Tokens are operational credentials handed to provisioning scripts — a day
+// bounds the window a leaked/forgotten one can be replayed in.
+const JoinTokenTTL int64 = 86400
+
+// JoinToken is a one-time credential for enrolling a worker node.
+type JoinToken struct {
+	ID        string `json:"id"`
+	TokenHash string `json:"-"` // sha256 hex of the secret; full token shown once at creation
+	CreatedAt int64  `json:"created_at"`
+	UsedAt    *int64 `json:"used_at"`
+	NodeHint  string `json:"node_hint"` // optional operator label, e.g. "hetzner-1"
+}
+
+// WgPeer is an enrolled worker's WireGuard identity + overlay address.
+type WgPeer struct {
+	PubKey    string `json:"pub_key"`    // base64 wg public key, unique
+	OverlayIP string `json:"overlay_ip"` // allocated overlay address, unique, e.g. "10.100.0.2"
+	Hostname  string `json:"hostname"`
+	CreatedAt int64  `json:"created_at"`
+}
+
 // UsageEvent is one append-only row per sandbox lifecycle transition —
 // the raw material for any future metering/billing aggregation.
 type UsageEvent struct {
@@ -63,6 +85,23 @@ type Store interface {
 	// key hash, or "" when unknown/revoked.
 	LookupKeyByHash(hash string) (string, error)
 	RevokeKey(id string, now int64) (bool, error)
+
+	// Join tokens (one-time, JoinTokenTTL lifetime).
+	CreateJoinToken(t *JoinToken) error
+	// CheckJoinToken reports whether the token is currently redeemable
+	// (unused, unexpired) without consuming it.
+	CheckJoinToken(hash string, now int64) (bool, error)
+	// ConsumeJoinToken atomically marks the token used and returns true iff
+	// it was valid, unused, and unexpired (single conditional UPDATE).
+	ConsumeJoinToken(hash string, now int64) (bool, error)
+
+	// WireGuard peers.
+	// CreateWgPeer upserts by pubkey: a re-join with the same key keeps its
+	// overlay IP and only refreshes the hostname.
+	CreateWgPeer(p *WgPeer) error
+	// GetWgPeerByPubKey returns nil, nil when the peer is absent.
+	GetWgPeerByPubKey(pub string) (*WgPeer, error)
+	ListWgPeers() ([]*WgPeer, error)
 
 	// Usage events (append-only).
 	AppendUsage(e UsageEvent) error

@@ -6,6 +6,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/alpham/infra-saas/hearth/internal/server"
 	"github.com/alpham/infra-saas/hearth/internal/state"
 	"github.com/alpham/infra-saas/hearth/internal/store"
+	"github.com/alpham/infra-saas/hearth/internal/wg"
 )
 
 func main() {
@@ -62,6 +64,52 @@ func main() {
 	}
 
 	srv := server.New(cfg, st, db)
+
+	// WireGuard overlay (v4 P2): bring up wg-hearth and re-add enrolled peers.
+	// Empty wg_ip means the overlay is disabled (single-network deployments).
+	if cfg.WgIP != "" {
+		// Fail fast on config the join flow depends on: a worker that joins
+		// against a misconfigured hub burns operator time (and, pre-fix,
+		// tokens). The overlay also must never run in open mode — minting
+		// join tokens would be unauthenticated kernel network config.
+		if cfg.Token == "" {
+			fmt.Fprintln(os.Stderr, "wg overlay requires an auth token (--token): refusing open-mode overlay")
+			os.Exit(1)
+		}
+		if cfg.WgEndpoint == "" {
+			fmt.Fprintln(os.Stderr, "wg overlay requires --wg-endpoint (public host:port workers dial)")
+			os.Exit(1)
+		}
+		if _, _, err := net.ParseCIDR(cfg.WgIP); err != nil {
+			fmt.Fprintf(os.Stderr, "wg overlay: bad --wg-ip %q: %v\n", cfg.WgIP, err)
+			os.Exit(1)
+		}
+		pub, err := wg.EnsureKey(cfg.WgKeyPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "wg key: %v\n", err)
+			os.Exit(1)
+		}
+		if err := wg.EnsureInterface(cfg.WgIP, cfg.WgPort, cfg.WgKeyPath); err != nil {
+			fmt.Fprintf(os.Stderr, "wg interface: %v\n", err)
+			os.Exit(1)
+		}
+		peers, err := db.ListWgPeers()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "wg peers: %v\n", err)
+			os.Exit(1)
+		}
+		batch := make([]wg.Peer, 0, len(peers))
+		for _, p := range peers {
+			batch = append(batch, wg.Peer{PubKey: p.PubKey, OverlayIP: p.OverlayIP})
+		}
+		if err := wg.AddPeers(batch); err != nil {
+			// Peers stay persisted; joins re-install live ones. Warn, don't die.
+			log.Printf("wg re-add %d peers: %v", len(batch), err)
+		}
+		srv.SetWgPubKey(pub)
+		log.Printf("wg overlay up: %s on %s port %d (%d peers)",
+			cfg.WgIP, wg.InterfaceName, cfg.WgPort, len(peers))
+	}
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
 	log.Printf("hearthd listening on %s (ui_dir=%s, db=%s, auth=%s)",
