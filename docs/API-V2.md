@@ -89,8 +89,12 @@ cases pin the scoping/quota behavior.
   guest configured via kernel boot arg `ip=<ip>::<gw>:<mask>::eth0:off`; FC `network-interfaces`
   configured before boot. Snapshots are taken **after** networking is up; restore/fork uses
   `/snapshot/load` `network_overrides` to attach a (new) tap.
-- Cross-namespace isolation (nftables drop between tenant IP sets) is **v3**; v2 delivers
-  connectivity + egress NAT + populated `ip`.
+- **Cross-tenant isolation is live (v4 P1)**: guest-to-guest traffic on `hearth0` is
+  dropped unless source and destination belong to the same tenant — the optional
+  `tenant_id` on `POST /v1/vms` (§3) governs membership; a VM with no/invalid tenant
+  joins no pair and is isolated from all peers. Egress NAT and host↔guest traffic are
+  unaffected. Tenant networks are node-scoped until the P2 overlay (per-node CIDRs are
+  node-local). Design: [ADR-0005](adr/ADR-0005-cross-tenant-network-isolation.md).
 
 ## 6. Configuration & production deployment (both binaries)
 

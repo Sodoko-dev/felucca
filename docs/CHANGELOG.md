@@ -191,6 +191,50 @@ one-sandbox TOCTOU burst window (row-level counting will close it);
 `usage_events` retention is deferred to P5; P1 must allowlist-sanitize
 `tenant_id` before any nft shell-out.
 
+## v4 P1 — cross-tenant network isolation (2026-06-12; lab live — conformance 178/0, verify-v2 21/0)
+
+Second phase of the v4 plan
+([ADR-0005](adr/ADR-0005-cross-tenant-network-isolation.md); spec in
+PLAN-v4 Phase 1): guest-to-guest traffic on a node now drops across tenants
+and flows within one, consuming the `tenant_id` P0 started recording in
+`meta.json`. All in the Rust agent (`rust/agent/src/net.rs`,
+`rust/agent/src/vm/mod.rs`).
+
+- **br_netfilter**: same-subnet guests on `hearth0` talk via L2 switching,
+  which bypasses the ip `forward` hook entirely — the agent loads
+  `br_netfilter` and sets `bridge-nf-call-iptables=1` so bridged frames
+  traverse netfilter and the forward chain can police them.
+- **Single concatenated pair set**: one nft set `tenant_pairs`
+  (`ipv4_addr . ipv4_addr`, table `ip hearth`) holds every allowed
+  same-tenant (saddr, daddr) pair. Forward chain (policy accept): accept
+  established/related, accept anything not `hearth0`→`hearth0`, accept pairs
+  in `@tenant_pairs`, drop the remaining bridge-to-bridge. Egress NAT and
+  host↔guest are untouched.
+- **Flush-and-rebuild from full membership** (the `ensure_nat` idiom):
+  `refresh_isolation()` snapshots (tenant, ip) under the state lock, releases
+  it, rebuilds under a dedicated `isolation_lock` (concurrent
+  create/fork/delete can't interleave nft commands). Runs at end of create
+  (pool claim + cold boot), fork success (child's post-re-IP address),
+  delete, and at startup after reconcile — nft sets don't survive reboot.
+- **Security (closes the P0 review requirement)**: `tenant_id` is never
+  interpolated into any nft command — it's only a Rust-side grouping key, so
+  there is no injection surface; only agent-allocated IPs reach nft.
+  `valid_tenant()` (`[A-Za-z0-9_-]`, 1..=64) is defense-in-depth; a
+  missing/invalid tenant joins no pair → isolated from all peers
+  (fail-closed). Rejected alternative: per-tenant named sets
+  `hearth_t_<tenant>` would have put tenant strings in command lines
+  (ADR-0005).
+- **Caveat**: tenant networks are node-scoped until the P2 overlay —
+  per-node CIDRs are node-local, cross-node same-tenant traffic is not
+  bridged in v1.
+
+Evidence: conformance **178/0** (12 new checks in `agent/11-isolation`:
+cross-tenant ping FAIL / same-tenant ping PASS / egress-to-gateway OK, driven
+via exec), verify-v2 **21/0** (wake 65ms), plus a live repro through the full
+control-plane path — two tenants created via the admin API, four sandboxes
+created with tenant keys all scheduled onto one node: cross-tenant ping exit 1
+(dropped), same-tenant ping exit 0, all deletes 204.
+
 ## Backlog (v3+, in order)
 
 branch (uffd CoW fork of running VMs) → cross-tenant nftables isolation →

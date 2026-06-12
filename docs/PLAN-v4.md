@@ -41,9 +41,17 @@ The foundation everything else keys on.
 
 Conformance: new `hearthd/17-tenancy` cases (key scoping, cross-tenant 404, quota 429). The existing single-token mode stays as "admin key" so all current cases keep passing.
 
-## Phase 1 — Cross-tenant network isolation (agent)
+## Phase 1 — Cross-tenant network isolation (agent) — ✅ DONE 2026-06-12
 
-Closes the table's worst ⛔. In `rust/agent/src/net.rs`, same shell-out style:
+Completed and committed. All five gates passed in one run: conformance **178/0**
+(new `agent/11-isolation`, +12 checks), verify-v2 **21/0**, live control-plane
+repro (cross-tenant ping dropped, same-tenant passes, egress intact). ADR-0005
+documents the delivered design — it differs from the sketch below in one way:
+a **single concatenated pair set** (`tenant_pairs`) instead of per-tenant named
+sets, so `tenant_id` never appears in an nft command (closes item 4 by
+construction). Tenant networks are node-scoped until P2 (item 3 documented).
+
+Original spec — closes the table's worst ⛔. In `rust/agent/src/net.rs`, same shell-out style:
 
 1. Add a `forward` chain (hook forward, policy drop for bridge-to-bridge) in the existing `ip hearth` table: allow established/related, allow guest→egress (non-CIDR destinations), **drop guest→guest by default**.
 2. Per-tenant nft **named sets** (`hearth_t_<tenant>`): member IPs added/removed on VM create/delete/IP-change (fork re-IP included); one rule allows intra-set traffic. Rebuilt idempotently on agent start from adopted metas (reuse the reconcile pass).

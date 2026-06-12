@@ -66,6 +66,8 @@ pub struct Manager {
     cidr: Cidr,
     pool_target: u32,
     inner: Mutex<Inner>,
+    // Serializes nft isolation rebuilds: never held together with `inner`.
+    isolation_lock: Mutex<()>,
 }
 
 impl Manager {
@@ -80,6 +82,7 @@ impl Manager {
                 allocator: None,
                 pool: Vec::new(),
             }),
+            isolation_lock: Mutex::new(()),
         })
     }
 
@@ -104,6 +107,26 @@ impl Manager {
             reconcile::reconcile(&self.data_dir, alloc_opt)
         };
         g.vms = vms;
+    }
+
+    /// Rebuild the cross-tenant isolation ruleset from the current VM list
+    /// (every VM holding an IP, keyed by tenant). Snapshots membership under
+    /// the state lock, releases it, then shells out to nft. Rebuilds are
+    /// serialized so concurrent create/fork/delete can't interleave nft
+    /// commands; each rebuild snapshots at its start, so the last one to run
+    /// leaves the freshest state.
+    pub async fn refresh_isolation(&self) {
+        if !self.net_on { return; }
+        let _guard = self.isolation_lock.lock().await;
+        let members: Vec<(String, String)> = {
+            let g = self.inner.lock().await;
+            g.vms.iter()
+                .filter_map(|v| {
+                    v.ip.clone().map(|ip| (v.tenant_id.clone().unwrap_or_default(), ip))
+                })
+                .collect()
+        };
+        net::rebuild_isolation(&members);
     }
 
     pub async fn live_count(&self) -> u32 {
@@ -200,9 +223,14 @@ impl Manager {
     pub async fn create(self: &Arc<Self>, id: &str, name: &str, vcpus: u32, mem_mib: u64, tenant_id: Option<String>) -> Result<(), String> {
         // Try to claim a warm-pool VM for a matching shape (1 vCPU / 256 MiB).
         if self.pool_target > 0 && vcpus == 1 && mem_mib == 256 {
-            if self.claim_from_pool(id, name, tenant_id.clone()).await? { return Ok(()); }
+            if self.claim_from_pool(id, name, tenant_id.clone()).await? {
+                self.refresh_isolation().await;
+                return Ok(());
+            }
         }
-        self.cold_create(id, name, vcpus, mem_mib, VmState::Running, None, tenant_id).await
+        self.cold_create(id, name, vcpus, mem_mib, VmState::Running, None, tenant_id).await?;
+        self.refresh_isolation().await;
+        Ok(())
     }
 
     /// Cold-boot a fresh VM. `force_slot` reuses a specific slot (pool refill).
@@ -770,6 +798,9 @@ impl Manager {
                 }
             }
         }
+        // The child's allocated (post-re-IP) address must join its tenant's
+        // pair set before the fork returns.
+        self.refresh_isolation().await;
         Ok(child_ip)
     }
 
@@ -965,10 +996,13 @@ impl Manager {
             eprintln!("warn: remove_dir_all {}: {}", dir_path, e);
         }
 
-        let mut g = self.inner.lock().await;
-        if let Some(pos) = g.vms.iter().position(|v| v.id == id) {
-            g.vms.remove(pos);
+        {
+            let mut g = self.inner.lock().await;
+            if let Some(pos) = g.vms.iter().position(|v| v.id == id) {
+                g.vms.remove(pos);
+            }
         }
+        self.refresh_isolation().await;
         // Idempotent: unknown id is fine (no error).
         Ok(())
     }

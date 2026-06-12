@@ -50,8 +50,10 @@ async fn main() {
     // Host networking + IP allocator.
     mgr.setup_host().await;
 
-    // Reconcile persisted instances.
+    // Reconcile persisted instances, then rebuild tenant isolation for
+    // adopted VMs (the nft sets don't survive an agent-host reboot).
     mgr.reconcile().await;
+    mgr.refresh_isolation().await;
 
     // Background registration + heartbeat loop.
     let node_id: NodeId = Arc::new(RwLock::new(String::new()));

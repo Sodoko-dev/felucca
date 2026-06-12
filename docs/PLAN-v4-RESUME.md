@@ -18,6 +18,9 @@ fresh session (after `/clear`) can continue without the in-memory task list.
   0 FAIL + a live repro of the phase's headline behavior; (4) docs — API-V2.md,
   ARCHITECTURE.md, CHANGELOG.md, + new/amended ADR; (5) one commit per phase.
 - **All builds run inside the Lima VMs, never the macOS host** (see CLAUDE/memory).
+- **Run /ultraqa after every step** (user directive 2026-06-12), scoped to that
+  step's verifiable goal; /ultrawork for parallelizable independent work
+  (fable-model executors only).
 - **Lab quirk**: kata-lab-0 (vz nested-virt) has twice crashed at the hypervisor
   level during rapid sleep/wake/fork bursts. Recovery: `limactl stop -f kata-lab-0`
   + `limactl start kata-lab-0`, then re-copy the agent binary (it lives in /tmp,
@@ -28,52 +31,31 @@ fresh session (after `/clear`) can continue without the in-memory task list.
 
 - **P0 — DONE**, committed `490c7a4` (tenancy + SQLite + metering; conformance 166/0,
   verify-v2 21/0). ADR-0004, API-V2 §3b written.
-- **P1 — IN PROGRESS** (this commit). See below.
-- P2–P6: not started. P2 needs external infra (public hearthd host, ≥1 external
-  worker, domain + DNS-01 DNS) — user is procuring during P1.
+- **P1 — DONE** (this commit): cross-tenant network isolation. All five gates green
+  in one run: cargo test 50/0, go vet/test clean, static hearthd links; agents +
+  hearthd rolled; conformance **178/0** (new `agent/11-isolation`, +12 checks),
+  verify-v2 **21/0**, live control-plane repro (two tenants via admin API, four
+  sandboxes on one node: cross-tenant ping exit 1, same-tenant exit 0, deletes 204).
+  ADR-0005 written; API-V2 §5 + ARCHITECTURE §1/status table updated. Design notes:
+  `tenant_id` never reaches an nft command (Rust-side grouping key only);
+  `Manager::refresh_isolation()` serialized by `isolation_lock`, called after
+  create/fork/delete and at startup post-reconcile; fail-closed for missing/invalid
+  tenants; tenant networks node-scoped until P2.
+- P2–P6: not started.
 
-## P1 — cross-tenant network isolation: exact remaining work
+## P2 — next: WireGuard overlay, join flow, hardened deployment
 
-Goal: guests of different tenants on one node cannot reach each other; same-tenant
-can; egress + host↔guest unaffected.
-
-DONE in this commit:
-- `rust/agent/src/net.rs`: `rebuild_isolation(members: &[(tenant_id, ip)])` added,
-  plus `ensure_bridge_netfilter()` and `valid_tenant()`. Design: enables
-  `br_netfilter` (same-subnet bridge traffic otherwise bypasses the ip forward
-  hook via L2), then builds an `ip hearth` `forward` chain (policy accept) that
-  drops `hearth0`↔`hearth0` guest traffic except ordered IP pairs sharing a tenant,
-  held in a single concatenated `ipv4_addr . ipv4_addr` set `tenant_pairs`.
-  **Security property: `tenant_id` is never interpolated into an nft command** —
-  it is only a Rust-side HashMap grouping key, so there is no shell-injection
-  vector; `valid_tenant()` is defense-in-depth.
-
-REMAINING (wire the rebuild into the manager + test + gates):
-1. `rust/agent/src/vm/mod.rs`: add `async fn refresh_isolation(&self)` on `Manager`
-   that snapshots `(tenant_id.unwrap_or_default(), ip)` for every vm with `Some(ip)`
-   under the lock, releases the lock, then calls `net::rebuild_isolation(&members)`
-   (guard with `if !self.net_on { return; }`). Call it AFTER the lock is released at
-   the end of: `create` (~line 200), `fork` (success path, ~line 773 `Ok(child_ip)`),
-   and `delete` (~line 944, after removal). Also call once at startup after
-   `reconcile`. The fork child's allocated IP is the post-re-IP guest IP, so adding
-   it to the set is correct.
-2. Startup: in `rust/agent/src/main.rs` after `mgr.reconcile().await` (~line 54),
-   call `mgr.refresh_isolation().await` so adopted VMs' sets are rebuilt on boot.
-3. Conformance: new agent case (e.g. `test/conformance/cases/agent/11-isolation.sh`)
-   — create two VMs with different `tenant_id`, exec a ping from one to the other's
-   IP → must FAIL; two VMs same tenant → ping must PASS; egress (ping 8.8.8.8 or the
-   gateway) still works. Use `wait_guest_ready` before exec; self-clean with DELETE
-   like the other agent cases. (Suite uses the agent API directly on kata-lab-0.)
-4. Gates: build in VM, roll agents (hearthd unchanged this phase but re-roll is
-   harmless), conformance 0 FAIL + verify-v2 0 FAIL + the live cross-tenant-ping
-   repro. Then docs: API-V2 (replace the v2 "isolation is v3" note with the v4
-   delivery), ARCHITECTURE (§ networking + status table P1 → done), CHANGELOG, and
-   ADR-0005 (cross-tenant isolation: br_netfilter + concatenated-set design, the
-   tenant-network-is-node-scoped-until-overlay caveat, why tenant_id never hits the
-   shell). Commit as "v4 P1: cross-tenant network isolation".
+Spec: PLAN-v4.md Phase 2. **External prerequisites (user-provided)**: public
+hearthd host, ≥1 external worker (bare-metal or nested-virt), a domain, DNS with
+ACME DNS-01 API. User was procuring these during P1 — ask for the hand-off
+(SSH access, domain, DNS API credentials) at P2 start. Code work (wg config
+block, join tokens, `POST /api/v1/nodes/join`, agent `--join`, autocert TLS,
+systemd soak fixes) proceeds on the lab regardless; the mixed-fleet acceptance
+needs the real infra.
 
 ## How to resume in a fresh session
 
-Tell the new session: "Continue Hearth v4 from docs/PLAN-v4-RESUME.md — implement
-the remaining P1 work, then continue P2–P6 under the working agreement there."
-Re-create the task list from PLAN-v4.md phases if you want progress tracking.
+Tell the new session: "Continue Hearth v4 from docs/PLAN-v4-RESUME.md — start P2
+(lab-side code first if external infra isn't ready), then P3–P6 under the working
+agreement there." Re-create the task list from PLAN-v4.md phases if you want
+progress tracking.

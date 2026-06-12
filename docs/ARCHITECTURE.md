@@ -46,7 +46,7 @@ flowchart TB
         VMM["VM manager<br/>(spawn firecracker, configure over UDS,<br/>snapshot/restore, track pids)"]
         GC["Guest client (v3.1)<br/>(hybrid vsock: CONNECT 52,<br/>exec + set_ip on fork)"]
         POOL["Warm pool<br/>(pool_size paused VMs,<br/>claim on create, async refill)"]
-        NET["Networking<br/>(bridge hearth0 + tap per VM,<br/>sequential IP, nft masquerade)"]
+        NET["Networking<br/>(bridge hearth0 + tap per VM,<br/>sequential IP, nft masquerade,<br/>cross-tenant nft isolation — v4 P1)"]
         HB["Heartbeat loop<br/>(every 5s: mem_free,<br/>vm_count, pool_size)"]
     end
 
@@ -85,6 +85,15 @@ flowchart TB
 Firecracker directly; the control plane only does placement and proxying. v2 delivers this: the warm
 pool is claimed and refilled entirely on the agent, and wake is one `/snapshot/load` away — no
 control-plane round trip on the latency-critical path.
+
+**Cross-tenant isolation (v4 P1):** guest-to-guest traffic on `hearth0` is dropped unless source
+and destination IPs share a tenant. One concatenated nft set (`tenant_pairs`, `ipv4_addr . ipv4_addr`,
+table `ip hearth`) holds the allowed same-tenant pairs; `br_netfilter` routes bridged L2 frames
+through the forward chain so same-subnet traffic can't bypass it. The agent rebuilds the set
+flush-and-repopulate (idempotent, serialized) after every create/fork/delete and at startup —
+`tenant_id` is only a Rust-side grouping key and never appears in an nft command. Egress NAT and
+host↔guest are unaffected; tenant networks are **node-scoped** until the P2 overlay. Rationale and
+alternatives: [ADR-0005](adr/ADR-0005-cross-tenant-network-isolation.md).
 
 ---
 
@@ -461,7 +470,7 @@ v4 — multi-tenant, deploy-anywhere, product-ready (in progress; plan P0–P6,
 | Phase | Capability | Status |
 |---|---|---|
 | P0 | Tenancy (API keys, enforced namespaces, quotas, usage metering) + SQLite store (`go/internal/store`, pure-Go driver, one-time state.json import) | **live in the lab 2026-06-12** — conformance **166/0** (new `hearthd/17-tenancy`), verify-v2 **21/0**; contract in API-V2 §3b |
-| P1 | Cross-tenant network isolation (nftables forward-drop + per-tenant sets) | next |
+| P1 | Cross-tenant network isolation (br_netfilter + single concatenated nft pair set `tenant_pairs`, flush-and-rebuild from full membership; `tenant_id` never hits an nft command) | **live in the lab 2026-06-12** — conformance **178/0** (new `agent/11-isolation`), verify-v2 **21/0**; design in [ADR-0005](adr/ADR-0005-cross-tenant-network-isolation.md); tenant networks node-scoped until P2 |
 | P2 | WireGuard overlay, join tokens, TLS, systemd soak (mixed-fleet acceptance) | planned |
 | P3 | Multi-service ingress gateway (`name--id.sb.<domain>`) | planned |
 | P4 | Templates (docker-base, odoo) + bigger guests + per-template pools | planned |
