@@ -63,7 +63,7 @@ CONF_DIR=/etc/hearth
 STATE_DIR=/var/lib/hearth
 DATA_DIR=/srv/hearth
 UI_DIR=/usr/share/hearth/ui
-RUN_DIR=/run/hearth
+# (no /run/hearth: nothing uses it — FC sockets live under DATA_DIR/instances)
 
 # ---------------------------------------------------------------------------
 # Binary installation
@@ -104,7 +104,6 @@ setup_directories() {
     install -d -m 0755 "${DATA_DIR}/images"
     install -d -m 0755 "${DATA_DIR}/instances"
     install -d -m 0755 "${UI_DIR}"
-    install -d -m 0755 "${RUN_DIR}"
 
     ok "Directories ready"
 }

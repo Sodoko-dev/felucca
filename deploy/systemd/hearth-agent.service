@@ -29,8 +29,11 @@ RestartSec=5s
 TimeoutStartSec=60s
 TimeoutStopSec=60s
 
-# Device access — /dev/kvm for Firecracker microVMs
+# Device access — /dev/kvm for Firecracker microVMs; /dev/net/tun for the
+# per-VM tap devices (both `ip tuntap add` and Firecracker itself open it,
+# and DevicePolicy=closed applies to every process in the cgroup).
 DeviceAllow=/dev/kvm rw
+DeviceAllow=/dev/net/tun rw
 DevicePolicy=closed
 
 # Capabilities required for tap/bridge/nftables setup.
@@ -51,10 +54,19 @@ RestrictNamespaces=true
 LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
-SystemCallFilter=@system-service @network-io
+# @sandbox: Firecracker hardens itself with per-thread seccomp filters via
+# seccomp(2), which @system-service does not allow — without it every FC
+# child dies with SIGSYS right after its API socket comes up (audit
+# type=1326 syscall=277/seccomp on aarch64).
+SystemCallFilter=@system-service @network-io @sandbox
 
-# Writable paths for VM instances, kernels, images
-ReadWritePaths=/srv/hearth /etc/hearth /run/hearth
+# Writable paths for VM instances, kernels, images. (No /run/hearth: nothing
+# uses it — FC API sockets live under {data_dir}/instances/<id>/ — and a
+# missing ReadWritePaths entry fails mount namespacing on every boot with
+# 226/NAMESPACE, /run being tmpfs.) Every entry must exist before start
+# (install.sh creates them); a non-default data_dir needs a drop-in that
+# RESETS the list:  ReadWritePaths=  then  ReadWritePaths=<dir> /etc/hearth
+ReadWritePaths=/srv/hearth /etc/hearth
 
 # Resource limits — each Firecracker child needs an FD for its unix socket
 LimitNOFILE=524288

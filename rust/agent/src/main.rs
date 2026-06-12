@@ -37,7 +37,16 @@ async fn main() {
         eprintln!("fatal: --join and --join-token must be set together");
         std::process::exit(1);
     }
-    let wg_state = wg::load_state(&cfg.data_dir);
+    // Err = wg.json exists but is unreadable/corrupt. Fatal here, not a
+    // fallback: the file's presence proves enrollment, and starting in
+    // direct mode instead would register the wrong address with the hub.
+    let wg_state = match wg::load_state(&cfg.data_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("fatal: {}", e);
+            std::process::exit(1);
+        }
+    };
     let joined: Option<wg::JoinInfo> = if let Some(info) = wg_state {
         if !cfg.join_url.is_empty() {
             eprintln!(

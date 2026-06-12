@@ -122,12 +122,16 @@ on the target arch is the path of least resistance.
 
 The installer finds binaries at `deploy/release/<arch>/`.
 
-> **Systemd note**: the units in `deploy/systemd/` were hardened against the
-> Zig binaries and are not yet soak-tested under the Go/Rust runtimes (the lab
-> runs processes directly). On first production install, watch
-> `journalctl -u hearthd -u hearth-agent` for seccomp kills — in particular
-> `MemoryDenyWriteExecute=true` in `hearthd.service` vs the Go runtime — and
-> relax the specific directive if needed.
+> **Systemd note**: the units in `deploy/systemd/` are validated under the
+> Go/Rust runtimes with Firecracker v1.16 (v4 P2.5): each allow-list entry
+> encodes a specific requirement (`@sandbox` for FC's own seccomp(2) filters,
+> `/dev/net/tun` for taps, `StateDirectoryMode=0750`), so treat a hardening
+> failure as a missing *specific* allowance to add, not a directive to remove
+> wholesale. The one remaining experiment is `MemoryDenyWriteExecute=true` in
+> `hearthd.service` vs the Go runtime — it survives startup and the
+> conformance suite; the 48h soak is the verdict. If you use a non-default
+> agent `data_dir`, override `ReadWritePaths` via a drop-in that resets the
+> list (see the comment in `hearth-agent.service`).
 
 ---
 

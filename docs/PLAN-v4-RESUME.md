@@ -24,11 +24,12 @@ fresh session (after `/clear`) can continue without the in-memory task list.
   parallelizable independent work (fable-model executors only).
 - **After each phase commit: prompt the user to run /compact** (user directive
   2026-06-12; Claude can't invoke the built-in command itself).
-- **Lab quirk**: kata-lab-0 (vz nested-virt) has twice crashed at the hypervisor
-  level during rapid sleep/wake/fork bursts. Recovery: `limactl stop -f kata-lab-0`
-  + `limactl start kata-lab-0`, then re-copy the agent binary (it lives in /tmp,
-  wiped on reboot) and nohup-relaunch (see the roll script / CHANGELOG for the exact
-  relaunch command). Agent conformance cases are self-cleaning so leftovers don't cascade.
+- **Lab quirk**: kata-lab-0 (vz nested-virt) has crashed four times at the
+  hypervisor level during rapid VM-churn bursts. Recovery (since the systemd
+  migration): just `limactl stop -f kata-lab-0` + `limactl start kata-lab-0` —
+  the hearth-agent unit auto-starts and re-registers, nothing to re-stage.
+  Agent conformance cases are self-cleaning so leftovers don't cascade. One
+  crash-recovery + rerun is gate-accepted.
 
 ## Status
 
@@ -54,11 +55,26 @@ fresh session (after `/clear`) can continue without the in-memory task list.
 ## P2 — remaining work
 
 Spec: PLAN-v4.md Phase 2. Done: overlay join flow (both sides), lab overlay
-e2e, TLS code. Remaining:
-1. **P2.5 systemd soak (48h, lab-workable)**: run the fleet under
-   deploy/systemd units; fix MemoryDenyWriteExecute-vs-Go-GC and
-   seccomp-vs-FC-spawn; units gain wg deps; install.sh join support; release
-   binaries both arches. Long wall-clock — start it, work on other things.
+e2e, TLS code, fleet migrated to systemd. Remaining:
+1. **P2.5 soak — RUNNING since 2026-06-12 ~11:20 CEST.** The whole lab fleet
+   now runs under the deploy/systemd units (hearthd on infra-saas-lab as user
+   `hearth`, state in /var/lib/hearth; agents on both kata VMs as root,
+   binaries in /usr/local/bin, configs in /etc/hearth). Migration findings,
+   all fixed + gate-verified (conformance 193/0, verify-v2 21/0, cargo 77/0):
+   seccomp killed FC (needs `@sandbox` — FC calls seccomp(2) for its own
+   filters); DeviceAllow needed /dev/net/tun; ReadWritePaths entries must
+   exist (RuntimeDirectory removed — /run/hearth was dead config, also
+   dropped from install.sh); StateDirectoryMode=0750 pin; missing
+   CAP_DAC_OVERRIDE made root unable to read magdy-owned state → wg.rs
+   load_state refactored to Result (unreadable/corrupt wg.json now FATAL,
+   never silent direct-mode) + wg.key pre-flight in ensure_interface.
+   kata-lab-0 vz crash #4 hit mid-conformance; systemd self-healed it on VM
+   restart (unit auto-start + modules-load.d) — zero manual staging, old
+   runbook re-copy steps obsolete. **Check after ~2026-06-14 11:00:** `sudo
+   journalctl -u hearthd -u hearth-agent` on all 3 VMs for restarts/SIGSYS/
+   MDWE kills (`systemctl show -p NRestarts`), then drop the MDWE
+   soak-experiment comment in hearthd.service if clean. Release binaries for
+   both arches still unaddressed (P2 close-out or P2.6).
 2. **P2.6 mixed-fleet acceptance — BLOCKED on user hand-off**: public hearthd
    host SSH, ≥1 external worker, domain, DNS-01 API creds. ASK THE USER.
    verify-v2 must pass unmodified against the real mixed fleet; live TLS
@@ -70,18 +86,23 @@ e2e, TLS code. Remaining:
    bootstrap trust note), API-V2/ARCHITECTURE/CHANGELOG updates, one summary
    reference in CHANGELOG to the step commits, prompt user to run /compact.
 
-## Lab overlay state (live since 2026-06-12)
+## Lab fleet state (systemd since 2026-06-12)
 
-hearthd on infra-saas-lab runs with `--wg-ip 10.100.0.1/24 --wg-endpoint
-192.168.104.3:51820 --wg-key /tmp/hearth/wg.key` (hd log: /tmp/hearth/hd.log).
-kata-lab-1's agent is enrolled (wg.json + wg.key in /srv/ignis, survives agent
-restarts but NOT a VM reboot of the /tmp binary — re-roll per runbook) and
-registers as 10.100.0.2:9090 over the tunnel. kata-lab-0 stays direct
-(192.168.104.1:9090, pool=1). wireguard-tools installed on both. Roll gotchas
-(both hit this session): pkill must live in its OWN limactl invocation; agent
-musl builds MUST use CARGO_TARGET_DIR=$HOME/.cargo-target/hearth-agent or the
-roll ships a stale binary. kata-lab-0 vz crash #3 happened mid-conformance;
-runbook recovery worked (one crash + rerun is accepted per gate).
+Everything reboot-survivable now. hearthd: `systemctl {status,restart} hearthd`
+on infra-saas-lab — binary /usr/local/bin/hearthd, config
+/etc/hearth/hearthd.json (token, wg_ip 10.100.0.1/24, wg_endpoint
+192.168.104.3:51820, wg_key/state/db under /var/lib/hearth, ui
+/usr/share/hearth/ui), logs via journalctl. Agents on both kata VMs:
+`hearth-agent.service` — binary /usr/local/bin/hearth-agent, config
+/etc/hearth/hearth-agent.json (+ drop-in lab.conf resetting ReadWritePaths to
+/srv/ignis, the lab's non-default data_dir). kata-lab-1 enrolled (wg.json/wg.key
+in /srv/ignis, root-owned — the unit user); kata-lab-0 direct, pool=1.
+To roll a new agent build: build with
+CARGO_TARGET_DIR=$HOME/.cargo-target/hearth-agent (stale-binary gotcha), copy
+to /usr/local/bin/hearth-agent, `systemctl restart hearth-agent`. The
+journald `sudo: unable to open /etc/sudoers` lines at agent start are benign
+(bare-then-sudo fallback probing under NoNewPrivileges). vz crash recovery is
+now just `limactl stop -f` + `start` — units self-heal (crash #4 proved it).
 
 ## How to resume in a fresh session
 

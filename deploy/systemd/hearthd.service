@@ -55,8 +55,17 @@ SystemCallErrorNumber=EPERM
 
 # Allow writes only to the paths hearthd needs.
 # /etc/hearth is config (read-only at runtime); writable paths are state + tmp.
+# StateDirectory creates /var/lib/hearth owned by the service user on fresh
+# installs and mounts it writable (so no ReadWritePaths entry for it, which
+# would also fail namespacing if the dir were missing). Mode must be pinned:
+# systemd re-applies it on every start and the default 0755 would silently
+# loosen install.sh's 0750. Note systemd also re-chowns the tree to
+# User=hearth if the top-level owner mismatches — don't park root-only
+# secrets under /var/lib/hearth.
+StateDirectory=hearth
+StateDirectoryMode=0750
 ReadOnlyPaths=/etc/hearth
-ReadWritePaths=/var/lib/hearth /usr/share/hearth
+ReadWritePaths=/usr/share/hearth
 
 # Resource limits (tune per your node size)
 LimitNOFILE=65536

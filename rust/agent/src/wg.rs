@@ -335,6 +335,17 @@ pub fn allowed_ips(info: &JoinInfo) -> String {
 /// host as hearthd would clobber the hub's key (documented constraint, see
 /// ADR-0006).
 pub fn ensure_interface(info: &JoinInfo, key_path: &str) -> Result<(), String> {
+    // Pre-flight the key file: `wg set` reads it as the same user, but its
+    // failure collapses into the generic message below — an unreadable key
+    // (same wrong-owner class load_state catches for wg.json) must name the
+    // actual file and fix.
+    if let Err(e) = std::fs::File::open(key_path) {
+        return Err(format!(
+            "wg key {} unreadable: {} — fix the file's owner/permissions",
+            key_path, e
+        ));
+    }
+
     // Create the interface (ignore "exists").
     run(&["ip", "link", "add", WG_IFACE, "type", "wireguard"]);
 
@@ -403,17 +414,37 @@ pub fn save_state(data_dir: &str, info: &JoinInfo) -> Result<(), String> {
         .map_err(|e| format!("rename {}: {}", path, e))
 }
 
-/// Load the persisted overlay assignment. None when missing or unparseable;
-/// the latter warns (the operator likely needs to re-join).
-pub fn load_state(data_dir: &str) -> Option<JoinInfo> {
+/// Load the persisted overlay assignment. `Ok(None)` strictly means "no
+/// wg.json" (never enrolled); `Ok(Some)` is the enrollment grant.
+///
+/// Everything else is `Err`, and the caller must treat it as fatal: a present
+/// wg.json proves this node enrolled, and silently starting in direct mode
+/// instead registers the wrong address with the hub (observed in the lab as
+/// control_plane=127.0.0.1 plus an endless register-retry loop). That covers
+/// both unreadable (EACCES from a wrong file owner under the systemd
+/// capability sandbox — no CAP_DAC_OVERRIDE —, EIO, ...) and corrupt
+/// (non-UTF-8 or unparseable JSON) state.
+pub fn load_state(data_dir: &str) -> Result<Option<JoinInfo>, String> {
     let path = state_path(data_dir);
-    let data = std::fs::read_to_string(&path).ok()?;
-    match serde_json::from_str::<JoinInfo>(&data) {
-        Ok(info) => Some(info),
+    let data = match std::fs::read_to_string(&path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
-            eprintln!("warn: {}: unparseable wg state: {}", path, e);
-            None
+            return Err(format!(
+                "{}: unreadable wg state ({}); refusing to guess enrollment status — \
+                 fix the file's owner/permissions (or restore it from backup)",
+                path, e
+            ));
         }
+    };
+    match serde_json::from_str::<JoinInfo>(&data) {
+        Ok(info) => Ok(Some(info)),
+        Err(e) => Err(format!(
+            "{}: corrupt wg state ({}); refusing to start un-enrolled — restore the \
+             file, or delete it and re-join with a fresh token (the hub re-issues the \
+             same overlay IP for an unchanged key)",
+            path, e
+        )),
     }
 }
 
@@ -606,7 +637,7 @@ mod tests {
 
         let info = good();
         save_state(&dir_s, &info).expect("save");
-        let loaded = load_state(&dir_s).expect("load");
+        let loaded = load_state(&dir_s).expect("load").expect("enrolled");
         assert_eq!(loaded.overlay_ip, info.overlay_ip);
         assert_eq!(loaded.overlay_prefix, info.overlay_prefix);
         assert_eq!(loaded.server_overlay_ip, info.server_overlay_ip);
@@ -677,12 +708,14 @@ mod tests {
     }
 
     #[test]
-    fn test_load_state_missing_is_none() {
-        assert!(load_state("/nonexistent/hearth-wg-test").is_none());
+    fn test_load_state_missing_is_ok_none() {
+        assert!(load_state("/nonexistent/hearth-wg-test")
+            .expect("missing file is not an error")
+            .is_none());
     }
 
     #[test]
-    fn test_load_state_unparseable_is_none() {
+    fn test_load_state_unparseable_is_err() {
         let dir = std::env::temp_dir().join(format!(
             "hearth-wg-garbage-{}-{:?}",
             std::process::id(),
@@ -690,7 +723,38 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("wg.json"), "not json {").unwrap();
-        assert!(load_state(&dir.to_string_lossy()).is_none());
+        let err = load_state(&dir.to_string_lossy()).unwrap_err();
+        assert!(err.contains("corrupt wg state"), "got: {}", err);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_load_state_unreadable_is_err() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "hearth-wg-noperm-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("wg.json");
+        std::fs::write(&f, "{}").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // root (CAP_DAC_OVERRIDE) can read 0o000 files; the EACCES branch is
+        // only reachable as an unprivileged user, so skip under root.
+        if std::fs::read_to_string(&f).is_err() {
+            let err = load_state(&dir.to_string_lossy()).unwrap_err();
+            assert!(err.contains("unreadable wg state"), "got: {}", err);
+        }
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_ensure_interface_unreadable_key_names_the_key() {
+        // Must fail BEFORE shelling out, with the key path in the error.
+        let err = ensure_interface(&good(), "/nonexistent/hearth-wg-test.key").unwrap_err();
+        assert!(err.contains("/nonexistent/hearth-wg-test.key"), "got: {}", err);
     }
 }
