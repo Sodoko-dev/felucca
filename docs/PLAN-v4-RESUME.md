@@ -50,7 +50,18 @@ fresh session (after `/clear`) can continue without the in-memory task list.
   conformance **193/0**, verify-v2 **21/0**, kata-lab-1 LIVE on the overlay as
   10.100.0.2 — mixed fleet running), P2.3 TLS autocert + agent https-join via
   curl-stdin (this commit; live TLS verify needs the domain).
-- P3–P6: not started.
+- **P3 — DONE 2026-06-12**: sandbox ingress. Step commits `ff3cdc3` (expose
+  API + worker DNAT), `653e2e2` (hearth-gw), plus the phase-close commit
+  (conformance `hearthd/19-expose`, hearth-gw.service, ADR-0007, docs).
+  Gates: cargo 87/0, go suite green, static hearthd+hearth-gw link;
+  conformance **227/0**, verify-v2 **21/0** on the systemd fleet; live e2e:
+  HTTP + WebSocket 101 through gw→DNAT→guest (direct worker), dynamic route
+  over the wg overlay worker, sleep→wake page→recovery, fork child URLs.
+  hearth-gw runs in the lab under systemd (config /etc/hearth/hearth-gw.env,
+  domain sb.lab.test, :8088). Deferred (ADR-0007): wildcard TLS (external
+  infra, with P2.6), auto-wake + dynamic-expose GC (P5), delete-failure
+  expose reconciliation (P6 reschedule sweep).
+- P4–P6: not started.
 
 ## P2 — remaining work
 

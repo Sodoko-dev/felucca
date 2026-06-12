@@ -276,6 +276,47 @@ remaining for phase close: soak verdict (MDWE decision) + P2.6 mixed-fleet
 acceptance on real external infra (public host, domain, DNS-01) + release
 binaries for both arches.
 
+## v4 P3 — sandbox ingress (2026-06-12, Go+Rust)
+
+Services inside sandboxes are now reachable by URL: `https://<name>--<id>.
+<domain>` through the new `hearth-gw` reverse proxy. Step commits `ff3cdc3`
+(hearthd expose API + worker DNAT) and `653e2e2` (hearth-gw). Contract:
+API-V2 §3d; design + deferred items: ADR-0007.
+
+- **Expose API**: POST/DELETE `/api/v1/sandboxes/{id}/expose[/{name}]`,
+  multi-service per sandbox; one route row + one worker nft DNAT rule
+  (the `ingress` chain — nat hook prerouting — in the existing `ip hearth`
+  table, node ports 20000-29999, flush-and-rebuild from meta.json like
+  isolation — same nothing-user-controlled-near-nft invariant). Forks re-expose the child
+  with fresh node ports.
+- **hearth-gw**: route table from hearthd (admin-only `GET /api/v1/routes`,
+  cached, outage-tolerant), WebSocket passthrough, 503 wake page for
+  sleeping sandboxes, dynamic `8069--<id>` port-in-hostname as a lazy
+  expose gated by the per-sandbox `allow_dynamic_ports` opt-in (canonical
+  decimal labels only), per-tenant edge toggles + token-bucket rate limits.
+  Ships with a hardened systemd unit (hearth-gw.service).
+- **Review loop** (pre-commit) caught and fixed: both snapshot stores
+  silently dropping all ingress state on hearthd restart (SQLite columns +
+  idempotent ALTER migration; state.json loadSandbox fields); a
+  concurrent-expose 409 path leaking unaccounted agent DNAT entries and a
+  shared-port unexpose TOCTOU (both fixed by serializing ingress mutations
+  end-to-end); 30s browser hangs on stale routes (3s connect timeout);
+  leading-zero dynamic labels as an unauthenticated hearthd-amplification
+  loop (canonical-spelling gate); node-less sandboxes vanishing from the
+  route table instead of serving state-aware 503s. Deferred to ADR-0007:
+  hearthd↔agent expose reconciliation after failed deletes, dynamic-expose
+  GC (P5 idle policies), wildcard TLS (external infra), auto-wake (P5).
+
+Evidence: conformance **227/0** (new `hearthd/19-expose`, +34 checks:
+validation ladder, scoping, idempotency/conflict, admin-only route table,
+dynamic gate, unexpose), verify-v2 **21/0**, cargo 87/0, go suite green.
+Live e2e through the gateway on the systemd fleet: HTTP + a real WebSocket
+101-and-frames exchange (gw → kata-lab-0 DNAT → guest python responder);
+dynamic-port route served from the **overlay worker** (gw → wg tunnel →
+kata-lab-1 DNAT → guest); sleep → wake page → wake → content recovered;
+fork child's URLs served the memory-cloned parent httpd on fresh node
+ports; deletes flushed every DNAT rule on both workers.
+
 ## Backlog (v3+, in order)
 
 branch (uffd CoW fork of running VMs) → cross-tenant nftables isolation →

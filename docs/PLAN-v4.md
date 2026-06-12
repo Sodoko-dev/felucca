@@ -80,7 +80,7 @@ The "flexibility is the edge" phase.
 3. **systemd soak**: run the lab fleet under `deploy/systemd/` units for 48h; fix the known hardening conflicts (`MemoryDenyWriteExecute` vs Go GC, seccomp vs Firecracker spawn); units gain the wg dependency. `install.sh` updated for joins; binaries to `deploy/release/<arch>/` for both arches.
 4. **Mixed-fleet acceptance**: one Hetzner bare-metal worker + one nested-virt cloud VM + one home-lab/Lima worker joined to a cloud hearthd — `verify-v2` must pass against that fleet unmodified. This test *is* the positioning claim.
 
-## Phase 3 — Sandbox ingress (the Sodoko unlock)
+## Phase 3 — Sandbox ingress (the Sodoko unlock) — ✅ DONE 2026-06-12 (wildcard TLS + auto-wake deferred: external infra / P5; see ADR-0007)
 
 Users must reach the Odoo UI inside a sandbox from the internet.
 

@@ -91,6 +91,33 @@ overlay (`advertise_addr` = its overlay IP). An unreadable or corrupt `wg.json`
 is fatal — an enrolled node never silently degrades to direct mode. The https
 join goes through `curl --config -` with the token on stdin, never argv.
 
+## 3d. Sandbox ingress (v4 P3, hearthd + hearth-gw)
+
+Services inside sandboxes get public URLs `https://<name>--<id>.<ingress
+domain>` via the `hearth-gw` reverse proxy (wildcard DNS → gateway → worker
+node port → DNAT → guest). Design: [ADR-0007](adr/ADR-0007-sandbox-ingress.md).
+
+| Method | Path | Auth | Body | Result |
+|---|---|---|---|---|
+| POST | `/api/v1/sandboxes/{id}/expose` | owner | `{"name","port"}` | 201 `{"name","guest_port","node_port","hostname","url"?}`; 200 idempotent repeat (same name+port); 409 name taken by another port; 400 bad name/port; 409 sandbox has no address. Names: `[a-z0-9-]` 1..=32, no edge/double dash, not all digits. |
+| DELETE | `/api/v1/sandboxes/{id}/expose/{name}` | owner | — | 204; 404 unknown name; 502 when the worker can't remove the rule (row kept — retry). |
+| GET | `/api/v1/routes` | admin (the gateway) | — | 200 `{"routes":[{hostname, sandbox_id, tenant_id, name, node_host, node_port, guest_port, state, allow_dynamic_ports}]}`. Node-less sandboxes keep rows with `node_host:""`. |
+| POST | `/api/v1/routes/ensure` | admin (the gateway) | `{"sandbox_id","port"}` | 200 lazy expose named after the port — only when the sandbox opted in via `allow_dynamic_ports` at create (403 otherwise). |
+
+Create accepts `"allow_dynamic_ports": true` (default false) enabling
+E2B-style `8069--<id>` hostnames. Sandbox JSON carries `exposes` (omitted
+when empty — pre-P3 wire shape unchanged). Forks re-expose the parent's
+services on the child with fresh node ports. Sleeping sandboxes get a 503
+wake page at the gateway; the expose survives sleep/wake (the guest IP
+persists). `hearth-gw` flags (env): `--listen`
+(`HEARTH_GW_LISTEN`, default :8088), `--hearthd` (`HEARTH_GW_HEARTHD`),
+`--token` (`HEARTH_TOKEN`, admin — the route table is admin-only),
+`--domain` (`HEARTH_GW_DOMAIN`), `--refresh` (flag-only, seconds), and
+`--tenant-limits` (`HEARTH_GW_TENANT_LIMITS`, path to a JSON file:
+per-tenant `enabled` toggle + token-bucket `rps`). hearthd's
+`ingress_domain` config key only renders the `url` field in expose
+responses.
+
 ## 4. Warm pool (agent-internal, Tier A wake)
 
 - Agent flag/config `pool_size` (default **0** = off). When >0 the agent keeps N **paused** generic
