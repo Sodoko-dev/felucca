@@ -2,5 +2,12 @@
   "bind": "0.0.0.0:8080",
   "state_path": "/var/lib/hearth/state.json",
   "ui_dir": "/usr/share/hearth/ui",
-  "token": "REPLACE_WITH_OUTPUT_OF__openssl_rand_-hex_32"
+  "token": "REPLACE_WITH_OUTPUT_OF__openssl_rand_-hex_32",
+  "wg_ip": "",
+  "wg_port": 51820,
+  "wg_key_path": "",
+  "wg_endpoint": "",
+  "wg_keepalive": 25,
+  "tls_domain": "",
+  "tls_cache_dir": ""
 }

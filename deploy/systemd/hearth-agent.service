@@ -1,7 +1,11 @@
 [Unit]
 Description=Hearth worker agent (hearth-agent)
 Documentation=https://github.com/alpham/infra-saas/docs/DEPLOYMENT.md
-After=network-online.target
+# systemd-modules-load preloads br_netfilter (cross-tenant isolation is
+# SILENTLY OFF without it — the agent logs an error if missing) and wireguard
+# (--join). ProtectKernelModules below forbids the agent loading them itself;
+# install.sh ships modules-load.d/hearth.conf.
+After=network-online.target systemd-modules-load.service
 Wants=network-online.target
 # Firecracker must be present before the agent starts.
 ConditionPathExists=/usr/local/bin/firecracker

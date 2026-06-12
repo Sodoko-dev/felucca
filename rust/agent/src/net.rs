@@ -113,11 +113,30 @@ fn valid_tenant(t: &str) -> bool {
 /// Same-subnet guests on one bridge talk via L2 switching, which bypasses the
 /// ip `forward` hook entirely. br_netfilter routes bridged IPv4 frames through
 /// netfilter so the forward chain can police guest-to-guest traffic.
-fn ensure_bridge_netfilter() {
+///
+/// Returns false — and screams — when the sysctl could not be confirmed on:
+/// without it the tenant_pairs drop rule sees no bridged traffic and
+/// cross-tenant isolation is silently OFF. Under the hardened systemd unit
+/// (ProtectKernelModules=true) modprobe is expected to fail; the module must
+/// be preloaded via modules-load.d (install.sh ships it).
+fn ensure_bridge_netfilter() -> bool {
     run(&["modprobe", "br_netfilter"]);
     if !run(&["sysctl", "-w", "net.bridge.bridge-nf-call-iptables=1"]) {
         run(&["sh", "-c", "echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables"]);
     }
+    // Verify, don't assume: read the knob back. Either runner may have
+    // "succeeded" without the key actually existing (module absent).
+    let confirmed = std::fs::read_to_string("/proc/sys/net/bridge/bridge-nf-call-iptables")
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false);
+    if !confirmed {
+        eprintln!(
+            "error: br_netfilter is not active (module missing and modprobe denied?) — \
+             CROSS-TENANT ISOLATION IS NOT ENFORCED on this node. \
+             Preload the module (modules-load.d/hearth.conf) and restart."
+        );
+    }
+    confirmed
 }
 
 /// Rebuild cross-tenant network isolation from the full member list. Idempotent
@@ -129,7 +148,9 @@ fn ensure_bridge_netfilter() {
 /// `ipv4_addr . ipv4_addr` set. VMs with no/invalid tenant join no pair and are
 /// thus isolated from every peer. Egress and host↔guest traffic are unaffected.
 pub fn rebuild_isolation(members: &[(String, String)]) {
-    ensure_bridge_netfilter();
+    // The ruleset is still built when br_netfilter is missing (routed traffic
+    // is policed either way) — the helper has already logged the loud error.
+    let _ = ensure_bridge_netfilter();
 
     // Table/set/chain exist (idempotent), then flush the parts we own.
     run(&["nft", "add", "table", "ip", "hearth"]);

@@ -6,5 +6,7 @@
   "token": "REPLACE_WITH_SAME_TOKEN_AS_HEARTHD",
   "pool_size": 2,
   "net": "on",
-  "net_cidr": "10.231.0.0/24"
+  "net_cidr": "10.231.0.0/24",
+  "join_url": "",
+  "join_token": ""
 }

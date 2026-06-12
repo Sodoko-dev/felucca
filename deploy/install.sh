@@ -147,6 +147,33 @@ install_unit() {
 }
 
 # ---------------------------------------------------------------------------
+# Kernel modules (both roles)
+# ---------------------------------------------------------------------------
+# The hardened units set ProtectKernelModules=true, so br_netfilter and
+# wireguard must be preloaded by the host (v4 P1/P2).
+
+install_modules_conf() {
+    local src="${SCRIPT_DIR}/systemd/hearth-modules.conf"
+    local dest=/etc/modules-load.d/hearth.conf
+
+    [ -f "${src}" ] || die "Modules file not found: ${src}"
+
+    info "Installing kernel modules config (br_netfilter, wireguard)"
+    install -m 0644 "${src}" "${dest}"
+    ok "${dest}"
+
+    # modules-load.d only applies at boot — load the modules for the current
+    # boot too. Best-effort: warn (don't fail) if neither path works.
+    if systemctl restart systemd-modules-load.service >/dev/null 2>&1 \
+        || { modprobe br_netfilter && modprobe wireguard; } >/dev/null 2>&1; then
+        ok "br_netfilter + wireguard loaded for the current boot"
+    else
+        echo "    WARNING: could not load br_netfilter/wireguard now."
+        echo "    They will be loaded on the next boot via ${dest}."
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Config file stubs (only if the file doesn't exist yet)
 # ---------------------------------------------------------------------------
 
@@ -216,6 +243,31 @@ check_nftables() {
     fi
 }
 
+check_wireguard_tools() {
+    local role="$1"  # control-plane | worker
+    info "Checking wireguard-tools"
+    if command -v wg >/dev/null 2>&1; then
+        ok "wg found: $(wg --version 2>&1 | head -1)"
+    else
+        echo "    WARNING: wg not found. Install wireguard-tools:"
+        echo "      apt-get install -y wireguard-tools   # Debian/Ubuntu"
+        echo "      dnf install -y wireguard-tools        # RHEL/Fedora"
+        if [ "${role}" = "control-plane" ]; then
+            echo "    (only needed when the WireGuard overlay is enabled — wg_ip set in hearthd.json)"
+        fi
+    fi
+}
+
+check_curl() {
+    info "Checking curl"
+    if command -v curl >/dev/null 2>&1; then
+        ok "curl found: $(curl --version 2>&1 | head -1)"
+    else
+        echo "    WARNING: curl not found. Install it — the join flow and"
+        echo "    Firecracker/asset downloads need it."
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -223,9 +275,11 @@ check_nftables() {
 info "Hearth installer — role: ${ROLE} — arch: ${ARCH}"
 
 setup_directories
+install_modules_conf
 
 case "${ROLE}" in
     control-plane)
+        check_wireguard_tools "control-plane"
         install_binary "hearthd"
         setup_hearth_user
         install_unit "hearthd"
@@ -253,6 +307,8 @@ ENVEOF
         check_kvm
         install_firecracker
         check_nftables
+        check_wireguard_tools "worker"
+        check_curl
         install_binary "hearth-agent"
         install_unit "hearth-agent"
         install_config_stub \
@@ -274,6 +330,7 @@ ENVEOF
         echo ""
         echo "Next step: fetch guest kernel + rootfs onto this worker:"
         echo "  sudo ${SCRIPT_DIR}/firecracker-assets.sh"
+        echo "Enroll with the hub: hearth-agent --join https://<hub> --join-token <token>  (token from POST /api/v1/join-tokens; ${CONF_DIR}/hearth-agent.json takes over on later boots)"
         ;;
 esac
 
