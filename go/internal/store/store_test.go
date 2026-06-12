@@ -40,6 +40,8 @@ func TestSnapshotRoundTrip(t *testing.T) {
 		ID: "sb-1", Name: "one", Namespace: "default", NodeID: strp("node-1"),
 		State: model.StateRunning, VCPUs: 2, MemMiB: 512, IP: strp("10.231.0.2"),
 		CreatedAt: 123, TenantID: "tn-aa",
+		Exposes:           []model.Expose{{Name: "odoo", GuestPort: 8069, NodePort: 20001}},
+		AllowDynamicPorts: true,
 	}, &model.Sandbox{
 		ID: "sb-2", Name: "two", Namespace: "ns", NodeID: nil,
 		State: model.StateSleeping, VCPUs: 1, MemMiB: 256, IP: nil,
@@ -78,6 +80,14 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	}
 	if sb1 == nil || sb1.TenantID != "tn-aa" || sb1.IP == nil || *sb1.IP != "10.231.0.2" || sb1.State != model.StateRunning {
 		t.Errorf("sb-1: %+v", sb1)
+	}
+	// Ingress state must survive the snapshot (a restart that drops it
+	// leaves dead routes + orphaned agent DNAT rules).
+	if sb1 != nil && (len(sb1.Exposes) != 1 || sb1.Exposes[0] != (model.Expose{Name: "odoo", GuestPort: 8069, NodePort: 20001}) || !sb1.AllowDynamicPorts) {
+		t.Errorf("sb-1 ingress: exposes=%+v dyn=%v", sb1.Exposes, sb1.AllowDynamicPorts)
+	}
+	if sb2 != nil && (len(sb2.Exposes) != 0 || sb2.AllowDynamicPorts) {
+		t.Errorf("sb-2 ingress should be empty: %+v", sb2.Exposes)
 	}
 	if sb2 == nil || sb2.TenantID != "" || sb2.IP != nil || sb2.ParentID == nil || *sb2.ParentID != "sb-1" {
 		t.Errorf("sb-2: %+v", sb2)

@@ -148,6 +148,9 @@ async fn main() {
     // adopted VMs (the nft sets don't survive an agent-host reboot).
     mgr.reconcile().await;
     mgr.refresh_isolation().await;
+    // Ingress DNAT rules don't survive a host reboot either; rebuild them
+    // from the exposes persisted in meta.json.
+    mgr.refresh_ingress().await;
 
     // Background registration + heartbeat loop.
     let node_id: NodeId = Arc::new(RwLock::new(String::new()));

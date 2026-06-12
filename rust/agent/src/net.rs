@@ -196,3 +196,68 @@ pub fn rebuild_isolation(members: &[(String, String)]) {
     run(&["nft", "add", "rule", "ip", "hearth", "forward",
           "iifname", BRIDGE_NAME, "oifname", BRIDGE_NAME, "drop"]);
 }
+
+// ---- worker-side ingress DNAT (v4 P3.2) ----
+
+/// Render the nft argv fragments for one ingress member:
+/// `(dport, dnat_target)` for `tcp dport <dport> dnat to <dnat_target>`.
+/// Ports are u16 by construction (our node-port allocator / API-validated
+/// guest_port) and the IP must parse as a real IPv4 address — a member that
+/// fails the parse never reaches an nft argv (same invariant as isolation:
+/// nothing user-controlled is ever interpolated). Pure for unit tests.
+fn ingress_rule_parts(node_port: u16, guest_ip: &str, guest_port: u16) -> Option<(String, String)> {
+    let ip: std::net::Ipv4Addr = guest_ip.parse().ok()?;
+    Some((node_port.to_string(), format!("{}:{}", ip, guest_port)))
+}
+
+/// Rebuild the ingress DNAT ruleset from the full member list. Idempotent
+/// (flush + repopulate), mirroring `rebuild_isolation`.
+///
+/// `members` is `(node_port, guest_ip, guest_port)` for every expose of every
+/// VM that currently holds an IP. node_ports come from our own 20000-range
+/// allocator and guest IPs from ipalloc — never user strings.
+pub fn rebuild_ingress(members: &[(u16, String, u16)]) {
+    run(&["nft", "add", "table", "ip", "hearth"]);
+    run(&["nft", "add", "chain", "ip", "hearth", "ingress",
+          "{ type nat hook prerouting priority -100 ; }"]);
+    run(&["nft", "flush", "chain", "ip", "hearth", "ingress"]);
+    for (node_port, guest_ip, guest_port) in members {
+        match ingress_rule_parts(*node_port, guest_ip, *guest_port) {
+            Some((dport, target)) => {
+                run(&["nft", "add", "rule", "ip", "hearth", "ingress",
+                      "tcp", "dport", &dport, "dnat", "to", &target]);
+            }
+            // Should be unreachable (IPs come from ipalloc); skipping is the
+            // safe failure mode — never feed an unparsed string to nft.
+            None => eprintln!("warn: ingress member with unparseable ip {:?} skipped", guest_ip),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ingress_rule_parts_formats_dport_and_target() {
+        let (dport, target) = ingress_rule_parts(20000, "10.231.0.5", 8069).expect("valid member");
+        assert_eq!(dport, "20000");
+        assert_eq!(target, "10.231.0.5:8069");
+    }
+
+    #[test]
+    fn test_ingress_rule_parts_port_bounds() {
+        let (dport, target) = ingress_rule_parts(29999, "10.231.0.2", 65535).expect("valid member");
+        assert_eq!(dport, "29999");
+        assert_eq!(target, "10.231.0.2:65535");
+    }
+
+    #[test]
+    fn test_ingress_rule_parts_rejects_non_ip() {
+        // Anything that is not a bare IPv4 literal must be dropped, never formatted.
+        assert!(ingress_rule_parts(20000, "10.231.0.5; drop table", 80).is_none());
+        assert!(ingress_rule_parts(20000, "evil.example.com", 80).is_none());
+        assert!(ingress_rule_parts(20000, "", 80).is_none());
+        assert!(ingress_rule_parts(20000, "fe80::1", 80).is_none());
+    }
+}

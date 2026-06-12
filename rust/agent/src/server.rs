@@ -14,7 +14,7 @@ use axum::{
 use std::sync::Arc;
 
 use crate::config::authorized;
-use crate::vm::{ExecOutcome, Manager};
+use crate::vm::{ExecOutcome, ExposeError, Manager};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -57,6 +57,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/vms/:id/wake", post(wake_vm))
         .route("/v1/vms/:id/fork", post(fork_vm))
         .route("/v1/vms/:id/exec", post(exec_vm))
+        .route("/v1/vms/:id/expose", post(expose_vm).delete(unexpose_vm))
         .route("/v1/vms/:id/pause", post(vm_pause))
         .route("/v1/vms/:id/resume", post(vm_resume))
         .route("/v1/vms/:id/stop", post(vm_stop))
@@ -257,6 +258,79 @@ async fn exec_vm(
         // (sleep/wake/etc. surface "NotFound" as a 500 error body).
         ExecOutcome::NotFound => {
             json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"NotFound\"}")
+        }
+    }
+}
+
+/// Read + parse {"guest_port": n} from a request body. Err carries the
+/// ready-made 400 response. guest_port 0 (or out of u16 range) is invalid.
+async fn parse_guest_port(req: Request) -> Result<u16, Response> {
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 1 << 20).await {
+        Ok(b) => b,
+        Err(_) => return Err(json_response(StatusCode::BAD_REQUEST, "{\"error\":\"bad request\"}")),
+    };
+    let body_str = match std::str::from_utf8(&body_bytes) {
+        Ok(s) => s,
+        Err(_) => return Err(json_response(StatusCode::BAD_REQUEST, "{\"error\":\"bad request\"}")),
+    };
+    let json: serde_json::Value = match serde_json::from_str(body_str) {
+        Ok(v) => v,
+        Err(_) => return Err(json_response(StatusCode::BAD_REQUEST, "{\"error\":\"bad json\"}")),
+    };
+    match json.get("guest_port").and_then(|v| v.as_u64()) {
+        Some(p) if (1..=65535).contains(&p) => Ok(p as u16),
+        _ => Err(json_response(StatusCode::BAD_REQUEST, "{\"error\":\"guest_port required\"}")),
+    }
+}
+
+async fn expose_vm(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    req: Request,
+) -> Response {
+    if !check_auth(&state.token, req.headers()) {
+        return json_response(StatusCode::UNAUTHORIZED, "{\"error\":\"unauthorized\"}");
+    }
+    let guest_port = match parse_guest_port(req).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    match state.mgr.expose(&id, guest_port).await {
+        Ok(node_port) => {
+            let body = format!("{{\"node_port\":{}}}", node_port);
+            json_response(StatusCode::OK, &body)
+        }
+        Err(ExposeError::NotFound) => {
+            json_response(StatusCode::NOT_FOUND, "{\"error\":\"not found\"}")
+        }
+        Err(ExposeError::NoIp) => json_response(StatusCode::CONFLICT, "{\"error\":\"no ip\"}"),
+        Err(ExposeError::Exhausted) => {
+            json_response(StatusCode::CONFLICT, "{\"error\":\"ports exhausted\"}")
+        }
+    }
+}
+
+async fn unexpose_vm(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    req: Request,
+) -> Response {
+    if !check_auth(&state.token, req.headers()) {
+        return json_response(StatusCode::UNAUTHORIZED, "{\"error\":\"unauthorized\"}");
+    }
+    let guest_port = match parse_guest_port(req).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    match state.mgr.unexpose(&id, guest_port).await {
+        // Missing entry is OK (idempotent) — only an unknown VM is 404.
+        Ok(()) => json_response(StatusCode::OK, "{\"ok\":true}"),
+        Err(ExposeError::NotFound) => {
+            json_response(StatusCode::NOT_FOUND, "{\"error\":\"not found\"}")
+        }
+        Err(e) => {
+            let msg = format!("{{\"error\":\"{:?}\"}}", e);
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, &msg)
         }
     }
 }

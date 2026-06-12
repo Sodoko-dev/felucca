@@ -2,8 +2,10 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/alpham/infra-saas/hearth/internal/model"
 	"github.com/alpham/infra-saas/hearth/internal/state"
@@ -38,7 +40,9 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   ip         TEXT,
   created_at INTEGER NOT NULL,
   parent_id  TEXT,
-  tenant_id  TEXT NOT NULL DEFAULT ''
+  tenant_id  TEXT NOT NULL DEFAULT '',
+  exposes    TEXT NOT NULL DEFAULT '',
+  allow_dynamic_ports INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sandboxes_tenant ON sandboxes(tenant_id);
 CREATE TABLE IF NOT EXISTS tenants (
@@ -113,6 +117,19 @@ func OpenSQLite(path string) (*SQLite, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	// v4 P3 migration for pre-P3 databases: CREATE TABLE IF NOT EXISTS never
+	// adds columns to an existing table. "duplicate column" is the
+	// already-migrated case; anything else is fatal (a snapshot written
+	// without these columns would silently drop ingress state).
+	for _, alter := range []string{
+		`ALTER TABLE sandboxes ADD COLUMN exposes TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sandboxes ADD COLUMN allow_dynamic_ports INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("migrate sandboxes: %w", err)
+		}
+	}
 	// The db holds key hashes and tenant data: owner-only (also covers the
 	// -wal/-shm siblings via SQLite inheriting the main file's mode).
 	if err := os.Chmod(path, 0o600); err != nil {
@@ -161,11 +178,20 @@ func (s *SQLite) SaveSnapshot(st *state.State) error {
 		}
 	}
 	for _, sb := range st.Sandboxes {
+		exposes := ""
+		if len(sb.Exposes) > 0 {
+			b, err := json.Marshal(sb.Exposes)
+			if err != nil {
+				return fmt.Errorf("marshal exposes for %s: %w", sb.ID, err)
+			}
+			exposes = string(b)
+		}
 		if _, err := tx.Exec(
-			`INSERT INTO sandboxes (id, name, namespace, node_id, state, vcpus, mem_mib, ip, created_at, parent_id, tenant_id)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+			`INSERT INTO sandboxes (id, name, namespace, node_id, state, vcpus, mem_mib, ip, created_at, parent_id, tenant_id, exposes, allow_dynamic_ports)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			sb.ID, sb.Name, sb.Namespace, nullable(sb.NodeID), string(sb.State),
 			sb.VCPUs, sb.MemMiB, nullable(sb.IP), sb.CreatedAt, nullable(sb.ParentID), sb.TenantID,
+			exposes, sb.AllowDynamicPorts,
 		); err != nil {
 			return err
 		}
@@ -222,15 +248,15 @@ func (s *SQLite) LoadInto(st *state.State) error {
 	}
 	rows.Close()
 
-	rows, err = s.db.Query(`SELECT id, name, namespace, node_id, state, vcpus, mem_mib, ip, created_at, parent_id, tenant_id FROM sandboxes`)
+	rows, err = s.db.Query(`SELECT id, name, namespace, node_id, state, vcpus, mem_mib, ip, created_at, parent_id, tenant_id, exposes, allow_dynamic_ports FROM sandboxes`)
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
 		sb := &model.Sandbox{}
 		var nodeID, ip, parentID sql.NullString
-		var stateStr string
-		if err := rows.Scan(&sb.ID, &sb.Name, &sb.Namespace, &nodeID, &stateStr, &sb.VCPUs, &sb.MemMiB, &ip, &sb.CreatedAt, &parentID, &sb.TenantID); err != nil {
+		var stateStr, exposes string
+		if err := rows.Scan(&sb.ID, &sb.Name, &sb.Namespace, &nodeID, &stateStr, &sb.VCPUs, &sb.MemMiB, &ip, &sb.CreatedAt, &parentID, &sb.TenantID, &exposes, &sb.AllowDynamicPorts); err != nil {
 			rows.Close()
 			return err
 		}
@@ -238,6 +264,12 @@ func (s *SQLite) LoadInto(st *state.State) error {
 		sb.NodeID = strPtr(nodeID)
 		sb.IP = strPtr(ip)
 		sb.ParentID = strPtr(parentID)
+		if exposes != "" {
+			if err := json.Unmarshal([]byte(exposes), &sb.Exposes); err != nil {
+				rows.Close()
+				return fmt.Errorf("unmarshal exposes for %s: %w", sb.ID, err)
+			}
+		}
 		st.Sandboxes = append(st.Sandboxes, sb)
 	}
 	rows.Close()

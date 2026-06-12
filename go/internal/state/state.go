@@ -339,6 +339,10 @@ type loadSandbox struct {
 	IP        *string `json:"ip"`
 	CreatedAt int64   `json:"created_at"`
 	ParentID  *string `json:"parent_id"`
+	// Ingress (v4 P3) — Persist writes the model wholesale; reading must not
+	// silently drop these (dead routes + orphaned DNAT rules on restart).
+	Exposes           []model.Expose `json:"exposes"`
+	AllowDynamicPorts bool           `json:"allow_dynamic_ports"`
 }
 
 // loadFile is the shape used when reading the persisted JSON.
@@ -422,6 +426,8 @@ func (s *State) Load(path string) error {
 			IP:        ls.IP,
 			CreatedAt: ls.CreatedAt,
 			ParentID:  ls.ParentID,
+			Exposes:           ls.Exposes,
+			AllowDynamicPorts: ls.AllowDynamicPorts,
 		}
 		s.Sandboxes = append(s.Sandboxes, sb)
 	}

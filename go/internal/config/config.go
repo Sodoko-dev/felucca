@@ -31,6 +31,11 @@ type Config struct {
 	// Let's Encrypt TLS on the public listener. Empty TLSDomain disables it.
 	TLSDomain   string // domain to obtain a certificate for (autocert host whitelist)
 	TLSCacheDir string // directory where autocert caches certificates
+
+	// Ingress (v4 P3): the gateway's wildcard zone, e.g. "sb.example.com".
+	// Only used to render public URLs in expose responses; empty means URLs
+	// are omitted (labels still route via the gateway's own domain config).
+	IngressDomain string
 }
 
 // Load builds a Config from the four layers (defaults < file < env < flags).
@@ -52,6 +57,8 @@ func Load(args []string) (*Config, error) {
 
 		TLSDomain:   "",
 		TLSCacheDir: "/var/lib/hearth/autocert",
+
+		IngressDomain: "",
 	}
 
 	// --- Layer 1: JSON config file (lowest above defaults) ---
@@ -115,6 +122,9 @@ func Load(args []string) (*Config, error) {
 	if v := os.Getenv("HEARTH_TLS_CACHE"); v != "" {
 		cfg.TLSCacheDir = v
 	}
+	if v := os.Getenv("HEARTH_INGRESS_DOMAIN"); v != "" {
+		cfg.IngressDomain = v
+	}
 
 	// --- Layer 3: Command-line flags (highest precedence) ---
 	fs := flag.NewFlagSet("hearthd", flag.ContinueOnError)
@@ -131,6 +141,7 @@ func Load(args []string) (*Config, error) {
 	wgKeepalive := fs.Uint("wg-keepalive", uint(cfg.WgKeepalive), "")
 	tlsDomain := fs.String("tls-domain", cfg.TLSDomain, "")
 	tlsCache := fs.String("tls-cache", cfg.TLSCacheDir, "")
+	ingressDomain := fs.String("ingress-domain", cfg.IngressDomain, "")
 	// --config is consumed above; define it here so flag parsing doesn't fail.
 	_ = fs.String("config", "", "")
 
@@ -172,6 +183,8 @@ func Load(args []string) (*Config, error) {
 			cfg.TLSDomain = *tlsDomain
 		case "tls-cache":
 			cfg.TLSCacheDir = *tlsCache
+		case "ingress-domain":
+			cfg.IngressDomain = *ingressDomain
 		}
 	})
 
@@ -204,6 +217,8 @@ type fileConfig struct {
 
 	TLSDomain   *string `json:"tls_domain"`
 	TLSCacheDir *string `json:"tls_cache_dir"`
+
+	IngressDomain *string `json:"ingress_domain"`
 }
 
 func applyFile(cfg *Config, path string) error {
@@ -254,6 +269,9 @@ func applyFile(cfg *Config, path string) error {
 	}
 	if fc.TLSCacheDir != nil {
 		cfg.TLSCacheDir = *fc.TLSCacheDir
+	}
+	if fc.IngressDomain != nil {
+		cfg.IngressDomain = *fc.IngressDomain
 	}
 	return nil
 }

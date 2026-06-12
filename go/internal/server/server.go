@@ -38,11 +38,24 @@ type Server struct {
 	wgPubKey string
 	joinMu   sync.Mutex
 	addPeer  func(pubKey, overlayIP string) error
+	// agentCall is the agent-HTTP hook for the ingress path (v4 P3) —
+	// agentclient.Request in production, swappable in tests.
+	agentCall func(host string, port uint16, method, path string, body []byte) (*agentclient.Response, error)
+	// exposeMu serializes expose/unexpose mutations end-to-end (check +
+	// agent call + row update). Without it, two racing exposes of one name
+	// leak an unaccounted agent DNAT entry on the 409 path, and two racing
+	// unexposes of names sharing a guest port can both skip the agent
+	// removal. Ordering: exposeMu OUTER, st lock INNER.
+	exposeMu sync.Mutex
 }
 
 // New creates a new Server.
 func New(cfg *config.Config, st *state.State, db store.Store) *Server {
-	return &Server{cfg: cfg, st: st, db: db, addPeer: wg.AddPeer}
+	srv := &Server{cfg: cfg, st: st, db: db, addPeer: wg.AddPeer}
+	srv.agentCall = func(host string, port uint16, method, path string, body []byte) (*agentclient.Response, error) {
+		return agentclient.Request(host, port, method, path, body, cfg.Token)
+	}
+	return srv
 }
 
 // SetWgPubKey records hearthd's WireGuard public key (returned to joining
@@ -166,7 +179,9 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request, tenant strin
 			strings.HasPrefix(path, "/api/v1/agents/"),
 			strings.HasPrefix(path, "/api/v1/tenants"),
 			strings.HasPrefix(path, "/api/v1/keys/"),
-			strings.HasPrefix(path, "/api/v1/join-tokens"):
+			strings.HasPrefix(path, "/api/v1/join-tokens"),
+			path == "/api/v1/routes",
+			strings.HasPrefix(path, "/api/v1/routes/"):
 			writeJSON(w, 404, []byte(`{"error":"not found"}`))
 			return
 		}
@@ -197,6 +212,12 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request, tenant strin
 	case path == "/api/v1/sandboxes" && method == http.MethodPost:
 		srv.createSandbox(w, r, tenant)
 
+	case path == "/api/v1/routes" && method == http.MethodGet:
+		srv.listRoutes(w)
+
+	case path == "/api/v1/routes/ensure" && method == http.MethodPost:
+		srv.ensureRoute(w, r)
+
 	default:
 		// Path-segment routes with {id}.
 		if id, ok := matchSuffix(path, "/api/v1/tenants/", "/keys"); ok && method == http.MethodPost {
@@ -210,6 +231,19 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request, tenant strin
 		if id, ok := matchSuffix(path, "/api/v1/sandboxes/", "/exec"); ok && method == http.MethodPost {
 			srv.execSandbox(w, r, id, tenant)
 			return
+		}
+		if id, ok := matchSuffix(path, "/api/v1/sandboxes/", "/expose"); ok && method == http.MethodPost {
+			srv.exposeSandbox(w, r, id, tenant)
+			return
+		}
+		// DELETE /api/v1/sandboxes/{id}/expose/{name}
+		if rest, ok := strings.CutPrefix(path, "/api/v1/sandboxes/"); ok && method == http.MethodDelete {
+			if id, name, ok2 := strings.Cut(rest, "/expose/"); ok2 &&
+				id != "" && name != "" &&
+				!strings.Contains(id, "/") && !strings.Contains(name, "/") {
+				srv.unexposeSandbox(w, id, name, tenant)
+				return
+			}
 		}
 		if id, ok := matchSuffix(path, "/api/v1/sandboxes/", "/fork"); ok && method == http.MethodPost {
 			srv.forkSandbox(w, r, id, tenant)
@@ -377,10 +411,11 @@ func (srv *Server) getSandbox(w http.ResponseWriter, id, tenant string) {
 
 func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant string) {
 	var req struct {
-		Name      string `json:"name"`
-		Namespace string `json:"namespace"`
-		VCPUs     *uint32 `json:"vcpus"`
-		MemMiB    *uint64 `json:"mem_mib"`
+		Name              string  `json:"name"`
+		Namespace         string  `json:"namespace"`
+		VCPUs             *uint32 `json:"vcpus"`
+		MemMiB            *uint64 `json:"mem_mib"`
+		AllowDynamicPorts bool    `json:"allow_dynamic_ports"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, []byte(`{"error":"bad json"}`))
@@ -426,6 +461,7 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 	agentAddr = node.Addr
 	sb := srv.st.CreateSandbox(req.Name, namespace, node.ID, vcpus, memMiB, now)
 	sb.TenantID = tenant
+	sb.AllowDynamicPorts = req.AllowDynamicPorts
 	sbID = sb.ID
 	srv.st.Unlock()
 
@@ -730,8 +766,13 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID,
 		return
 	}
 	agentAddr = node.Addr
+	// Snapshot ingress config to re-create on the child: same names/guest
+	// ports, fresh node ports (the smoke contract — a fork's services are
+	// reachable on the child's own URLs).
+	parentExposes := append([]model.Expose(nil), parent.Exposes...)
 	child := srv.st.CreateForkChild(childName, parent.Namespace, node.ID, parent.VCPUs, parent.MemMiB, parentID, now)
 	child.TenantID = parent.TenantID
+	child.AllowDynamicPorts = parent.AllowDynamicPorts
 	childID = child.ID
 	srv.st.Unlock()
 
@@ -771,6 +812,22 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID,
 	}
 	srv.st.SetSandboxState(childID, model.StateRunning)
 	srv.st.RecordFork()
+
+	// Re-expose the parent's services on the child (fresh node ports).
+	// Best-effort: a failed re-expose degrades that one URL, not the fork —
+	// the operator can retry via the expose API.
+	for _, e := range parentExposes {
+		nodePort, err := srv.agentExpose(agentAddr, childID, e.GuestPort)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "fork %s: re-expose %s: %v\n", childID, e.Name, err)
+			continue
+		}
+		srv.st.Lock()
+		if c := srv.st.FindSandbox(childID); c != nil {
+			c.Exposes = append(c.Exposes, model.Expose{Name: e.Name, GuestPort: e.GuestPort, NodePort: nodePort})
+		}
+		srv.st.Unlock()
+	}
 	if err := srv.persist(); err != nil {
 		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
 	}

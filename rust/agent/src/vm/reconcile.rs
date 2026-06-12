@@ -94,6 +94,7 @@ fn reconcile_one(data_dir: &str, dir_name: &str, alloc: Option<&mut Allocator>) 
         ip,
         vsock,
         tenant_id,
+        exposes: meta.exposes.clone(),
     })
 }
 

@@ -11,7 +11,7 @@ pub mod reconcile;
 use crate::fc;
 use crate::ipalloc::{Allocator, Cidr};
 use crate::net;
-use meta::{Meta, VmState};
+use meta::{ExposeEntry, Meta, VmState};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::path::Path;
 use std::sync::Arc;
@@ -37,6 +37,28 @@ pub struct Vm {
     pub vsock: bool,
     /// v4: optional tenant identifier for nftables isolation.
     pub tenant_id: Option<String>,
+    /// v4 P3: ingress DNAT mappings (node_port → this VM's ip:guest_port).
+    pub exposes: Vec<ExposeEntry>,
+}
+
+/// Errors from expose/unexpose; the server handler maps each to a status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExposeError {
+    /// Unknown VM id (→ 404).
+    NotFound,
+    /// VM holds no IP, nothing to DNAT to (→ 409).
+    NoIp,
+    /// Every node port in NODE_PORT_MIN..=NODE_PORT_MAX is taken (→ 409).
+    Exhausted,
+}
+
+/// Worker-side ingress node-port range (inclusive).
+const NODE_PORT_MIN: u16 = 20000;
+const NODE_PORT_MAX: u16 = 29999;
+
+/// Lowest node port not in `used` (used spans every expose of every VM).
+fn lowest_free_node_port(used: &std::collections::HashSet<u16>) -> Option<u16> {
+    (NODE_PORT_MIN..=NODE_PORT_MAX).find(|p| !used.contains(p))
 }
 
 /// Result of a guest exec attempt; the server handler maps each to a status.
@@ -66,8 +88,9 @@ pub struct Manager {
     cidr: Cidr,
     pool_target: u32,
     inner: Mutex<Inner>,
-    // Serializes nft isolation rebuilds: never held together with `inner`.
-    isolation_lock: Mutex<()>,
+    // Serializes nft ruleset rebuilds (isolation + ingress): never held
+    // together with `inner`.
+    ruleset_lock: Mutex<()>,
 }
 
 impl Manager {
@@ -82,7 +105,7 @@ impl Manager {
                 allocator: None,
                 pool: Vec::new(),
             }),
-            isolation_lock: Mutex::new(()),
+            ruleset_lock: Mutex::new(()),
         })
     }
 
@@ -117,7 +140,7 @@ impl Manager {
     /// leaves the freshest state.
     pub async fn refresh_isolation(&self) {
         if !self.net_on { return; }
-        let _guard = self.isolation_lock.lock().await;
+        let _guard = self.ruleset_lock.lock().await;
         let members: Vec<(String, String)> = {
             let g = self.inner.lock().await;
             g.vms.iter()
@@ -127,6 +150,79 @@ impl Manager {
                 .collect()
         };
         net::rebuild_isolation(&members);
+    }
+
+    /// Rebuild the ingress DNAT ruleset from the current VM list (every expose
+    /// of every VM holding an IP). Same discipline as `refresh_isolation`:
+    /// snapshot membership under the state lock, release it, then shell out to
+    /// nft under the ruleset lock so rebuilds never interleave.
+    pub async fn refresh_ingress(&self) {
+        if !self.net_on { return; }
+        let _guard = self.ruleset_lock.lock().await;
+        let members: Vec<(u16, String, u16)> = {
+            let g = self.inner.lock().await;
+            let mut out = Vec::new();
+            for v in &g.vms {
+                if let Some(ip) = &v.ip {
+                    for e in &v.exposes {
+                        out.push((e.node_port, ip.clone(), e.guest_port));
+                    }
+                }
+            }
+            out
+        };
+        net::rebuild_ingress(&members);
+    }
+
+    // ---- ingress expose (v4 P3) ----
+
+    /// Map a host node port to `id`'s ip:guest_port (TCP DNAT). Idempotent per
+    /// (vm, guest_port): an existing entry returns its node_port unchanged.
+    pub async fn expose(&self, id: &str, guest_port: u16) -> Result<u16, ExposeError> {
+        let node_port = {
+            let mut g = self.inner.lock().await;
+            // node ports are unique across ALL VMs — collect before the
+            // mutable borrow of the target record.
+            let used: std::collections::HashSet<u16> = g.vms.iter()
+                .flat_map(|v| v.exposes.iter().map(|e| e.node_port))
+                .collect();
+            let v = g.vms.iter_mut().find(|v| v.id == id).ok_or(ExposeError::NotFound)?;
+            if v.ip.is_none() { return Err(ExposeError::NoIp); }
+            if let Some(e) = v.exposes.iter().find(|e| e.guest_port == guest_port) {
+                // Idempotent: mapping already live, nothing to persist or rebuild.
+                return Ok(e.node_port);
+            }
+            let np = lowest_free_node_port(&used).ok_or(ExposeError::Exhausted)?;
+            v.exposes.push(ExposeEntry { guest_port, node_port: np });
+            np
+        };
+        // Persist + rebuild outside the state lock (write_meta re-locks).
+        // Persist is best-effort like other meta writes off the happy path:
+        // the in-memory entry and the nft rule are already authoritative.
+        if let Err(e) = self.write_meta(id).await {
+            eprintln!("warn: expose persist for {} failed: {}", id, e);
+        }
+        self.refresh_ingress().await;
+        Ok(node_port)
+    }
+
+    /// Remove the (vm, guest_port) mapping. A missing entry is OK (idempotent);
+    /// NotFound only when the VM itself is unknown.
+    pub async fn unexpose(&self, id: &str, guest_port: u16) -> Result<(), ExposeError> {
+        let changed = {
+            let mut g = self.inner.lock().await;
+            let v = g.vms.iter_mut().find(|v| v.id == id).ok_or(ExposeError::NotFound)?;
+            let before = v.exposes.len();
+            v.exposes.retain(|e| e.guest_port != guest_port);
+            v.exposes.len() != before
+        };
+        if changed {
+            if let Err(e) = self.write_meta(id).await {
+                eprintln!("warn: unexpose persist for {} failed: {}", id, e);
+            }
+            self.refresh_ingress().await;
+        }
+        Ok(())
     }
 
     pub async fn live_count(&self) -> u32 {
@@ -261,6 +357,7 @@ impl Manager {
                 ip: None,
                 vsock: false,
                 tenant_id: tenant_id.clone(),
+                exposes: Vec::new(),
             });
         }
 
@@ -676,6 +773,9 @@ impl Manager {
                 vsock: parent_vsock,
                 // Child inherits parent's tenant_id.
                 tenant_id: parent_tenant_id.clone(),
+                // Exposes are NOT inherited: the parent's node ports keep
+                // pointing at the parent; hearthd re-exposes the child.
+                exposes: Vec::new(),
             });
         }
 
@@ -1003,6 +1103,8 @@ impl Manager {
             }
         }
         self.refresh_isolation().await;
+        // The VM's exposes die with it: rebuild from the remaining members.
+        self.refresh_ingress().await;
         // Idempotent: unknown id is fine (no error).
         Ok(())
     }
@@ -1089,6 +1191,7 @@ impl Manager {
                 state: v.state.clone(),
                 vsock: v.vsock,
                 tenant_id: v.tenant_id.clone(),
+                exposes: v.exposes.clone(),
             }
         };
 
@@ -1159,4 +1262,42 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_node_port_alloc_lowest_free() {
+        let used = HashSet::new();
+        assert_eq!(lowest_free_node_port(&used), Some(20000));
+    }
+
+    #[test]
+    fn test_node_port_alloc_skips_taken_across_vms() {
+        // `used` spans every expose of every VM — holes are filled lowest-first.
+        let used: HashSet<u16> = [20000, 20001, 20003].into_iter().collect();
+        assert_eq!(lowest_free_node_port(&used), Some(20002));
+        let used: HashSet<u16> = (20000..=20999).collect();
+        assert_eq!(lowest_free_node_port(&used), Some(21000));
+    }
+
+    #[test]
+    fn test_node_port_alloc_exhaustion() {
+        let mut used: HashSet<u16> = (NODE_PORT_MIN..=NODE_PORT_MAX).collect();
+        assert_eq!(lowest_free_node_port(&used), None);
+        // Freeing any one port makes exactly that port allocatable again.
+        used.remove(&25555);
+        assert_eq!(lowest_free_node_port(&used), Some(25555));
+    }
+
+    #[test]
+    fn test_node_port_alloc_ignores_out_of_range_used() {
+        // Ports outside the range never block allocation (can't occur from our
+        // allocator, but the set is just u16s).
+        let used: HashSet<u16> = [80, 8069, 30000].into_iter().collect();
+        assert_eq!(lowest_free_node_port(&used), Some(20000));
+    }
 }

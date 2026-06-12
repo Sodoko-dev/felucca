@@ -52,6 +52,21 @@ type Sandbox struct {
 	CreatedAt int64        `json:"created_at"`
 	ParentID  *string      `json:"parent_id"`
 	TenantID  string       `json:"-"`
+	// Ingress (v4 P3). omitempty keeps the frozen pre-P3 wire shape for
+	// sandboxes that never used ingress (the conformance goldens).
+	Exposes           []Expose `json:"exposes,omitempty"`
+	AllowDynamicPorts bool     `json:"allow_dynamic_ports,omitempty"`
+}
+
+// Expose is one published service port on a sandbox (v4 P3 ingress): the
+// hostname label "<name>--<id>" routes to the owning node's NodePort, which
+// the worker DNATs to the guest's GuestPort. Names are single-label,
+// lowercase, and never contain "--" (keeps the separator unambiguous);
+// all-digit names are reserved for dynamic port-in-hostname routing.
+type Expose struct {
+	Name      string `json:"name"`
+	GuestPort uint16 `json:"guest_port"`
+	NodePort  uint16 `json:"node_port"`
 }
 
 // Node is the in-memory representation of an agent node.

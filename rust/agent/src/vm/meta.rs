@@ -6,6 +6,8 @@
 //! defaults false when absent so older meta.json files parse unchanged.
 //! `tenant_id` is the v4 addition: optional, serialized only when Some (after vsock),
 //! absent in older meta.json files → None.
+//! `exposes` is the v4 P3 addition: ingress DNAT mappings, serialized only when
+//! non-empty (after tenant_id), absent in older meta.json files → empty.
 //! Options serialize as explicit null — NO skip_serializing_if (except tenant_id).
 //! State strings: creating|running|paused|stopped|sleeping|error|pooled.
 
@@ -60,6 +62,14 @@ impl std::str::FromStr for VmState {
     }
 }
 
+/// One ingress DNAT mapping: host node_port → guest_ip:guest_port (v4 P3).
+/// Both ports come from our own allocation (never user strings into nft).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExposeEntry {
+    pub guest_port: u16,
+    pub node_port: u16,
+}
+
 /// On-disk metadata for one VM instance.
 /// Field order matches the Zig writeMeta output exactly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +92,10 @@ pub struct Meta {
     /// meta.json files → None. Serialized only when Some (after vsock).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
+    /// v4 P3: ingress DNAT mappings. Absent in older meta.json files → empty.
+    /// Serialized only when non-empty (after tenant_id).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exposes: Vec<ExposeEntry>,
 }
 
 impl Meta {
@@ -104,8 +118,16 @@ impl Meta {
             Some(t) => format!(",\"tenant_id\":{}", json_str(t)),
             None => String::new(),
         };
+        let exposes_suffix = if self.exposes.is_empty() {
+            String::new()
+        } else {
+            let elems: Vec<String> = self.exposes.iter()
+                .map(|e| format!("{{\"guest_port\":{},\"node_port\":{}}}", e.guest_port, e.node_port))
+                .collect();
+            format!(",\"exposes\":[{}]", elems.join(","))
+        };
         format!(
-            "{{\"id\":{},\"name\":{},\"dir_id\":{},\"vcpus\":{},\"mem_mib\":{},\"pid\":{},\"slot\":{},\"ip\":{},\"state\":{},\"vsock\":{}{}}}",
+            "{{\"id\":{},\"name\":{},\"dir_id\":{},\"vcpus\":{},\"mem_mib\":{},\"pid\":{},\"slot\":{},\"ip\":{},\"state\":{},\"vsock\":{}{}{}}}",
             json_str(&self.id),
             json_str(&self.name),
             json_str(&self.dir_id),
@@ -117,6 +139,7 @@ impl Meta {
             json_str(self.state.as_str()),
             self.vsock,
             tenant_suffix,
+            exposes_suffix,
         )
     }
 }
@@ -205,6 +228,7 @@ mod tests {
             state: VmState::Stopped,
             vsock: false,
             tenant_id: None,
+            exposes: vec![],
         };
         let json = meta.to_json();
         // All Option fields must appear as explicit null.
@@ -229,6 +253,7 @@ mod tests {
             state: VmState::Running,
             vsock: true,
             tenant_id: None,
+            exposes: vec![],
         };
         let json = meta.to_json();
         // Keys must appear in order: id, name, dir_id, vcpus, mem_mib, pid, slot, ip, state, vsock.
@@ -269,6 +294,7 @@ mod tests {
             state: VmState::Running,
             vsock: true,
             tenant_id: Some("acme".into()),
+            exposes: vec![],
         };
         let json = meta.to_json();
         let vsock_pos = json.find("\"vsock\"").unwrap();
@@ -324,6 +350,7 @@ mod tests {
             state: VmState::Running,
             vsock: true,
             tenant_id: None,
+            exposes: vec![],
         };
         let json = meta.to_json();
         assert!(json.contains("\"vsock\":true"), "vsock should serialize true: {}", json);
@@ -347,6 +374,7 @@ mod tests {
             state: VmState::Stopped,
             vsock: false,
             tenant_id: None,
+            exposes: vec![],
         };
         let json = meta.to_json();
         assert!(json.contains("\"vsock\":false"), "vsock:false must be explicit: {}", json);
@@ -368,6 +396,7 @@ mod tests {
             state: VmState::Running,
             vsock: false,
             tenant_id: Some("acme-corp".into()),
+            exposes: vec![],
         };
         let json = meta.to_json();
         assert!(json.contains("\"tenant_id\":\"acme-corp\""), "tenant_id must appear: {}", json);
@@ -389,6 +418,7 @@ mod tests {
             state: VmState::Running,
             vsock: false,
             tenant_id: None,
+            exposes: vec![],
         };
         let json = meta.to_json();
         assert!(!json.contains("tenant_id"), "tenant_id must not appear when None: {}", json);
@@ -417,11 +447,69 @@ mod tests {
             state: VmState::Running,
             vsock: true,
             tenant_id: Some("tenant-42".into()),
+            exposes: vec![],
         };
         let json = meta.to_json();
         let meta2: Meta = serde_json::from_str(&json).expect("round-trip");
         assert_eq!(meta2.tenant_id, Some("tenant-42".into()));
         assert_eq!(meta2.vsock, true);
         assert_eq!(meta2.state, VmState::Running);
+    }
+
+    #[test]
+    fn test_old_meta_without_exposes_parses_empty() {
+        // Pre-P3 file (no exposes key) must parse with exposes defaulting to empty.
+        let fixture = r#"{"id":"vm-v3","name":"vm-v3","dir_id":"vm-v3","vcpus":1,"mem_mib":256,"pid":null,"slot":0,"ip":"10.231.0.2","state":"running","vsock":true,"tenant_id":"acme"}"#;
+        let meta: Meta = serde_json::from_str(fixture).expect("parse pre-P3 fixture");
+        assert!(meta.exposes.is_empty(), "absent exposes must default to empty");
+    }
+
+    #[test]
+    fn test_exposes_absent_when_empty() {
+        let meta = Meta {
+            id: "vm-e".into(),
+            name: "vm-e".into(),
+            dir_id: "vm-e".into(),
+            vcpus: 1,
+            mem_mib: 256,
+            pid: None,
+            slot: None,
+            ip: None,
+            state: VmState::Running,
+            vsock: false,
+            tenant_id: None,
+            exposes: vec![],
+        };
+        let json = meta.to_json();
+        assert!(!json.contains("exposes"), "exposes must not appear when empty: {}", json);
+    }
+
+    #[test]
+    fn test_exposes_round_trip() {
+        let meta = Meta {
+            id: "vm-x".into(),
+            name: "vm-x".into(),
+            dir_id: "vm-x".into(),
+            vcpus: 1,
+            mem_mib: 256,
+            pid: Some(42),
+            slot: Some(0),
+            ip: Some("10.231.0.2".into()),
+            state: VmState::Running,
+            vsock: true,
+            tenant_id: None,
+            exposes: vec![
+                ExposeEntry { guest_port: 8069, node_port: 20000 },
+                ExposeEntry { guest_port: 443, node_port: 20001 },
+            ],
+        };
+        let json = meta.to_json();
+        // exposes serialize last, after the mandatory keys.
+        assert!(
+            json.ends_with("\"exposes\":[{\"guest_port\":8069,\"node_port\":20000},{\"guest_port\":443,\"node_port\":20001}]}"),
+            "exposes must serialize in order, last: {}", json
+        );
+        let meta2: Meta = serde_json::from_str(&json).expect("round-trip parse");
+        assert_eq!(meta2.exposes, meta.exposes);
     }
 }
