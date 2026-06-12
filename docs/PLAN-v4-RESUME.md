@@ -61,7 +61,32 @@ fresh session (after `/clear`) can continue without the in-memory task list.
   domain sb.lab.test, :8088). Deferred (ADR-0007): wildcard TLS (external
   infra, with P2.6), auto-wake + dynamic-expose GC (P5), delete-failure
   expose reconciliation (P6 reschedule sweep).
-- P4–P6: not started.
+- **P4 — DONE 2026-06-12**: templates & bigger guests. Template entity +
+  rootfs capture (`POST /api/v1/templates`, stopped-only, capture-guarded),
+  sha256-addressed pull-and-cache image distribution (per-image locks,
+  sidecar-first ordering, prefetch push), grow-only disk resize with the
+  `image_size_gb` floor feeding the `max_disk_gb` quota, per-template warm
+  pools (drain + sha-matched claims, single PUT /v1/pools channel),
+  `scripts/build-template.sh` + `deploy/templates/{docker-base,odoo-v18}.sh`.
+  Gates: conformance **266/0** (new `hearthd/20-templates`, +39), verify-v2
+  **21/0**, cargo **117/0**; docker-base built live via the public API.
+  Two kata-lab-0 vz crashes (#5, #6) during the heavier P4 suites — both
+  healed by `limactl stop -f` + `start`, zero manual staging. Key fixes
+  found live: hearthd's global 60s WriteTimeout killed >60s capture/image
+  streams AND >60s execs (per-route ResponseController deadlines — exec's
+  sized to its own timeout, it's tenant-reachable); guest /tmp is noexec
+  (provision runs via `sh`); bash `while read` drops fold's final
+  unterminated chunk (upload silently empty for small scripts) and exec's
+  `ok:true` only covers transport, never the command's exit_code; the FC
+  guest kernel has legacy xtables only (docker needs iptables-legacy +
+  nat-unprotected bridge networks — see deploy/templates/docker-base.sh);
+  snapshot-restored guests (fork children) answer host ARP only after
+  their first transmit (ping-only, self-heals; gratuitous-ARP-after-re-IP
+  in hearth-guest is the P5/P6 fix).
+  Deferred (ADR-0008): per-template tenant visibility (P5), disk-aware
+  scheduling (P6), worker image-cache GC (P5), odoo-v18 lab build (needs
+  ~12 GB guest disk + long pulls; provision script ships ready).
+- P5–P6: not started.
 
 ## P2 — remaining work
 

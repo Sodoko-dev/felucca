@@ -20,11 +20,13 @@ skip() { SKIP=$((SKIP+1)); say "  SKIP: $*"; }
 # req <base> <method> <path> [json-body] [auth: token|none|badtoken]
 # Sets: R_STATUS, R_BODY, R_CT. Fails the run if the response is chunked —
 # the fleet's minimal HTTP clients are Content-Length-only (API-V2 §6 risk).
+# REQ_MAX_TIME overrides the 30s curl budget for known-long calls (v4 P4
+# rootfs capture streams gigabytes); set it per call site, never globally.
 req() {
   local base="$1" method="$2" path="$3" body="${4:-}" auth="${5:-token}"
   local hdr bod
   hdr=$(mktemp) bod=$(mktemp)
-  local args=(-s -m 30 -X "$method" -D "$hdr" -o "$bod" -w '%{http_code}')
+  local args=(-s -m "${REQ_MAX_TIME:-30}" -X "$method" -D "$hdr" -o "$bod" -w '%{http_code}')
   case "$auth" in
     token) [ -n "${HEARTH_TOKEN:-}" ] && args+=(-H "Authorization: Bearer $HEARTH_TOKEN") ;;
     badtoken) args+=(-H "Authorization: Bearer definitely-not-the-token") ;;

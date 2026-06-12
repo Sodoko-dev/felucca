@@ -118,13 +118,45 @@ per-tenant `enabled` toggle + token-bucket `rps`). hearthd's
 `ingress_domain` config key only renders the `url` field in expose
 responses.
 
-## 4. Warm pool (agent-internal, Tier A wake)
+## 3e. Templates & bigger guests (v4 P4, hearthd + agent)
+
+Sandboxes can boot from custom rootfs images with bigger shapes (caps:
+16 vCPU, 32768 MiB, 128 GB disk). A template = a catalog row + one image file
+on hearthd (`images_dir`, default `/var/lib/hearth/images`); workers
+pull-and-cache images sha256-addressed. Design:
+[ADR-0008](adr/ADR-0008-templates-and-image-distribution.md).
+
+| Method | Path | Auth | Body | Result |
+|---|---|---|---|---|
+| POST | `/api/v1/templates` | admin | `{"name", "from_sandbox"\|"image_file", "vcpus"?, "mem_mib"?, "disk_gb"?, "pool_size"?}` | 201 template JSON (`image_sha256`, `image_size_gb` computed). `from_sandbox` captures a **stopped** sandbox's rootfs (409 running / capture in progress / image file exists); `image_file` registers a pre-provisioned image. `disk_gb` defaults to the image size and may not be below it (400). Names use the expose-label grammar; 409 duplicate. |
+| GET | `/api/v1/templates` | any key | — | 200 `{"templates":[...]}` — the catalog is tenant-visible. |
+| DELETE | `/api/v1/templates/{name}` | admin | — | 204 (captured templates delete their image file; registered ones keep the shared file); 404 unknown. |
+| GET | `/api/v1/images/{name}` | admin/node token | — | 200 image bytes (streaming; workers pull with the node token). Tenant keys 404. |
+
+Sandbox create accepts `"template": "<name>"` (image + default shape from the
+row; explicit `vcpus`/`mem_mib`/`disk_gb` override — `disk_gb` never below
+the image size, or the 2 GiB base image without a template) and grows the
+rootfs on the worker (`truncate` + `resize2fs`, grow-only). Sandbox JSON
+carries `template`/`disk_gb` (omitted when unset — pre-P4 wire shape
+unchanged); forks inherit both. Per-tenant `max_disk_gb` quota counts each
+sandbox's effective disk (declared `disk_gb`, or 2 GiB for unresized base
+sandboxes). Agent: `POST /v1/vms` gains `image`/`image_sha256`/`disk_gb`;
+`GET /v1/vms/{id}/rootfs` streams a stopped VM's rootfs (capture);
+`POST /v1/images/prefetch` warms the cache; `PUT /v1/pools` replaces the
+node's template warm-pool specs (hearthd pushes on template changes and to
+every node right after it registers — the register response stays `{"id"}`).
+
+## 4. Warm pools (agent-internal, Tier A wake; per-template since v4 P4)
 
 - Agent flag/config `pool_size` (default **0** = off). When >0 the agent keeps N **paused** generic
-  VMs (1 vCPU / 256 MiB, base rootfs) pre-booted.
-- `POST /v1/vms` with a matching shape (vcpus=1, mem_mib=256) claims a pool VM (resume + rename
-  bookkeeping) instead of cold-booting; pool refills asynchronously.
-- Non-matching shapes cold-boot as in v1. Pool size exposed as a metric (below).
+  VMs (1 vCPU / 256 MiB, base rootfs) pre-booted — the always-present default spec.
+- Templates with `pool_size > 0` add per-template specs (image+sha+shape+count),
+  delivered via `PUT /v1/pools` (see §3e). The 5s refill loop tops up AND
+  drains: pooled VMs matching no current spec (deleted templates, re-captured
+  shas) are deleted; failures back off 300s per spec.
+- `POST /v1/vms` claims a pool VM only on an exact (image, sha, vcpus, mem, disk)
+  match; anything else cold-boots. `node.pool_size` (heartbeat + metric) counts
+  ALL pooled VMs across specs.
 
 ## 5. Guest networking (tap + bridge + NAT)
 
@@ -157,6 +189,9 @@ localhost/Lima paths — local lab and remote servers differ only by config.
   `wg_key_path`, `wg_endpoint` (public `host:port` advertised to joiners), `wg_keepalive`
   (default 25), `tls_domain` (enables in-binary autocert on :443 + HTTP-01 on :80; the
   plain `port` listener stays for in-tunnel agents), `tls_cache_dir`.
+- **hearthd** template keys (v4 P4): `images_dir` (`HEARTH_IMAGES_DIR`,
+  `--images-dir`, default `/var/lib/hearth/images`) — where template images
+  live (captures land here; workers pull from `/api/v1/images/{name}`).
 - **hearth-agent** keys: `bind` (`HEARTH_AGENT_BIND`, default `0.0.0.0:9090`),
   `control_plane` (`HEARTH_CONTROL_PLANE`, e.g. `https://hearth.example.com` or `http://192.168.104.3:8080`),
   `advertise_addr` (`HEARTH_ADVERTISE_ADDR`; **if unset, auto-detect** the source IP used to reach

@@ -89,7 +89,20 @@ Users must reach the Odoo UI inside a sandbox from the internet.
 3. **Gateway component**: a small Go reverse proxy (`cmd/hearth-gw`, reusing config/auth packages) deployable anywhere (typically beside hearthd): wildcard DNS `*.sb.<domain>` → gateway; ACME DNS-01 wildcard cert; routes from hearthd's API (cached, event-refreshed). Runs over the WG overlay to reach workers — so a sandbox on a NAT'd home-lab box is still publicly reachable. **WebSocket upgrade passthrough is in the acceptance tests from day one** (Odoo longpolling/chat, Chatwoot live updates; multi-worker Odoo's 8072 is just a second expose). Sleeping sandbox → 503 wake-on-request page (later: auto-wake).
 4. Per-tenant ingress toggles + rate limits at the gateway.
 
-## Phase 4 — Templates & bigger guests (Sodoko workloads)
+## Phase 4 — Templates & bigger guests (Sodoko workloads) — ✅ DONE 2026-06-12
+
+Completed and committed. All five gates green: conformance **266/0** (new
+`hearthd/20-templates`, +39 checks incl. a capture → cross-node pull →
+boot-from-captured-image marker proof), verify-v2 **21/0**, cargo **117/0**,
+go suite green, both static binaries link; docker-base built live through
+`scripts/build-template.sh` against the systemd fleet. ADR-0008 + API-V2 §3e
+written. Notable deltas from the sketch below: capture-from-stopped-sandbox
+IS the image pipeline (no separate builder path); `disk_gb` is floored at the
+recorded image size (quota honesty); warm pools drain as well as fill, with
+sha-matched claims; warm-pool specs have exactly one delivery channel
+(PUT /v1/pools, pushed on template changes + after node register). Deferred
+(ADR-0008): per-template tenant visibility (P5), disk-aware scheduling (P6),
+worker image-cache GC (P5).
 
 1. **Template entity** (Phase 0 store): name, rootfs image ref, default vcpus/mem/disk, optional warm-pool size. Create accepts `template`.
 2. **Image pipeline**: `scripts/build-template.sh` — boot a builder VM from base, run a provision script in-guest (via exec), shut down, capture rootfs as `images/<template>.ext4`. First templates: `docker-base` (Docker+compose preinstalled — Sodoko stacks run unchanged) and `odoo-v18` (compose images pre-pulled so first boot is seconds). Distribution: hearthd holds the catalog; nodes pull-and-cache over the overlay (sha256-addressed; reuse the existing image-dir layout).

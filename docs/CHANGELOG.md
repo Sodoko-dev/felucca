@@ -317,6 +317,84 @@ kata-lab-1 DNAT → guest); sleep → wake page → wake → content recovered;
 fork child's URLs served the memory-cloned parent httpd on fresh node
 ports; deletes flushed every DNAT rule on both workers.
 
+## v4 P4 — templates & bigger guests (2026-06-12, Go+Rust)
+
+Sandboxes now boot from custom rootfs images with bigger shapes (caps
+16 vCPU / 32 GiB / 128 GB disk). A template is a catalog row + one image on
+hearthd; capture IS the build pipeline; workers pull-and-cache
+sha256-addressed. Contract: API-V2 §3e; design + deferred: ADR-0008.
+
+- **Template entity + capture**: `POST /api/v1/templates` captures a
+  stopped sandbox's rootfs (streamed agent→hearthd, hashed in flight,
+  O_EXCL'd partial as the per-image capture mutex) or registers a
+  pre-provisioned image; `disk_gb` is floored at the recorded
+  `image_size_gb` so the agent's grow-only resize can never be asked to
+  shrink — and disk quota can't be under-counted by big images. Catalog
+  is tenant-visible; mutations + raw image downloads are admin/node only.
+- **Create-by-template**: image + default shape from the row, explicit
+  overrides win; the worker pulls missing/stale images from
+  `GET /api/v1/images/{name}` (curl-on-stdin token, per-image locks,
+  verified-sidecar-before-image rename order, self-healing no-sidecar
+  cache) and grows the rootfs (`truncate` + `e2fsck -fp` + `resize2fs`).
+  Per-tenant `max_disk_gb` quota enforced at create/fork.
+- **Per-template warm pools**: `PUT /v1/pools` replaces a node's specs;
+  the refill loop tops up AND drains (deleted/re-captured templates lose
+  their pooled VMs — claims match the full shape INCLUDING sha, so a
+  re-capture can never serve a stale rootfs); prewarm failures are
+  deleted + backed off 300s. Specs are pushed on template changes and to
+  every node right after register (the register response stays the frozen
+  `{"id"}`).
+- **Pipeline**: `scripts/build-template.sh` (builder boot → base64-chunked
+  script upload → nohup+poll run, immune to the 5-min exec cap and the
+  guest's noexec /tmp → stop → capture → delete) + provision scripts
+  `deploy/templates/docker-base.sh` / `odoo-v18.sh`.
+- **Review loop** (pre-commit) caught and fixed: pools that only ever grew
+  (teardown was documented but unimplemented — and the executor's drain
+  machinery was written + unit-tested yet never wired into the loop:
+  release-build dead-code warnings exposed it); pooled VMs served stale
+  after template re-capture (sha matching); a 5s prewarm-failure loop
+  leaking an Error VM + instance dir per tick; one global download lock
+  blocking all creates behind a multi-GB pull; rename-before-sidecar
+  pinning a stale image forever after a crash; `stop` returning before FC
+  exit (capture could stream a dirty rootfs) + a capture-vs-start race
+  (drop-guarded capture registration); create requests cancelled by
+  hearthd's 30s timeout leaving records stuck in `creating`
+  (spawn-shielded); hearthd's global 60s WriteTimeout killing >60s
+  capture/image transfers mid-stream (found live — per-route
+  `ResponseController` deadlines); a store error tearing down every pool
+  (error-aware spec push); the admin token on build-template.sh's curl
+  argv (config-on-stdin); disk_gb=0 meaning "2 GiB" to Go but "image
+  size" to Rust (the image_size_gb floor closes the 6× quota bypass).
+- **Guest-environment findings** (docker-base e2e, all fixed in the
+  provision/pipeline scripts): guest `/tmp` is noexec (run scripts via
+  `sh`); the base image ships a 1-byte resolv.conf pointing nowhere
+  (rm + rewrite, never `[ -s ] ||`); the FC guest kernel has legacy
+  xtables but no nf_tables (pin `iptables-legacy`) and no `raw` table
+  (docker bridge networks need `gateway_mode_ipv4=nat-unprotected`; the
+  template pre-bakes a `hearth` network and compose project networks
+  inherit the mode via `default-network-opts`).
+- **Lab churn**: kata-lab-0 vz crashes #5–#7 mid-suite (heavier P4 I/O);
+  all healed by `limactl stop -f` + `start` with zero manual staging.
+  Post-crash orphan churn surfaced a latent quirk: snapshot-restored
+  guests (fork children) don't answer host ARP until their first
+  transmit — ping-only, self-healing, exec/vsock unaffected; gratuitous
+  ARP from hearth-guest after re-IP is the P5/P6 candidate fix.
+
+Evidence: conformance **266/0** (new `hearthd/20-templates`, +39 checks:
+validation, capture incl. running/duplicate/in-progress 409s, catalog,
+create-by-template with a marker file proving the child booted from the
+captured image after a cross-node pull, disk floors, tenant scoping, disk
+quota 429, cleanup), verify-v2 **21/0** (clean-node run; one
+crash-recovery + rerun per the runbook), cargo **117/0**, go suite green,
+both static binaries link — all on the final binaries. Live repro on the
+systemd fleet: `docker-base` built through the public API
+(`build-template.sh`: 6 GB builder, in-guest apt provision, stop→capture
+streaming past the old 60s limit), then a sandbox created from it ran
+`docker run hello-world` (image pulled from Docker Hub through guest NAT)
+and a `docker compose` busybox httpd — which was then exposed via the P3
+ingress and served through hearth-gw: the miniature Sodoko smoke
+(template → compose stack → public URL) passes end-to-end.
+
 ## Backlog (v3+, in order)
 
 branch (uffd CoW fork of running VMs) → cross-tenant nftables isolation →
