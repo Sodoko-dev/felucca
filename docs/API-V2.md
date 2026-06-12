@@ -71,6 +71,26 @@ Durable state moved from `state.json` to **SQLite (WAL)** at `--db`/`HEARTH_DB`/
 are unchanged; the conformance suite passes unmodified, plus new `hearthd/17-tenancy`
 cases pin the scoping/quota behavior.
 
+## 3c. WireGuard overlay & node join (v4 P2, hearthd + agent)
+
+Workers join a remote hearthd over a hub-and-spoke WireGuard overlay instead of
+sharing its L2 segment. Design + deferred items: [ADR-0006](adr/ADR-0006-wireguard-overlay-and-node-join.md).
+
+| Method | Path | Auth | Body | Result |
+|---|---|---|---|---|
+| POST | `/api/v1/join-tokens` | admin | `{"node_hint"?}` (≤64 chars) | 201 `{"id":"jt-…","token":"hearth_jt_…"}` — token shown **once**, sha256-only at rest, TTL 24h, single-use. Tenant keys → 404. (Minting works even with the overlay off; the token just can't be redeemed until it's on.) |
+| POST | `/api/v1/nodes/join` | the join token itself as bearer (routed before the normal bearer gate) | `{"pubkey","hostname"}` (44-char base64 pubkey) | 200 `{"overlay_ip","overlay_prefix","server_overlay_ip","server_pubkey","server_endpoint","keepalive_s"}`. Bad/used/expired token → uniform 401; overlay off → 503 (after the credential check); bad body → 400 **without** consuming the token. |
+
+Semantics: the token is consumed **last** (after the peer row is persisted and
+the kernel peer is installed), so no failure mode burns it. Re-join with the
+same pubkey keeps the allocated overlay IP (while it fits the configured
+subnet). The agent enrolls with `--join <url> --join-token <tok>`, persists the
+grant to `{data_dir}/wg.json` (0600), and on every later boot brings the tunnel
+up from the file (which takes precedence over `--join`) and registers over the
+overlay (`advertise_addr` = its overlay IP). An unreadable or corrupt `wg.json`
+is fatal — an enrolled node never silently degrades to direct mode. The https
+join goes through `curl --config -` with the token on stdin, never argv.
+
 ## 4. Warm pool (agent-internal, Tier A wake)
 
 - Agent flag/config `pool_size` (default **0** = off). When >0 the agent keeps N **paused** generic
@@ -105,16 +125,23 @@ localhost/Lima paths — local lab and remote servers differ only by config.
 - **hearthd** keys (JSON / env / flag): `bind` (`HEARTH_BIND`, default `0.0.0.0:8080`),
   `state_path` (`HEARTH_STATE`, default `/var/lib/hearth/state.json`),
   `ui_dir` (`HEARTH_UI_DIR`, default `/usr/share/hearth/ui`), `token` (`HEARTH_TOKEN`).
+- **hearthd** overlay/TLS keys (v4 P2): `wg_ip` (CIDR, e.g. `10.100.0.1/24` — setting it
+  enables the overlay; requires auth-on and `wg_endpoint`), `wg_port` (default 51820),
+  `wg_key_path`, `wg_endpoint` (public `host:port` advertised to joiners), `wg_keepalive`
+  (default 25), `tls_domain` (enables in-binary autocert on :443 + HTTP-01 on :80; the
+  plain `port` listener stays for in-tunnel agents), `tls_cache_dir`.
 - **hearth-agent** keys: `bind` (`HEARTH_AGENT_BIND`, default `0.0.0.0:9090`),
   `control_plane` (`HEARTH_CONTROL_PLANE`, e.g. `https://hearth.example.com` or `http://192.168.104.3:8080`),
   `advertise_addr` (`HEARTH_ADVERTISE_ADDR`; **if unset, auto-detect** the source IP used to reach
   the control plane), `data_dir` (`HEARTH_DATA_DIR`, default `/srv/ignis`), `token` (`HEARTH_TOKEN`),
-  `pool_size`, `net`, `net_cidr`.
+  `pool_size`, `net`, `net_cidr`, `join_url`/`join_token` (`HEARTH_JOIN_URL`/`HEARTH_JOIN_TOKEN`,
+  `--join`/`--join-token` — first-boot enrollment only; the persisted `wg.json` wins afterwards).
 - **Auth**: when `token` is set on hearthd, every `/api/*` and agent-registration request requires
   `Authorization: Bearer <token>`; agents send it on register/heartbeat; hearthd sends it on proxy
   calls to agents (agents verify when their own `token` is set). `/healthz`, `/metrics`, and static
-  UI stay open. Constant-time comparison. TLS itself is terminated by a reverse proxy
-  (caddy/nginx) in production — documented in DEPLOYMENT.md, not implemented in-binary.
+  UI stay open. Constant-time comparison. TLS: in-binary autocert when `tls_domain` is set
+  (v4 P2.3, see above); a reverse proxy (caddy/nginx) remains a valid alternative —
+  both documented in DEPLOYMENT.md.
 - Build targets: `zig build -Dtarget=aarch64-linux-musl` **and** `-Dtarget=x86_64-linux-musl`
   must both produce static binaries (production servers are typically x86_64).
 

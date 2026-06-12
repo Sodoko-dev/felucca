@@ -471,7 +471,7 @@ v4 — multi-tenant, deploy-anywhere, product-ready (in progress; plan P0–P6,
 |---|---|---|
 | P0 | Tenancy (API keys, enforced namespaces, quotas, usage metering) + SQLite store (`go/internal/store`, pure-Go driver, one-time state.json import) | **live in the lab 2026-06-12** — conformance **166/0** (new `hearthd/17-tenancy`), verify-v2 **21/0**; contract in API-V2 §3b |
 | P1 | Cross-tenant network isolation (br_netfilter + single concatenated nft pair set `tenant_pairs`, flush-and-rebuild from full membership; `tenant_id` never hits an nft command) | **live in the lab 2026-06-12** — conformance **178/0** (new `agent/11-isolation`), verify-v2 **21/0**; design in [ADR-0005](adr/ADR-0005-cross-tenant-network-isolation.md); tenant networks node-scoped until P2 |
-| P2 | WireGuard overlay, join tokens, TLS, systemd soak (mixed-fleet acceptance) | planned |
+| P2 | WireGuard hub-and-spoke overlay (hearthd = hub; one-time join tokens, sha256-at-rest, consume-last; agent `--join` + persisted `wg.json`), in-binary TLS (autocert), fleet under hardened systemd units | **overlay live in the lab 2026-06-12** — mixed fleet (one direct + one overlay worker), conformance **193/0** (new `hearthd/18-join`), verify-v2 **21/0**; design in [ADR-0006](adr/ADR-0006-wireguard-overlay-and-node-join.md); contract in API-V2 §3c; 48h systemd soak running; mixed-fleet acceptance (P2.6: external worker + live TLS) pending external infra |
 | P3 | Multi-service ingress gateway (`name--id.sb.<domain>`) | planned |
 | P4 | Templates (docker-base, odoo) + bigger guests + per-template pools | planned |
 | P5 | Streaming exec, idle/TTL policies, TS SDK, usage aggregation | planned |

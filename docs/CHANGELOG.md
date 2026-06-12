@@ -235,6 +235,47 @@ control-plane path — two tenants created via the admin API, four sandboxes
 created with tenant keys all scheduled onto one node: cross-tenant ping exit 1
 (dropped), same-tenant ping exit 0, all deletes 204.
 
+## v4 P2 — WireGuard overlay, node join, TLS, systemd fleet (2026-06-12, Go+Rust)
+
+Workers now join hearthd from anywhere: hub-and-spoke WireGuard overlay with
+hearthd as hub. Step commits `bb182f3` (hub: wg config, one-time join tokens
+sha256-at-rest TTL 24h, `/api/v1/nodes/join` with consume-LAST semantics so no
+failure burns a token), `7ac7ead` (agent `--join`: enroll once, persist
+`wg.json`, every boot brings the tunnel up and registers over the overlay),
+`fdeb995` (in-binary TLS via autocert on :443/:80 when `tls_domain` is set —
+plain listener stays for in-tunnel agents; agent https join via
+`curl --config -` so the token never hits argv), `ee54a9f` (conformance
+`hearthd/18-join` + live lab overlay), `f2eb5a1`+`80dcc08` (systemd units
+validated by running the real fleet under them). Contract: API-V2 §3c; design
++ deferred items: ADR-0006.
+
+Security handled inline (per working agreement, no separate review step):
+join tokens single-use + peeked-then-consumed-last under `joinMu`; uniform
+401s (no token-state oracle); credential-shape auth checked before overlay-off
+503 (no fingerprinting); secrets only on stdin/0600 files, never argv;
+enrolled nodes never silently degrade to direct mode (unreadable/corrupt
+`wg.json` is fatal — found live when the systemd capability sandbox, which
+drops CAP_DAC_OVERRIDE, couldn't read a wrong-owner state file).
+
+systemd migration findings, all unit-encoded now: Firecracker needs `@sandbox`
+(it installs its own seccomp(2) filters; died SIGSYS without it) and
+`/dev/net/tun`; `ReadWritePaths` entries must pre-exist (226/NAMESPACE);
+`StateDirectoryMode=0750` pinned (default re-loosens to 0755 every start);
+`modules-load.d/hearth.conf` preloads `br_netfilter`+`wireguard` because
+`ProtectKernelModules` forbids the services doing it (load-bearing for P1
+isolation). kata-lab-0 vz crash #4 self-healed via unit auto-start on VM
+restart — the old re-stage runbook is obsolete.
+
+Evidence: conformance **193/0** (15 new checks in `hearthd/18-join`: mint /
+validation ladder / admin-only / uniform 401s / 400-doesn't-burn-token),
+verify-v2 **21/0**, both against a mixed fleet running entirely under the
+hardened units — kata-lab-1 enrolled as `10.100.0.2` over the tunnel
+(sandbox create+exec through it), kata-lab-0 direct. cargo 77/0, go tests
+green, static builds intact. 48h soak started 2026-06-12 ~11:20 CEST;
+remaining for phase close: soak verdict (MDWE decision) + P2.6 mixed-fleet
+acceptance on real external infra (public host, domain, DNS-01) + release
+binaries for both arches.
+
 ## Backlog (v3+, in order)
 
 branch (uffd CoW fork of running VMs) → cross-tenant nftables isolation →
