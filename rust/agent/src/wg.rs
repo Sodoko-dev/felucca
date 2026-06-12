@@ -4,7 +4,13 @@
 //! A worker enrolls once via POST {join_url}/api/v1/nodes/join with a
 //! single-use join token, persists the granted overlay assignment to
 //! <data_dir>/wg.json, and reconfigures the tunnel from that state on every
-//! boot. Shell-out to ip/wg uses net.rs's bare-then-`sudo -n` idiom
+//! boot. Two join transports (P2.3): an `http://` join_url uses the built-in
+//! minimal client (registration::tcp_request), while an `https://` join_url
+//! shells out to `curl` ONE-SHOT for the enrollment exchange — the config
+//! (token included) is piped on stdin via `curl --config -`, never argv. The
+//! persistent control-plane channel stays plain HTTP inside the wg tunnel;
+//! TLS is only for the bootstrap call that crosses the untrusted network.
+//! Shell-out to ip/wg uses net.rs's bare-then-`sudo -n` idiom
 //! (net::run); only `wg genkey`/`wg pubkey` run unprivileged directly since
 //! they are pure computation and the private key must never touch argv.
 
@@ -169,41 +175,140 @@ fn valid_endpoint(ep: &str) -> bool {
 /// token as bearer auth and our pubkey + hostname. 200 returns the overlay
 /// assignment (validated before returning); non-200 is failure (401 invalid
 /// or used token, 503 overlay off).
+///
+/// Transport depends on the join_url scheme: http:// uses the built-in
+/// minimal client (tcp_request); https:// shells out to curl one-shot
+/// (curl_join). Both produce (status, body); parse/validate is shared.
 pub async fn join(
     join_url: &str,
     token: &str,
     pubkey: &str,
     hostname: &str,
 ) -> Result<JoinInfo, String> {
-    // The minimal client speaks plain HTTP only. Refuse an https:// URL
-    // loudly rather than silently downgrading and leaking the one-time
-    // token in cleartext (P2.3 adds the TLS join path).
-    if join_url.starts_with("https://") {
-        return Err("https join is not supported yet (P2.3): refusing to send the join token over plaintext for an https:// URL".into());
-    }
     let body = serde_json::json!({ "pubkey": pubkey, "hostname": hostname }).to_string();
-    let (host, port) = split_host_port(join_url);
-    let resp = crate::registration::tcp_request(
-        host, port, "POST", "/api/v1/nodes/join", &body, token,
-    )
-    .await
-    .map_err(|e| format!("join request failed: {}", e))?;
 
-    if resp.status != 200 {
+    let (status, resp_body, api_port) = if join_url.starts_with("https://") {
+        let (status, resp_body) = curl_join(join_url, token, &body)?;
+        // split_host_port defaults a portless URL to 8080 — wrong for TLS;
+        // derive the https port explicitly (explicit port in URL, else 443).
+        (status, resp_body, https_api_port(join_url))
+    } else if join_url.starts_with("http://") {
+        let (host, port) = split_host_port(join_url);
+        let resp = crate::registration::tcp_request(
+            host, port, "POST", "/api/v1/nodes/join", &body, token,
+        )
+        .await
+        .map_err(|e| format!("join request failed: {}", e))?;
+        (resp.status, resp.body, port)
+    } else {
+        return Err(format!(
+            "join_url must start with http:// or https://: {}",
+            join_url
+        ));
+    };
+
+    if status != 200 {
         return Err(format!(
             "join rejected: status {} body {}",
-            resp.status,
-            resp.body.trim()
+            status,
+            resp_body.trim()
         ));
     }
 
-    let mut info: JoinInfo = serde_json::from_str(&resp.body)
+    let mut info: JoinInfo = serde_json::from_str(&resp_body)
         .map_err(|e| format!("join response parse: {}", e))?;
     // Record which port the hub's API answers on — the same port we just
     // joined through — so post-reboot boots target it over the overlay.
-    info.api_port = port;
+    info.api_port = api_port;
     validate_join_info(&info)?;
     Ok(info)
+}
+
+/// hearthd API port for an https join_url: the explicit port in the URL when
+/// present, else 443 (the https default). split_host_port is NOT used here
+/// because its portless fallback is 8080.
+fn https_api_port(join_url: &str) -> u16 {
+    let mut a = join_url.strip_prefix("https://").unwrap_or(join_url);
+    if let Some(slash) = a.find('/') {
+        a = &a[..slash];
+    }
+    match a.rfind(':') {
+        // unwrap_or(443) also covers a bracketed portless IPv6 host like
+        // "[fd00::1]" whose inner colon is not a port separator.
+        Some(colon) => a[colon + 1..].parse::<u16>().unwrap_or(443),
+        None => 443,
+    }
+}
+
+/// Escape a value for a double-quoted curl config string: backslash and
+/// double quote (backslash first, or the quote escape would be re-escaped).
+fn curl_config_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Build the curl config for the one-shot https join. Passed on STDIN via
+/// `curl --config -` so the bearer token never appears on argv (argv is
+/// world-readable through /proc). write-out appends "\n<http_code>" to the
+/// output so curl_join can split status from body.
+fn build_curl_config(join_url: &str, token: &str, body: &str) -> String {
+    let url = format!("{}/api/v1/nodes/join", join_url.trim_end_matches('/'));
+    format!(
+        concat!(
+            "url = \"{}\"\n",
+            "request = \"POST\"\n",
+            "header = \"Authorization: Bearer {}\"\n",
+            "header = \"Content-Type: application/json\"\n",
+            "data = \"{}\"\n",
+            "write-out = \"\\n%{{http_code}}\"\n",
+            "max-time = 30\n",
+        ),
+        curl_config_escape(&url),
+        curl_config_escape(token),
+        curl_config_escape(body),
+    )
+}
+
+/// One-shot https enrollment via `curl -sS --config -`: config (with token)
+/// piped on stdin, stdout split into (http status, response body) using the
+/// trailing write-out line.
+fn curl_join(join_url: &str, token: &str, body: &str) -> Result<(u16, String), String> {
+    let config = build_curl_config(join_url, token, body);
+    let mut child = Command::new("curl")
+        .args(["-sS", "--config", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("curl spawn: {}", e))?;
+    // The taken stdin handle is dropped at the end of this statement,
+    // closing the pipe so curl sees EOF on its config.
+    child
+        .stdin
+        .take()
+        .ok_or("curl: no stdin")?
+        .write_all(config.as_bytes())
+        .map_err(|e| format!("curl stdin: {}", e))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("curl: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "curl join failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    // write-out guarantees the last line is the http code.
+    let Some(pos) = stdout.rfind('\n') else {
+        return Err(format!("curl join: malformed output: {}", stdout.trim()));
+    };
+    let code = stdout[pos + 1..].trim();
+    let status: u16 = code
+        .parse()
+        .map_err(|_| format!("curl join: bad http code {:?}", code))?;
+    Ok((status, stdout[..pos].to_string()))
 }
 
 // ---- interface configuration ----
@@ -510,6 +615,65 @@ mod tests {
         assert_eq!(loaded.keepalive_s, info.keepalive_s);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_curl_config_escape_quotes_and_backslashes() {
+        assert_eq!(curl_config_escape("plain"), "plain");
+        assert_eq!(curl_config_escape(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(curl_config_escape(r"a\b"), r"a\\b");
+        // Backslash-then-quote: backslash escaped first, then the quote.
+        assert_eq!(curl_config_escape(r#"a\"b"#), r#"a\\\"b"#);
+        assert_eq!(curl_config_escape(""), "");
+    }
+
+    #[test]
+    fn test_build_curl_config_shape() {
+        let body = r#"{"pubkey":"PK=","hostname":"worker-1"}"#;
+        let cfg = build_curl_config("https://hub.example.com:8443", "tok123", body);
+        assert!(cfg.contains("url = \"https://hub.example.com:8443/api/v1/nodes/join\""));
+        assert!(cfg.contains("request = \"POST\""));
+        assert!(cfg.contains("header = \"Authorization: Bearer tok123\""));
+        assert!(cfg.contains("header = \"Content-Type: application/json\""));
+        // Body quotes must be escaped inside the double-quoted config value.
+        assert!(cfg.contains(
+            r#"data = "{\"pubkey\":\"PK=\",\"hostname\":\"worker-1\"}""#
+        ));
+        assert!(cfg.contains("write-out = \"\\n%{http_code}\""));
+        assert!(cfg.contains("max-time = 30"));
+        // No unescaped raw body line, and the token never appears bare on
+        // any non-header line (it only lives in the config, not argv).
+        assert!(!cfg.contains(&format!("data = \"{}\"", body)));
+    }
+
+    #[test]
+    fn test_build_curl_config_trims_trailing_slash() {
+        let cfg = build_curl_config("https://hub/", "t", "{}");
+        assert!(cfg.contains("url = \"https://hub/api/v1/nodes/join\""));
+    }
+
+    #[test]
+    fn test_https_api_port_derivation() {
+        // Explicit port kept.
+        assert_eq!(https_api_port("https://hub.example.com:8443"), 8443);
+        assert_eq!(https_api_port("https://hub.example.com:8443/path"), 8443);
+        // No port -> 443.
+        assert_eq!(https_api_port("https://hub.example.com"), 443);
+        assert_eq!(https_api_port("https://hub.example.com/path"), 443);
+        // Bracketed IPv6 without a port: inner colons are not a port.
+        assert_eq!(https_api_port("https://[fd00::1]"), 443);
+        assert_eq!(https_api_port("https://[fd00::1]:8443"), 8443);
+    }
+
+    #[test]
+    fn test_http_api_port_defaults_8080() {
+        // The http join path uses split_host_port, whose portless default
+        // is 8080 (NOT 443 — that's https-only).
+        let (host, port) = split_host_port("http://hub.example.com");
+        assert_eq!(host, "hub.example.com");
+        assert_eq!(port, 8080);
+        let (_, port) = split_host_port("http://hub.example.com:9090");
+        assert_eq!(port, 9090);
     }
 
     #[test]

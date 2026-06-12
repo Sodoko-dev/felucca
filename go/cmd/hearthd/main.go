@@ -11,6 +11,8 @@ import (
 	"os"
 	"time"
 
+	"golang.org/x/crypto/acme/autocert"
+
 	"github.com/alpham/infra-saas/hearth/internal/config"
 	"github.com/alpham/infra-saas/hearth/internal/server"
 	"github.com/alpham/infra-saas/hearth/internal/state"
@@ -122,6 +124,47 @@ func main() {
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 	}
+
+	// Optional Let's Encrypt TLS (v4 P2.3). Empty tls_domain means plain
+	// HTTP only — exactly the pre-TLS behavior.
+	if cfg.TLSDomain != "" {
+		if err := os.MkdirAll(cfg.TLSCacheDir, 0o700); err != nil {
+			log.Fatalf("tls: could not create autocert cache dir %s: %v", cfg.TLSCacheDir, err)
+		}
+		m := &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(cfg.TLSDomain),
+			Cache:      autocert.DirCache(cfg.TLSCacheDir),
+		}
+		log.Printf("tls enabled: domain=%s autocert_cache=%s", cfg.TLSDomain, cfg.TLSCacheDir)
+
+		// :443 — public TLS endpoint, same handler/timeouts as the plain server.
+		tlsSrv := &http.Server{
+			Addr:         ":443",
+			Handler:      srv.Handler(),
+			ReadTimeout:  30 * time.Second,
+			WriteTimeout: 60 * time.Second,
+			TLSConfig:    m.TLSConfig(),
+		}
+		go func() {
+			// Cert/key paths empty: certificates come from autocert.
+			if err := tlsSrv.ListenAndServeTLS("", ""); err != nil {
+				log.Fatalf("tls listen :443: %v", err)
+			}
+		}()
+
+		// :80 — ACME HTTP-01 challenges + redirect everything else to https.
+		go func() {
+			if err := http.ListenAndServe(":80", m.HTTPHandler(nil)); err != nil {
+				log.Fatalf("tls listen :80: %v", err)
+			}
+		}()
+	}
+
+	// The plain cfg.Port listener stays up UNCONDITIONALLY, even with TLS on:
+	// overlay-joined agents speak plain HTTP to hearthd's overlay IP inside the
+	// wg tunnel (the tunnel provides the encryption). Removing this listener
+	// would cut every enrolled agent off from the control plane.
 	if err := httpSrv.ListenAndServe(); err != nil {
 		fmt.Fprintf(os.Stderr, "listen: %v\n", err)
 		os.Exit(1)

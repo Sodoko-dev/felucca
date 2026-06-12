@@ -226,6 +226,55 @@ func TestWgFile(t *testing.T) {
 	}
 }
 
+func TestTLSDefaults(t *testing.T) {
+	cfg, err := config.Load([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TLSDomain != "" {
+		t.Errorf("TLSDomain default: got %q", cfg.TLSDomain)
+	}
+	if cfg.TLSCacheDir != "/var/lib/hearth/autocert" {
+		t.Errorf("TLSCacheDir default: got %q", cfg.TLSCacheDir)
+	}
+}
+
+func TestTLSEnv(t *testing.T) {
+	t.Setenv("HEARTH_TLS_DOMAIN", "hearth.example.com")
+	t.Setenv("HEARTH_TLS_CACHE", "/tmp/env-autocert")
+
+	cfg, err := config.Load([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TLSDomain != "hearth.example.com" {
+		t.Errorf("TLSDomain from env: got %q", cfg.TLSDomain)
+	}
+	if cfg.TLSCacheDir != "/tmp/env-autocert" {
+		t.Errorf("TLSCacheDir from env: got %q", cfg.TLSCacheDir)
+	}
+}
+
+func TestTLSFlagPrecedence(t *testing.T) {
+	t.Setenv("HEARTH_TLS_DOMAIN", "env.example.com")
+	t.Setenv("HEARTH_TLS_CACHE", "/tmp/env-autocert")
+
+	cfg, err := config.Load([]string{
+		"--tls-domain", "flag.example.com",
+		"--tls-cache", "/tmp/flag-autocert",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Flags beat env.
+	if cfg.TLSDomain != "flag.example.com" {
+		t.Errorf("tls-domain flag override: got %q", cfg.TLSDomain)
+	}
+	if cfg.TLSCacheDir != "/tmp/flag-autocert" {
+		t.Errorf("tls-cache flag override: got %q", cfg.TLSCacheDir)
+	}
+}
+
 func TestAuthorized(t *testing.T) {
 	// No token configured → always open.
 	if !config.Authorized("", "") {

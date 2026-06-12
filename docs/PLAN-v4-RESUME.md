@@ -44,17 +44,44 @@ fresh session (after `/clear`) can continue without the in-memory task list.
   `Manager::refresh_isolation()` serialized by `isolation_lock`, called after
   create/fork/delete and at startup post-reconcile; fail-closed for missing/invalid
   tenants; tenant networks node-scoped until P2.
-- P2–P6: not started.
+- **P2 — IN PROGRESS.** Step commits: P2.1 hearthd overlay+join (`bb182f3`),
+  P2.2 agent --join (`7ac7ead`), P2.4 conformance+lab overlay e2e (`ee54a9f`,
+  conformance **193/0**, verify-v2 **21/0**, kata-lab-1 LIVE on the overlay as
+  10.100.0.2 — mixed fleet running), P2.3 TLS autocert + agent https-join via
+  curl-stdin (this commit; live TLS verify needs the domain).
+- P3–P6: not started.
 
-## P2 — next: WireGuard overlay, join flow, hardened deployment
+## P2 — remaining work
 
-Spec: PLAN-v4.md Phase 2. **External prerequisites (user-provided)**: public
-hearthd host, ≥1 external worker (bare-metal or nested-virt), a domain, DNS with
-ACME DNS-01 API. User was procuring these during P1 — ask for the hand-off
-(SSH access, domain, DNS API credentials) at P2 start. Code work (wg config
-block, join tokens, `POST /api/v1/nodes/join`, agent `--join`, autocert TLS,
-systemd soak fixes) proceeds on the lab regardless; the mixed-fleet acceptance
-needs the real infra.
+Spec: PLAN-v4.md Phase 2. Done: overlay join flow (both sides), lab overlay
+e2e, TLS code. Remaining:
+1. **P2.5 systemd soak (48h, lab-workable)**: run the fleet under
+   deploy/systemd units; fix MemoryDenyWriteExecute-vs-Go-GC and
+   seccomp-vs-FC-spawn; units gain wg deps; install.sh join support; release
+   binaries both arches. Long wall-clock — start it, work on other things.
+2. **P2.6 mixed-fleet acceptance — BLOCKED on user hand-off**: public hearthd
+   host SSH, ≥1 external worker, domain, DNS-01 API creds. ASK THE USER.
+   verify-v2 must pass unmodified against the real mixed fleet; live TLS
+   (autocert) verification happens here too.
+3. **Phase close-out**: ADR-0006 (overlay design; deferred items recorded in
+   step-commit messages: store-transactional IP allocation for HA, hub
+   ip_forward for spoke↔spoke (P3 gateway-not-beside-hearthd), wg package
+   client-side shape (P3), same-host hub/worker iface collision, TOFU
+   bootstrap trust note), API-V2/ARCHITECTURE/CHANGELOG updates, one summary
+   reference in CHANGELOG to the step commits, prompt user to run /compact.
+
+## Lab overlay state (live since 2026-06-12)
+
+hearthd on infra-saas-lab runs with `--wg-ip 10.100.0.1/24 --wg-endpoint
+192.168.104.3:51820 --wg-key /tmp/hearth/wg.key` (hd log: /tmp/hearth/hd.log).
+kata-lab-1's agent is enrolled (wg.json + wg.key in /srv/ignis, survives agent
+restarts but NOT a VM reboot of the /tmp binary — re-roll per runbook) and
+registers as 10.100.0.2:9090 over the tunnel. kata-lab-0 stays direct
+(192.168.104.1:9090, pool=1). wireguard-tools installed on both. Roll gotchas
+(both hit this session): pkill must live in its OWN limactl invocation; agent
+musl builds MUST use CARGO_TARGET_DIR=$HOME/.cargo-target/hearth-agent or the
+roll ships a stale binary. kata-lab-0 vz crash #3 happened mid-conformance;
+runbook recovery worked (one crash + rerun is accepted per gate).
 
 ## How to resume in a fresh session
 

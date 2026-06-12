@@ -27,6 +27,10 @@ type Config struct {
 	WgKeyPath   string // private key file path
 	WgEndpoint  string // public "host:port" workers dial for wg
 	WgKeepalive uint16 // persistent-keepalive seconds handed to joining workers
+
+	// Let's Encrypt TLS on the public listener. Empty TLSDomain disables it.
+	TLSDomain   string // domain to obtain a certificate for (autocert host whitelist)
+	TLSCacheDir string // directory where autocert caches certificates
 }
 
 // Load builds a Config from the four layers (defaults < file < env < flags).
@@ -45,6 +49,9 @@ func Load(args []string) (*Config, error) {
 		WgKeyPath:   "/var/lib/hearth/wg.key",
 		WgEndpoint:  "",
 		WgKeepalive: 25,
+
+		TLSDomain:   "",
+		TLSCacheDir: "/var/lib/hearth/autocert",
 	}
 
 	// --- Layer 1: JSON config file (lowest above defaults) ---
@@ -102,6 +109,12 @@ func Load(args []string) (*Config, error) {
 			cfg.WgKeepalive = uint16(p)
 		}
 	}
+	if v := os.Getenv("HEARTH_TLS_DOMAIN"); v != "" {
+		cfg.TLSDomain = v
+	}
+	if v := os.Getenv("HEARTH_TLS_CACHE"); v != "" {
+		cfg.TLSCacheDir = v
+	}
 
 	// --- Layer 3: Command-line flags (highest precedence) ---
 	fs := flag.NewFlagSet("hearthd", flag.ContinueOnError)
@@ -116,6 +129,8 @@ func Load(args []string) (*Config, error) {
 	wgKeyPath := fs.String("wg-key", cfg.WgKeyPath, "")
 	wgEndpoint := fs.String("wg-endpoint", cfg.WgEndpoint, "")
 	wgKeepalive := fs.Uint("wg-keepalive", uint(cfg.WgKeepalive), "")
+	tlsDomain := fs.String("tls-domain", cfg.TLSDomain, "")
+	tlsCache := fs.String("tls-cache", cfg.TLSCacheDir, "")
 	// --config is consumed above; define it here so flag parsing doesn't fail.
 	_ = fs.String("config", "", "")
 
@@ -153,6 +168,10 @@ func Load(args []string) (*Config, error) {
 			if *wgKeepalive <= 65535 {
 				cfg.WgKeepalive = uint16(*wgKeepalive)
 			}
+		case "tls-domain":
+			cfg.TLSDomain = *tlsDomain
+		case "tls-cache":
+			cfg.TLSCacheDir = *tlsCache
 		}
 	})
 
@@ -182,6 +201,9 @@ type fileConfig struct {
 	WgKeyPath   *string `json:"wg_key_path"`
 	WgEndpoint  *string `json:"wg_endpoint"`
 	WgKeepalive *int64  `json:"wg_keepalive"`
+
+	TLSDomain   *string `json:"tls_domain"`
+	TLSCacheDir *string `json:"tls_cache_dir"`
 }
 
 func applyFile(cfg *Config, path string) error {
@@ -226,6 +248,12 @@ func applyFile(cfg *Config, path string) error {
 	}
 	if fc.WgKeepalive != nil && *fc.WgKeepalive >= 0 && *fc.WgKeepalive <= 65535 {
 		cfg.WgKeepalive = uint16(*fc.WgKeepalive)
+	}
+	if fc.TLSDomain != nil {
+		cfg.TLSDomain = *fc.TLSDomain
+	}
+	if fc.TLSCacheDir != nil {
+		cfg.TLSCacheDir = *fc.TLSCacheDir
 	}
 	return nil
 }
