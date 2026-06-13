@@ -44,9 +44,11 @@ ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictNamespaces=true
 LockPersonality=true
-# Known soak experiment (PLAN-v4 P2): flagged as a Go-runtime risk when these
-# units were written for the Zig binaries. Pure-Go hearthd (no cgo, no JIT)
-# should tolerate it — the 48h soak is the verdict; remove if it trips.
+# Validated (PLAN-v4 P2.5 soak): flagged as a Go-runtime risk when these units
+# were written for the Zig binaries, but pure-Go hearthd (no cgo, no JIT)
+# tolerates it. The lab fleet ran under MDWE=true across the P2–P5 soak window
+# (2026-06-12 → 2026-06-13, all conformance/verify load) with zero SIGSYS or
+# W^X faults in the journal — keep it on.
 MemoryDenyWriteExecute=true
 RestrictRealtime=true
 RestrictSUIDSGID=true

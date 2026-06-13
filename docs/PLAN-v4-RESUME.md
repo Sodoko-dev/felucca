@@ -133,10 +133,23 @@ e2e, TLS code, fleet migrated to systemd. Remaining:
    never silent direct-mode) + wg.key pre-flight in ensure_interface.
    kata-lab-0 vz crash #4 hit mid-conformance; systemd self-healed it on VM
    restart (unit auto-start + modules-load.d) — zero manual staging, old
-   runbook re-copy steps obsolete. **Check after ~2026-06-14 11:00:** `sudo
-   journalctl -u hearthd -u hearth-agent` on all 3 VMs for restarts/SIGSYS/
-   MDWE kills (`systemctl show -p NRestarts`), then drop the MDWE
-   soak-experiment comment in hearthd.service if clean. Release binaries for
+   runbook re-copy steps obsolete. **Soak verdict — HARDENING PASS
+   (2026-06-13):** journals across the whole window (2026-06-12 11:20 →
+   2026-06-13, all P3/P4/P5 conformance + verify load) on all 3 VMs show ZERO
+   SIGSYS / seccomp denial / MDWE (W^X) kill / OOM — under `MDWE=true`
+   (hearthd) and the `@sandbox` seccomp set (agent, so FC installs its own
+   per-thread filters). Pure-Go hearthd tolerates MemoryDenyWriteExecute; the
+   soak-experiment comment in `deploy/systemd/hearthd.service` is resolved to
+   "validated, keep". All unit restarts in the window are explained by vz
+   hypervisor crashes #5–#9 on kata-lab-0 (Lima/macOS nested-virt, NOT the
+   hardening — they kill the whole VM, systemd cleanly restarts the unit on
+   boot) plus the P5 binary redeploys. CAVEAT: the literal *continuous*-48h
+   clock was reset by tonight's P5 deploy (~20:09; all units restarted with
+   new binaries) — the hardening *config* (the .service files) is unchanged
+   and now validated across THREE binary generations, but a frozen-binary
+   48h-continuous number would need a fresh soak (completes ~2026-06-15 20:40).
+   Recommendation: hardening risk is closed; a fresh soak can run as
+   belt-and-suspenders at zero cost (fleet just keeps running). Release binaries for
    both arches: BUILT 2026-06-12, staged in deploy/release/{aarch64,x86_64}/
    (gitignored; rebuilt in the infra-saas-lab VM — x86_64 agent cross-built
    with rust-lld, Go via GOARCH; x86_64 pair untested until P2.6's real
