@@ -202,6 +202,9 @@ func (srv *Server) createTemplate(w http.ResponseWriter, r *http.Request, tenant
 		PoolSize    *uint32 `json:"pool_size"`
 		FromSandbox string  `json:"from_sandbox"`
 		ImageFile   string  `json:"image_file"`
+		// Tenant scoping (v4 P5.4): "" = public catalog entry; a tenant id
+		// restricts visibility and create-by-template to that tenant.
+		Tenant string `json:"tenant"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, []byte(`{"error":"bad json"}`))
@@ -215,11 +218,23 @@ func (srv *Server) createTemplate(w http.ResponseWriter, r *http.Request, tenant
 		writeJSON(w, 400, []byte(`{"error":"exactly one of from_sandbox or image_file required"}`))
 		return
 	}
+	if req.Tenant != "" {
+		owner, err := srv.db.GetTenant(req.Tenant)
+		if err != nil {
+			writeJSON(w, 500, []byte(`{"error":"store error"}`))
+			return
+		}
+		if owner == nil {
+			writeJSON(w, 400, []byte(`{"error":"unknown tenant"}`))
+			return
+		}
+	}
 
 	t := &store.Template{
 		Name:      req.Name,
 		Vcpus:     1,
 		MemMiB:    256,
+		TenantID:  req.Tenant,
 		CreatedAt: time.Now().Unix(),
 	}
 	if req.Vcpus != nil {
@@ -308,7 +323,7 @@ func (srv *Server) createTemplate(w http.ResponseWriter, r *http.Request, tenant
 	writeJSON(w, 201, b)
 }
 
-func (srv *Server) listTemplates(w http.ResponseWriter) {
+func (srv *Server) listTemplates(w http.ResponseWriter, tenant string) {
 	ts, err := srv.db.ListTemplates()
 	if err != nil {
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
@@ -316,10 +331,17 @@ func (srv *Server) listTemplates(w http.ResponseWriter) {
 	}
 	var buf strings.Builder
 	buf.WriteString(`{"templates":[`)
-	for i, t := range ts {
-		if i > 0 {
+	first := true
+	for _, t := range ts {
+		// Tenant scoping (v4 P5.4): tenants see public entries plus their
+		// own; the admin sees everything.
+		if t.TenantID != "" && tenant != adminTenant && tenant != t.TenantID {
+			continue
+		}
+		if !first {
 			buf.WriteByte(',')
 		}
+		first = false
 		b, _ := json.Marshal(t)
 		buf.Write(b)
 	}

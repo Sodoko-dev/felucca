@@ -55,6 +55,10 @@ func (srv *Server) createTenant(w http.ResponseWriter, r *http.Request) {
 		MaxVcpus     int64  `json:"max_vcpus"`
 		MaxMemMiB    int64  `json:"max_mem_mib"`
 		MaxDiskGb    int64  `json:"max_disk_gb"`
+		// Lifecycle defaults (v4 P5.2): seconds; 0 = no policy. Unlike the
+		// per-sandbox overrides there is no -1 here — "off" IS the zero.
+		DefaultIdleSleepS    int64 `json:"default_idle_sleep_s"`
+		DefaultAsleepDeleteS int64 `json:"default_asleep_delete_s"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, []byte(`{"error":"bad json"}`))
@@ -68,15 +72,22 @@ func (srv *Server) createTenant(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, []byte(`{"error":"name too long (max 64)"}`))
 		return
 	}
+	if req.DefaultIdleSleepS < 0 || (req.DefaultIdleSleepS > 0 && !validPolicy(req.DefaultIdleSleepS, minIdleSleepS)) ||
+		req.DefaultAsleepDeleteS < 0 || (req.DefaultAsleepDeleteS > 0 && !validPolicy(req.DefaultAsleepDeleteS, minAsleepDeleteS)) {
+		writeJSON(w, 400, []byte(`{"error":"bad lifecycle default: 0 or seconds within bounds"}`))
+		return
+	}
 	now := time.Now().Unix()
 	t := &store.Tenant{
-		ID:           "tn-" + newSecret(4),
-		Name:         req.Name,
-		MaxSandboxes: req.MaxSandboxes,
-		MaxVcpus:     req.MaxVcpus,
-		MaxMemMiB:    req.MaxMemMiB,
-		MaxDiskGb:    req.MaxDiskGb,
-		CreatedAt:    now,
+		ID:                   "tn-" + newSecret(4),
+		Name:                 req.Name,
+		MaxSandboxes:         req.MaxSandboxes,
+		MaxVcpus:             req.MaxVcpus,
+		MaxMemMiB:            req.MaxMemMiB,
+		MaxDiskGb:            req.MaxDiskGb,
+		DefaultIdleSleepS:    req.DefaultIdleSleepS,
+		DefaultAsleepDeleteS: req.DefaultAsleepDeleteS,
+		CreatedAt:            now,
 	}
 	if err := srv.db.CreateTenant(t); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {

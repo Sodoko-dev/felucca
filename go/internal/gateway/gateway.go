@@ -39,8 +39,9 @@ type Route struct {
 // TenantLimit is the per-tenant ingress policy (from the gateway's own
 // config — ingress policy lives at the ingress, not in hearthd's store).
 type TenantLimit struct {
-	Enabled *bool   `json:"enabled"` // nil = enabled
-	RPS     float64 `json:"rps"`     // 0 = unlimited
+	Enabled  *bool   `json:"enabled"`   // nil = enabled
+	RPS      float64 `json:"rps"`       // 0 = unlimited
+	AutoWake *bool   `json:"auto_wake"` // nil = the gateway-wide default
 }
 
 // Config is the gateway's runtime configuration.
@@ -50,18 +51,40 @@ type Config struct {
 	Token        string // hearthd admin token (routes are admin-only)
 	Refresh      time.Duration
 	TenantLimits map[string]TenantLimit
+	// AutoWake (v4 P5.2, ADR-0007 deferral): a request for a sleeping
+	// sandbox wakes it and waits briefly instead of serving the 503 page.
+	AutoWake bool
 }
 
 // Gateway is an http.Handler proxying sandbox ingress traffic.
 type Gateway struct {
-	cfg    Config
-	client *http.Client
+	cfg        Config
+	client     *http.Client
+	wakeClient *http.Client // wake calls block on the snapshot restore
 
 	mu     sync.RWMutex
 	routes map[string]Route // hostname label -> route
 
 	lmu      sync.Mutex
 	limiters map[string]*bucket
+
+	// Sandboxes that served ingress traffic since the last activity report
+	// (v4 P5.2: hearthd's idle clock counts ingress, not just exec).
+	amu    sync.Mutex
+	active map[string]struct{}
+
+	// In-flight auto-wakes, keyed by sandbox id (v4 P5.2): a traffic burst to
+	// one sleeping sandbox must produce ONE wake + poll, not one per request.
+	wmu    sync.Mutex
+	waking map[string]*wakeCall
+}
+
+// wakeCall is a single shared auto-wake operation; concurrent requests for the
+// same sleeping sandbox wait on it instead of each firing their own.
+type wakeCall struct {
+	done  chan struct{}
+	route Route
+	ok    bool
 }
 
 func New(cfg Config) *Gateway {
@@ -69,14 +92,18 @@ func New(cfg Config) *Gateway {
 		cfg.Refresh = 5 * time.Second
 	}
 	return &Gateway{
-		cfg:      cfg,
-		client:   &http.Client{Timeout: 10 * time.Second},
-		routes:   map[string]Route{},
-		limiters: map[string]*bucket{},
+		cfg:        cfg,
+		client:     &http.Client{Timeout: 10 * time.Second},
+		wakeClient: &http.Client{Timeout: 30 * time.Second},
+		routes:     map[string]Route{},
+		limiters:   map[string]*bucket{},
+		active:     map[string]struct{}{},
+		waking:     map[string]*wakeCall{},
 	}
 }
 
-// Run blocks, refreshing the route table until stop is closed.
+// Run blocks, refreshing the route table (and flushing the ingress-activity
+// batch) until stop is closed.
 func (g *Gateway) Run(stop <-chan struct{}) {
 	t := time.NewTicker(g.cfg.Refresh)
 	defer t.Stop()
@@ -84,11 +111,127 @@ func (g *Gateway) Run(stop <-chan struct{}) {
 	for {
 		select {
 		case <-t.C:
+			g.reportActivity()
 			g.refresh()
 		case <-stop:
 			return
 		}
 	}
+}
+
+// reportActivity flushes the batched "served traffic" sandbox ids to
+// hearthd. On failure the batch is re-queued — a hearthd blip must not make
+// an active sandbox look idle.
+func (g *Gateway) reportActivity() {
+	g.amu.Lock()
+	if len(g.active) == 0 {
+		g.amu.Unlock()
+		return
+	}
+	ids := make([]string, 0, len(g.active))
+	for id := range g.active {
+		ids = append(ids, id)
+	}
+	g.active = map[string]struct{}{}
+	g.amu.Unlock()
+
+	payload, _ := json.Marshal(struct {
+		SandboxIDs []string `json:"sandbox_ids"`
+	}{ids})
+	req, err := http.NewRequest(http.MethodPost, g.cfg.HearthdURL+"/api/v1/routes/activity", strings.NewReader(string(payload)))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+g.cfg.Token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := g.client.Do(req)
+	if err != nil || resp.StatusCode >= 300 {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gw: activity report: %v\n", err)
+		} else {
+			resp.Body.Close()
+			fmt.Fprintf(os.Stderr, "gw: activity report: status %d\n", resp.StatusCode)
+		}
+		g.amu.Lock()
+		for _, id := range ids {
+			g.active[id] = struct{}{}
+		}
+		g.amu.Unlock()
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	resp.Body.Close()
+}
+
+// markActive records that a sandbox served (or is about to serve) traffic.
+func (g *Gateway) markActive(sandboxID string) {
+	g.amu.Lock()
+	g.active[sandboxID] = struct{}{}
+	g.amu.Unlock()
+}
+
+// autoWakeAllowed resolves the per-tenant toggle over the gateway default.
+func (g *Gateway) autoWakeAllowed(tenantID string) bool {
+	if lim, ok := g.cfg.TenantLimits[tenantID]; ok && lim.AutoWake != nil {
+		return *lim.AutoWake
+	}
+	return g.cfg.AutoWake
+}
+
+// wakeAndWait coalesces concurrent requests for the same sleeping sandbox: the
+// first caller runs the wake+poll, the rest wait on its shared result. Without
+// this, a burst to one popular sleeping sandbox would fire one wake POST and
+// 15 full route-table fetches PER request.
+func (g *Gateway) wakeAndWait(label, sandboxID string) (Route, bool) {
+	g.wmu.Lock()
+	if call, ok := g.waking[sandboxID]; ok {
+		g.wmu.Unlock()
+		<-call.done
+		return call.route, call.ok
+	}
+	call := &wakeCall{done: make(chan struct{})}
+	g.waking[sandboxID] = call
+	g.wmu.Unlock()
+
+	call.route, call.ok = g.doWake(label, sandboxID)
+	close(call.done)
+
+	g.wmu.Lock()
+	delete(g.waking, sandboxID)
+	g.wmu.Unlock()
+	return call.route, call.ok
+}
+
+// doWake asks hearthd to wake the sandbox, then polls the route table (≤15s)
+// until the label shows running. Even a failed wake call is followed by the
+// poll: a concurrent process may have won the race and woken it.
+func (g *Gateway) doWake(label, sandboxID string) (Route, bool) {
+	req, err := http.NewRequest(http.MethodPost, g.cfg.HearthdURL+"/api/v1/sandboxes/"+sandboxID+"/wake", nil)
+	if err != nil {
+		return Route{}, false
+	}
+	req.Header.Set("Authorization", "Bearer "+g.cfg.Token)
+	if resp, err := g.wakeClient.Do(req); err == nil {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+	}
+	for i := 0; i < 15; i++ {
+		routes, err := g.fetchRoutes()
+		if err == nil {
+			m := make(map[string]Route, len(routes))
+			for _, r := range routes {
+				m[r.Hostname] = r
+			}
+			g.mu.Lock()
+			g.routes = m
+			g.mu.Unlock()
+			if r, ok := m[label]; ok && r.State == "running" && r.NodeHost != "" {
+				return r, true
+			}
+		}
+		time.Sleep(time.Second)
+	}
+	return Route{}, false
 }
 
 // refresh swaps in the latest route table; on error the old table stays (a
@@ -274,6 +417,15 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Auto-wake (v4 P5.2): wake-on-request replaces the 503 page when
+	// allowed; on success the refreshed route proxies below. Failure falls
+	// through to the page exactly as before.
+	if route.State == "sleeping" && g.autoWakeAllowed(route.TenantID) {
+		if woken, ok := g.wakeAndWait(label, route.SandboxID); ok {
+			route = woken
+		}
+	}
+
 	switch route.State {
 	case "running":
 		// proxy below
@@ -287,6 +439,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 503, "sandbox is "+route.State)
 		return
 	}
+
+	// The proxied request is activity for hearthd's idle clock; batched and
+	// reported on the refresh tick.
+	g.markActive(route.SandboxID)
 
 	target := &url.URL{Scheme: "http", Host: fmt.Sprintf("%s:%d", route.NodeHost, route.NodePort)}
 	proxy := &httputil.ReverseProxy{

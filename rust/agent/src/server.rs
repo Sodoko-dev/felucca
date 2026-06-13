@@ -14,7 +14,10 @@ use axum::{
 use std::sync::Arc;
 
 use crate::config::authorized;
-use crate::vm::{image, CreateSpec, ExecOutcome, ExposeError, Manager, PoolSpec, RootfsError, DEFAULT_IMAGE};
+use crate::vm::{
+    image, CreateSpec, ExecOutcome, ExecStreamOutcome, ExposeError, Manager, PoolSpec,
+    RootfsError, DEFAULT_IMAGE,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -284,6 +287,47 @@ async fn exec_vm(
         .and_then(|v| v.as_u64())
         .unwrap_or(30_000)
         .min(300_000);
+
+    // v5 P5.1: "stream": true switches the response to chunked NDJSON — the
+    // guest's frames forwarded verbatim. Setup failures keep the buffered
+    // path's status mapping.
+    if json.get("stream").and_then(|v| v.as_bool()) == Some(true) {
+        return match state.mgr.exec_stream(&id, &cmd, timeout_ms).await {
+            ExecStreamOutcome::Ok(guest) => {
+                // Bound the data phase: the guest kills the command at
+                // timeout_ms and writes its done frame; +60s covers transfer
+                // and scheduling. On expiry the body just ends — the absent
+                // done frame is the consumer's error signal.
+                let deadline = std::time::Duration::from_millis(timeout_ms + 60_000);
+                let stream = DeadlineStream {
+                    inner: tokio_util::io::ReaderStream::new(guest),
+                    sleep: Box::pin(tokio::time::sleep(deadline)),
+                };
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/x-ndjson")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }
+            ExecStreamOutcome::NotRunning => {
+                json_response(StatusCode::CONFLICT, "{\"error\":\"not running\"}")
+            }
+            ExecStreamOutcome::Unavailable => json_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "{\"error\":\"guest agent unavailable\"}",
+            ),
+            ExecStreamOutcome::Failed(reason) => {
+                eprintln!("warn: exec stream on {} failed (guest unreachable): {}", id, reason);
+                json_response(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "{\"error\":\"guest agent unavailable\"}",
+                )
+            }
+            ExecStreamOutcome::NotFound => {
+                json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"NotFound\"}")
+            }
+        };
+    }
 
     match state.mgr.exec(&id, &cmd, timeout_ms).await {
         ExecOutcome::Ok(v) => json_response(StatusCode::OK, &v.to_string()),
@@ -557,6 +601,29 @@ impl Drop for CaptureStream {
         let mgr = Arc::clone(&self.mgr);
         let id = std::mem::take(&mut self.id);
         tokio::spawn(async move { mgr.end_capture(&id).await });
+    }
+}
+
+/// ReaderStream wrapper with an absolute deadline (v5 P5.1 streamed exec):
+/// when the timer fires the stream ends, closing the guest connection —
+/// the guest sees the hangup and SIGKILLs the command group. Consumers detect
+/// the cut by the missing `done` frame.
+struct DeadlineStream {
+    inner: tokio_util::io::ReaderStream<tokio::net::UnixStream>,
+    sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+impl futures_core::Stream for DeadlineStream {
+    type Item = std::io::Result<bytes::Bytes>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::future::Future;
+        if self.sleep.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(None);
+        }
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
     }
 }
 

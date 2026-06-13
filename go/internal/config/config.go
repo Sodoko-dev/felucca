@@ -41,6 +41,10 @@ type Config struct {
 	// (<name>.ext4 + captured uploads). Workers pull from
 	// GET /api/v1/images/{name} and cache locally.
 	ImagesDir string
+
+	// Usage-event retention in days (v4 P5.3): events older than this are
+	// pruned hourly by the lifecycle loop. 0 keeps everything forever.
+	UsageRetentionDays int64
 }
 
 // Load builds a Config from the four layers (defaults < file < env < flags).
@@ -66,6 +70,8 @@ func Load(args []string) (*Config, error) {
 		IngressDomain: "",
 
 		ImagesDir: "/var/lib/hearth/images",
+
+		UsageRetentionDays: 90,
 	}
 
 	// --- Layer 1: JSON config file (lowest above defaults) ---
@@ -135,6 +141,11 @@ func Load(args []string) (*Config, error) {
 	if v := os.Getenv("HEARTH_IMAGES_DIR"); v != "" {
 		cfg.ImagesDir = v
 	}
+	if v := os.Getenv("HEARTH_USAGE_RETENTION_DAYS"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			cfg.UsageRetentionDays = n
+		}
+	}
 
 	// --- Layer 3: Command-line flags (highest precedence) ---
 	fs := flag.NewFlagSet("hearthd", flag.ContinueOnError)
@@ -153,6 +164,7 @@ func Load(args []string) (*Config, error) {
 	tlsCache := fs.String("tls-cache", cfg.TLSCacheDir, "")
 	ingressDomain := fs.String("ingress-domain", cfg.IngressDomain, "")
 	imagesDir := fs.String("images-dir", cfg.ImagesDir, "")
+	usageRetention := fs.Int64("usage-retention-days", cfg.UsageRetentionDays, "")
 	// --config is consumed above; define it here so flag parsing doesn't fail.
 	_ = fs.String("config", "", "")
 
@@ -198,6 +210,10 @@ func Load(args []string) (*Config, error) {
 			cfg.IngressDomain = *ingressDomain
 		case "images-dir":
 			cfg.ImagesDir = *imagesDir
+		case "usage-retention-days":
+			if *usageRetention >= 0 {
+				cfg.UsageRetentionDays = *usageRetention
+			}
 		}
 	})
 
@@ -234,6 +250,8 @@ type fileConfig struct {
 	IngressDomain *string `json:"ingress_domain"`
 
 	ImagesDir *string `json:"images_dir"`
+
+	UsageRetentionDays *int64 `json:"usage_retention_days"`
 }
 
 func applyFile(cfg *Config, path string) error {
@@ -290,6 +308,9 @@ func applyFile(cfg *Config, path string) error {
 	}
 	if fc.ImagesDir != nil {
 		cfg.ImagesDir = *fc.ImagesDir
+	}
+	if fc.UsageRetentionDays != nil && *fc.UsageRetentionDays >= 0 {
+		cfg.UsageRetentionDays = *fc.UsageRetentionDays
 	}
 	return nil
 }

@@ -86,7 +86,34 @@ fresh session (after `/clear`) can continue without the in-memory task list.
   Deferred (ADR-0008): per-template tenant visibility (P5), disk-aware
   scheduling (P6), worker image-cache GC (P5), odoo-v18 lab build (needs
   ~12 GB guest disk + long pulls; provision script ships ready).
-- P5–P6: not started.
+- **P5 — DONE 2026-06-13**, committed `4c09f4e`: streaming exec, lifecycle
+  policies, usage aggregation, TS SDK. Streamed exec is NDJSON in the guest →
+  chunked `application/x-ndjson` at the agent → SSE (`?stream=1`) at hearthd
+  (buffered exec byte-frozen; 16 MiB/stream cap; per-stream UTF-8 carry across
+  chunk boundaries). Per-tenant + per-sandbox idle auto-sleep / asleep-TTL
+  auto-delete via a 15s hearthd sweep; activity from create/fork(parent+child)/
+  wake/exec/gateway-ingress; gateway auto-wake (singleflighted) + dynamic-expose
+  GC. `GET /tenants/{id}/usage` folds usage_events (exec events appended per
+  exec; retention prunes ONLY exec rows — transitions are the interval
+  skeleton). Per-template tenant visibility, worker image-cache GC,
+  gratuitous-ARP fork fix, zero-dep `sdk/ts` + `scripts/hearth-verify.sh`.
+  Gates: cargo **41/0 guest + 121/0 agent**, go vet/test green (17 new server
+  tests), static hearthd+hearth-gw link; fleet rolled; conformance **326/0**
+  (new `21-stream-exec`, `22-lifecycle`, `23-template-visibility`), verify-v2
+  **21/0**; ADR-0009 + API-V2 §3f + ARCHITECTURE + CHANGELOG. Review-loop
+  catches fixed before commit: per-stream UTF-8 boundary corruption; a
+  tenant-inventory leak on the unauthenticated `/metrics` (gauges removed);
+  retention pruning interval-anchor events; a per-exec DB write under the
+  global state lock; an un-singleflighted auto-wake storm. Two conformance
+  failures surfaced were both NEW test cases (SSE-is-chunked harness
+  assumption; `image_file` pointing at a worker-only image) — fixed in the
+  harness/test, no production code weakened. kata-lab-0 vz crashed #8–#9 under
+  the heavier P5 capture/VM churn (3 capture/lifecycle cases) — healed by
+  `limactl stop -f` + `start`; every crash-run failure was `000`/empty-body,
+  the recovered re-run a clean 326/0. Deferred (ADR-0009): exec stdin/PTY,
+  `hearth` CLI binary, authenticated per-tenant metrics, per-sandbox policy
+  PATCH, SDK npm publish.
+- P6: not started.
 
 ## P2 — remaining work
 

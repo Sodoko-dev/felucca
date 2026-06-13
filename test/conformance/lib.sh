@@ -36,7 +36,12 @@ req() {
   R_STATUS=$(curl "${args[@]}" "$base$path")
   R_BODY=$(cat "$bod")
   R_CT=$(grep -i '^content-type:' "$hdr" | head -1 | tr -d '\r' | cut -d' ' -f2-)
-  if grep -qi '^transfer-encoding:' "$hdr"; then
+  # Chunked Transfer-Encoding is banned (the fleet's minimal HTTP clients are
+  # Content-Length-only) EXCEPT for SSE streams (text/event-stream), which are
+  # inherently unframed and consumed only by streaming-aware clients — the
+  # streamed-exec endpoint (v4 P5.1), never the minimal internal clients.
+  if grep -qi '^transfer-encoding:' "$hdr" && \
+     ! printf '%s' "$R_CT" | grep -qi 'text/event-stream'; then
     bad "$method $path: response uses Transfer-Encoding (must be Content-Length framed)"
   fi
   rm -f "$hdr" "$bod"
@@ -60,7 +65,12 @@ req_as() {
   R_STATUS=$(curl "${args[@]}" "$base$path")
   R_BODY=$(cat "$bod")
   R_CT=$(grep -i '^content-type:' "$hdr" | head -1 | tr -d '\r' | cut -d' ' -f2-)
-  if grep -qi '^transfer-encoding:' "$hdr"; then
+  # Chunked Transfer-Encoding is banned (the fleet's minimal HTTP clients are
+  # Content-Length-only) EXCEPT for SSE streams (text/event-stream), which are
+  # inherently unframed and consumed only by streaming-aware clients — the
+  # streamed-exec endpoint (v4 P5.1), never the minimal internal clients.
+  if grep -qi '^transfer-encoding:' "$hdr" && \
+     ! printf '%s' "$R_CT" | grep -qi 'text/event-stream'; then
     bad "$method $path: response uses Transfer-Encoding (must be Content-Length framed)"
   fi
   rm -f "$hdr" "$bod"

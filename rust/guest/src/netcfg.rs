@@ -10,6 +10,14 @@ const IP_BIN: &str = "/sbin/ip";
 /// error string describing the failure.
 pub trait IpRunner {
     fn run(&self, args: &[&str]) -> Result<(), String>;
+
+    /// Best-effort presence announcement after a successful re-IP. Snapshot-
+    /// restored guests answer host-side ARP only after their first transmit;
+    /// sending any packet toward the gateway forces that transmit (the kernel
+    /// ARPs for the gateway, broadcasting our MAC) so the host's ARP/FDB
+    /// entries are live before the first organic packet. Default: no-op
+    /// (tests); the production runner sends a throwaway UDP datagram.
+    fn announce(&self, _gw: &str) {}
 }
 
 /// Production runner: shells out to `/sbin/ip`.
@@ -31,6 +39,14 @@ impl IpRunner for RealIpRunner {
                 args.join(" "),
                 stderr.trim()
             ))
+        }
+    }
+
+    fn announce(&self, gw: &str) {
+        // One datagram to the discard port; no reply expected, errors ignored.
+        // The transmit (and the ARP resolution it triggers) is the payload.
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            let _ = sock.send_to(&[0u8], (gw, 9));
         }
     }
 }
@@ -99,11 +115,16 @@ pub mod tests {
     #[derive(Default)]
     pub struct FakeIpRunner {
         recorded: Mutex<Vec<Vec<String>>>,
+        announced: Mutex<Vec<String>>,
     }
 
     impl FakeIpRunner {
         pub fn calls(&self) -> Vec<Vec<String>> {
             self.recorded.lock().unwrap().clone()
+        }
+
+        pub fn announced(&self) -> Vec<String> {
+            self.announced.lock().unwrap().clone()
         }
     }
 
@@ -114,6 +135,10 @@ pub mod tests {
                 .unwrap()
                 .push(args.iter().map(|s| s.to_string()).collect());
             Ok(())
+        }
+
+        fn announce(&self, gw: &str) {
+            self.announced.lock().unwrap().push(gw.to_string());
         }
     }
 

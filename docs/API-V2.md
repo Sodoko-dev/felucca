@@ -146,6 +146,65 @@ sandboxes). Agent: `POST /v1/vms` gains `image`/`image_sha256`/`disk_gb`;
 node's template warm-pool specs (hearthd pushes on template changes and to
 every node right after it registers — the register response stays `{"id"}`).
 
+## 3f. Streaming exec, lifecycle policies, usage (v4 P5)
+
+Design: [ADR-0009](adr/ADR-0009-streaming-lifecycle-usage.md).
+
+**Streaming exec** — `POST /api/v1/sandboxes/{id}/exec?stream=1` (same body
+as buffered exec) returns `text/event-stream`; each `data:` payload is one
+JSON frame: zero or more `{"stream":"stdout"|"stderr","data":"…"}` chunks in
+arrival order, then exactly one terminal
+`{"done":true,"ok":true,"exit_code":N,"truncated":bool}` (or
+`{"done":true,"ok":false,"error":"…"}`; a relay cut mid-stream is closed
+with `"stream interrupted"`). Pre-stream failures keep the buffered status
+mapping (404/409/501/502 plain JSON). Stream mode caps each output stream at
+16 MiB (buffered stays 1 MiB); guest timeouts surface as `exit_code` 124.
+Agent: `POST /v1/vms/{id}/exec` with `"stream":true` → chunked
+`application/x-ndjson`, one frame per line. Guest vsock: the exec request
+gains `"stream":true` and the response becomes those frames as JSON lines.
+
+**Lifecycle policies** — tenants gain `default_idle_sleep_s` /
+`default_asleep_delete_s` (create-time, seconds, 0 = off); sandbox create
+(and fork, inherited) accepts `idle_sleep_s` / `asleep_delete_s`
+(0 = inherit tenant default, -1 = disabled, else bounded `[5|30, 31536000]`,
+400 outside). A 15s hearthd sweep auto-sleeps running sandboxes idle past
+the effective policy (no exec, no ingress, no wake since) and auto-deletes
+sleeping ones past their TTL (events recorded as ordinary `slept`/`deleted`).
+Auto-sleep also drops the sandbox's **dynamic** (all-digit-named) exposes;
+named exposes and manual sleeps are untouched. The activity clock counts:
+create, fork, wake, both exec arms, and gateway traffic
+(`POST /api/v1/routes/activity {"sandbox_ids":[…]}`, admin/gateway-only,
+batched by hearth-gw every refresh tick).
+
+**Auto-wake (hearth-gw)** — a request for a sleeping sandbox wakes it and
+waits ≤15s for the route to go running before falling back to the 503 page.
+Default on; `--auto-wake=false` / `HEARTH_GW_AUTO_WAKE=0` gateway-wide,
+`"auto_wake": false` per tenant in the tenant-limits file.
+
+**Usage** — `GET /api/v1/tenants/{id}/usage?from=<unix>&to=<unix>` (defaults
+`to`=now, `from`=to−30d; admin for any tenant, a tenant key for its own id
+only) folds `usage_events` into
+`{"tenant_id","from","to","sandbox_hours","vcpu_hours","mem_gib_hours",
+"disk_gb_hours","execs","events"}` — intervals open on
+created/started/resumed/woken/forked, close on paused/slept/stopped/deleted,
+clipped to the window and to now; `disk_gb` 0 counts as the 2 GiB base
+image. Every exec attempt appends an `"exec"` event. Retention: hearthd
+hourly prunes **`exec`** events older than `usage_retention_days`
+(config/`HEARTH_USAGE_RETENTION_DAYS`/`--usage-retention-days`, default 90,
+0 = keep forever) — lifecycle transition events are kept (they are the
+interval skeleton the aggregation replays, and are low-volume).
+
+**Template tenant scoping (P5.4)** — `POST /api/v1/templates` accepts
+`"tenant": "<tenant-id>"` (400 unknown): the row carries `tenant_id`, the
+catalog GET filters to public + own entries for tenant keys, and a foreign
+tenant's create-by-template gets the same `400 unknown template` as a
+missing one. Admin sees and uses everything.
+
+**SDK & verify** — `sdk/ts/` ships `@hearth/sdk` (zero-dep typed client:
+create/exec/execStream/sleep/wake/fork/expose/templates/tenantUsage);
+`scripts/hearth-verify.sh <endpoint> [token]` runs this conformance suite
+against any deployment.
+
 ## 4. Warm pools (agent-internal, Tier A wake; per-template since v4 P4)
 
 - Agent flag/config `pool_size` (default **0** = off). When >0 the agent keeps N **paused** generic
@@ -217,6 +276,12 @@ hearth_forks_total         counter
 hearth_pool_size{node=...} gauge   (agent-side, aggregated by hearthd)
 hearth_sandboxes_total{state="sleeping"} added to the existing state gauge set
 ```
+
+Per-tenant gauges are deliberately **not** emitted here: `/metrics` is
+unauthenticated, so tenant-labeled series would leak the tenant inventory and
+per-tenant footprint. Per-tenant usage is served by the authenticated
+`GET /api/v1/tenants/{id}/usage` endpoint (§3f); an authenticated metrics
+surface is a P6 item.
 
 ## 8. UI requirements
 

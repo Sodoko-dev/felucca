@@ -44,7 +44,11 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   exposes    TEXT NOT NULL DEFAULT '',
   allow_dynamic_ports INTEGER NOT NULL DEFAULT 0,
   template   TEXT NOT NULL DEFAULT '',
-  disk_gb    INTEGER NOT NULL DEFAULT 0
+  disk_gb    INTEGER NOT NULL DEFAULT 0,
+  idle_sleep_s    INTEGER NOT NULL DEFAULT 0,
+  asleep_delete_s INTEGER NOT NULL DEFAULT 0,
+  last_activity   INTEGER NOT NULL DEFAULT 0,
+  slept_at        INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sandboxes_tenant ON sandboxes(tenant_id);
 CREATE TABLE IF NOT EXISTS tenants (
@@ -54,6 +58,8 @@ CREATE TABLE IF NOT EXISTS tenants (
   max_vcpus     INTEGER NOT NULL DEFAULT 0,
   max_mem_mib   INTEGER NOT NULL DEFAULT 0,
   max_disk_gb   INTEGER NOT NULL DEFAULT 0,
+  default_idle_sleep_s    INTEGER NOT NULL DEFAULT 0,
+  default_asleep_delete_s INTEGER NOT NULL DEFAULT 0,
   created_at    INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -86,6 +92,7 @@ CREATE TABLE IF NOT EXISTS templates (
   disk_gb       INTEGER NOT NULL,
   image_size_gb INTEGER NOT NULL DEFAULT 0,
   pool_size     INTEGER NOT NULL,
+  tenant_id     TEXT NOT NULL DEFAULT '',
   created_at    INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS join_tokens (
@@ -144,6 +151,14 @@ func OpenSQLite(path string) (*SQLite, error) {
 		`ALTER TABLE sandboxes ADD COLUMN template TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sandboxes ADD COLUMN disk_gb INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_events ADD COLUMN disk_gb INTEGER NOT NULL DEFAULT 0`,
+		// v4 P5 (lifecycle policies + template visibility).
+		`ALTER TABLE sandboxes ADD COLUMN idle_sleep_s INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sandboxes ADD COLUMN asleep_delete_s INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sandboxes ADD COLUMN last_activity INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sandboxes ADD COLUMN slept_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE tenants ADD COLUMN default_idle_sleep_s INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE tenants ADD COLUMN default_asleep_delete_s INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE templates ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -207,11 +222,12 @@ func (s *SQLite) SaveSnapshot(st *state.State) error {
 			exposes = string(b)
 		}
 		if _, err := tx.Exec(
-			`INSERT INTO sandboxes (id, name, namespace, node_id, state, vcpus, mem_mib, ip, created_at, parent_id, tenant_id, exposes, allow_dynamic_ports, template, disk_gb)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			`INSERT INTO sandboxes (id, name, namespace, node_id, state, vcpus, mem_mib, ip, created_at, parent_id, tenant_id, exposes, allow_dynamic_ports, template, disk_gb, idle_sleep_s, asleep_delete_s, last_activity, slept_at)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			sb.ID, sb.Name, sb.Namespace, nullable(sb.NodeID), string(sb.State),
 			sb.VCPUs, sb.MemMiB, nullable(sb.IP), sb.CreatedAt, nullable(sb.ParentID), sb.TenantID,
 			exposes, sb.AllowDynamicPorts, sb.Template, sb.DiskGB,
+			sb.IdleSleepS, sb.AsleepDeleteS, sb.LastActivity, sb.SleptAt,
 		); err != nil {
 			return err
 		}
@@ -268,7 +284,7 @@ func (s *SQLite) LoadInto(st *state.State) error {
 	}
 	rows.Close()
 
-	rows, err = s.db.Query(`SELECT id, name, namespace, node_id, state, vcpus, mem_mib, ip, created_at, parent_id, tenant_id, exposes, allow_dynamic_ports, template, disk_gb FROM sandboxes`)
+	rows, err = s.db.Query(`SELECT id, name, namespace, node_id, state, vcpus, mem_mib, ip, created_at, parent_id, tenant_id, exposes, allow_dynamic_ports, template, disk_gb, idle_sleep_s, asleep_delete_s, last_activity, slept_at FROM sandboxes`)
 	if err != nil {
 		return err
 	}
@@ -276,7 +292,7 @@ func (s *SQLite) LoadInto(st *state.State) error {
 		sb := &model.Sandbox{}
 		var nodeID, ip, parentID sql.NullString
 		var stateStr, exposes string
-		if err := rows.Scan(&sb.ID, &sb.Name, &sb.Namespace, &nodeID, &stateStr, &sb.VCPUs, &sb.MemMiB, &ip, &sb.CreatedAt, &parentID, &sb.TenantID, &exposes, &sb.AllowDynamicPorts, &sb.Template, &sb.DiskGB); err != nil {
+		if err := rows.Scan(&sb.ID, &sb.Name, &sb.Namespace, &nodeID, &stateStr, &sb.VCPUs, &sb.MemMiB, &ip, &sb.CreatedAt, &parentID, &sb.TenantID, &exposes, &sb.AllowDynamicPorts, &sb.Template, &sb.DiskGB, &sb.IdleSleepS, &sb.AsleepDeleteS, &sb.LastActivity, &sb.SleptAt); err != nil {
 			rows.Close()
 			return err
 		}
@@ -300,8 +316,8 @@ func (s *SQLite) LoadInto(st *state.State) error {
 
 func (s *SQLite) CreateTenant(t *Tenant) error {
 	_, err := s.db.Exec(
-		`INSERT INTO tenants (id, name, max_sandboxes, max_vcpus, max_mem_mib, max_disk_gb, created_at) VALUES (?,?,?,?,?,?,?)`,
-		t.ID, t.Name, t.MaxSandboxes, t.MaxVcpus, t.MaxMemMiB, t.MaxDiskGb, t.CreatedAt,
+		`INSERT INTO tenants (id, name, max_sandboxes, max_vcpus, max_mem_mib, max_disk_gb, default_idle_sleep_s, default_asleep_delete_s, created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+		t.ID, t.Name, t.MaxSandboxes, t.MaxVcpus, t.MaxMemMiB, t.MaxDiskGb, t.DefaultIdleSleepS, t.DefaultAsleepDeleteS, t.CreatedAt,
 	)
 	return err
 }
@@ -309,8 +325,8 @@ func (s *SQLite) CreateTenant(t *Tenant) error {
 func (s *SQLite) GetTenant(id string) (*Tenant, error) {
 	t := &Tenant{}
 	err := s.db.QueryRow(
-		`SELECT id, name, max_sandboxes, max_vcpus, max_mem_mib, max_disk_gb, created_at FROM tenants WHERE id=?`, id,
-	).Scan(&t.ID, &t.Name, &t.MaxSandboxes, &t.MaxVcpus, &t.MaxMemMiB, &t.MaxDiskGb, &t.CreatedAt)
+		`SELECT id, name, max_sandboxes, max_vcpus, max_mem_mib, max_disk_gb, default_idle_sleep_s, default_asleep_delete_s, created_at FROM tenants WHERE id=?`, id,
+	).Scan(&t.ID, &t.Name, &t.MaxSandboxes, &t.MaxVcpus, &t.MaxMemMiB, &t.MaxDiskGb, &t.DefaultIdleSleepS, &t.DefaultAsleepDeleteS, &t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -321,7 +337,7 @@ func (s *SQLite) GetTenant(id string) (*Tenant, error) {
 }
 
 func (s *SQLite) ListTenants() ([]*Tenant, error) {
-	rows, err := s.db.Query(`SELECT id, name, max_sandboxes, max_vcpus, max_mem_mib, max_disk_gb, created_at FROM tenants ORDER BY created_at`)
+	rows, err := s.db.Query(`SELECT id, name, max_sandboxes, max_vcpus, max_mem_mib, max_disk_gb, default_idle_sleep_s, default_asleep_delete_s, created_at FROM tenants ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -329,7 +345,7 @@ func (s *SQLite) ListTenants() ([]*Tenant, error) {
 	var out []*Tenant
 	for rows.Next() {
 		t := &Tenant{}
-		if err := rows.Scan(&t.ID, &t.Name, &t.MaxSandboxes, &t.MaxVcpus, &t.MaxMemMiB, &t.MaxDiskGb, &t.CreatedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.Name, &t.MaxSandboxes, &t.MaxVcpus, &t.MaxMemMiB, &t.MaxDiskGb, &t.DefaultIdleSleepS, &t.DefaultAsleepDeleteS, &t.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
@@ -461,8 +477,8 @@ func (s *SQLite) ListWgPeers() ([]*WgPeer, error) {
 
 func (s *SQLite) CreateTemplate(t *Template) error {
 	_, err := s.db.Exec(
-		`INSERT INTO templates (id, name, image, image_sha256, vcpus, mem_mib, disk_gb, image_size_gb, pool_size, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		t.ID, t.Name, t.Image, t.ImageSHA256, t.Vcpus, t.MemMiB, t.DiskGB, t.ImageSizeGB, t.PoolSize, t.CreatedAt,
+		`INSERT INTO templates (id, name, image, image_sha256, vcpus, mem_mib, disk_gb, image_size_gb, pool_size, tenant_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		t.ID, t.Name, t.Image, t.ImageSHA256, t.Vcpus, t.MemMiB, t.DiskGB, t.ImageSizeGB, t.PoolSize, t.TenantID, t.CreatedAt,
 	)
 	return err
 }
@@ -470,8 +486,8 @@ func (s *SQLite) CreateTemplate(t *Template) error {
 func (s *SQLite) GetTemplateByName(name string) (*Template, error) {
 	t := &Template{}
 	err := s.db.QueryRow(
-		`SELECT id, name, image, image_sha256, vcpus, mem_mib, disk_gb, image_size_gb, pool_size, created_at FROM templates WHERE name=?`, name,
-	).Scan(&t.ID, &t.Name, &t.Image, &t.ImageSHA256, &t.Vcpus, &t.MemMiB, &t.DiskGB, &t.ImageSizeGB, &t.PoolSize, &t.CreatedAt)
+		`SELECT id, name, image, image_sha256, vcpus, mem_mib, disk_gb, image_size_gb, pool_size, tenant_id, created_at FROM templates WHERE name=?`, name,
+	).Scan(&t.ID, &t.Name, &t.Image, &t.ImageSHA256, &t.Vcpus, &t.MemMiB, &t.DiskGB, &t.ImageSizeGB, &t.PoolSize, &t.TenantID, &t.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -482,7 +498,7 @@ func (s *SQLite) GetTemplateByName(name string) (*Template, error) {
 }
 
 func (s *SQLite) ListTemplates() ([]*Template, error) {
-	rows, err := s.db.Query(`SELECT id, name, image, image_sha256, vcpus, mem_mib, disk_gb, image_size_gb, pool_size, created_at FROM templates ORDER BY created_at, name`)
+	rows, err := s.db.Query(`SELECT id, name, image, image_sha256, vcpus, mem_mib, disk_gb, image_size_gb, pool_size, tenant_id, created_at FROM templates ORDER BY created_at, name`)
 	if err != nil {
 		return nil, err
 	}
@@ -490,7 +506,7 @@ func (s *SQLite) ListTemplates() ([]*Template, error) {
 	var out []*Template
 	for rows.Next() {
 		t := &Template{}
-		if err := rows.Scan(&t.ID, &t.Name, &t.Image, &t.ImageSHA256, &t.Vcpus, &t.MemMiB, &t.DiskGB, &t.ImageSizeGB, &t.PoolSize, &t.CreatedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.Name, &t.Image, &t.ImageSHA256, &t.Vcpus, &t.MemMiB, &t.DiskGB, &t.ImageSizeGB, &t.PoolSize, &t.TenantID, &t.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
@@ -515,6 +531,48 @@ func (s *SQLite) AppendUsage(e UsageEvent) error {
 		e.TenantID, e.SandboxID, e.Event, e.Vcpus, e.MemMiB, e.TS, e.DiskGB,
 	)
 	return err
+}
+
+func (s *SQLite) ListUsage(tenantID string, from, upTo int64) ([]UsageEvent, error) {
+	// id tiebreaks same-second transitions (created+started in one second
+	// must replay in insert order or the interval folding misorders them).
+	// Pre-window 'exec' rows are excluded — they only ever feed an in-window
+	// counter, so loading the tenant's whole exec history would be wasteful.
+	rows, err := s.db.Query(
+		`SELECT tenant_id, sandbox_id, event, vcpus, mem_mib, ts, disk_gb
+		 FROM usage_events
+		 WHERE tenant_id=? AND ts<=? AND (event != 'exec' OR ts >= ?)
+		 ORDER BY ts, id`,
+		tenantID, upTo, from,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UsageEvent
+	for rows.Next() {
+		var e UsageEvent
+		if err := rows.Scan(&e.TenantID, &e.SandboxID, &e.Event, &e.Vcpus, &e.MemMiB, &e.TS, &e.DiskGB); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) PruneUsage(before int64) (int64, error) {
+	// Prune ONLY the high-volume per-exec counter rows. Lifecycle transition
+	// events (created/started/.../deleted) are the interval skeleton the usage
+	// fold replays — deleting the 'created'/'woken' anchor of a sandbox still
+	// running past the retention window would make its interval un-openable and
+	// silently zero its billable hours. Transitions are bounded by lifecycle
+	// churn (tiny next to exec rate), so keeping them costs little.
+	res, err := s.db.Exec(`DELETE FROM usage_events WHERE ts < ? AND event = 'exec'`, before)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // ---- helpers ----

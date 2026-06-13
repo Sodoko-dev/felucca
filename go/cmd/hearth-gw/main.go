@@ -34,7 +34,8 @@ func main() {
 	token := flag.String("token", envOr("HEARTH_TOKEN", ""), "hearthd admin token (routes are admin-only)")
 	domain := flag.String("domain", envOr("HEARTH_GW_DOMAIN", ""), "wildcard ingress zone, e.g. sb.example.com")
 	refresh := flag.Uint("refresh", 5, "route table refresh interval (seconds)")
-	limitsPath := flag.String("tenant-limits", envOr("HEARTH_GW_TENANT_LIMITS", ""), "optional JSON file: {\"<tenant-id>\":{\"enabled\":true,\"rps\":10}}")
+	limitsPath := flag.String("tenant-limits", envOr("HEARTH_GW_TENANT_LIMITS", ""), "optional JSON file: {\"<tenant-id>\":{\"enabled\":true,\"rps\":10,\"auto_wake\":true}}")
+	autoWake := flag.Bool("auto-wake", envOr("HEARTH_GW_AUTO_WAKE", "1") != "0", "wake sleeping sandboxes on request instead of serving the 503 page")
 	flag.Parse()
 
 	if *domain == "" {
@@ -61,6 +62,7 @@ func main() {
 		Token:        *token,
 		Refresh:      time.Duration(*refresh) * time.Second,
 		TenantLimits: limits,
+		AutoWake:     *autoWake,
 	})
 
 	stop := make(chan struct{})

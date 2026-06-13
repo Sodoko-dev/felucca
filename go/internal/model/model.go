@@ -62,7 +62,22 @@ type Sandbox struct {
 	// EffectiveDiskGB, never the raw field.
 	Template string `json:"template,omitempty"`
 	DiskGB   uint32 `json:"disk_gb,omitempty"`
+	// Lifecycle policy (v4 P5.2). 0 = inherit the tenant default, -1 =
+	// explicitly disabled, >0 = seconds. omitempty keeps the frozen wire
+	// shape for sandboxes that never set a policy.
+	IdleSleepS    int64 `json:"idle_sleep_s,omitempty"`
+	AsleepDeleteS int64 `json:"asleep_delete_s,omitempty"`
+	// Activity bookkeeping for the lifecycle loop (v4 P5.2): unix seconds of
+	// the last exec/ingress/wake, and of the sleeping transition. Operational
+	// state, not contract — excluded from JSON like TenantID (the pre-P5
+	// conformance goldens must not change).
+	LastActivity int64 `json:"-"`
+	SleptAt      int64 `json:"-"`
 }
+
+// PolicyDisabled is the explicit per-sandbox "never" override for the
+// lifecycle policy fields (0 means "inherit the tenant default").
+const PolicyDisabled int64 = -1
 
 // BaseImageDiskGB is the size of the stock base rootfs (ubuntu-base.ext4,
 // built as a 2 GiB ext4 by deploy/firecracker-assets.sh). Sandboxes with

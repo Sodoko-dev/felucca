@@ -3,9 +3,11 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -100,13 +102,11 @@ func tenantOwns(tenant string, sb *model.Sandbox) bool {
 	return tenant == adminTenant || sb.TenantID == tenant
 }
 
-// recordUsage appends a metering event (best-effort; metering must never
-// fail the request path).
-func (srv *Server) recordUsage(sb *model.Sandbox, event string) {
-	if sb == nil {
-		return
-	}
-	e := store.UsageEvent{
+// usageEventFor builds a metering event from a sandbox's current shape. The
+// caller must hold srv.st (it reads sb's fields); the returned value can then
+// be appended after the lock is released.
+func usageEventFor(sb *model.Sandbox, event string) store.UsageEvent {
+	return store.UsageEvent{
 		TenantID:  sb.TenantID,
 		SandboxID: sb.ID,
 		Event:     event,
@@ -115,7 +115,18 @@ func (srv *Server) recordUsage(sb *model.Sandbox, event string) {
 		DiskGB:    sb.EffectiveDiskGB(),
 		TS:        time.Now().Unix(),
 	}
-	if err := srv.db.AppendUsage(e); err != nil {
+}
+
+// recordUsage appends a metering event (best-effort; metering must never
+// fail the request path). Used by the rare lifecycle transitions, which
+// already hold the lock for other state writes; the per-request exec path
+// builds the event with usageEventFor and appends AFTER unlocking instead, so
+// a synchronous sqlite write never gates the global state lock.
+func (srv *Server) recordUsage(sb *model.Sandbox, event string) {
+	if sb == nil {
+		return
+	}
+	if err := srv.db.AppendUsage(usageEventFor(sb, event)); err != nil {
 		fmt.Fprintf(os.Stderr, "usage event: %v\n", err)
 	}
 }
@@ -175,6 +186,12 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request, tenant strin
 	// Infrastructure and tenant-administration routes are admin-only. Tenant
 	// keys get 404 (not 403) so the surface doesn't advertise what exists.
 	if tenant != adminTenant {
+		// The one tenant-reachable corner of /api/v1/tenants: a tenant may
+		// read ITS OWN usage (v4 P5.3). Anything else 404s below.
+		if id, ok := matchSuffix(path, "/api/v1/tenants/", "/usage"); ok && method == http.MethodGet && id == tenant {
+			srv.tenantUsage(w, r, id)
+			return
+		}
 		switch {
 		case path == "/api/v1/nodes",
 			strings.HasPrefix(path, "/api/v1/agents/"),
@@ -220,11 +237,15 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request, tenant strin
 	case path == "/api/v1/routes/ensure" && method == http.MethodPost:
 		srv.ensureRoute(w, r)
 
+	// Gateway ingress-activity reports (v4 P5.2; admin-gated above).
+	case path == "/api/v1/routes/activity" && method == http.MethodPost:
+		srv.routesActivity(w, r)
+
 	// Template catalog: GET is tenant-visible (tenants must be able to
 	// discover what they can create from); mutations are admin-only via
 	// handler-level guards.
 	case path == "/api/v1/templates" && method == http.MethodGet:
-		srv.listTemplates(w)
+		srv.listTemplates(w, tenant)
 
 	case path == "/api/v1/templates" && method == http.MethodPost:
 		srv.createTemplate(w, r, tenant)
@@ -233,6 +254,12 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request, tenant strin
 		// Path-segment routes with {id}.
 		if id, ok := matchSuffix(path, "/api/v1/tenants/", "/keys"); ok && method == http.MethodPost {
 			srv.createTenantKey(w, id)
+			return
+		}
+		// Admin reach of the usage endpoint (tenant self-access is granted
+		// before the admin gate above).
+		if id, ok := matchSuffix(path, "/api/v1/tenants/", "/usage"); ok && method == http.MethodGet {
+			srv.tenantUsage(w, r, id)
 			return
 		}
 		if id, ok := matchExact(path, "/api/v1/keys/"); ok && method == http.MethodDelete {
@@ -442,6 +469,8 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 		AllowDynamicPorts bool    `json:"allow_dynamic_ports"`
 		Template          string  `json:"template"`
 		DiskGB            *uint32 `json:"disk_gb"`
+		IdleSleepS        int64   `json:"idle_sleep_s"`
+		AsleepDeleteS     int64   `json:"asleep_delete_s"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, []byte(`{"error":"bad json"}`))
@@ -449,6 +478,11 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 	}
 	if req.Name == "" {
 		writeJSON(w, 400, []byte(`{"error":"name required"}`))
+		return
+	}
+	// Lifecycle overrides (v4 P5.2): 0 inherit, -1 disabled, else bounded.
+	if !validPolicy(req.IdleSleepS, minIdleSleepS) || !validPolicy(req.AsleepDeleteS, minAsleepDeleteS) {
+		writeJSON(w, 400, []byte(`{"error":"bad lifecycle policy: 0, -1, or seconds within bounds"}`))
 		return
 	}
 	namespace := req.Namespace
@@ -472,6 +506,12 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 			return
 		}
 		if tpl == nil {
+			writeJSON(w, 400, []byte(`{"error":"unknown template"}`))
+			return
+		}
+		// Tenant-scoped templates (v4 P5.4): a foreign tenant gets the same
+		// error as a missing template — no existence leak.
+		if tpl.TenantID != "" && tenant != adminTenant && tenant != tpl.TenantID {
 			writeJSON(w, 400, []byte(`{"error":"unknown template"}`))
 			return
 		}
@@ -525,6 +565,9 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 	sb.AllowDynamicPorts = req.AllowDynamicPorts
 	sb.Template = req.Template
 	sb.DiskGB = diskGB
+	sb.IdleSleepS = req.IdleSleepS
+	sb.AsleepDeleteS = req.AsleepDeleteS
+	sb.LastActivity = now
 	sbID = sb.ID
 	srv.st.Unlock()
 
@@ -710,19 +753,21 @@ func (srv *Server) sleepSandbox(w http.ResponseWriter, id, tenant string) {
 	}
 
 	srv.st.SetSandboxState(id, model.StateSleeping)
-	if err := srv.persist(); err != nil {
-		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
-	}
 
 	srv.st.Lock()
-	defer srv.st.Unlock()
 	sb := srv.st.FindSandbox(id)
 	if sb == nil {
+		srv.st.Unlock()
 		writeJSON(w, 500, []byte(`{"error":"lost sandbox"}`))
 		return
 	}
+	sb.SleptAt = time.Now().Unix() // the auto-delete TTL clock (v4 P5.2)
 	srv.recordUsage(sb, "slept")
 	b, _ := json.Marshal(sb)
+	srv.st.Unlock()
+	if err := srv.persist(); err != nil {
+		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+	}
 	writeJSON(w, 200, b)
 }
 
@@ -754,20 +799,26 @@ func (srv *Server) wakeSandbox(w http.ResponseWriter, id, tenant string) {
 
 	srv.st.SetSandboxState(id, model.StateRunning)
 	srv.st.RecordWake(wakeMs)
-	if err := srv.persist(); err != nil {
-		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
-	}
 
 	srv.st.Lock()
-	defer srv.st.Unlock()
 	sb := srv.st.FindSandbox(id)
 	if sb == nil {
+		srv.st.Unlock()
 		writeJSON(w, 500, []byte(`{"error":"lost sandbox"}`))
 		return
 	}
+	// A wake is activity: restart the idle clock, stop the TTL clock (v4 P5.2).
+	sb.LastActivity = time.Now().Unix()
+	sb.SleptAt = 0
 	srv.recordUsage(sb, "woken")
 	// Append "wake_ms" as the final key before the closing brace (Zig behavior).
 	sbJSON, _ := json.Marshal(sb)
+	srv.st.Unlock()
+	// Persist AFTER releasing the lock (SaveSnapshot takes it) so the
+	// snapshot carries the fresh activity clocks.
+	if err := srv.persist(); err != nil {
+		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+	}
 	// Drop trailing '}'
 	body := make([]byte, len(sbJSON)-1, len(sbJSON)+32)
 	copy(body, sbJSON[:len(sbJSON)-1])
@@ -845,7 +896,21 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID,
 	// template-built) rootfs — inherit both for accounting.
 	child.Template = parent.Template
 	child.DiskGB = parent.DiskGB
+	// Lifecycle overrides travel with the fork (v4 P5.2); the fork itself
+	// starts the child's idle clock.
+	child.IdleSleepS = parent.IdleSleepS
+	child.AsleepDeleteS = parent.AsleepDeleteS
+	child.LastActivity = now
 	childID = child.ID
+	// A fork reads the parent's live disk+memory: strong evidence the parent
+	// is in use, so it counts as parent activity (v4 P5.2). For a RUNNING
+	// parent this defers its idle auto-sleep; a SLEEPING fork-base parent's
+	// auto-delete TTL is also pushed out, so a regularly-forked golden image
+	// is never reaped out from under its children.
+	parent.LastActivity = now
+	if parent.State == model.StateSleeping {
+		parent.SleptAt = now
+	}
 	srv.st.Unlock()
 
 	if err := srv.persist(); err != nil {
@@ -950,6 +1015,14 @@ func (srv *Server) execSandbox(w http.ResponseWriter, r *http.Request, id, tenan
 		}
 	}
 
+	// v4 P5.1: ?stream=1 selects the SSE relay arm — same body, same
+	// validation/resolution, but the agent's NDJSON exec stream is forwarded
+	// live instead of buffered.
+	if r.URL.Query().Get("stream") == "1" {
+		srv.execSandboxStream(w, r, id, tenant, cmdStrings, timeoutMs)
+		return
+	}
+
 	// Exec's cap (300s) outlives the server's global 60s WriteTimeout —
 	// without a per-connection extension, any guest command over ~60s gets
 	// its connection killed mid-wait (latent since the P2.3 hardening,
@@ -986,7 +1059,16 @@ func (srv *Server) execSandbox(w http.ResponseWriter, r *http.Request, id, tenan
 		return
 	}
 	agentAddr := node.Addr
+	// v4 P5: an exec restarts the idle clock and leaves a metering event
+	// (the usage endpoint counts execs per tenant per window). Build the
+	// event under the lock but append it AFTER unlocking — exec is the hot
+	// path and the global state lock must not gate a synchronous sqlite write.
+	sb.LastActivity = time.Now().Unix()
+	execEvent := usageEventFor(sb, "exec")
 	srv.st.Unlock()
+	if err := srv.db.AppendUsage(execEvent); err != nil {
+		fmt.Fprintf(os.Stderr, "usage event: %v\n", err)
+	}
 
 	// Build forwarded body.
 	agentBody, _ := json.Marshal(struct {
@@ -1008,6 +1090,124 @@ func (srv *Server) execSandbox(w http.ResponseWriter, r *http.Request, id, tenan
 		writeJSON(w, 501, []byte(`{"error":"guest agent unavailable"}`))
 	default:
 		writeJSON(w, 502, []byte(`{"error":"agent exec failed"}`))
+	}
+}
+
+// execSandboxStream is the ?stream=1 arm of execSandbox (v4 P5.1): identical
+// validation/resolution to the buffered path, but the agent's NDJSON exec
+// stream is relayed to the client as SSE events as the frames arrive.
+// cmd/timeoutMs were already parsed and clamped by execSandbox.
+func (srv *Server) execSandboxStream(w http.ResponseWriter, r *http.Request, id, tenant string, cmd []string, timeoutMs int64) {
+	// Slow-loris bound sized to cover the whole stream: the agent's own
+	// data deadline is timeout+60s, plus 30s margin for relay slack.
+	deadlineFor(w, time.Duration(timeoutMs)*time.Millisecond+90*time.Second)
+
+	// Count the attempt before proxying.
+	srv.st.RecordExec()
+
+	// Resolve sandbox and agent address (same flow as the buffered path).
+	srv.st.Lock()
+	sb := srv.st.FindSandbox(id)
+	if sb == nil || !tenantOwns(tenant, sb) {
+		srv.st.Unlock()
+		writeJSON(w, 404, []byte(`{"error":"not found"}`))
+		return
+	}
+	if sb.State != model.StateRunning {
+		srv.st.Unlock()
+		writeJSON(w, 409, []byte(`{"error":"not running"}`))
+		return
+	}
+	if sb.NodeID == nil {
+		srv.st.Unlock()
+		writeJSON(w, 404, []byte(`{"error":"not found"}`))
+		return
+	}
+	node := srv.st.FindNode(*sb.NodeID)
+	if node == nil {
+		srv.st.Unlock()
+		writeJSON(w, 404, []byte(`{"error":"not found"}`))
+		return
+	}
+	agentAddr := node.Addr
+	// v4 P5: an exec restarts the idle clock and leaves a metering event
+	// (same as the buffered arm — append after unlocking, off the hot path).
+	sb.LastActivity = time.Now().Unix()
+	execEvent := usageEventFor(sb, "exec")
+	srv.st.Unlock()
+	if err := srv.db.AppendUsage(execEvent); err != nil {
+		fmt.Fprintf(os.Stderr, "usage event: %v\n", err)
+	}
+
+	// Build forwarded body: the buffered shape plus "stream":true.
+	agentBody, _ := json.Marshal(struct {
+		Cmd       []string `json:"cmd"`
+		TimeoutMs int64    `json:"timeout_ms"`
+		Stream    bool     `json:"stream,omitempty"`
+	}{cmd, timeoutMs, true})
+
+	host, port := agentclient.SplitHostPort(agentAddr)
+	reqTimeout := time.Duration(timeoutMs)*time.Millisecond + 70*time.Second
+	resp, cancel, err := agentclient.ExecVMStream(host, port, id, agentBody, srv.cfg.Token, reqTimeout)
+	if err != nil {
+		writeJSON(w, 502, []byte(`{"error":"agent exec failed"}`))
+		return
+	}
+	defer cancel()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		// Drain a bounded slice of the error body so the connection can be
+		// reused/closed cleanly, then map exactly like the buffered path.
+		_, _ = io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		if resp.StatusCode == 501 {
+			writeJSON(w, 501, []byte(`{"error":"guest agent unavailable"}`))
+			return
+		}
+		writeJSON(w, 502, []byte(`{"error":"agent exec failed"}`))
+		return
+	}
+
+	// 200: commit to SSE and relay each NDJSON line as one event, flushed
+	// immediately so output appears as the guest produces it.
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream; charset=utf-8")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("X-Accel-Buffering", "no")
+	w.WriteHeader(200)
+	rc := http.NewResponseController(w)
+
+	sawDone := false
+	sc := bufio.NewScanner(resp.Body)
+	// Guest chunks are ≤8KiB raw, but JSON string escaping can inflate a
+	// line well past that.
+	sc.Buffer(make([]byte, 64*1024), 1<<20)
+	for sc.Scan() {
+		select {
+		case <-r.Context().Done():
+			// Client hung up — nothing left to relay to.
+			return
+		default:
+		}
+		line := sc.Bytes()
+		// A frame is terminal iff it unmarshals with done:true (unmarshal
+		// errors → not done).
+		var frame struct {
+			Done bool `json:"done"`
+		}
+		if json.Unmarshal(line, &frame) == nil && frame.Done {
+			sawDone = true
+		}
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", line); err != nil {
+			return
+		}
+		_ = rc.Flush()
+	}
+	if !sawDone {
+		// Agent stream ended without a terminal frame (EOF or read error
+		// mid-stream): tell the client explicitly instead of going silent.
+		_, _ = w.Write([]byte("data: " + `{"done":true,"ok":false,"error":"stream interrupted"}` + "\n\n"))
+		_ = rc.Flush()
 	}
 }
 
@@ -1070,6 +1270,15 @@ func (srv *Server) serveMetrics(w http.ResponseWriter) {
 	for _, n := range srv.st.Nodes {
 		fmt.Fprintf(&buf, "hearth_pool_size{node=%q} %d\n", n.Hostname, n.PoolSize)
 	}
+
+	// NB (v4 P5): per-tenant gauges with the tenant_id as a label were
+	// considered here but deliberately NOT emitted — /metrics is
+	// unauthenticated (see handle(): "Metrics — open, no auth"), so labeling
+	// by tenant would let any reachable client enumerate the full tenant
+	// inventory and per-tenant resource footprint (an existence + sizing
+	// leak that the rest of the API is careful to avoid). Per-tenant
+	// observability is served by the authenticated GET /api/v1/tenants/{id}/usage
+	// endpoint instead; an authenticated metrics surface is a P6 item.
 
 	body := buf.Bytes()
 	h := w.Header()

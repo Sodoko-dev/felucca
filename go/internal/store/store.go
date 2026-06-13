@@ -8,6 +8,8 @@ import (
 )
 
 // Tenant is an isolation + quota boundary. Zero quota values mean unlimited.
+// The lifecycle defaults (v4 P5.2) are seconds; 0 disables the policy for the
+// tenant (sandboxes can still opt in per-sandbox).
 type Tenant struct {
 	ID           string `json:"id"`
 	Name         string `json:"name"`
@@ -15,7 +17,13 @@ type Tenant struct {
 	MaxVcpus     int64  `json:"max_vcpus"`
 	MaxMemMiB    int64  `json:"max_mem_mib"`
 	MaxDiskGb    int64  `json:"max_disk_gb"`
-	CreatedAt    int64  `json:"created_at"`
+	// DefaultIdleSleepS auto-sleeps a running sandbox after this many seconds
+	// without exec or ingress activity.
+	DefaultIdleSleepS int64 `json:"default_idle_sleep_s"`
+	// DefaultAsleepDeleteS auto-deletes a sandbox that has been sleeping this
+	// many seconds.
+	DefaultAsleepDeleteS int64 `json:"default_asleep_delete_s"`
+	CreatedAt            int64 `json:"created_at"`
 }
 
 // APIKey carries only the sha256 of the secret; the full key is shown once at
@@ -72,7 +80,11 @@ type Template struct {
 	// floor for any per-sandbox disk_gb override.
 	ImageSizeGB uint32 `json:"image_size_gb"`
 	PoolSize    uint32 `json:"pool_size"`
-	CreatedAt   int64  `json:"created_at"`
+	// TenantID scopes catalog visibility and create-by-template (v4 P5.4,
+	// ADR-0008 deferral): "" = public (every tenant sees and may use it),
+	// otherwise only the owning tenant (and the admin) can.
+	TenantID  string `json:"tenant_id,omitempty"`
+	CreatedAt int64  `json:"created_at"`
 }
 
 // UsageEvent is one append-only row per sandbox lifecycle transition —
@@ -138,6 +150,16 @@ type Store interface {
 
 	// Usage events (append-only).
 	AppendUsage(e UsageEvent) error
+	// ListUsage returns, in ts order, the events the usage fold needs: every
+	// lifecycle TRANSITION with ts <= upTo (the aggregation needs the full
+	// transition history up to the window's end to know each sandbox's state
+	// at the window's start), plus the high-volume 'exec' counter rows only
+	// within [from, upTo] (pre-window exec rows are never counted or folded,
+	// so loading them would be pure waste). v4 P5.3.
+	ListUsage(tenantID string, from, upTo int64) ([]UsageEvent, error)
+	// PruneUsage deletes events older than `before`, returning the count
+	// (retention, v4 P5.3).
+	PruneUsage(before int64) (int64, error)
 
 	Close() error
 }

@@ -94,6 +94,39 @@ func ExecVM(host string, port uint16, id string, body []byte, token string, time
 	return &Response{Status: resp.StatusCode, Body: respBody}, nil
 }
 
+// ExecVMStream proxies a streaming exec request (body carries "stream":true)
+// to the node agent at host:port for the given vm id. Same wire shape as
+// ExecVM, but the live *http.Response is returned WITHOUT reading the body so
+// the caller can relay the agent's NDJSON stream as it arrives. The returned
+// cancel func releases the request context — the caller must defer it (and
+// close resp.Body); the context timeout bounds the whole stream.
+func ExecVMStream(host string, port uint16, id string, body []byte, token string, timeout time.Duration) (*http.Response, context.CancelFunc, error) {
+	url := fmt.Sprintf("http://%s:%d/v1/vms/%s/exec", host, port, id)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		cancel()
+		return nil, nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = int64(len(body))
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("Connection", "close")
+
+	// Use a transport without keepalives so the timeout is per-request.
+	c := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	resp, err := c.Do(req)
+	if err != nil {
+		cancel()
+		return nil, nil, fmt.Errorf("do request: %w", err)
+	}
+	return resp, cancel, nil
+}
+
 // SplitHostPort replicates splitHostPort from client.zig / main.zig:
 // strips http:// or https:// scheme, strips any trailing path, then splits on
 // the last colon. Default port is 9090.

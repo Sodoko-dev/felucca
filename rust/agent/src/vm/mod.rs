@@ -233,6 +233,30 @@ fn lowest_free_node_port(used: &std::collections::HashSet<u16>) -> Option<u16> {
     (NODE_PORT_MIN..=NODE_PORT_MAX).find(|p| !used.contains(p))
 }
 
+/// Map an images-dir entry name to the cache image it belongs to, or None for
+/// files the image cache did not create (which the GC must never touch).
+/// Cache files per pull_image/ensure_image: `<image>.ext4`, its
+/// `<image>.ext4.sha256` sidecar, and the in-flight `.<image>.partial`.
+fn gc_image_for_entry(fname: &str) -> Option<String> {
+    let image = if let Some(stem) = fname.strip_suffix(".ext4.sha256") {
+        stem
+    } else if let Some(stem) = fname.strip_suffix(".ext4") {
+        stem
+    } else if let Some(stem) = fname
+        .strip_prefix('.')
+        .and_then(|r| r.strip_suffix(".partial"))
+    {
+        stem
+    } else {
+        return None;
+    };
+    if image::valid_image_name(image) {
+        Some(image.to_string())
+    } else {
+        None
+    }
+}
+
 /// Result of a guest exec attempt; the server handler maps each to a status.
 pub enum ExecOutcome {
     /// Guest replied — carries the response JSON verbatim (→ 200).
@@ -244,6 +268,17 @@ pub enum ExecOutcome {
     /// VM has no vsock device — pre-v3 or marker absent (→ 501).
     Unavailable,
     /// Connect/handshake/round-trip failed (→ 501 {"error":"guest agent unavailable"}).
+    Failed(String),
+}
+
+/// Result of opening a streamed exec (v5 P5.1). Setup failures share
+/// `ExecOutcome`'s status mapping; success carries the live frame stream.
+pub enum ExecStreamOutcome {
+    /// Handshake + request sent — the stream yields the guest's NDJSON frames.
+    Ok(tokio::net::UnixStream),
+    NotFound,
+    NotRunning,
+    Unavailable,
     Failed(String),
 }
 
@@ -798,6 +833,69 @@ impl Manager {
         Ok(())
     }
 
+    /// v4 P5.4 (ADR-0008 deferral): collect image-cache entries nothing
+    /// references anymore. Referenced = the image of any VM record (in-flight
+    /// `Creating` records are inserted BEFORE ensure_image runs, so creates
+    /// are covered) or of any hearthd-pushed pool spec; `DEFAULT_IMAGE` is
+    /// never collected (deploy-provisioned base). `min_age_secs` gates on
+    /// mtime so a file being pulled or just published is never a candidate
+    /// (tests pass 0). Each candidate is re-checked under its per-image
+    /// download lock before the unlink; the remaining race (a create's
+    /// lock-free decide() fast path between re-check and unlink) at worst
+    /// fails that create with a retryable 502 — the retry repulls.
+    pub async fn gc_images(&self, min_age_secs: u64) {
+        let images_dir = format!("{}/images", self.data_dir);
+        let entries = match std::fs::read_dir(&images_dir) {
+            Ok(e) => e,
+            Err(_) => return, // no cache yet
+        };
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            // Only files this module created are ours to delete.
+            let Some(image) = gc_image_for_entry(&fname) else {
+                continue;
+            };
+            if image == DEFAULT_IMAGE {
+                continue;
+            }
+            let old_enough = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .map(|age| age.as_secs() >= min_age_secs)
+                .unwrap_or(false);
+            if !old_enough || self.image_referenced(&image).await {
+                continue;
+            }
+            // Serialize with an in-flight pull of the same image, then
+            // re-check: a create registers its VM record before its pull.
+            let lock = {
+                let mut m = self.image_locks.lock().await;
+                Arc::clone(
+                    m.entry(image.clone())
+                        .or_insert_with(|| Arc::new(Mutex::new(()))),
+                )
+            };
+            let _guard = lock.lock().await;
+            if self.image_referenced(&image).await {
+                continue;
+            }
+            if std::fs::remove_file(entry.path()).is_ok() {
+                eprintln!("info: image gc: removed {} (unreferenced)", fname);
+            }
+        }
+    }
+
+    /// True when any VM record or pool spec references `image`. The legacy
+    /// config pool's image is DEFAULT_IMAGE, which the GC skips outright.
+    async fn image_referenced(&self, image: &str) -> bool {
+        let g = self.inner.lock().await;
+        g.vms.iter().any(|v| v.image == image)
+            || g.template_pools.iter().any(|s| s.image == image)
+    }
+
     async fn spawn_and_configure(
         self: &Arc<Self>,
         id: &str,
@@ -1298,6 +1396,36 @@ impl Manager {
             Ok(v) => ExecOutcome::Ok(v),
             // Connect/handshake/round-trip failure → guest agent unavailable.
             Err(e) => ExecOutcome::Failed(e.0),
+        }
+    }
+
+    /// Open a streamed exec (v5 P5.1): same preconditions as `exec`, but on
+    /// success returns the guest connection for the caller to forward frames
+    /// from. The data-phase deadline is the caller's job (the setup phase is
+    /// bounded inside guestclient).
+    pub async fn exec_stream(
+        &self,
+        id: &str,
+        cmd: &[String],
+        timeout_ms: u64,
+    ) -> ExecStreamOutcome {
+        let (state, vsock, dir_id) = {
+            let g = self.inner.lock().await;
+            match g.vms.iter().find(|v| v.id == id) {
+                Some(v) => (v.state.clone(), v.vsock, v.dir_id.clone()),
+                None => return ExecStreamOutcome::NotFound,
+            }
+        };
+        if state != VmState::Running {
+            return ExecStreamOutcome::NotRunning;
+        }
+        if !vsock {
+            return ExecStreamOutcome::Unavailable;
+        }
+        let dir = format!("{}/instances/{}", self.data_dir, dir_id);
+        match crate::guestclient::exec_stream(&dir, cmd, timeout_ms).await {
+            Ok(s) => ExecStreamOutcome::Ok(s),
+            Err(e) => ExecStreamOutcome::Failed(e.0),
         }
     }
 
@@ -1859,6 +1987,110 @@ mod tests {
         let specs: Vec<PoolSpec> = serde_json::from_str(body).expect("parse minimal spec");
         assert_eq!(specs[0].image_sha256, "");
         assert_eq!(specs[0].disk_gb, 0);
+    }
+
+    // ---- v4 P5.4: image-cache GC ----
+
+    #[test]
+    fn test_gc_image_for_entry_owned_files_only() {
+        assert_eq!(gc_image_for_entry("odoo-v18.ext4"), Some("odoo-v18".into()));
+        assert_eq!(
+            gc_image_for_entry("odoo-v18.ext4.sha256"),
+            Some("odoo-v18".into())
+        );
+        assert_eq!(
+            gc_image_for_entry(".odoo-v18.partial"),
+            Some("odoo-v18".into())
+        );
+        // Not ours: never candidates.
+        assert_eq!(gc_image_for_entry("notes.txt"), None);
+        assert_eq!(gc_image_for_entry("rootfs.ext4.bak"), None);
+        assert_eq!(gc_image_for_entry(".hidden"), None);
+        assert_eq!(gc_image_for_entry("ext4"), None);
+        // Invalid image names (traversal etc.) are not ours either.
+        assert_eq!(gc_image_for_entry("..%2Fetc.ext4"), None);
+        assert_eq!(gc_image_for_entry(".ext4"), None);
+    }
+
+    #[tokio::test]
+    async fn test_gc_images_sweeps_only_unreferenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let images = format!("{}/images", data_dir);
+        std::fs::create_dir_all(&images).unwrap();
+        for f in [
+            "ubuntu-base.ext4",        // DEFAULT_IMAGE: never collected
+            "vm-ref.ext4",             // referenced by a VM record
+            "pool-ref.ext4",           // referenced by a pool spec
+            "pool-ref.ext4.sha256",    // sidecar of a referenced image
+            "stale.ext4",              // unreferenced -> collected
+            "stale.ext4.sha256",       // unreferenced sidecar -> collected
+            ".stale.partial",          // unreferenced partial -> collected
+            "stranger.txt",            // not ours -> untouched
+        ] {
+            std::fs::write(format!("{}/{}", images, f), b"x").unwrap();
+        }
+
+        let mgr = Manager::new(
+            data_dir,
+            false,
+            Cidr { base: 0x0AE7_0000, prefix: 24 },
+            0,
+            "http://cp".into(),
+            "tok".into(),
+        );
+        {
+            let mut g = mgr.inner.lock().await;
+            g.vms.push(pooled_vm("vm-1", "vm-ref", 1, 256, 0));
+            g.template_pools.push(PoolSpec {
+                image: "pool-ref".into(),
+                image_sha256: "a".repeat(64),
+                vcpus: 1,
+                mem_mib: 256,
+                disk_gb: 0,
+                count: 1,
+            });
+        }
+
+        mgr.gc_images(0).await;
+
+        let left: std::collections::HashSet<String> = std::fs::read_dir(&images)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let want: std::collections::HashSet<String> = [
+            "ubuntu-base.ext4",
+            "vm-ref.ext4",
+            "pool-ref.ext4",
+            "pool-ref.ext4.sha256",
+            "stranger.txt",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(left, want);
+    }
+
+    #[tokio::test]
+    async fn test_gc_images_age_gate_spares_fresh_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let images = format!("{}/images", data_dir);
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::write(format!("{}/fresh.ext4", images), b"x").unwrap();
+
+        let mgr = Manager::new(
+            data_dir,
+            false,
+            Cidr { base: 0x0AE7_0000, prefix: 24 },
+            0,
+            "http://cp".into(),
+            "tok".into(),
+        );
+        // Unreferenced, but younger than the age gate -> spared.
+        mgr.gc_images(3600).await;
+        assert!(std::fs::metadata(format!("{}/fresh.ext4", images)).is_ok());
     }
 
     fn pooled_vm(id: &str, image: &str, vcpus: u32, mem_mib: u64, disk_gb: u32) -> Vm {

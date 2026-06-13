@@ -118,6 +118,53 @@ pub async fn exec(dir: &str, cmd: &[String], timeout_ms: u64) -> Result<serde_js
         .map_err(|e| GuestError(format!("decode response {:?}: {}", resp, e)))
 }
 
+/// Open a streamed exec (v5 P5.1): connect, complete the CONNECT handshake,
+/// send the request with `"stream": true`, and return the stream positioned at
+/// the first response byte. From there the guest writes NDJSON frames
+/// (`{"stream":...,"data":...}` chunks, then one `{"done":true,...}` line) and
+/// closes. Only the setup is bounded here (10s); the caller owns the
+/// data-phase deadline, sized to the command's timeout.
+pub async fn exec_stream(dir: &str, cmd: &[String], timeout_ms: u64) -> Result<UnixStream> {
+    let request = serde_json::json!({
+        "op": "exec",
+        "cmd": cmd,
+        "timeout_ms": timeout_ms,
+        "stream": true,
+    });
+    let line = serde_json::to_string(&request)
+        .map_err(|e| GuestError(format!("encode request: {}", e)))?;
+    let uds = format!("{}/v.sock", dir);
+
+    let setup = async {
+        let mut stream = UnixStream::connect(&uds)
+            .await
+            .map_err(|e| GuestError(format!("connect {}: {}", uds, e)))?;
+        let connect = format!("CONNECT {}\n", GUEST_PORT);
+        stream
+            .write_all(connect.as_bytes())
+            .await
+            .map_err(|e| GuestError(format!("write CONNECT: {}", e)))?;
+        let ok_line = read_line(&mut stream).await?;
+        if !ok_line.starts_with("OK ") {
+            return Err(GuestError(format!(
+                "handshake: expected 'OK <port>', got {:?}",
+                ok_line
+            )));
+        }
+        let mut req = line.clone();
+        req.push('\n');
+        stream
+            .write_all(req.as_bytes())
+            .await
+            .map_err(|e| GuestError(format!("write request: {}", e)))?;
+        Ok(stream)
+    };
+    match timeout(Duration::from_millis(10_000), setup).await {
+        Ok(r) => r,
+        Err(_) => Err(GuestError("guest stream setup timed out after 10000ms".into())),
+    }
+}
+
 /// Reconfigure the guest's primary interface (fork re-IP). Best-effort: tries up
 /// to 3 times, 1s apart, because the just-restored guest may still be settling.
 pub async fn set_ip(dir: &str, ip: &str, prefix: u8, gw: &str) -> Result<()> {
@@ -224,6 +271,36 @@ mod tests {
         assert_eq!(parsed["op"], serde_json::json!("exec"));
         assert_eq!(parsed["cmd"], serde_json::json!(["/bin/sh", "-c", "echo hi"]));
         assert_eq!(parsed["timeout_ms"], serde_json::json!(30_000));
+    }
+
+    #[tokio::test]
+    async fn test_exec_stream_framing_and_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_str().unwrap().to_string();
+        let uds = format!("{}/v.sock", dir_path);
+
+        let handle = fake_server(
+            uds,
+            "OK 7\n",
+            "{\"stream\":\"stdout\",\"data\":\"a\"}\n{\"done\":true,\"ok\":true,\"exit_code\":0,\"truncated\":false}\n",
+        )
+        .await;
+
+        let cmd = vec!["true".to_string()];
+        let mut stream = exec_stream(&dir_path, &cmd, 5_000).await.expect("stream setup");
+        let mut buf = String::new();
+        stream.read_to_string(&mut buf).await.unwrap();
+        let lines: Vec<&str> = buf.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"stream\":\"stdout\""));
+        assert!(lines[1].contains("\"done\":true"));
+
+        // The request line must carry the stream flag.
+        let req = handle.await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&req).unwrap();
+        assert_eq!(parsed["op"], serde_json::json!("exec"));
+        assert_eq!(parsed["stream"], serde_json::json!(true));
+        assert_eq!(parsed["timeout_ms"], serde_json::json!(5_000));
     }
 
     #[tokio::test]

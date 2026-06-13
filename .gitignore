@@ -9,3 +9,7 @@ deploy/release/
 docs/.omc/
 .playwright-mcp/
 .claude/
+sdk/ts/node_modules/
+sdk/ts/dist/
+sdk/ts/.test-dist/
+sdk/ts/package-lock.json

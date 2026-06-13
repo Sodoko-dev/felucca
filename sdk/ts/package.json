@@ -1,0 +1,29 @@
+{
+  "name": "@hearth/sdk",
+  "version": "0.1.0",
+  "description": "Typed TypeScript client for the Hearth control plane (hearthd) REST API. Zero runtime dependencies; uses global fetch (Node >= 18 / browsers).",
+  "type": "module",
+  "main": "dist/client.js",
+  "types": "dist/client.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc -p tsconfig.test.json && node --test .test-dist/test/client.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@types/node": "^18",
+    "typescript": "^5"
+  }
+}

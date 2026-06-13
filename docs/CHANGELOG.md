@@ -395,6 +395,81 @@ and a `docker compose` busybox httpd — which was then exposed via the P3
 ingress and served through hearth-gw: the miniature Sodoko smoke
 (template → compose stack → public URL) passes end-to-end.
 
+## v4 P5 — streaming exec, lifecycle policies, usage, TS SDK (2026-06-13, Go+Rust)
+
+Phase 5 of PLAN-v4: the features that make sandboxes serverless and
+integrable, plus the deferrals parked by earlier phases.
+Design: [ADR-0009](adr/ADR-0009-streaming-lifecycle-usage.md).
+
+- **Streaming exec** (`?stream=1` → SSE): one wire shape translated at each
+  hop — the guest's vsock exec gains `"stream":true` and replies with NDJSON
+  frames (`{"stream":"stdout|stderr","data"}` chunks then a terminal
+  `{"done":true,...}`); the agent passes them through as chunked
+  `application/x-ndjson`; hearthd relays each as one SSE `data:` event,
+  flushed immediately. Buffered exec is byte-frozen. Stream cap 16 MiB/stream
+  (vs buffered 1 MiB); guest timeouts surface as exit 124; a relay cut yields
+  a synthetic `"stream interrupted"` done frame.
+- **Lifecycle policies**: per-tenant `default_idle_sleep_s` /
+  `default_asleep_delete_s`, per-sandbox `idle_sleep_s` / `asleep_delete_s`
+  (0 = inherit, −1 = disabled). A 15s hearthd sweep auto-sleeps idle running
+  sandboxes (no exec/ingress/wake) and auto-deletes sleeping ones past their
+  TTL. The activity clock is fed by create, fork (parent AND child), wake,
+  both exec arms, and gateway ingress reports (`POST /routes/activity`,
+  batched per refresh tick).
+- **Auto-wake (hearth-gw)**: a request for a sleeping sandbox wakes it and
+  waits ≤15s (singleflighted per sandbox id — a burst is one wake, not N) for
+  the route to go running; default on, per-tenant `auto_wake` override. Plus
+  the ADR-0007 deferral: auto-sleep GCs the sandbox's dynamic (all-digit)
+  exposes; auto-wake re-ensures them transparently.
+- **Usage**: `GET /api/v1/tenants/{id}/usage?from&to` folds `usage_events`
+  into sandbox/vCPU/mem-GiB/disk-GB hours + exec/event counts (admin any
+  tenant; a tenant key its own only). Each exec appends an `"exec"` event.
+  Retention prunes ONLY `exec` rows hourly (default 90d) — transition events
+  are the interval skeleton and are kept.
+- **Per-template tenant visibility** (ADR-0008 deferral): `POST /templates`
+  takes `"tenant"`; the catalog filters to public + own for tenant keys, and
+  foreign create-by-template 404s as "unknown template".
+- **Worker image-cache GC** (ADR-0008 deferral): the agent's refill loop
+  every ~10 min drops cache images referenced by no VM/pool spec, older than
+  1h, re-checked under the per-image download lock.
+- **Gratuitous ARP** (P4 deferral): after a fork re-IP the guest fires one
+  throwaway UDP datagram at the gateway so snapshot-restored children answer
+  host ARP immediately (no more first-transmit ping gap in verify-v2).
+- **TS SDK** (`sdk/ts/`, `@hearth/sdk`, zero-dep): create/exec/execStream/
+  sleep/wake/fork/expose/templates/tenantUsage; node:test against an
+  in-process fake hearthd (8/8). `scripts/hearth-verify.sh <endpoint>` runs
+  the conformance suite against any deployment.
+
+Review-loop findings, fixed before commit: (1) the streamed path lossy-decoded
+UTF-8 per 8 KiB read, mangling multibyte chars at chunk boundaries — fixed
+with a per-stream carry of incomplete sequences (`emit_utf8`, unit-tested with
+split `€` and a 12 KiB all-`€` stream); (2) per-tenant `/metrics` gauges would
+have leaked the tenant inventory on the unauthenticated metrics endpoint —
+removed, per-tenant data stays behind the authed usage endpoint; (3) usage
+retention pruned by raw `ts`, which would delete the `created` anchor of a
+long-running sandbox and silently zero its hours — now prunes only `exec`
+rows; (4) the exec hot path did a synchronous sqlite write under the global
+state lock — the event is now built under the lock and appended after
+release; (5) gateway auto-wake had no singleflight (wake/route-fetch storm
+under a burst) — coalesced per sandbox id; (6) `ListUsage` loaded the tenant's
+whole exec history per query — bounded to in-window exec rows.
+
+Gates: cargo (guest UTF-8 + stream tests added), go vet/test green incl. new
+`lifecycle_test`/`usage_test`/`exec_stream_test` (17 new server tests), static
+hearthd+hearth-gw link; fleet rolled under systemd; conformance **326/0**
+(new `hearthd/21-stream-exec`, `22-lifecycle`, `23-template-visibility`; +60
+checks over P4's 266), verify-v2 **21/0** (fork-child ping checks pass — the
+gratuitous-ARP fix working); live repro: streamed exec of a multi-write command
+returned ordered stdout/stderr frames + a `done` frame with the exit code
+through hearthd's SSE relay. kata-lab-0 vz crashes #8 and #9 mid-suite (P5
+conformance now boots+captures+sleep/wakes VMs across three cases — `20`,
+`22`, `23` — much heavier I/O than P4) — each healed by `limactl stop -f` +
+`start`, zero staging; every crash-run failure was `000`/empty-body from the
+dead hypervisor, never an assertion mismatch, and the recovered re-run was a
+clean 326/0. Deferred
+(ADR-0009): exec stdin/PTY, `hearth` CLI binary, authenticated metrics,
+per-sandbox policy PATCH, SDK npm publish.
+
 ## Backlog (v3+, in order)
 
 branch (uffd CoW fork of running VMs) → cross-tenant nftables isolation →

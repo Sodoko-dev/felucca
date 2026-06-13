@@ -113,6 +113,10 @@ func main() {
 			cfg.WgIP, wg.InterfaceName, cfg.WgPort, len(peers))
 	}
 
+	// Lifecycle sweep (v4 P5.2): idle auto-sleep, asleep-TTL auto-delete,
+	// hourly usage-event retention. Runs for the process lifetime.
+	go srv.LifecycleLoop(make(chan struct{}))
+
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
 	log.Printf("hearthd listening on %s (ui_dir=%s, db=%s, auth=%s)",
 		addr, cfg.UIDir, cfg.DBPath,

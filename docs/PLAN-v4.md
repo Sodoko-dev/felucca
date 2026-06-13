@@ -109,7 +109,23 @@ worker image-cache GC (P5).
 3. **Resource flexibility**: configurable disk size at create (truncate + `resize2fs` after the reflink copy — same copy_rootfs path), guests up to e.g. 8 vCPU/16GB; **per-template warm pools** (generalize `pool.rs` from the single hardcoded 1c/256MB shape to per-template shapes/counts).
 4. Per-tenant disk accounting feeds Phase 0 quotas.
 
-## Phase 5 — Exec streaming, lifecycle policies, TS SDK
+## Phase 5 — Exec streaming, lifecycle policies, TS SDK — ✅ DONE 2026-06-13
+
+Completed and committed (`4c09f4e`). All five gates green: conformance **326/0**
+(new `hearthd/21-stream-exec`, `22-lifecycle`, `23-template-visibility`),
+verify-v2 **21/0**, cargo **41/0 guest + 121/0 agent**, go suite green, static
+hearthd+hearth-gw link. ADR-0009 + API-V2 §3f written. Also closed the
+deferrals parked by earlier phases: auto-wake + dynamic-expose GC (ADR-0007),
+per-template tenant visibility + worker image-cache GC (ADR-0008),
+usage_events retention (P0), gratuitous-ARP-after-fork (P4). Notable deltas
+from the sketch below: streamed exec is NDJSON-in-guest → chunked at the agent
+→ SSE at hearthd (one wire shape, translated per hop), buffered exec
+byte-frozen; usage retention prunes only the high-volume `exec` rows (lifecycle
+transitions are the interval skeleton); per-tenant `/metrics` gauges were
+rejected as a tenant-inventory leak on the unauthenticated endpoint (data
+served via the authed usage endpoint instead). Deferred (ADR-0009): exec
+stdin/PTY, `hearth` CLI binary, authenticated metrics, per-sandbox policy
+PATCH, SDK npm publish.
 
 1. **Streaming exec**: SSE on hearthd (`?stream=1`) — agent streams stdout/stderr chunks over the existing vsock protocol (protocol gains a `stream` op; hearth-guest writes incremental frames). Long-running agent commands (module installs, builds) need this; buffered exec stays for compat.
 2. **Idle/TTL policies**: per-tenant defaults + per-sandbox overrides — auto-sleep after N min idle (no exec/ingress traffic), optional auto-delete after M days asleep. Reconcile loop in hearthd drives it (it owns last-activity timestamps from exec/ingress).
