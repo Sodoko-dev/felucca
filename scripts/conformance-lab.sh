@@ -8,7 +8,13 @@ set -u
 TOKEN="${1:-hearth-lab-token}"
 MODE="${2:-run}"
 CP_VM=infra-saas-lab
-AGENT_ADDR="${AGENT_ADDR:-192.168.104.1:9090}"
+# Agent-suite target: resolve kata-lab-0's CURRENT user-v2 address at run
+# time — Lima's DHCP reassigns these across long stops (the workers' .1/.4
+# swapped once), so a hardcoded default silently retargets the suite.
+if [ -z "${AGENT_ADDR:-}" ]; then
+  k0_ip=$(limactl shell kata-lab-0 -- bash -c 'ip -4 -br addr | grep 192.168.104 | awk "{print \$3}" | cut -d/ -f1' 2>/dev/null | tr -d '\r\n')
+  AGENT_ADDR="${k0_ip:-192.168.104.1}:9090"
+fi
 
 REPO_DIR_HOST="$(cd "$(dirname "$0")/.." && pwd)"
 # Lima mounts the macOS home at the same path inside the VM.

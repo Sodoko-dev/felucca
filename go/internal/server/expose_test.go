@@ -27,7 +27,7 @@ type fakeAgent struct {
 	failNext bool
 }
 
-func (f *fakeAgent) call(host string, port uint16, method, path string, body []byte) (*agentclient.Response, error) {
+func (f *fakeAgent) call(host string, port uint16, method, path string, body []byte, reqID string) (*agentclient.Response, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failNext {

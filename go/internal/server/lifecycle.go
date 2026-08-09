@@ -7,9 +7,8 @@ package server
 
 import (
 	"encoding/json"
-	"fmt"
+	"log/slog"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/alpham/infra-saas/hearth/internal/agentclient"
@@ -69,9 +68,9 @@ func (srv *Server) LifecycleLoop(stop <-chan struct{}) {
 				lastPrune = now
 				cutoff := now - srv.cfg.UsageRetentionDays*86400
 				if n, err := srv.db.PruneUsage(cutoff); err != nil {
-					fmt.Fprintf(os.Stderr, "lifecycle: prune usage: %v\n", err)
+					slog.Error("lifecycle: prune usage", "err", err)
 				} else if n > 0 {
-					fmt.Fprintf(os.Stderr, "info: lifecycle: pruned %d usage events older than %dd\n", n, srv.cfg.UsageRetentionDays)
+					slog.Info("lifecycle: pruned usage events", "count", n, "older_than_days", srv.cfg.UsageRetentionDays)
 				}
 			}
 		case <-stop:
@@ -156,10 +155,13 @@ func (srv *Server) autoSleep(id string, now int64) {
 	if state != model.StateRunning || agentAddr == "" {
 		return // raced a manual transition or lost the node; next sweep re-decides
 	}
+	// Each sweep action is its own traceable actor: the ID lets operators
+	// correlate agent sleep calls with this sandbox's sweep decision.
+	sweepID := newTraceID("sweep")
 	host, port := agentclient.SplitHostPort(agentAddr)
-	resp, err := agentclient.Request(host, port, http.MethodPost, fmt.Sprintf("/v1/vms/%s/sleep", id), nil, srv.cfg.Token)
+	resp, err := agentclient.Request(host, port, http.MethodPost, "/v1/vms/"+id+"/sleep", nil, srv.cfg.Token, sweepID)
 	if err != nil || resp.Status >= 300 {
-		fmt.Fprintf(os.Stderr, "lifecycle: auto-sleep %s: agent call failed\n", id)
+		slog.Warn("lifecycle: auto-sleep agent call failed", "sandbox", id)
 		return
 	}
 
@@ -177,12 +179,12 @@ func (srv *Server) autoSleep(id string, now int64) {
 	}
 	srv.st.Unlock()
 	for _, e := range dynamic {
-		srv.dropExpose(id, e)
+		srv.dropExpose(id, e, sweepID)
 	}
 	if err := srv.persist(); err != nil {
-		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+		slog.Error("persist failed", "err", err)
 	}
-	fmt.Fprintf(os.Stderr, "info: lifecycle: auto-slept %s (idle)\n", id)
+	slog.Info("lifecycle: auto-slept sandbox", "sandbox", id, "reason", "idle")
 }
 
 // autoDelete is the sweep's twin of the delete handler (same best-effort
@@ -203,22 +205,24 @@ func (srv *Server) autoDelete(id string) {
 	}
 	srv.st.Unlock()
 
+	// Each sweep action is its own traceable actor.
+	sweepID := newTraceID("sweep")
 	if agentAddr != "" {
 		host, port := agentclient.SplitHostPort(agentAddr)
-		_, _ = agentclient.Request(host, port, http.MethodDelete, fmt.Sprintf("/v1/vms/%s", id), nil, srv.cfg.Token)
+		_, _ = agentclient.Request(host, port, http.MethodDelete, "/v1/vms/"+id, nil, srv.cfg.Token, sweepID)
 	}
 	srv.st.RemoveSandbox(id)
 	if err := srv.persist(); err != nil {
-		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+		slog.Error("persist failed", "err", err)
 	}
 	srv.recordUsage(&usage, "deleted")
-	fmt.Fprintf(os.Stderr, "info: lifecycle: auto-deleted %s (asleep past TTL)\n", id)
+	slog.Info("lifecycle: auto-deleted sandbox", "sandbox", id, "reason", "asleep past TTL")
 }
 
 // dropExpose removes one expose row and its agent DNAT rule, preserving the
 // shared-guest-port rule like the unexpose handler. Best-effort: on agent
 // failure the row stays (the rule is still live) for a later manual delete.
-func (srv *Server) dropExpose(id string, e model.Expose) {
+func (srv *Server) dropExpose(id string, e model.Expose, reqID string) {
 	srv.exposeMu.Lock()
 	defer srv.exposeMu.Unlock()
 
@@ -241,8 +245,8 @@ func (srv *Server) dropExpose(id string, e model.Expose) {
 	srv.st.Unlock()
 
 	if agentAddr != "" && !shared {
-		if err := srv.agentUnexpose(agentAddr, id, e.GuestPort); err != nil {
-			fmt.Fprintf(os.Stderr, "lifecycle: drop expose %s/%s: %v\n", id, e.Name, err)
+		if err := srv.agentUnexpose(agentAddr, id, e.GuestPort, reqID); err != nil {
+			slog.Warn("lifecycle: drop expose failed", "sandbox", id, "expose", e.Name, "err", err)
 			return
 		}
 	}

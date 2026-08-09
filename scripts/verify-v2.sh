@@ -51,13 +51,17 @@ ip=$(printf '%s' "$sb" | grep -oE '"ip":"[0-9.]+"' | head -1 | cut -d'"' -f4)
 say "== 4. guest reachable from its worker =="
 node_id=$(printf '%s' "$sb" | grep -oE '"node_id":"[^"]+"' | head -1 | cut -d'"' -f4)
 node_addr=$(printf '%s' "$nodes" | tr '{' '\n' | grep "$node_id" | grep -oE '"addr":"[^"]+"' | cut -d'"' -f4)
+# Resolve the Lima VM from the node's REGISTRATION HOSTNAME (lima-<vm>),
+# never from its IP: Lima's user-v2 DHCP reassigns addresses across long
+# stops (the workers' .1/.4 literally swapped after a 2-month gap and every
+# hardcoded addr→VM mapping silently pinged from the wrong machine).
+# Hostnames are stable and the agent re-registers its (auto-detected) addr
+# anyway, so the addr column stays correct for hearthd while the hostname
+# stays correct for us.
+node_host=$(printf '%s' "$nodes" | tr '{' '\n' | grep "$node_id" | grep -oE '"hostname":"[^"]+"' | cut -d'"' -f4)
 worker_vm=""
-case "$node_addr" in
-  192.168.104.1*) worker_vm=kata-lab-0 ;;
-  192.168.104.4*) worker_vm=kata-lab-1 ;;
-  # v4 P2: a worker joined to the wg overlay advertises its overlay IP.
-  # kata-lab-1 is the lab's overlay-joined worker (kata-lab-0 stays direct).
-  10.100.0.*) worker_vm=kata-lab-1 ;;
+case "$node_host" in
+  lima-*) worker_vm=${node_host#lima-} ;;
 esac
 if [ -n "$worker_vm" ] && [ -n "$ip" ]; then
   sleep 3  # give the guest a moment to finish boot

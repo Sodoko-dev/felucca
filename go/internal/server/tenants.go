@@ -8,8 +8,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -94,13 +94,13 @@ func (srv *Server) createTenant(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 409, []byte(`{"error":"tenant name exists"}`))
 			return
 		}
-		fmt.Fprintf(os.Stderr, "create tenant: %v\n", err)
+		slog.Error("create tenant", "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
 	key, secret := mintKey(t.ID, now)
 	if err := srv.db.CreateKey(key); err != nil {
-		fmt.Fprintf(os.Stderr, "create key: %v\n", err)
+		slog.Error("create key", "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
@@ -115,7 +115,7 @@ func (srv *Server) createTenant(w http.ResponseWriter, r *http.Request) {
 func (srv *Server) listTenants(w http.ResponseWriter) {
 	ts, err := srv.db.ListTenants()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "list tenants: %v\n", err)
+		slog.Error("list tenants", "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
@@ -131,7 +131,7 @@ func (srv *Server) listTenants(w http.ResponseWriter) {
 func (srv *Server) createTenantKey(w http.ResponseWriter, tenantID string) {
 	t, err := srv.db.GetTenant(tenantID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "get tenant: %v\n", err)
+		slog.Error("get tenant", "tenant", tenantID, "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
@@ -141,7 +141,7 @@ func (srv *Server) createTenantKey(w http.ResponseWriter, tenantID string) {
 	}
 	key, secret := mintKey(t.ID, time.Now().Unix())
 	if err := srv.db.CreateKey(key); err != nil {
-		fmt.Fprintf(os.Stderr, "create key: %v\n", err)
+		slog.Error("create key", "tenant", tenantID, "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
@@ -155,7 +155,7 @@ func (srv *Server) createTenantKey(w http.ResponseWriter, tenantID string) {
 func (srv *Server) revokeTenantKey(w http.ResponseWriter, keyID string) {
 	ok, err := srv.db.RevokeKey(keyID, time.Now().Unix())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "revoke key: %v\n", err)
+		slog.Error("revoke key", "key", keyID, "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
@@ -174,7 +174,7 @@ func (srv *Server) revokeTenantKey(w http.ResponseWriter, keyID string) {
 func (srv *Server) quotaExceeded(tenantID string, vcpus uint32, memMiB uint64, diskGB uint32) string {
 	t, err := srv.db.GetTenant(tenantID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "quota lookup: %v\n", err)
+		slog.Error("quota lookup", "tenant", tenantID, "err", err)
 		return "" // store trouble must not block the data plane
 	}
 	if t == nil {

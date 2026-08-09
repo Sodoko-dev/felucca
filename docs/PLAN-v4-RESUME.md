@@ -113,7 +113,19 @@ fresh session (after `/clear`) can continue without the in-memory task list.
   the recovered re-run a clean 326/0. Deferred (ADR-0009): exec stdin/PTY,
   `hearth` CLI binary, authenticated per-tenant metrics, per-sandbox policy
   PATCH, SDK npm publish.
-- P6: not started.
+- **P6 — DONE 2026-08-09**: observability, bench, HA groundwork. Structured
+  logging (Go slog / Rust tracing; fatal + isolation diagnostics stay
+  unconditional on stderr), X-Hearth-Request-Id minted per API request and
+  propagated hearthd→agent (SDK captures it in HearthError), latency
+  histograms on open /metrics + tenant gauges behind authed
+  /api/v1/metrics/tenants, Grafana dashboard in deploy/grafana/,
+  scripts/bench.sh + BENCHMARKS.md (wake p50 75ms, exec 41ms, stream
+  first-frame 9ms, fork 1.1s), HA-GROUNDWORK.md + research/uffd-cow-fork.md.
+  Gates: conformance 342/0, verify-v2 21/0, cargo 121/0+41/0. ADR-0010.
+  LAB LESSON: Lima user-v2 DHCP addresses are NOT stable across long stops —
+  the workers' .1/.4 swapped after a 2-month gap; the product self-healed
+  (agent addr auto-detect) but hardcoded test maps broke. verify-v2 and
+  conformance-lab.sh now resolve workers dynamically; never hardcode 104.x.
 
 ## P2 — remaining work
 

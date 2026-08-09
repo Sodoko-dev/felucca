@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -142,15 +143,17 @@ func (srv *Server) readyNodeAddrs() []string {
 func (srv *Server) pushPoolsTo(addr string) {
 	specs, err := srv.poolSpecs()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "pool specs: %v (push to %s skipped)\n", err, addr)
+		slog.Error("pool specs", "addr", addr, "err", err)
 		return
 	}
 	body, _ := json.Marshal(specs)
 	host, port := agentclient.SplitHostPort(addr)
-	if resp, err := srv.agentCall(host, port, http.MethodPut, "/v1/pools", body); err != nil {
-		fmt.Fprintf(os.Stderr, "pool push to %s: %v\n", addr, err)
+	// Background pool pushes get their own traceable ID.
+	bgID := newTraceID("bg")
+	if resp, err := srv.agentCall(host, port, http.MethodPut, "/v1/pools", body, bgID); err != nil {
+		slog.Warn("pool push failed", "addr", addr, "err", err)
 	} else if resp.Status >= 300 {
-		fmt.Fprintf(os.Stderr, "pool push to %s: status %d\n", addr, resp.Status)
+		slog.Warn("pool push failed", "addr", addr, "status", resp.Status)
 	}
 }
 
@@ -173,10 +176,12 @@ func (srv *Server) prefetchImage(image, sha string) {
 	}{image, sha})
 	for _, addr := range srv.readyNodeAddrs() {
 		host, port := agentclient.SplitHostPort(addr)
-		if resp, err := srv.agentCall(host, port, http.MethodPost, "/v1/images/prefetch", body); err != nil {
-			fmt.Fprintf(os.Stderr, "prefetch push to %s: %v\n", addr, err)
+		// Background prefetch calls get their own traceable ID per node.
+		bgID := newTraceID("bg")
+		if resp, err := srv.agentCall(host, port, http.MethodPost, "/v1/images/prefetch", body, bgID); err != nil {
+			slog.Warn("prefetch push failed", "addr", addr, "err", err)
 		} else if resp.Status >= 300 {
-			fmt.Fprintf(os.Stderr, "prefetch push to %s: status %d\n", addr, resp.Status)
+			slog.Warn("prefetch push failed", "addr", addr, "status", resp.Status)
 		}
 	}
 }
@@ -304,7 +309,7 @@ func (srv *Server) createTemplate(w http.ResponseWriter, r *http.Request, tenant
 	if err := srv.db.CreateTemplate(t); err != nil {
 		// A captured image file without a row is harmless (re-capture
 		// refuses; delete cleans) but don't leave it silently.
-		fmt.Fprintf(os.Stderr, "create template: %v\n", err)
+		slog.Error("create template", "template", t.Name, "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
@@ -371,7 +376,7 @@ func (srv *Server) deleteTemplate(w http.ResponseWriter, name, tenant string) {
 	// ones reference a shared pre-provisioned image which stays.
 	if t.Image == t.Name {
 		if err := os.Remove(srv.imagePath(t.Image)); err != nil && !os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "delete template image: %v\n", err)
+			slog.Warn("delete template image", "template", name, "err", err)
 		}
 	}
 	go srv.pushPools()

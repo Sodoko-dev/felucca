@@ -7,6 +7,7 @@ use super::{Vm, VmState};
 use crate::ipalloc::Allocator;
 use crate::vm::meta::Meta;
 use std::path::Path;
+use tracing::warn;
 
 /// Scan data_dir/instances/ and return a Vec of reconciled Vm records.
 /// Also calls `alloc.reserve(slot)` for every record that has a slot set.
@@ -29,7 +30,7 @@ pub fn reconcile(data_dir: &str, mut alloc: Option<&mut Allocator>) -> Vec<Vm> {
         match reconcile_one(data_dir, &dir_name, alloc.as_deref_mut()) {
             Some(vm) => vms.push(vm),
             None => {
-                eprintln!("reconcile {}: skipped (no valid meta.json)", dir_name);
+                warn!(dir = %dir_name, "reconcile: skipped (no valid meta.json)");
             }
         }
     }

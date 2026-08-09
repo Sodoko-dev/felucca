@@ -12,8 +12,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -29,6 +28,8 @@ func envOr(key, def string) string {
 }
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
 	listen := flag.String("listen", envOr("HEARTH_GW_LISTEN", "0.0.0.0:8088"), "address to serve ingress on")
 	hearthd := flag.String("hearthd", envOr("HEARTH_GW_HEARTHD", "http://127.0.0.1:8080"), "hearthd base URL (route table source)")
 	token := flag.String("token", envOr("HEARTH_TOKEN", ""), "hearthd admin token (routes are admin-only)")
@@ -39,20 +40,24 @@ func main() {
 	flag.Parse()
 
 	if *domain == "" {
-		log.Fatal("hearth-gw: --domain is required (the wildcard zone ingress hostnames live under)")
+		slog.Error("hearth-gw: --domain is required (the wildcard zone ingress hostnames live under)")
+		os.Exit(1)
 	}
 	if *token == "" {
-		log.Fatal("hearth-gw: --token is required (the route table is admin-only)")
+		slog.Error("hearth-gw: --token is required (the route table is admin-only)")
+		os.Exit(1)
 	}
 
 	limits := map[string]gateway.TenantLimit{}
 	if *limitsPath != "" {
 		data, err := os.ReadFile(*limitsPath)
 		if err != nil {
-			log.Fatalf("hearth-gw: tenant limits: %v", err)
+			slog.Error("hearth-gw: tenant limits", "err", err)
+			os.Exit(1)
 		}
 		if err := json.Unmarshal(data, &limits); err != nil {
-			log.Fatalf("hearth-gw: tenant limits %s: %v", *limitsPath, err)
+			slog.Error("hearth-gw: tenant limits", "path", *limitsPath, "err", err)
+			os.Exit(1)
 		}
 	}
 
@@ -74,6 +79,9 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		// No WriteTimeout: WebSocket/longpolling connections are long-lived.
 	}
-	fmt.Fprintf(os.Stderr, "hearth-gw listening on %s (domain=%s, hearthd=%s)\n", *listen, *domain, *hearthd)
-	log.Fatal(srv.ListenAndServe())
+	slog.Info("hearth-gw listening", "addr", *listen, "domain", *domain, "hearthd", *hearthd)
+	if err := srv.ListenAndServe(); err != nil {
+		slog.Error("listen", "err", err)
+		os.Exit(1)
+	}
 }

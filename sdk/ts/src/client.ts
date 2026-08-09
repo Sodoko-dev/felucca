@@ -36,12 +36,22 @@ export class HearthError extends Error {
   readonly status: number;
   /** Raw response body (or stream error text). */
   readonly body: string;
+  /**
+   * hearthd's X-Hearth-Request-Id for this call (v4 P6) — quote it in bug
+   * reports; the operator can grep both hearthd's and the agent's journals
+   * for it. Empty when the server predates P6 or the failure was client-side.
+   */
+  readonly requestId: string;
 
-  constructor(status: number, body: string) {
-    super(`hearthd request failed: ${status}: ${body}`);
+  constructor(status: number, body: string, requestId = "") {
+    super(
+      `hearthd request failed: ${status}: ${body}` +
+        (requestId ? ` (request_id ${requestId})` : ""),
+    );
     this.name = "HearthError";
     this.status = status;
     this.body = body;
+    this.requestId = requestId;
   }
 }
 
@@ -154,7 +164,7 @@ export class HearthClient {
       req,
     );
     if (!res.body) {
-      throw new HearthError(res.status, "response has no body");
+      throw new HearthError(res.status, "response has no body", reqIDOf(res));
     }
 
     const reader = res.body.getReader();
@@ -173,7 +183,7 @@ export class HearthClient {
           if (cut === null) break;
           const raw = buf.slice(0, cut.index);
           buf = buf.slice(cut.index + cut.length);
-          const frame = parseFrame(raw, res.status);
+          const frame = parseFrame(raw, res.status, reqIDOf(res));
           if (frame === null) continue; // comment / heartbeat
           if ("done" in frame) {
             if (frame.ok) {
@@ -182,7 +192,7 @@ export class HearthClient {
                 truncated: frame.truncated ?? false,
               };
             }
-            throw new HearthError(res.status, frame.error);
+            throw new HearthError(res.status, frame.error, reqIDOf(res));
           }
           if (frame.stream === "stdout") handlers.onStdout?.(frame.data);
           else if (frame.stream === "stderr") handlers.onStderr?.(frame.data);
@@ -191,7 +201,7 @@ export class HearthClient {
     } finally {
       reader.cancel().catch(() => {});
     }
-    throw new HearthError(res.status, "stream ended without done frame");
+    throw new HearthError(res.status, "stream ended without done frame", reqIDOf(res));
   }
 
   // ---- Ingress (API-V2 §3d) ----
@@ -276,7 +286,7 @@ export class HearthClient {
       body: payload,
     });
     if (!res.ok) {
-      throw new HearthError(res.status, await res.text());
+      throw new HearthError(res.status, await res.text(), reqIDOf(res));
     }
     return res;
   }
@@ -285,6 +295,11 @@ export class HearthClient {
     const res = await this.#request(method, path, body);
     return (await res.json()) as T;
   }
+}
+
+/** hearthd's per-request id (v4 P6); "" when absent (pre-P6 servers). */
+function reqIDOf(res: Response): string {
+  return res.headers.get("x-hearth-request-id") ?? "";
 }
 
 /**
@@ -310,7 +325,11 @@ function findMessageEnd(
  * (per the SSE spec) and JSON-parses the payload. Returns null for messages
  * with no data (comments / keep-alives).
  */
-function parseFrame(raw: string, status: number): ExecStreamFrame | null {
+function parseFrame(
+  raw: string,
+  status: number,
+  requestId: string,
+): ExecStreamFrame | null {
   const parts: string[] = [];
   for (const line of raw.split(/\r?\n/)) {
     if (line.startsWith("data:")) {
@@ -325,6 +344,6 @@ function parseFrame(raw: string, status: number): ExecStreamFrame | null {
   try {
     return JSON.parse(payload) as ExecStreamFrame;
   } catch {
-    throw new HearthError(status, `invalid SSE frame: ${payload}`);
+    throw new HearthError(status, `invalid SSE frame: ${payload}`, requestId);
   }
 }

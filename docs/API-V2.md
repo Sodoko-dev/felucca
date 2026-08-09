@@ -205,6 +205,32 @@ create/exec/execStream/sleep/wake/fork/expose/templates/tenantUsage);
 `scripts/hearth-verify.sh <endpoint> [token]` runs this conformance suite
 against any deployment.
 
+## 3g. Observability (v4 P6, hearthd + agent)
+
+Design: [ADR-0010](adr/ADR-0010-observability-and-bench.md).
+
+**Request IDs** — every `/api/` request is assigned `req-<hex>`, echoed back
+as the `X-Hearth-Request-Id` response header and forwarded on every
+hearthd→agent proxy call via the same header; both binaries log it
+(`request_id` field). Headers only — no wire-shape change; pre-P6 agents
+ignore it. Background actors mint `sweep-`/`bg-` prefixed ids.
+
+**Structured logs** — hearthd/hearth-gw log via Go `slog` (text, stderr),
+the agent via Rust `tracing` (`RUST_LOG` filter, default `info`). Message
+phrases are stable (grep-able); values are structured fields. The guest
+stays on plain stderr by design.
+
+**Admin metrics surface** — `GET /api/v1/metrics/tenants` (admin token only;
+404 to tenant keys) serves the per-tenant Prometheus gauges
+(`hearth_tenant_{sandboxes,running,vcpus,mem_mib,disk_gb}`) that are
+deliberately kept OFF the open `/metrics` (tenant-inventory leak —
+ADR-0009). Scrape it as a second Prometheus job with bearer credentials;
+dashboard + scrape config in `deploy/grafana/`.
+
+**Bench** — `scripts/bench.sh <endpoint> [token]` measures p50/p95 for
+create (cold + pool-claim), exec (buffered + stream first-frame), wake, and
+fork; lab numbers live in [BENCHMARKS.md](BENCHMARKS.md).
+
 ## 4. Warm pools (agent-internal, Tier A wake; per-template since v4 P4)
 
 - Agent flag/config `pool_size` (default **0** = off). When >0 the agent keeps N **paused** generic
@@ -275,13 +301,17 @@ hearth_wake_ms_sum         counter (for avg = sum/total)
 hearth_forks_total         counter
 hearth_pool_size{node=...} gauge   (agent-side, aggregated by hearthd)
 hearth_sandboxes_total{state="sleeping"} added to the existing state gauge set
+hearth_wake_duration_ms_{bucket,sum,count}    histogram (v4 P6; ms buckets 5..30000,+Inf)
+hearth_exec_duration_ms_{bucket,sum,count}    histogram (v4 P6; buffered exec, hearthd wall-clock)
+hearth_create_duration_ms_{bucket,sum,count}  histogram (v4 P6; to 201, cold+claim mixed)
 ```
 
-Per-tenant gauges are deliberately **not** emitted here: `/metrics` is
-unauthenticated, so tenant-labeled series would leak the tenant inventory and
-per-tenant footprint. Per-tenant usage is served by the authenticated
-`GET /api/v1/tenants/{id}/usage` endpoint (§3f); an authenticated metrics
-surface is a P6 item.
+Histogram state is in-memory (resets on restart — standard Prometheus
+counter semantics). Per-tenant gauges are deliberately **not** emitted here:
+`/metrics` is unauthenticated, so tenant-labeled series would leak the
+tenant inventory and per-tenant footprint. They are served by the
+**authenticated** `GET /api/v1/metrics/tenants` surface instead (§3g);
+per-tenant billable history stays on `GET /api/v1/tenants/{id}/usage` (§3f).
 
 ## 8. UI requirements
 

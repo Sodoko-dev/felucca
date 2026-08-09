@@ -12,6 +12,7 @@ pub mod reconcile;
 use crate::fc;
 use crate::ipalloc::{Allocator, Cidr};
 use crate::net;
+use tracing::{info, warn};
 use meta::{ExposeEntry, Meta, VmState};
 use serde::Deserialize;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
@@ -354,7 +355,7 @@ impl Manager {
             g.allocator = Some(alloc);
         }
         if !net::ensure_bridge(self.cidr) {
-            eprintln!("warn: bridge setup failed; guests may lack networking");
+            warn!("bridge setup failed; guests may lack networking");
         }
     }
 
@@ -436,7 +437,7 @@ impl Manager {
         // Persist is best-effort like other meta writes off the happy path:
         // the in-memory entry and the nft rule are already authoritative.
         if let Err(e) = self.write_meta(id).await {
-            eprintln!("warn: expose persist for {} failed: {}", id, e);
+            warn!(vm = %id, err = %e, "expose persist failed");
         }
         self.refresh_ingress().await;
         Ok(node_port)
@@ -454,7 +455,7 @@ impl Manager {
         };
         if changed {
             if let Err(e) = self.write_meta(id).await {
-                eprintln!("warn: unexpose persist for {} failed: {}", id, e);
+                warn!(vm = %id, err = %e, "unexpose persist failed");
             }
             self.refresh_ingress().await;
         }
@@ -761,7 +762,7 @@ impl Manager {
             self.control_plane.trim_end_matches('/'),
             image_name
         );
-        eprintln!("info: pulling image {} from control plane", image_name);
+        info!(image = %image_name, "pulling image from control plane");
         image::curl_download(&url, &self.token, &tmp).await?;
 
         let got = image::sha256_of(&tmp).await?;
@@ -781,7 +782,7 @@ impl Manager {
         image::write_sidecar(path, want_sha)?;
         std::fs::rename(&tmp, path)
             .map_err(|e| format!("rename {} -> {}: {}", tmp, path, e))?;
-        eprintln!("info: image {} cached ({})", image_name, want_sha);
+        info!(image = %image_name, sha = %want_sha, "image cached");
         Ok(())
     }
 
@@ -883,7 +884,7 @@ impl Manager {
                 continue;
             }
             if std::fs::remove_file(entry.path()).is_ok() {
-                eprintln!("info: image gc: removed {} (unreferenced)", fname);
+                info!(file = %fname, "image gc: removed (unreferenced)");
             }
         }
     }
@@ -1356,13 +1357,13 @@ impl Manager {
                     .iter().map(|s| s.to_string()).collect();
                 match crate::guestclient::exec(&child_dir, &cmd, 5_000).await {
                     Ok(v) if v.get("exit_code").and_then(|c| c.as_i64()) == Some(0) => {}
-                    Ok(v) => eprintln!("warn: fork re-MAC for {} failed (best-effort): {}", child_id, v),
-                    Err(e) => eprintln!("warn: fork re-MAC for {} failed (best-effort): {}", child_id, e),
+                    Ok(v) => warn!(vm = %child_id, err = %v, "fork re-MAC failed (best-effort)"),
+                    Err(e) => warn!(vm = %child_id, err = %e, "fork re-MAC failed (best-effort)"),
                 }
                 let gw = crate::ipalloc::fmt_ip(self.cidr.gateway());
                 match crate::guestclient::set_ip(&child_dir, ip, self.cidr.prefix, &gw).await {
                     Ok(()) => {}
-                    Err(e) => eprintln!("warn: fork re-IP for {} failed (best-effort): {}", child_id, e),
+                    Err(e) => warn!(vm = %child_id, err = %e, "fork re-IP failed (best-effort)"),
                 }
             }
         }
@@ -1477,9 +1478,9 @@ impl Manager {
             surplus_pooled_ids(&g.vms, &specs)
         };
         for sid in surplus {
-            eprintln!("info: draining surplus pool vm {}", sid);
+            info!(vm = %sid, "draining surplus pool vm");
             if let Err(e) = self.delete(&sid).await {
-                eprintln!("warn: pool drain {}: {}", sid, e);
+                warn!(vm = %sid, err = %e, "pool drain failed");
             }
         }
 
@@ -1511,12 +1512,12 @@ impl Manager {
                     disk_gb: spec.disk_gb,
                 };
                 if let Err(e) = self.cold_create(&cs, VmState::Pooled, None).await {
-                    eprintln!("warn: pool prewarm {} ({}) failed: {}", id, spec.image, e);
+                    warn!(vm = %id, image = %spec.image, err = %e, "pool prewarm failed");
                     // Remove the failed record + instance dir (each tick
                     // would otherwise leak one Error VM) and back the spec
                     // off so a broken sha doesn't retry every 5s.
                     if let Err(de) = self.delete(&id).await {
-                        eprintln!("warn: pool prewarm cleanup {}: {}", id, de);
+                        warn!(vm = %id, err = %de, "pool prewarm cleanup failed");
                     }
                     let mut bo = self.pool_backoff.lock().await;
                     bo.insert(spec_key(&spec), Instant::now() + REFILL_BACKOFF);
@@ -1552,7 +1553,7 @@ impl Manager {
         if let Err(e) = fc::patch_vm_state(&sock, "Resumed").await {
             // Pool VM is unusable (FC likely dead). Retag the record back,
             // mark it error, and let the caller fall through to a cold boot.
-            eprintln!("warn: pool claim of {} for {} failed: {}", pooled_id, id, e);
+            warn!(pool_vm = %pooled_id, vm = %id, err = %e, "pool claim failed");
             let dead_pid = {
                 let mut g = self.inner.lock().await;
                 if let Some(v) = g.vms.iter_mut().find(|v| v.id == id) {
@@ -1609,7 +1610,7 @@ impl Manager {
                     killed = true;
                 }
                 if waited >= Duration::from_secs(10) {
-                    eprintln!("warn: stop {}: pid {} still present after 10s", id, p);
+                    warn!(vm = %id, pid = p, "stop: pid still present after 10s");
                     break;
                 }
                 sleep(Duration::from_millis(100)).await;
@@ -1692,7 +1693,7 @@ impl Manager {
 
         let dir_path = self.instance_dir(id).await;
         if let Err(e) = std::fs::remove_dir_all(&dir_path) {
-            eprintln!("warn: remove_dir_all {}: {}", dir_path, e);
+            warn!(path = %dir_path, err = %e, "remove_dir_all failed");
         }
 
         {
@@ -1745,7 +1746,7 @@ impl Manager {
             }
         };
         if transitioned {
-            eprintln!("warn: firecracker for {} (pid {}) exited unexpectedly; state -> error", id, pid);
+            warn!(vm = %id, pid = pid, "firecracker exited unexpectedly; state -> error");
             // Best-effort: the instance dir may be mid-delete.
             let _ = self.write_meta(id).await;
         }

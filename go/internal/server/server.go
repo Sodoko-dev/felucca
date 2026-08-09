@@ -5,9 +5,11 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -28,6 +30,24 @@ import (
 // (and for open mode when no token is configured): unrestricted access.
 const adminTenant = ""
 
+// reqIDKey is the context key for the per-request trace ID.
+type reqIDKey struct{}
+
+// reqID extracts the request ID from the context, returning "" when absent.
+func reqID(ctx context.Context) string {
+	if v, ok := ctx.Value(reqIDKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// newTraceID mints a trace identifier for one actor: "req" for API requests,
+// "sweep" for lifecycle sweep actions, "bg" for background pushes. One mint
+// site so the format can never diverge per actor class.
+func newTraceID(prefix string) string {
+	return prefix + "-" + newSecret(6)
+}
+
 // Server holds the application state and configuration.
 type Server struct {
 	cfg *config.Config
@@ -42,7 +62,7 @@ type Server struct {
 	addPeer  func(pubKey, overlayIP string) error
 	// agentCall is the agent-HTTP hook for the ingress path (v4 P3) —
 	// agentclient.Request in production, swappable in tests.
-	agentCall func(host string, port uint16, method, path string, body []byte) (*agentclient.Response, error)
+	agentCall func(host string, port uint16, method, path string, body []byte, reqID string) (*agentclient.Response, error)
 	// exposeMu serializes expose/unexpose mutations end-to-end (check +
 	// agent call + row update). Without it, two racing exposes of one name
 	// leak an unaccounted agent DNAT entry on the 409 path, and two racing
@@ -54,8 +74,8 @@ type Server struct {
 // New creates a new Server.
 func New(cfg *config.Config, st *state.State, db store.Store) *Server {
 	srv := &Server{cfg: cfg, st: st, db: db, addPeer: wg.AddPeer}
-	srv.agentCall = func(host string, port uint16, method, path string, body []byte) (*agentclient.Response, error) {
-		return agentclient.Request(host, port, method, path, body, cfg.Token)
+	srv.agentCall = func(host string, port uint16, method, path string, body []byte, reqID string) (*agentclient.Response, error) {
+		return agentclient.Request(host, port, method, path, body, cfg.Token, reqID)
 	}
 	return srv
 }
@@ -86,7 +106,7 @@ func (srv *Server) authenticate(authHeader string) (string, bool) {
 	}
 	tenantID, err := srv.db.LookupKeyByHash(hashSecret(key))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "key lookup: %v\n", err)
+		slog.Error("key lookup", "err", err)
 		return "", false
 	}
 	if tenantID == "" {
@@ -127,7 +147,7 @@ func (srv *Server) recordUsage(sb *model.Sandbox, event string) {
 		return
 	}
 	if err := srv.db.AppendUsage(usageEventFor(sb, event)); err != nil {
-		fmt.Fprintf(os.Stderr, "usage event: %v\n", err)
+		slog.Error("usage event", "err", err)
 	}
 }
 
@@ -163,6 +183,13 @@ func (srv *Server) handle(w http.ResponseWriter, r *http.Request) {
 	// API routes — bearer-guarded when token configured. The admin token (or
 	// open mode) gets the admin context; tenant API keys get their tenant.
 	if strings.HasPrefix(path, "/api/") {
+		// Mint the per-request trace ID BEFORE auth (API-V2 §3g: EVERY /api/
+		// request gets one): a 401 caused by a transient store error in key
+		// lookup is exactly the case an operator needs to correlate.
+		id := newTraceID("req")
+		w.Header().Set(agentclient.RequestIDHeader, id)
+		r = r.WithContext(context.WithValue(r.Context(), reqIDKey{}, id))
+
 		authHeader := r.Header.Get("Authorization")
 		tenant, ok := srv.authenticate(authHeader)
 		if !ok {
@@ -200,7 +227,8 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request, tenant strin
 			strings.HasPrefix(path, "/api/v1/join-tokens"),
 			path == "/api/v1/routes",
 			strings.HasPrefix(path, "/api/v1/routes/"),
-			strings.HasPrefix(path, "/api/v1/images/"):
+			strings.HasPrefix(path, "/api/v1/images/"),
+			strings.HasPrefix(path, "/api/v1/metrics/"):
 			writeJSON(w, 404, []byte(`{"error":"not found"}`))
 			return
 		}
@@ -240,6 +268,11 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request, tenant strin
 	// Gateway ingress-activity reports (v4 P5.2; admin-gated above).
 	case path == "/api/v1/routes/activity" && method == http.MethodPost:
 		srv.routesActivity(w, r)
+
+	// Per-tenant Prometheus gauges (v4 P6; admin-gated above — the open
+	// /metrics deliberately omits tenant labels, ADR-0010).
+	case path == "/api/v1/metrics/tenants" && method == http.MethodGet:
+		srv.serveTenantMetrics(w)
 
 	// Template catalog: GET is tenant-visible (tenants must be able to
 	// discover what they can create from); mutations are admin-only via
@@ -287,7 +320,7 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request, tenant strin
 			if id, name, ok2 := strings.Cut(rest, "/expose/"); ok2 &&
 				id != "" && name != "" &&
 				!strings.Contains(id, "/") && !strings.Contains(name, "/") {
-				srv.unexposeSandbox(w, id, name, tenant)
+				srv.unexposeSandbox(w, r, id, name, tenant)
 				return
 			}
 		}
@@ -296,16 +329,16 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request, tenant strin
 			return
 		}
 		if id, ok := matchSuffix(path, "/api/v1/sandboxes/", "/sleep"); ok && method == http.MethodPost {
-			srv.sleepSandbox(w, id, tenant)
+			srv.sleepSandbox(w, r, id, tenant)
 			return
 		}
 		if id, ok := matchSuffix(path, "/api/v1/sandboxes/", "/wake"); ok && method == http.MethodPost {
-			srv.wakeSandbox(w, id, tenant)
+			srv.wakeSandbox(w, r, id, tenant)
 			return
 		}
 		for _, action := range []string{"stop", "start", "pause", "resume"} {
 			if id, ok := matchSuffix(path, "/api/v1/sandboxes/", "/"+action); ok && method == http.MethodPost {
-				srv.sandboxAction(w, id, action, tenant)
+				srv.sandboxAction(w, r, id, action, tenant)
 				return
 			}
 		}
@@ -314,7 +347,7 @@ func (srv *Server) serveAPI(w http.ResponseWriter, r *http.Request, tenant strin
 			case http.MethodGet:
 				srv.getSandbox(w, id, tenant)
 			case http.MethodDelete:
-				srv.deleteSandbox(w, id, tenant)
+				srv.deleteSandbox(w, r, id, tenant)
 			default:
 				writeJSON(w, 404, []byte(`{"error":"not found"}`))
 			}
@@ -390,7 +423,7 @@ func (srv *Server) agentRegister(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().Unix()
 	id := srv.st.RegisterNode(req.Hostname, req.Addr, req.CPUs, req.MemTotal, now)
 	if err := srv.persist(); err != nil {
-		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+		slog.Error("persist failed", "err", err)
 	}
 	// Push the current warm-pool specs to the (re)registering node off the
 	// response path (v4 P4). The response shape itself stays the frozen
@@ -461,6 +494,10 @@ func (srv *Server) getSandbox(w http.ResponseWriter, id, tenant string) {
 }
 
 func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant string) {
+	// Create-to-201 latency histogram (v4 P6): started at entry so template
+	// resolution, scheduling, and the agent round-trip are all included —
+	// the number a caller experiences.
+	createStart := time.Now()
 	var req struct {
 		Name              string  `json:"name"`
 		Namespace         string  `json:"namespace"`
@@ -572,7 +609,7 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 	srv.st.Unlock()
 
 	if err := srv.persist(); err != nil {
-		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+		slog.Error("persist failed", "err", err)
 	}
 
 	// Build agent create request body (tenant_id feeds nft isolation on the
@@ -590,20 +627,22 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 	}{sbID, req.Name, vcpus, memMiB, tenant, image, imageSHA, diskGB})
 
 	host, port := agentclient.SplitHostPort(agentAddr)
-	resp, err := agentclient.Request(host, port, http.MethodPost, "/v1/vms", agentBody, srv.cfg.Token)
+	resp, err := agentclient.Request(host, port, http.MethodPost, "/v1/vms", agentBody, srv.cfg.Token, reqID(r.Context()))
 	if err != nil {
 		srv.st.SetSandboxState(sbID, model.StateError)
 		if perr := srv.persist(); perr != nil {
-			fmt.Fprintf(os.Stderr, "persist: %v\n", perr)
+			slog.Error("persist failed", "err", perr)
 		}
+		slog.Error("agent unreachable", "sandbox", sbID, "request_id", reqID(r.Context()), "err", err)
 		writeJSON(w, 502, []byte(`{"error":"agent unreachable"}`))
 		return
 	}
 	if resp.Status >= 300 {
 		srv.st.SetSandboxState(sbID, model.StateError)
 		if perr := srv.persist(); perr != nil {
-			fmt.Fprintf(os.Stderr, "persist: %v\n", perr)
+			slog.Error("persist failed", "err", perr)
 		}
+		slog.Error("agent create failed", "sandbox", sbID, "request_id", reqID(r.Context()), "status", resp.Status)
 		writeJSON(w, 502, []byte(`{"error":"agent create failed"}`))
 		return
 	}
@@ -617,7 +656,7 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 	}
 	srv.st.SetSandboxState(sbID, model.StateRunning)
 	if err := srv.persist(); err != nil {
-		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+		slog.Error("persist failed", "err", err)
 	}
 
 	srv.st.Lock()
@@ -628,11 +667,12 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 		return
 	}
 	srv.recordUsage(sb, "created")
+	observeCreateMs(uint64(time.Since(createStart).Milliseconds()))
 	b, _ := json.Marshal(sb)
 	writeJSON(w, 201, b)
 }
 
-func (srv *Server) sandboxAction(w http.ResponseWriter, id, action, tenant string) {
+func (srv *Server) sandboxAction(w http.ResponseWriter, r *http.Request, id, action, tenant string) {
 	var agentAddr string
 	srv.st.Lock()
 	sb := srv.st.FindSandbox(id)
@@ -657,7 +697,7 @@ func (srv *Server) sandboxAction(w http.ResponseWriter, id, action, tenant strin
 
 	host, port := agentclient.SplitHostPort(agentAddr)
 	agentPath := fmt.Sprintf("/v1/vms/%s/%s", id, action)
-	resp, err := agentclient.Request(host, port, http.MethodPost, agentPath, nil, srv.cfg.Token)
+	resp, err := agentclient.Request(host, port, http.MethodPost, agentPath, nil, srv.cfg.Token, reqID(r.Context()))
 	if err != nil {
 		writeJSON(w, 502, []byte(`{"error":"agent unreachable"}`))
 		return
@@ -690,7 +730,7 @@ func (srv *Server) sandboxAction(w http.ResponseWriter, id, action, tenant strin
 	if newState != "" {
 		srv.st.SetSandboxState(id, newState)
 		if err := srv.persist(); err != nil {
-			fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+			slog.Error("persist failed", "err", err)
 		}
 		srv.st.Lock()
 		srv.recordUsage(srv.st.FindSandbox(id), usageEvent)
@@ -699,7 +739,7 @@ func (srv *Server) sandboxAction(w http.ResponseWriter, id, action, tenant strin
 	writeEmpty(w, 200)
 }
 
-func (srv *Server) deleteSandbox(w http.ResponseWriter, id, tenant string) {
+func (srv *Server) deleteSandbox(w http.ResponseWriter, r *http.Request, id, tenant string) {
 	var agentAddr string
 	srv.st.Lock()
 	sb := srv.st.FindSandbox(id)
@@ -724,25 +764,25 @@ func (srv *Server) deleteSandbox(w http.ResponseWriter, id, tenant string) {
 		host, port := agentclient.SplitHostPort(agentAddr)
 		agentPath := fmt.Sprintf("/v1/vms/%s", id)
 		// Best-effort: ignore errors per Zig behavior.
-		_, _ = agentclient.Request(host, port, http.MethodDelete, agentPath, nil, srv.cfg.Token)
+		_, _ = agentclient.Request(host, port, http.MethodDelete, agentPath, nil, srv.cfg.Token, reqID(r.Context()))
 	}
 
 	srv.st.RemoveSandbox(id)
 	if err := srv.persist(); err != nil {
-		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+		slog.Error("persist failed", "err", err)
 	}
 	srv.recordUsage(&usage, "deleted")
 	writeEmpty(w, 204)
 }
 
-func (srv *Server) sleepSandbox(w http.ResponseWriter, id, tenant string) {
-	agentAddr, ok := srv.resolveAgent(w, id, tenant)
+func (srv *Server) sleepSandbox(w http.ResponseWriter, r *http.Request, id, tenant string) {
+	agentAddr, ok := srv.resolveAgent(w, r, id, tenant)
 	if !ok {
 		return
 	}
 	host, port := agentclient.SplitHostPort(agentAddr)
 	agentPath := fmt.Sprintf("/v1/vms/%s/sleep", id)
-	resp, err := agentclient.Request(host, port, http.MethodPost, agentPath, nil, srv.cfg.Token)
+	resp, err := agentclient.Request(host, port, http.MethodPost, agentPath, nil, srv.cfg.Token, reqID(r.Context()))
 	if err != nil {
 		writeJSON(w, 502, []byte(`{"error":"agent unreachable"}`))
 		return
@@ -766,19 +806,20 @@ func (srv *Server) sleepSandbox(w http.ResponseWriter, id, tenant string) {
 	b, _ := json.Marshal(sb)
 	srv.st.Unlock()
 	if err := srv.persist(); err != nil {
-		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+		slog.Error("persist failed", "err", err)
 	}
 	writeJSON(w, 200, b)
 }
 
-func (srv *Server) wakeSandbox(w http.ResponseWriter, id, tenant string) {
-	agentAddr, ok := srv.resolveAgent(w, id, tenant)
+func (srv *Server) wakeSandbox(w http.ResponseWriter, r *http.Request, id, tenant string) {
+	agentAddr, ok := srv.resolveAgent(w, r, id, tenant)
 	if !ok {
 		return
 	}
 	host, port := agentclient.SplitHostPort(agentAddr)
 	agentPath := fmt.Sprintf("/v1/vms/%s/wake", id)
-	resp, err := agentclient.Request(host, port, http.MethodPost, agentPath, nil, srv.cfg.Token)
+	wakeStart := time.Now()
+	resp, err := agentclient.Request(host, port, http.MethodPost, agentPath, nil, srv.cfg.Token, reqID(r.Context()))
 	if err != nil {
 		writeJSON(w, 502, []byte(`{"error":"agent unreachable"}`))
 		return
@@ -787,6 +828,9 @@ func (srv *Server) wakeSandbox(w http.ResponseWriter, id, tenant string) {
 		writeJSON(w, 502, []byte(`{"error":"agent wake failed"}`))
 		return
 	}
+	// Successful wake: histogram gets hearthd's wall-clock (v4 P6) — the
+	// agent-reported wake_ms below stays the wire/legacy-counter value.
+	observeWakeMs(uint64(time.Since(wakeStart).Milliseconds()))
 
 	// Extract wake_ms from agent response.
 	var wakeMsRaw struct {
@@ -817,7 +861,7 @@ func (srv *Server) wakeSandbox(w http.ResponseWriter, id, tenant string) {
 	// Persist AFTER releasing the lock (SaveSnapshot takes it) so the
 	// snapshot carries the fresh activity clocks.
 	if err := srv.persist(); err != nil {
-		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+		slog.Error("persist failed", "err", err)
 	}
 	// Drop trailing '}'
 	body := make([]byte, len(sbJSON)-1, len(sbJSON)+32)
@@ -914,7 +958,7 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID,
 	srv.st.Unlock()
 
 	if err := srv.persist(); err != nil {
-		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+		slog.Error("persist failed", "err", err)
 	}
 
 	host, port := agentclient.SplitHostPort(agentAddr)
@@ -923,20 +967,22 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID,
 		Name string `json:"name"`
 	}{childID, childName})
 	agentPath := fmt.Sprintf("/v1/vms/%s/fork", parentID)
-	resp, err := agentclient.Request(host, port, http.MethodPost, agentPath, agentBody, srv.cfg.Token)
+	resp, err := agentclient.Request(host, port, http.MethodPost, agentPath, agentBody, srv.cfg.Token, reqID(r.Context()))
 	if err != nil {
 		srv.st.SetSandboxState(childID, model.StateError)
 		if perr := srv.persist(); perr != nil {
-			fmt.Fprintf(os.Stderr, "persist: %v\n", perr)
+			slog.Error("persist failed", "err", perr)
 		}
+		slog.Error("agent unreachable", "sandbox", childID, "request_id", reqID(r.Context()), "err", err)
 		writeJSON(w, 502, []byte(`{"error":"agent unreachable"}`))
 		return
 	}
 	if resp.Status >= 300 {
 		srv.st.SetSandboxState(childID, model.StateError)
 		if perr := srv.persist(); perr != nil {
-			fmt.Fprintf(os.Stderr, "persist: %v\n", perr)
+			slog.Error("persist failed", "err", perr)
 		}
+		slog.Error("agent fork failed", "sandbox", childID, "request_id", reqID(r.Context()), "status", resp.Status)
 		writeJSON(w, 502, []byte(`{"error":"agent fork failed"}`))
 		return
 	}
@@ -954,9 +1000,9 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID,
 	// Best-effort: a failed re-expose degrades that one URL, not the fork —
 	// the operator can retry via the expose API.
 	for _, e := range parentExposes {
-		nodePort, err := srv.agentExpose(agentAddr, childID, e.GuestPort)
+		nodePort, err := srv.agentExpose(agentAddr, childID, e.GuestPort, reqID(r.Context()))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "fork %s: re-expose %s: %v\n", childID, e.Name, err)
+			slog.Warn("fork: re-expose failed", "sandbox", childID, "expose", e.Name, "err", err)
 			continue
 		}
 		srv.st.Lock()
@@ -966,7 +1012,7 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID,
 		srv.st.Unlock()
 	}
 	if err := srv.persist(); err != nil {
-		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+		slog.Error("persist failed", "err", err)
 	}
 
 	srv.st.Lock()
@@ -1067,7 +1113,7 @@ func (srv *Server) execSandbox(w http.ResponseWriter, r *http.Request, id, tenan
 	execEvent := usageEventFor(sb, "exec")
 	srv.st.Unlock()
 	if err := srv.db.AppendUsage(execEvent); err != nil {
-		fmt.Fprintf(os.Stderr, "usage event: %v\n", err)
+		slog.Error("usage event", "err", err)
 	}
 
 	// Build forwarded body.
@@ -1078,13 +1124,18 @@ func (srv *Server) execSandbox(w http.ResponseWriter, r *http.Request, id, tenan
 
 	host, port := agentclient.SplitHostPort(agentAddr)
 	reqTimeout := time.Duration(timeoutMs)*time.Millisecond + 10*time.Second
-	resp, err := agentclient.ExecVM(host, port, id, agentBody, srv.cfg.Token, reqTimeout)
+	execStart := time.Now()
+	resp, err := agentclient.ExecVM(host, port, id, agentBody, srv.cfg.Token, reqTimeout, reqID(r.Context()))
 	if err != nil {
+		slog.Error("agent exec failed", "sandbox", id, "request_id", reqID(r.Context()), "err", err)
 		writeJSON(w, 502, []byte(`{"error":"agent exec failed"}`))
 		return
 	}
 	switch resp.Status {
 	case 200:
+		// Histogram counts only completed execs (v4 P6): a 501/502 is an
+		// availability failure, not exec latency.
+		observeExecMs(uint64(time.Since(execStart).Milliseconds()))
 		writeJSON(w, 200, resp.Body)
 	case 501:
 		writeJSON(w, 501, []byte(`{"error":"guest agent unavailable"}`))
@@ -1136,7 +1187,7 @@ func (srv *Server) execSandboxStream(w http.ResponseWriter, r *http.Request, id,
 	execEvent := usageEventFor(sb, "exec")
 	srv.st.Unlock()
 	if err := srv.db.AppendUsage(execEvent); err != nil {
-		fmt.Fprintf(os.Stderr, "usage event: %v\n", err)
+		slog.Error("usage event", "err", err)
 	}
 
 	// Build forwarded body: the buffered shape plus "stream":true.
@@ -1148,8 +1199,9 @@ func (srv *Server) execSandboxStream(w http.ResponseWriter, r *http.Request, id,
 
 	host, port := agentclient.SplitHostPort(agentAddr)
 	reqTimeout := time.Duration(timeoutMs)*time.Millisecond + 70*time.Second
-	resp, cancel, err := agentclient.ExecVMStream(host, port, id, agentBody, srv.cfg.Token, reqTimeout)
+	resp, cancel, err := agentclient.ExecVMStream(host, port, id, agentBody, srv.cfg.Token, reqTimeout, reqID(r.Context()))
 	if err != nil {
+		slog.Error("agent exec stream failed", "sandbox", id, "request_id", reqID(r.Context()), "err", err)
 		writeJSON(w, 502, []byte(`{"error":"agent exec failed"}`))
 		return
 	}
@@ -1214,7 +1266,7 @@ func (srv *Server) execSandboxStream(w http.ResponseWriter, r *http.Request, id,
 // resolveAgent returns the agent address for a sandbox's node, writing a 404
 // if the sandbox or its agent is not found — or if the tenant context does
 // not own the sandbox (no cross-tenant existence leak).
-func (srv *Server) resolveAgent(w http.ResponseWriter, id, tenant string) (string, bool) {
+func (srv *Server) resolveAgent(w http.ResponseWriter, r *http.Request, id, tenant string) (string, bool) {
 	srv.st.Lock()
 	defer srv.st.Unlock()
 	sb := srv.st.FindSandbox(id)
@@ -1270,6 +1322,9 @@ func (srv *Server) serveMetrics(w http.ResponseWriter) {
 	for _, n := range srv.st.Nodes {
 		fmt.Fprintf(&buf, "hearth_pool_size{node=%q} %d\n", n.Hostname, n.PoolSize)
 	}
+
+	// Latency histograms (v4 P6, ADR-0010): always emitted, in-memory only.
+	appendHistograms(&buf)
 
 	// NB (v4 P5): per-tenant gauges with the tenant_id as a label were
 	// considered here but deliberately NOT emitted — /metrics is

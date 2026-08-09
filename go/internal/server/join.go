@@ -7,11 +7,10 @@ package server
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -44,7 +43,7 @@ func (srv *Server) createJoinToken(w http.ResponseWriter, r *http.Request) {
 		NodeHint:  req.NodeHint,
 	}
 	if err := srv.db.CreateJoinToken(jt); err != nil {
-		fmt.Fprintf(os.Stderr, "create join token: %v\n", err)
+		slog.Error("create join token", "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
@@ -110,7 +109,7 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().Unix()
 	if ok, err := srv.db.CheckJoinToken(tokenHash, now); err != nil {
-		fmt.Fprintf(os.Stderr, "check join token: %v\n", err)
+		slog.Error("check join token", "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	} else if !ok {
@@ -120,7 +119,7 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 
 	var overlayIP string
 	if existing, err := srv.db.GetWgPeerByPubKey(req.PubKey); err != nil {
-		fmt.Fprintf(os.Stderr, "wg peer lookup: %v\n", err)
+		slog.Error("wg peer lookup", "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	} else if existing != nil && ipnet.Contains(net.ParseIP(existing.OverlayIP)) {
@@ -130,7 +129,7 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 	} else {
 		peers, err := srv.db.ListWgPeers()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "list wg peers: %v\n", err)
+			slog.Error("list wg peers", "err", err)
 			writeJSON(w, 500, []byte(`{"error":"store error"}`))
 			return
 		}
@@ -140,7 +139,7 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		}
 		overlayIP, err = wg.AllocateOverlayIP(srv.cfg.WgIP, taken)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "overlay allocation: %v\n", err)
+			slog.Error("overlay allocation", "err", err)
 			writeJSON(w, 503, []byte(`{"error":"overlay exhausted"}`))
 			return
 		}
@@ -151,14 +150,14 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		Hostname:  req.Hostname,
 		CreatedAt: now,
 	}); err != nil {
-		fmt.Fprintf(os.Stderr, "persist wg peer: %v\n", err)
+		slog.Error("persist wg peer", "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
 	if err := srv.addPeer(req.PubKey, overlayIP); err != nil {
 		// Token NOT consumed: the worker can retry with the same token once
 		// the host-side issue (sudo, missing wg binary) is fixed.
-		fmt.Fprintf(os.Stderr, "wg add peer: %v\n", err)
+		slog.Error("wg add peer", "err", err)
 		writeJSON(w, 500, []byte(`{"error":"wg peer install failed"}`))
 		return
 	}
@@ -166,7 +165,7 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 	// excluded by joinMu; a false result here means the token was somehow
 	// redeemed elsewhere, which must fail the request.
 	if ok, err := srv.db.ConsumeJoinToken(tokenHash, now); err != nil || !ok {
-		fmt.Fprintf(os.Stderr, "consume join token: ok=%v err=%v\n", ok, err)
+		slog.Error("consume join token", "ok", ok, "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}

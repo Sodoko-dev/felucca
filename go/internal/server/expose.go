@@ -7,8 +7,8 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
-	"os"
 	"strconv"
 
 	"github.com/alpham/infra-saas/hearth/internal/agentclient"
@@ -74,12 +74,12 @@ func (srv *Server) exposeView(sbID string, e model.Expose) exposeView {
 // agentExpose asks the owning agent to DNAT a node port to guestPort and
 // returns the allocated node port. The agent call is idempotent per
 // (vm, guest_port).
-func (srv *Server) agentExpose(agentAddr, sbID string, guestPort uint16) (uint16, error) {
+func (srv *Server) agentExpose(agentAddr, sbID string, guestPort uint16, reqID string) (uint16, error) {
 	body, _ := json.Marshal(struct {
 		GuestPort uint16 `json:"guest_port"`
 	}{guestPort})
 	host, port := agentclient.SplitHostPort(agentAddr)
-	resp, err := srv.agentCall(host, port, http.MethodPost, "/v1/vms/"+sbID+"/expose", body)
+	resp, err := srv.agentCall(host, port, http.MethodPost, "/v1/vms/"+sbID+"/expose", body, reqID)
 	if err != nil {
 		return 0, fmt.Errorf("agent unreachable: %w", err)
 	}
@@ -95,12 +95,12 @@ func (srv *Server) agentExpose(agentAddr, sbID string, guestPort uint16) (uint16
 	return ar.NodePort, nil
 }
 
-func (srv *Server) agentUnexpose(agentAddr, sbID string, guestPort uint16) error {
+func (srv *Server) agentUnexpose(agentAddr, sbID string, guestPort uint16, reqID string) error {
 	body, _ := json.Marshal(struct {
 		GuestPort uint16 `json:"guest_port"`
 	}{guestPort})
 	host, port := agentclient.SplitHostPort(agentAddr)
-	resp, err := srv.agentCall(host, port, http.MethodDelete, "/v1/vms/"+sbID+"/expose", body)
+	resp, err := srv.agentCall(host, port, http.MethodDelete, "/v1/vms/"+sbID+"/expose", body, reqID)
 	if err != nil {
 		return fmt.Errorf("agent unreachable: %w", err)
 	}
@@ -130,13 +130,13 @@ func (srv *Server) exposeSandbox(w http.ResponseWriter, r *http.Request, id, ten
 		writeJSON(w, 400, []byte(`{"error":"port required"}`))
 		return
 	}
-	srv.exposeCommon(w, id, tenant, req.Name, req.Port, false)
+	srv.exposeCommon(w, r, id, tenant, req.Name, req.Port, false)
 }
 
 // exposeCommon is the shared expose path for the named API and the dynamic
 // ensure-route path (which uses the all-digit name namespace). dynamic only
 // changes the success status code shape (200 route view vs 201 expose view).
-func (srv *Server) exposeCommon(w http.ResponseWriter, id, tenant, name string, guestPort uint16, dynamic bool) {
+func (srv *Server) exposeCommon(w http.ResponseWriter, r *http.Request, id, tenant, name string, guestPort uint16, dynamic bool) {
 	// One ingress mutation at a time (see exposeMu); the state lock is still
 	// taken per-section so reads elsewhere never wait on the agent call.
 	srv.exposeMu.Lock()
@@ -178,9 +178,9 @@ func (srv *Server) exposeCommon(w http.ResponseWriter, id, tenant, name string, 
 	}
 	srv.st.Unlock()
 
-	nodePort, err := srv.agentExpose(agentAddr, id, guestPort)
+	nodePort, err := srv.agentExpose(agentAddr, id, guestPort, reqID(r.Context()))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "expose %s/%s: %v\n", id, name, err)
+		slog.Error("expose agent failed", "sandbox", id, "expose", name, "err", err, "request_id", reqID(r.Context()))
 		writeJSON(w, 502, []byte(`{"error":"agent expose failed"}`))
 		return
 	}
@@ -212,7 +212,7 @@ func (srv *Server) exposeCommon(w http.ResponseWriter, id, tenant, name string, 
 	v := srv.exposeView(sb.ID, model.Expose{Name: name, GuestPort: guestPort, NodePort: nodePort})
 	srv.st.Unlock()
 	if err := srv.persist(); err != nil {
-		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+		slog.Error("persist failed", "err", err)
 	}
 	b, _ := json.Marshal(v)
 	if dynamic {
@@ -225,7 +225,7 @@ func (srv *Server) exposeCommon(w http.ResponseWriter, id, tenant, name string, 
 // unexposeSandbox handles DELETE /api/v1/sandboxes/{id}/expose/{name}.
 // The agent rule is removed first: on agent failure the row stays (the call
 // is retryable) rather than leaving an orphaned DNAT rule with no record.
-func (srv *Server) unexposeSandbox(w http.ResponseWriter, id, name, tenant string) {
+func (srv *Server) unexposeSandbox(w http.ResponseWriter, r *http.Request, id, name, tenant string) {
 	srv.exposeMu.Lock()
 	defer srv.exposeMu.Unlock()
 
@@ -274,8 +274,8 @@ func (srv *Server) unexposeSandbox(w http.ResponseWriter, id, name, tenant strin
 		}
 		srv.st.Unlock()
 		if !shared {
-			if err := srv.agentUnexpose(agentAddr, id, guestPort); err != nil {
-				fmt.Fprintf(os.Stderr, "unexpose %s/%s: %v\n", id, name, err)
+			if err := srv.agentUnexpose(agentAddr, id, guestPort, reqID(r.Context())); err != nil {
+				slog.Error("unexpose agent failed", "sandbox", id, "expose", name, "err", err, "request_id", reqID(r.Context()))
 				writeJSON(w, 502, []byte(`{"error":"agent unexpose failed"}`))
 				return
 			}
@@ -297,7 +297,7 @@ func (srv *Server) unexposeSandbox(w http.ResponseWriter, id, name, tenant strin
 	}
 	srv.st.Unlock()
 	if err := srv.persist(); err != nil {
-		fmt.Fprintf(os.Stderr, "persist: %v\n", err)
+		slog.Error("persist failed", "err", err)
 	}
 	w.WriteHeader(204)
 }
@@ -380,5 +380,5 @@ func (srv *Server) ensureRoute(w http.ResponseWriter, r *http.Request) {
 	}
 	srv.st.Unlock()
 	// Dynamic exposes live in the reserved all-digit name namespace.
-	srv.exposeCommon(w, req.SandboxID, adminTenant, strconv.Itoa(int(req.Port)), req.Port, true)
+	srv.exposeCommon(w, r, req.SandboxID, adminTenant, strconv.Itoa(int(req.Port)), req.Port, true)
 }

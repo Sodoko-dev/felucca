@@ -18,6 +18,7 @@ use crate::vm::{
     image, CreateSpec, ExecOutcome, ExecStreamOutcome, ExposeError, Manager, PoolSpec,
     RootfsError, DEFAULT_IMAGE,
 };
+use tracing::warn;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -50,6 +51,14 @@ fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
 
 fn check_auth(token: &str, headers: &HeaderMap) -> bool {
     authorized(token, extract_bearer(headers))
+}
+
+/// Extract the X-Hearth-Request-Id header for structured log correlation.
+fn req_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-hearth-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -260,6 +269,7 @@ async fn exec_vm(
     if !check_auth(&state.token, req.headers()) {
         return json_response(StatusCode::UNAUTHORIZED, "{\"error\":\"unauthorized\"}");
     }
+    let rid = req_id(req.headers()).unwrap_or_default();
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1 << 20).await {
         Ok(b) => b,
         Err(_) => return json_response(StatusCode::BAD_REQUEST, "{\"error\":\"bad request\"}"),
@@ -317,7 +327,7 @@ async fn exec_vm(
                 "{\"error\":\"guest agent unavailable\"}",
             ),
             ExecStreamOutcome::Failed(reason) => {
-                eprintln!("warn: exec stream on {} failed (guest unreachable): {}", id, reason);
+                warn!(vm = %id, err = %reason, request_id = %rid, "exec stream failed (guest unreachable)");
                 json_response(
                     StatusCode::NOT_IMPLEMENTED,
                     "{\"error\":\"guest agent unavailable\"}",
@@ -340,7 +350,7 @@ async fn exec_vm(
         ),
         ExecOutcome::Failed(reason) => {
             // Connect/handshake failure → same 501 body; log the cause server-side.
-            eprintln!("warn: exec on {} failed (guest unreachable): {}", id, reason);
+            warn!(vm = %id, err = %reason, request_id = %rid, "exec failed (guest unreachable)");
             json_response(
                 StatusCode::NOT_IMPLEMENTED,
                 "{\"error\":\"guest agent unavailable\"}",
@@ -533,6 +543,7 @@ async fn vm_rootfs(
     if !check_auth(&state.token, req.headers()) {
         return json_response(StatusCode::UNAUTHORIZED, "{\"error\":\"unauthorized\"}");
     }
+    let rid = req_id(req.headers()).unwrap_or_default();
     let path = match state.mgr.begin_capture(&id).await {
         Ok(p) => p,
         Err(RootfsError::NotFound) => {
@@ -548,7 +559,7 @@ async fn vm_rootfs(
     let file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("warn: rootfs capture for {} failed to open {}: {}", id, path, e);
+            warn!(vm = %id, path = %path, err = %e, request_id = %rid, "rootfs capture failed to open");
             state.mgr.end_capture(&id).await;
             return json_response(StatusCode::NOT_FOUND, "{\"error\":\"not found\"}");
         }
@@ -556,7 +567,7 @@ async fn vm_rootfs(
     let len = match file.metadata().await {
         Ok(m) => m.len(),
         Err(e) => {
-            eprintln!("warn: rootfs capture for {} failed to stat {}: {}", id, path, e);
+            warn!(vm = %id, path = %path, err = %e, request_id = %rid, "rootfs capture failed to stat");
             state.mgr.end_capture(&id).await;
             return json_response(StatusCode::INTERNAL_SERVER_ERROR, "{\"error\":\"stat failed\"}");
         }
@@ -661,6 +672,7 @@ async fn prefetch_image(State(state): State<AppState>, req: Request) -> Response
     if !check_auth(&state.token, req.headers()) {
         return json_response(StatusCode::UNAUTHORIZED, "{\"error\":\"unauthorized\"}");
     }
+    let rid = req_id(req.headers()).unwrap_or_default();
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1 << 20).await {
         Ok(b) => b,
         Err(_) => return json_response(StatusCode::BAD_REQUEST, "{\"error\":\"bad request\"}"),
@@ -680,7 +692,7 @@ async fn prefetch_image(State(state): State<AppState>, req: Request) -> Response
     let mgr = Arc::clone(&state.mgr);
     tokio::spawn(async move {
         if let Err(e) = mgr.ensure_image(&image_name, Some(&sha)).await {
-            eprintln!("warn: prefetch {} failed: {}", image_name, e);
+            warn!(image = %image_name, err = %e, request_id = %rid, "prefetch failed");
         }
     });
     json_response(StatusCode::ACCEPTED, "{\"ok\":true}")

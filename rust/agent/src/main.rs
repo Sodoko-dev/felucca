@@ -21,9 +21,32 @@ use crate::vm::{pool::{liveness_loop, pool_loop}, Manager};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
+use tracing::{error, info, warn};
+
+/// Unconditional fatal diagnostic. Bypasses the RUST_LOG filter deliberately:
+/// every caller exits(1) next, and a filtered journal on an exit path would
+/// crash-loop the unit with zero evidence (the P6 review's worst finding).
+/// Also emitted through tracing for structured consumers when the filter
+/// allows. The "fatal:" prefix is the pre-P6 grep phrase, kept on purpose.
+fn fatal(msg: &str) -> ! {
+    eprintln!("fatal: {msg}");
+    tracing::error!("fatal: {msg}");
+    std::process::exit(1);
+}
 
 #[tokio::main]
 async fn main() {
+    // Structured logging to stderr; RUST_LOG overrides the default "info" filter.
+    // with_ansi(false): journald captures raw bytes — no escape codes in journals.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .init();
+
     let args: Vec<String> = std::env::args().collect();
     let env: HashMap<String, String> = std::env::vars().collect();
 
@@ -34,8 +57,7 @@ async fn main() {
     if cfg.join_url.is_empty() != cfg.join_token.is_empty() {
         // Half-configured join is an operator mistake — silently skipping it
         // would register this node off-overlay while they believe it joined.
-        eprintln!("fatal: --join and --join-token must be set together");
-        std::process::exit(1);
+        fatal("--join and --join-token must be set together");
     }
     // Err = wg.json exists but is unreadable/corrupt. Fatal here, not a
     // fallback: the file's presence proves enrollment, and starting in
@@ -43,16 +65,14 @@ async fn main() {
     let wg_state = match wg::load_state(&cfg.data_dir) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("fatal: {}", e);
-            std::process::exit(1);
+            fatal(&format!("wg state load: {e}"));
         }
     };
     let joined: Option<wg::JoinInfo> = if let Some(info) = wg_state {
         if !cfg.join_url.is_empty() {
-            eprintln!(
-                "warn: persisted wg enrollment ({}) takes precedence over --join; \
-                 delete it to re-enroll with a fresh token",
-                wg::state_path(&cfg.data_dir)
+            warn!(
+                path = %wg::state_path(&cfg.data_dir),
+                "persisted wg enrollment takes precedence over --join; delete it to re-enroll with a fresh token"
             );
         }
         Some(info)
@@ -61,8 +81,7 @@ async fn main() {
         let pubkey = match wg::ensure_key(&wg::key_path(&cfg.data_dir)) {
             Ok(pk) => pk,
             Err(e) => {
-                eprintln!("fatal: wg key: {}", e);
-                std::process::exit(1);
+                fatal(&format!("wg key: {e}"));
             }
         };
         let hostname = registration::read_hostname();
@@ -80,22 +99,17 @@ async fn main() {
                     // Fail NOW, while the operator is watching: the token is
                     // consumed, and without wg.json the next boot would
                     // crash-loop on a burned token weeks later instead.
-                    eprintln!("fatal: wg joined but state not persisted: {}", e);
-                    std::process::exit(1);
+                    fatal(&format!("wg joined but state not persisted: {e}"));
                 }
                 Some(info)
             }
             Err(e) => {
                 if e.contains("status 401") {
-                    eprintln!(
-                        "fatal: wg join: {} (this node's key file may already be \
-                         enrolled — mint a fresh token, or restore wg.json)",
-                        e
-                    );
-                } else {
-                    eprintln!("fatal: wg join: {}", e);
+                    fatal(&format!(
+                        "wg join (this node's key file may already be enrolled — mint a fresh token, or restore wg.json): {e}"
+                    ));
                 }
-                std::process::exit(1);
+                fatal(&format!("wg join: {e}"));
             }
         }
     } else {
@@ -103,12 +117,10 @@ async fn main() {
     };
     if let Some(info) = &joined {
         wg::validate_join_info(info).unwrap_or_else(|e| {
-            eprintln!("fatal: wg state invalid: {}", e);
-            std::process::exit(1);
+            fatal(&format!("wg state invalid: {e}"));
         });
         if let Err(e) = wg::ensure_interface(info, &wg::key_path(&cfg.data_dir)) {
-            eprintln!("fatal: wg interface: {}", e);
-            std::process::exit(1);
+            fatal(&format!("wg interface: {e}"));
         }
         // Route control-plane traffic over the overlay; advertise our overlay
         // IP so hearthd reaches this agent through the tunnel. The hub's API
@@ -116,9 +128,11 @@ async fn main() {
         // it survives reboots after the one-time join flags are removed.
         cfg.control_plane = format!("http://{}:{}", info.server_overlay_ip, info.api_port);
         cfg.advertise_addr = info.overlay_ip.clone();
-        eprintln!(
-            "info: wg overlay joined: {} -> {} ({})",
-            info.overlay_ip, info.server_overlay_ip, info.server_endpoint
+        info!(
+            overlay_ip = %info.overlay_ip,
+            server_ip = %info.server_overlay_ip,
+            endpoint = %info.server_endpoint,
+            "wg overlay joined"
         );
     }
 
@@ -131,12 +145,16 @@ async fn main() {
     let cidr = Cidr::parse(&cfg.net_cidr)
         .unwrap_or_else(|| Cidr::parse("10.231.0.0/24").unwrap());
 
-    eprintln!(
-        "info: hearth-agent: control_plane={} data_dir={} advertise={} port={} net={} cidr={} pool={} auth={}",
-        cfg.control_plane, cfg.data_dir, cfg.advertise_addr, cfg.port,
-        if cfg.net { "on" } else { "off" },
-        cfg.net_cidr, cfg.pool_size,
-        if !cfg.token.is_empty() { "on" } else { "off" },
+    info!(
+        control_plane = %cfg.control_plane,
+        data_dir = %cfg.data_dir,
+        advertise = %cfg.advertise_addr,
+        port = cfg.port,
+        net = if cfg.net { "on" } else { "off" },
+        cidr = %cfg.net_cidr,
+        pool = cfg.pool_size,
+        auth = if !cfg.token.is_empty() { "on" } else { "off" },
+        "hearth-agent startup"
     );
 
     // control_plane/token also drive image pulls (v4 P4); cfg.control_plane
@@ -200,7 +218,7 @@ async fn main() {
     let bind_addr = format!("0.0.0.0:{}", cfg.port);
     let listener = TcpListener::bind(&bind_addr).await
         .unwrap_or_else(|e| panic!("bind {}: {}", bind_addr, e));
-    eprintln!("info: listening on {}", bind_addr);
+    info!(addr = %bind_addr, "listening");
 
     axum::serve(listener, app).await
         .unwrap_or_else(|e| panic!("serve: {}", e));

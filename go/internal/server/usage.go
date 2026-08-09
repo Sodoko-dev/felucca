@@ -6,9 +6,8 @@ package server
 
 import (
 	"encoding/json"
-	"fmt"
+	"log/slog"
 	"net/http"
-	"os"
 	"strconv"
 	"time"
 
@@ -147,7 +146,7 @@ func (srv *Server) tenantUsage(w http.ResponseWriter, r *http.Request, tenantID 
 
 	events, err := srv.db.ListUsage(tenantID, from, to)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "usage %s: %v\n", tenantID, err)
+		slog.Error("usage", "tenant", tenantID, "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}

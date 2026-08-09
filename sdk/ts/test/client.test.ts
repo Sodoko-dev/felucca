@@ -8,6 +8,7 @@
 // node strips the types at run time.
 
 import { test } from "node:test";
+// (request-id capture test appended at the bottom of this file — v4 P6)
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -298,6 +299,45 @@ test("listTemplates unwraps {templates:[...]}", async () => {
     assert.equal(tpls.length, 1);
     assert.equal(tpls[0]?.name, "odoo-18");
     assert.equal(tpls[0]?.image_sha256.length, 64);
+  } finally {
+    await close();
+  }
+});
+
+test("HearthError carries X-Hearth-Request-Id from error responses (v4 P6)", async () => {
+  const { baseUrl, close } = await fakeHearthd((_req, res) => {
+    res.writeHead(404, {
+      "content-type": "application/json",
+      "x-hearth-request-id": "req-abc123",
+    });
+    res.end(`{"error":"not found"}`);
+  });
+  try {
+    const c = new HearthClient({ baseUrl, apiKey: API_KEY });
+    await assert.rejects(c.getSandbox("sb-nope"), (err: unknown) => {
+      assert.ok(err instanceof HearthError);
+      assert.equal(err.status, 404);
+      assert.equal(err.requestId, "req-abc123");
+      assert.match(err.message, /request_id req-abc123/);
+      return true;
+    });
+  } finally {
+    await close();
+  }
+});
+
+test("HearthError requestId is empty against pre-P6 servers", async () => {
+  const { baseUrl, close } = await fakeHearthd((_req, res) => {
+    res.writeHead(500, { "content-type": "application/json" });
+    res.end(`{"error":"boom"}`);
+  });
+  try {
+    const c = new HearthClient({ baseUrl, apiKey: API_KEY });
+    await assert.rejects(c.getSandbox("sb-x"), (err: unknown) => {
+      assert.ok(err instanceof HearthError);
+      assert.equal(err.requestId, "");
+      return true;
+    });
   } finally {
     await close();
   }

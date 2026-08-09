@@ -7,6 +7,7 @@
 use crate::ipalloc::Cidr;
 use std::collections::HashMap;
 use std::process::Command;
+use tracing::{error, warn};
 
 pub const BRIDGE_NAME: &str = "hearth0";
 
@@ -130,8 +131,16 @@ fn ensure_bridge_netfilter() -> bool {
         .map(|s| s.trim() == "1")
         .unwrap_or(false);
     if !confirmed {
+        // Dual-emit ON PURPOSE: this is the security-critical diagnostic of
+        // the whole agent, and tracing's RUST_LOG filter can silence error!
+        // events. The raw stderr line cannot be filtered away.
         eprintln!(
             "error: br_netfilter is not active (module missing and modprobe denied?) — \
+             CROSS-TENANT ISOLATION IS NOT ENFORCED on this node. \
+             Preload the module (modules-load.d/hearth.conf) and restart."
+        );
+        error!(
+            "br_netfilter is not active (module missing and modprobe denied?) — \
              CROSS-TENANT ISOLATION IS NOT ENFORCED on this node. \
              Preload the module (modules-load.d/hearth.conf) and restart."
         );
@@ -229,7 +238,7 @@ pub fn rebuild_ingress(members: &[(u16, String, u16)]) {
             }
             // Should be unreachable (IPs come from ipalloc); skipping is the
             // safe failure mode — never feed an unparsed string to nft.
-            None => eprintln!("warn: ingress member with unparseable ip {:?} skipped", guest_ip),
+            None => warn!(addr = %guest_ip, "ingress member with unparseable ip skipped"),
         }
     }
 }

@@ -7,6 +7,7 @@ use crate::config::split_host_port;
 use crate::vm::Manager;
 use std::sync::{Arc, RwLock};
 use tokio::time::{sleep, Duration};
+use tracing::{info, warn};
 
 /// Shared node id set after successful registration.
 pub type NodeId = Arc<RwLock<String>>;
@@ -24,7 +25,7 @@ pub async fn heartbeat_loop(
     loop {
         match register_once(&control_plane, &advertise_addr, port, &token, &node_id).await {
             Ok(_) => break,
-            Err(e) => eprintln!("warn: register failed: {}", e),
+            Err(e) => warn!(err = %e, "register failed"),
         }
         sleep(Duration::from_secs(5)).await;
     }
@@ -32,7 +33,7 @@ pub async fn heartbeat_loop(
     // Heartbeat every 5s.
     loop {
         if let Err(e) = heartbeat_once(&mgr, &control_plane, &token, &node_id).await {
-            eprintln!("warn: heartbeat failed: {}", e);
+            warn!(err = %e, "heartbeat failed");
         }
         sleep(Duration::from_secs(5)).await;
     }
@@ -78,7 +79,7 @@ async fn register_once(
         let mut n = node_id.write().map_err(|_| "lock")?;
         *n = id.clone();
     }
-    eprintln!("info: registered as node {}", id);
+    info!(node_id = %id, "registered as node");
     Ok(())
 }
 

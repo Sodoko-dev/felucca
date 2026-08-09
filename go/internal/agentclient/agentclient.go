@@ -12,6 +12,11 @@ import (
 	"time"
 )
 
+// RequestIDHeader carries the hearthd-minted per-request trace ID on every
+// hop (client response, hearthd→agent calls). One constant on the Go side —
+// the Rust agent and TS SDK read the same name (lowercased by their stacks).
+const RequestIDHeader = "X-Hearth-Request-Id"
+
 // Response mirrors the Zig client.Response.
 type Response struct {
 	Status int
@@ -22,7 +27,8 @@ var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 // Request performs an HTTP request to the agent at host:port.
 // token is attached as "Authorization: Bearer <token>" when non-empty.
-func Request(host string, port uint16, method, path string, body []byte, token string) (*Response, error) {
+// reqID is attached as "X-Hearth-Request-Id" when non-empty.
+func Request(host string, port uint16, method, path string, body []byte, token, reqID string) (*Response, error) {
 	url := fmt.Sprintf("http://%s:%d%s", host, port, path)
 
 	var bodyReader io.Reader
@@ -41,6 +47,9 @@ func Request(host string, port uint16, method, path string, body []byte, token s
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if reqID != "" {
+		req.Header.Set(RequestIDHeader, reqID)
 	}
 	req.Header.Set("Connection", "close")
 
@@ -61,7 +70,8 @@ func Request(host string, port uint16, method, path string, body []byte, token s
 // ExecVM proxies an exec request to the node agent at host:port for the given
 // vm id.  timeout is the per-request HTTP timeout (timeout_ms + 10s); a fresh
 // http.Client is created so the shared client's 30 s timeout is not used.
-func ExecVM(host string, port uint16, id string, body []byte, token string, timeout time.Duration) (*Response, error) {
+// reqID is attached as "X-Hearth-Request-Id" when non-empty.
+func ExecVM(host string, port uint16, id string, body []byte, token string, timeout time.Duration, reqID string) (*Response, error) {
 	url := fmt.Sprintf("http://%s:%d/v1/vms/%s/exec", host, port, id)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -75,6 +85,9 @@ func ExecVM(host string, port uint16, id string, body []byte, token string, time
 	req.ContentLength = int64(len(body))
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if reqID != "" {
+		req.Header.Set(RequestIDHeader, reqID)
 	}
 	req.Header.Set("Connection", "close")
 
@@ -100,7 +113,8 @@ func ExecVM(host string, port uint16, id string, body []byte, token string, time
 // the caller can relay the agent's NDJSON stream as it arrives. The returned
 // cancel func releases the request context — the caller must defer it (and
 // close resp.Body); the context timeout bounds the whole stream.
-func ExecVMStream(host string, port uint16, id string, body []byte, token string, timeout time.Duration) (*http.Response, context.CancelFunc, error) {
+// reqID is attached as "X-Hearth-Request-Id" when non-empty.
+func ExecVMStream(host string, port uint16, id string, body []byte, token string, timeout time.Duration, reqID string) (*http.Response, context.CancelFunc, error) {
 	url := fmt.Sprintf("http://%s:%d/v1/vms/%s/exec", host, port, id)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -114,6 +128,9 @@ func ExecVMStream(host string, port uint16, id string, body []byte, token string
 	req.ContentLength = int64(len(body))
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if reqID != "" {
+		req.Header.Set(RequestIDHeader, reqID)
 	}
 	req.Header.Set("Connection", "close")
 

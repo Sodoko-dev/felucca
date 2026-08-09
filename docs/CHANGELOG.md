@@ -470,6 +470,94 @@ clean 326/0. Deferred
 (ADR-0009): exec stdin/PTY, `hearth` CLI binary, authenticated metrics,
 per-sandbox policy PATCH, SDK npm publish.
 
+## v4 P6 — observability, bench, HA groundwork (2026-08-09, Go+Rust)
+
+Phase 6 of PLAN-v4 — the post-launch operability phase.
+Design: [ADR-0010](adr/ADR-0010-observability-and-bench.md).
+
+- **Structured logging**: hearthd + hearth-gw on Go `slog` (text handler,
+  stderr, journald-friendly), the agent on Rust `tracing`
+  (`tracing-subscriber` fmt, `RUST_LOG` filter, default info). Core
+  message phrases preserved (grep for the key word still matches), but exact
+  formats changed — colon-suffixed greps like `persist:` must drop the colon
+  (migration note in DEPLOYMENT §11); values moved to structured fields with a fixed vocabulary (`err`,
+  `sandbox`/`vm`, `tenant`, `node`, `image`, `request_id`, ...). The guest
+  deliberately stays on `eprintln!` (serial console, binary size).
+- **Request IDs**: hearthd mints `req-<hex>` per `/api/` request, echoes it
+  as `X-Hearth-Request-Id`, forwards it on every agent proxy call; the agent
+  logs it. Background actors mint `sweep-`/`bg-` ids. Headers only —
+  mixed-fleet safe (pre-P6 agents ignore it).
+- **Metrics**: three hand-rolled histograms on the open `/metrics` —
+  `hearth_{wake,exec,create}_duration_ms` (ms buckets 5..30000,+Inf,
+  hearthd wall-clock, always-emitted so scrapes are shape-stable). Legacy
+  wake counters kept. Per-tenant gauges return — behind the
+  **authenticated** `GET /api/v1/metrics/tenants` (admin token; 404 to
+  tenant keys), resolving ADR-0009's leak concern with auth instead of
+  feature removal. Grafana dashboard + two-job scrape config in
+  `deploy/grafana/`.
+- **Bench**: `scripts/bench.sh <endpoint> [token]` — p50/p95/min/max over N
+  runs for create-cold, create-claim, exec-buffered, exec-stream
+  first-frame, wake (API wall-clock and agent-reported `wake_ms`), fork;
+  self-cleaning, per-op failure counts; markdown table output published in
+  [BENCHMARKS.md](BENCHMARKS.md).
+- **HA groundwork** (docs/HA-GROUNDWORK.md): honest readiness assessment —
+  what the Store boundary already buys, the real blockers (in-memory
+  working set, snapshot-granularity persistence, singleton wg hub), the
+  staged litestream → Postgres → N×hearthd path with effort estimates.
+  No code; litestream documented as deployable-today insurance.
+- **uffd CoW fork research** (research/uffd-cow-fork.md): the "branch a
+  live Odoo system" track — FC uffd-backed snapshot load, per-lineage
+  page-fault handler, parent-frozen semantics, bounded prototype scope.
+  Implementation deferred until bench data shows fork latency blocking a
+  product use.
+
+Conformance grows `hearthd/24-observability` (histogram presence, the
+no-tenant-series-on-open-metrics leak guard, the admin-surface auth ladder,
+request-id minting — deliberately boots no VMs).
+
+Review-loop findings, fixed before commit: (1) fatal-exit and the
+CROSS-TENANT-ISOLATION-NOT-ENFORCED diagnostics were routed through the
+RUST_LOG filter and could be silenced — now emitted unconditionally to stderr
+(`fatal()` helper, dual-emit for the isolation warning); (2) 401 responses
+carried no request id (minted after auth) — minting moved before the auth
+gate; (3) the SDK's SSE-frame parse errors lost the request id — threaded;
+(4) trace-ID minting deduplicated into `newTraceID`, the wire header name
+into `agentclient.RequestIDHeader`; (5) the phrase-preservation claim above
+corrected to match reality. Deferred to ADR-0010: context-scoped logger
+(request_id on every request-path line), context-based propagation instead
+of the string param, bench.sh op dedup.
+
+P6 began with an unplanned validation: the whole lab fleet had been STOPPED
+for ~2 months (2026-06-14 → 2026-08-09). On `limactl start` of all three
+VMs, every systemd unit self-started, both agents re-registered, and the
+fleet reported ready with zero manual staging — the strongest proof yet of
+the P2.5 reboot-survivability work. The cold boot also surfaced a known-class
+gap worth naming: hearthd's sandbox states (13 `running` rows) had diverged
+from the agents' ground truth (`sleeping`/`stopped` after adoption) — hearthd
+never re-reconciles against agents after a restart. Left as-is (user
+sandboxes among them; wake still works from the agent's real state); the fix
+belongs to the backlog's reschedule/reconcile sweep, not P6.
+
+Gates: cargo **121/0 agent** (zero warnings — nothing unwired) + guest
+unchanged (41/0 from P5), go vet clean + full suite green (new histogram/
+admin-metrics unit tests), static binaries link; fleet
+rolled; conformance **342/0** (new `hearthd/24-observability`, +16 checks;
+metrics-names golden re-recorded for the histogram series), verify-v2
+**21/0** — after a genuinely instructive failure: the first two runs failed
+4/21 on host→guest pings because Lima's user-v2 DHCP had SWAPPED the two
+workers' 192.168.104.{1,4} addresses across the 2-month stop. The PRODUCT
+self-healed (agent advertise auto-detect re-registered the new addrs;
+exec/scheduling/conformance never noticed) — only the test harness's
+hardcoded addr→VM map broke, silently pinging from the wrong machine.
+verify-v2 now resolves workers by registration hostname (lima-<vm>) and
+conformance-lab.sh resolves the agent-suite target at run time; nothing in
+the lab tooling hardcodes those DHCP addresses anymore. kata-lab-1 also
+wedged once during diagnosis (its first-ever vz crash — all prior nine were
+kata-lab-0) — stop -f + start healed it, zero staging. Live repro: one
+request id followed from an API call through hearthd's journal into the
+owning agent's journal; bench table in BENCHMARKS.md. Zero vz crashes under the bench's ~90 VM
+operations; one kata-lab-1 wedge during the verify diagnosis (above).
+
 ## Backlog (v3+, in order)
 
 branch (uffd CoW fork of running VMs) → cross-tenant nftables isolation →

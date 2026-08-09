@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 
@@ -168,7 +169,7 @@ func OpenSQLite(path string) (*SQLite, error) {
 	// The db holds key hashes and tenant data: owner-only (also covers the
 	// -wal/-shm siblings via SQLite inheriting the main file's mode).
 	if err := os.Chmod(path, 0o600); err != nil {
-		fmt.Fprintf(os.Stderr, "warn: chmod %s: %v\n", path, err)
+		slog.Warn("chmod db file", "path", path, "err", err)
 	}
 	return &SQLite{db: db}, nil
 }

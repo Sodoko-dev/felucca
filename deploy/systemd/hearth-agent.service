@@ -21,6 +21,10 @@ Group=root
 
 # Config and env
 EnvironmentFile=-/etc/hearth/agent.env
+# Log verbosity (v4 P6, tracing): RUST_LOG overrides the default "info" —
+# e.g. RUST_LOG=debug in agent.env for a debugging session. Journald captures
+# the structured key=value output; grep by request_id to follow one hearthd
+# API call into this agent.
 ExecStart=/usr/local/bin/hearth-agent --config /etc/hearth/hearth-agent.json
 
 # Restart policy

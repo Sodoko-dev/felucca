@@ -12,11 +12,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -147,10 +147,10 @@ func (g *Gateway) reportActivity() {
 	resp, err := g.client.Do(req)
 	if err != nil || resp.StatusCode >= 300 {
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "gw: activity report: %v\n", err)
+			slog.Error("gw: activity report", "err", err)
 		} else {
 			resp.Body.Close()
-			fmt.Fprintf(os.Stderr, "gw: activity report: status %d\n", resp.StatusCode)
+			slog.Warn("gw: activity report", "status", resp.StatusCode)
 		}
 		g.amu.Lock()
 		for _, id := range ids {
@@ -239,7 +239,7 @@ func (g *Gateway) doWake(label, sandboxID string) (Route, bool) {
 func (g *Gateway) refresh() {
 	routes, err := g.fetchRoutes()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "gw: route refresh: %v\n", err)
+		slog.Warn("gw: route refresh", "err", err)
 		return
 	}
 	m := make(map[string]Route, len(routes))
@@ -388,7 +388,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			case status == 404:
 				// fall through to the shared 404 below
 			default:
-				fmt.Fprintf(os.Stderr, "gw: ensure %s: %v\n", label, err)
+				slog.Warn("gw: ensure failed", "label", label, "err", err)
 			}
 		}
 	}

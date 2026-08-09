@@ -477,6 +477,33 @@ Upgrade workers one at a time. Before restarting an agent, optionally drain it:
 
 ## 11. Troubleshooting
 
+### Observability (v4 P6)
+
+All three binaries log structured `key=value` text to stderr → journald.
+Every `/api/` request gets an `X-Hearth-Request-Id` (also echoed to the
+client); to follow one failing call across binaries:
+
+```bash
+# On the control plane, find the request:
+sudo journalctl -u hearthd | grep req-<id>
+# On the owning worker, the same id appears on the agent's handler logs:
+sudo journalctl -u hearth-agent | grep req-<id>
+```
+
+Agent verbosity: set `RUST_LOG=debug` in `/etc/hearth/agent.env` and restart.
+Fatal-exit diagnostics (`fatal: ...`) and the cross-tenant-isolation warning
+bypass the filter and always reach the journal — a restrictive `RUST_LOG`
+can never hide them.
+
+**Grep migration (pre-P6 → P6):** message key words are unchanged but exact
+formats moved to `key=value`; drop colons and inline values from old greps —
+`grep 'persist:'` → `grep 'persist failed'`, `grep 'listening on'` →
+`grep 'listening'`, `grep 'exec on'` → `grep 'exec failed'`.
+Latency histograms live on the open `/metrics`; per-tenant gauges require the
+admin token at `GET /api/v1/metrics/tenants` (Prometheus scrape config and a
+ready-made Grafana dashboard: `deploy/grafana/`). Release ritual:
+`scripts/bench.sh <endpoint> <token>` and refresh `docs/BENCHMARKS.md`.
+
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `systemctl status hearthd` shows `failed` | Binary not found or config parse error | Check `journalctl -u hearthd -n 50`; verify `/usr/local/bin/hearthd` exists and is executable |

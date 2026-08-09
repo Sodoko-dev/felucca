@@ -132,7 +132,19 @@ PATCH, SDK npm publish.
 3. **TypeScript SDK** (`sdk/ts/`): thin typed client over REST — create/exec(stream)/sleep/wake/fork/expose; mirrors the conformance contract so Sodoko integrates in a day. Publish the conformance suite as `hearth verify <endpoint>` — the trust artifact for self-hosters.
 4. **Usage aggregation** over P0's `usage_events`: `GET /api/v1/tenants/{id}/usage?from&to` → sandbox-hours, vCPU-hours, GB-hours, exec counts (computed from transition pairs); `hearth_tenant_*` gauges for dashboards. Billing integration stays out of scope — this endpoint is its future input.
 
-## Phase 6 — Scale-out & observability (post-launch)
+## Phase 6 — Scale-out & observability — ✅ DONE 2026-08-09
+
+Completed and committed. All five gates green: conformance **342/0** (new
+`hearthd/24-observability`), verify-v2 **21/0**, cargo **121/0 agent +
+41/0 guest**, go suite green, static binaries link; bench numbers published
+in BENCHMARKS.md (wake p50 75 ms wall-clock, exec 41 ms, stream first-frame
+9 ms, fork 1.1 s — the uffd baseline). ADR-0010 + API-V2 §3g written.
+Deltas from the sketch below: per-tenant metrics live behind the authed
+`GET /api/v1/metrics/tenants` (not the open endpoint — ADR-0009 leak rule);
+HA and uffd delivered as groundwork documents (docs/HA-GROUNDWORK.md,
+research/uffd-cow-fork.md), implementation deferred; structured logging
+keeps fatal/security diagnostics unconditionally on stderr (immune to
+RUST_LOG) after the review loop caught the filterability hazard.
 
 - Structured logging (Go `slog`, Rust `tracing`) replacing eprintln/stderr; request IDs across hearthd→agent.
 - Metrics expansion (per-tenant counters, wake/exec latency histograms) + Grafana dashboard in `deploy/`.

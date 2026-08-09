@@ -6,7 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"flag"
-	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -85,7 +85,7 @@ func Load(args []string) (*Config, error) {
 	if configPath != "" {
 		if err := applyFile(cfg, configPath); err != nil {
 			// Log but don't fail — mirrors Zig warn-and-continue.
-			fmt.Fprintf(os.Stderr, "config: could not load %s: %v\n", configPath, err)
+			slog.Warn("config: could not load", "path", configPath, "err", err)
 		}
 	}
 
