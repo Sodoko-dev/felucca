@@ -551,7 +551,11 @@ exec/scheduling/conformance never noticed) — only the test harness's
 hardcoded addr→VM map broke, silently pinging from the wrong machine.
 verify-v2 now resolves workers by registration hostname (lima-<vm>) and
 conformance-lab.sh resolves the agent-suite target at run time; nothing in
-the lab tooling hardcodes those DHCP addresses anymore. kata-lab-1 also
+the lab tooling hardcodes those DHCP addresses anymore. Because the passing
+verify run happened to schedule onto kata-lab-0, the full failing sequence
+(fresh-boot / post-wake / fork-child / parent-after-fork pings) was then
+re-proven directly against kata-lab-1's agent: all four pass (wake 59 ms) —
+the node's data path was never broken. kata-lab-1 also
 wedged once during diagnosis (its first-ever vz crash — all prior nine were
 kata-lab-0) — stop -f + start healed it, zero staging. Live repro: one
 request id followed from an API call through hearthd's journal into the
