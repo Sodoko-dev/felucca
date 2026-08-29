@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Templates & bigger guests (v4 P4): template CRUD, rootfs capture from a
 # stopped sandbox, create-by-template (which exercises the full image
 # distribution path — the worker pulls the captured image from hearthd and

@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Node join (v4 P2): admin-minted one-time join tokens and the
 # POST /api/v1/nodes/join exchange. Covers mint (201 + prefixes), mint input
 # validation, admin-only enforcement (tenant key -> 404-ish non-201), and the

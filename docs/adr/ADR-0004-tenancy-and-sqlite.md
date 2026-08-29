@@ -1,6 +1,7 @@
 # ADR-0004 — Tenancy via API keys + enforced namespaces; SQLite storage layer
 
-- Status: Accepted
+- Status: Accepted, **amended 2026-08-29** (see the amendment below: the admin
+  token now has minimum requirements, and API keys gained expiry + listing)
 - Date: 2026-06-12
 - Context: first phase (P0) of the v4 "multi-tenant, deploy-anywhere, product-ready"
   plan. Fulfills the SQLite design point ADR-0002 named. Related: ADR-0002
@@ -60,9 +61,54 @@
 
 - Pre-v4 single-token deployments work unchanged (admin context); the
   conformance suite passes unmodified against a v4 control plane.
+  *(Amended 2026-08-29 — "unchanged" is no longer unconditional: a pre-v4
+  deployment whose token is empty, a shipped placeholder, or shorter than 32
+  characters now **fails to start** rather than serving. See the amendment
+  below; this is deliberate and is the one intended upgrade break.)*
 - Quota checks are O(sandboxes) under the state lock — fine at lab scale,
   revisit with row-level queries when sandbox counts grow.
 - Snapshot-per-mutation writes the whole working set per change (as JSON did);
   WAL keeps this cheap; row-level writes are the known upgrade path.
 - Key revocation is immediate (per-request hash lookup); key *rotation* is
   manual (mint new, revoke old). Usage events exist from the first deployment.
+  *(Amended 2026-08-29: keys can now also expire on their own, and are listable
+  — see below.)*
+
+## Amendment — 2026-08-29 (v4 security hardening)
+
+Two things Decision 1 left open turned out to matter.
+
+**The admin credential now has minimum requirements.** Decision 1 promoted "the
+pre-existing single configured token" to the admin credential without saying
+what a usable token is, and the answer was "anything, including nothing": an
+empty token meant *auth off*, and the placeholders committed to this public
+repo (`REPLACE_WITH…`, `hearth-lab-token`) authenticated anyone who could read
+GitHub. Since the admin credential is remote root on every worker in the fleet,
+both binaries now **refuse to start** on an empty, placeholder, or short token
+(under 32 chars for hearthd, under 16 for the agent), and an empty token
+authorizes nobody rather than everybody. Open mode survives only as an
+explicitly named `hearthd --insecure-no-auth` for loopback labs, WARN'd at every
+start; `hearth-agent` has no equivalent. Failed credentials are additionally
+throttled per source address (429 + `Retry-After`) — but the credential is
+authenticated **before** the throttle is consulted, so a correct token is always
+served and the guard can only ever shape the answer to an attempt that had
+already failed. Ordering it the other way turned the shipped topology's one
+shared `127.0.0.1` key into an unauthenticated fleet-wide denial of service, and
+was itself a finding of the review that followed.
+
+**Keys can expire, and can be found.** Decision 1 minted keys that lived
+forever, and stored only their SHA-256 — correct for the hash, but it left no
+way to *find* a leaked key: `DELETE /api/v1/keys/{id}` needs a `key_id` nobody
+kept, so the only remediation was raw SQL against `hearth.db`. Two additions:
+
+- `POST /api/v1/tenants/{id}/keys` accepts `expires_in_s` (max one year); the
+  row carries `expires_at` (0 = never, still the default and still what
+  `POST /api/v1/tenants` mints), and an expired key is rejected exactly like a
+  revoked one — the check is in the lookup SQL, not the handler.
+- `GET /api/v1/tenants/{id}/keys` (admin) lists id, `prefix`, and timestamps —
+  **never** the secret or its hash. `prefix` is the secret's first 14 chars
+  (`hearth_sk_` + 4), which is enough to match a leaked value against a row and
+  revoke it, and useless for guessing the rest.
+
+Neither changes the wire shape of any pre-existing response, so the conformance
+goldens are untouched.

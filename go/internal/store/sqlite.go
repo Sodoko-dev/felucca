@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
   key_hash   TEXT NOT NULL UNIQUE,
   prefix     TEXT NOT NULL,
   created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL DEFAULT 0,
   revoked_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
@@ -102,6 +103,12 @@ CREATE TABLE IF NOT EXISTS join_tokens (
   created_at INTEGER NOT NULL,
   used_at    INTEGER,
   node_hint  TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS node_creds (
+  host       TEXT PRIMARY KEY,
+  token      TEXT NOT NULL DEFAULT '',
+  legacy     INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS wg_peers (
   pubkey     TEXT PRIMARY KEY,
@@ -160,6 +167,9 @@ func OpenSQLite(path string) (*SQLite, error) {
 		`ALTER TABLE tenants ADD COLUMN default_idle_sleep_s INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE tenants ADD COLUMN default_asleep_delete_s INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE templates ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''`,
+		// Key expiry. Existing rows default to 0 (never expires) so upgrading
+		// cannot lock an operator out of their own control plane.
+		`ALTER TABLE api_keys ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -243,7 +253,10 @@ func (s *SQLite) SaveSnapshot(st *state.State) error {
 	return tx.Commit()
 }
 
-// LoadInto populates the in-memory state from the last snapshot.
+// LoadInto populates the in-memory state from the last snapshot. Every scan
+// checks rows.Err(): SaveSnapshot is a full delete-and-reinsert, so an
+// iteration cut short by a driver/IO error that still reported success would
+// have the next mutation permanently delete every row that was not read.
 func (s *SQLite) LoadInto(st *state.State) error {
 	st.Lock()
 	defer st.Unlock()
@@ -268,6 +281,9 @@ func (s *SQLite) LoadInto(st *state.State) error {
 		}
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	st.Seq = seq
 	st.RequestCount = reqCount
 
@@ -284,6 +300,9 @@ func (s *SQLite) LoadInto(st *state.State) error {
 		st.Nodes = append(st.Nodes, n)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
 
 	rows, err = s.db.Query(`SELECT id, name, namespace, node_id, state, vcpus, mem_mib, ip, created_at, parent_id, tenant_id, exposes, allow_dynamic_ports, template, disk_gb, idle_sleep_s, asleep_delete_s, last_activity, slept_at FROM sandboxes`)
 	if err != nil {
@@ -310,7 +329,7 @@ func (s *SQLite) LoadInto(st *state.State) error {
 		st.Sandboxes = append(st.Sandboxes, sb)
 	}
 	rows.Close()
-	return nil
+	return rows.Err()
 }
 
 // ---- Tenants ----
@@ -358,16 +377,20 @@ func (s *SQLite) ListTenants() ([]*Tenant, error) {
 
 func (s *SQLite) CreateKey(k *APIKey) error {
 	_, err := s.db.Exec(
-		`INSERT INTO api_keys (id, tenant_id, key_hash, prefix, created_at, revoked_at) VALUES (?,?,?,?,?,NULL)`,
-		k.ID, k.TenantID, k.KeyHash, k.Prefix, k.CreatedAt,
+		`INSERT INTO api_keys (id, tenant_id, key_hash, prefix, created_at, expires_at, revoked_at) VALUES (?,?,?,?,?,?,NULL)`,
+		k.ID, k.TenantID, k.KeyHash, k.Prefix, k.CreatedAt, k.ExpiresAt,
 	)
 	return err
 }
 
+// LookupKeyByHash resolves a presented key to its tenant. Expiry is enforced
+// here in SQL next to the revocation predicate — against the database's own
+// clock, so every authentication path gets it without a call-site change.
 func (s *SQLite) LookupKeyByHash(hash string) (string, error) {
 	var tenantID string
 	err := s.db.QueryRow(
-		`SELECT tenant_id FROM api_keys WHERE key_hash=? AND revoked_at IS NULL`, hash,
+		`SELECT tenant_id FROM api_keys
+		 WHERE key_hash=? AND revoked_at IS NULL AND (expires_at = 0 OR expires_at > unixepoch())`, hash,
 	).Scan(&tenantID)
 	if err == sql.ErrNoRows {
 		return "", nil
@@ -378,6 +401,32 @@ func (s *SQLite) LookupKeyByHash(hash string) (string, error) {
 	return tenantID, nil
 }
 
+// ListKeys returns a tenant's keys, newest first. key_hash is deliberately not
+// selected: the listing exists so an operator can find a key to revoke, and it
+// must not be able to hand back the verifier even by accident.
+func (s *SQLite) ListKeys(tenantID string) ([]*APIKey, error) {
+	rows, err := s.db.Query(
+		`SELECT id, tenant_id, prefix, created_at, expires_at, revoked_at FROM api_keys WHERE tenant_id=? ORDER BY created_at DESC, id DESC`,
+		tenantID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*APIKey
+	for rows.Next() {
+		k := &APIKey{}
+		var revokedAt sql.NullInt64
+		if err := rows.Scan(&k.ID, &k.TenantID, &k.Prefix, &k.CreatedAt, &k.ExpiresAt, &revokedAt); err != nil {
+			return nil, err
+		}
+		k.KeyHash = ""
+		k.RevokedAt = intPtr(revokedAt)
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
 func (s *SQLite) RevokeKey(id string, now int64) (bool, error) {
 	res, err := s.db.Exec(`UPDATE api_keys SET revoked_at=? WHERE id=? AND revoked_at IS NULL`, now, id)
 	if err != nil {
@@ -385,6 +434,33 @@ func (s *SQLite) RevokeKey(id string, now int64) (bool, error) {
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+// RevokeKeyByHash revokes by the hash of the presented secret and reports the
+// id it burned, so a leaked key can be killed by whoever holds the leak. An
+// already-expired key is still revocable — expiry is not a revocation record.
+func (s *SQLite) RevokeKeyByHash(hash string, now int64) (string, bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", false, err
+	}
+	defer tx.Rollback()
+
+	var id string
+	err = tx.QueryRow(`SELECT id FROM api_keys WHERE key_hash=? AND revoked_at IS NULL`, hash).Scan(&id)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if _, err := tx.Exec(`UPDATE api_keys SET revoked_at=? WHERE id=?`, now, id); err != nil {
+		return "", false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", false, err
+	}
+	return id, true, nil
 }
 
 // ---- Join tokens ----
@@ -428,6 +504,106 @@ func (s *SQLite) ConsumeJoinToken(hash string, now int64) (bool, error) {
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+// ---- Node credentials ----
+
+func (s *SQLite) GetNodeCred(host string) (*NodeCred, error) {
+	c := &NodeCred{}
+	err := s.db.QueryRow(
+		`SELECT host, token, legacy, created_at FROM node_creds WHERE host=?`, host,
+	).Scan(&c.Host, &c.Token, &c.Legacy, &c.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// PutNodeCred upserts by host: a re-enrollment rotates the node's token.
+func (s *SQLite) PutNodeCred(c *NodeCred) error {
+	_, err := s.db.Exec(
+		`INSERT INTO node_creds (host, token, legacy, created_at) VALUES (?,?,?,?)
+		 ON CONFLICT(host) DO UPDATE SET token=excluded.token, legacy=excluded.legacy, created_at=excluded.created_at`,
+		c.Host, c.Token, c.Legacy, c.CreatedAt,
+	)
+	return err
+}
+
+// DeleteNodeCred removes one credential row (idempotent: false when absent).
+func (s *SQLite) DeleteNodeCred(host string) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM node_creds WHERE host=?`, host)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// ListNodeCreds returns every credential row, oldest first.
+func (s *SQLite) ListNodeCreds() ([]*NodeCred, error) {
+	rows, err := s.db.Query(`SELECT host, token, legacy, created_at FROM node_creds ORDER BY created_at, host`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*NodeCred
+	for rows.Next() {
+		c := &NodeCred{}
+		if err := rows.Scan(&c.Host, &c.Token, &c.Legacy, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// SeedLegacyNodeCreds writes one Legacy row per host, once per database. The
+// meta marker is set even when hosts is empty, so a fresh install grandfathers
+// nobody and every node it ever enrolls needs its own credential.
+func (s *SQLite) SeedLegacyNodeCreds(hosts []string, now int64) (int, error) {
+	var marker string
+	err := s.db.QueryRow(`SELECT v FROM meta WHERE k='node_creds_seeded'`).Scan(&marker)
+	if err == nil {
+		return 0, nil // already ran; a second pass would re-grandfather
+	}
+	if err != sql.ErrNoRows {
+		return 0, err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	seeded := 0
+	for _, host := range hosts {
+		if host == "" {
+			continue
+		}
+		res, err := tx.Exec(
+			`INSERT OR IGNORE INTO node_creds (host, token, legacy, created_at) VALUES (?,'',1,?)`,
+			host, now,
+		)
+		if err != nil {
+			return 0, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			seeded++
+		}
+	}
+	if _, err := tx.Exec(
+		`INSERT OR REPLACE INTO meta (k, v) VALUES ('node_creds_seeded', ?)`, fmt.Sprintf("%d", now),
+	); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return seeded, nil
 }
 
 // ---- WireGuard peers ----
@@ -590,5 +766,13 @@ func strPtr(ns sql.NullString) *string {
 		return nil
 	}
 	v := ns.String
+	return &v
+}
+
+func intPtr(ni sql.NullInt64) *int64 {
+	if !ni.Valid {
+		return nil
+	}
+	v := ni.Int64
 	return &v
 }

@@ -117,12 +117,23 @@ pub async fn put_drive_rootfs(sock: &str, rootfs_path: &str) -> Result<()> {
 }
 
 /// PUT /network-interfaces/eth0 (only when networking on).
-pub async fn put_network_interface(sock: &str, tap: &str) -> Result<()> {
-    let body = format!(
-        "{{\"iface_id\":\"eth0\",\"host_dev_name\":{}}}",
-        json_str(tap)
-    );
+///
+/// `guest_mac` pins the NIC's L2 identity to the address the host's per-tap
+/// anti-spoof chain matches on. It is a `GuestMac` rather than a string so the
+/// two halves cannot drift apart: there is no "let Firecracker pick" body, and
+/// therefore no NIC whose address the tap's pin does not know.
+pub async fn put_network_interface(sock: &str, tap: &str, guest_mac: &crate::net::GuestMac) -> Result<()> {
+    let body = build_network_interface(tap, guest_mac);
     put(sock, "/network-interfaces/eth0", &body).await
+}
+
+/// Build network-interfaces JSON body — used in tests too.
+pub fn build_network_interface(tap: &str, guest_mac: &crate::net::GuestMac) -> String {
+    format!(
+        "{{\"iface_id\":\"eth0\",\"host_dev_name\":{},\"guest_mac\":{}}}",
+        json_str(tap),
+        json_str(guest_mac.as_str())
+    )
 }
 
 /// PUT /machine-config
@@ -301,6 +312,37 @@ mod tests {
             body,
             r#"{"kernel_image_path":"/srv/ignis/kernels/vmlinux","boot_args":"console=ttyS0 reboot=k panic=1 root=/dev/vda rw"}"#
         );
+    }
+
+    #[test]
+    fn test_build_network_interface_pins_the_guest_mac() {
+        // Was: the NIC was attached with no guest_mac, so nothing fixed an L2
+        // identity for the host's per-tap filter to match.
+        let body = build_network_interface("hth-3", &crate::net::guest_mac_for_slot(3));
+        assert_eq!(
+            body,
+            r#"{"iface_id":"eth0","host_dev_name":"hth-3","guest_mac":"02:48:54:00:00:03"}"#
+        );
+    }
+
+    #[test]
+    fn test_build_network_interface_always_carries_a_mac() {
+        // There is no MAC-less body any more: the argument is a GuestMac, which
+        // has no empty inhabitant, so a NIC can never be attached with an
+        // address its tap's pin does not know about.
+        for slot in [0u32, 1, 7, 253] {
+            let body = build_network_interface(
+                &crate::net::tap_name(slot),
+                &crate::net::guest_mac_for_slot(slot),
+            );
+            assert!(
+                body.contains(&format!(
+                    "\"guest_mac\":\"{}\"",
+                    crate::net::guest_mac_for_slot(slot)
+                )),
+                "slot {slot}: {body}"
+            );
+        }
     }
 
     #[test]

@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Agent actions are empty-200 with observable transitions.
 cf_agent_state() { # <id> <expected> <label>
   ag GET /v1/vms

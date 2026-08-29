@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # v3 exec: run a command in a guest via hearthd → agent → vsock → guest agent.
 # Requires a v3 stack with injected guest assets; the sandbox from case 05 has
 # been deleted by case 11, so create a short-lived one here.
@@ -13,7 +14,27 @@ else
   check_golden hearthd/exec
   hd POST "/api/v1/sandboxes/$cf_exec_id/exec" '{"cmd":[]}'
   assert_status 400 "exec with empty cmd rejected"
-  hd POST /api/v1/sandboxes/sb-deadbeef-99999/exec '{"cmd":["true"]}'
+
+  # timeout_ms is bounded [1, 300000] and REJECTED outside it, not clamped.
+  # A negative value used to overflow time.Duration(ms)*time.Millisecond into a
+  # ~290-year POSITIVE duration, and that value feeds both the connection
+  # deadline and the agent request context — so "-1" disarmed the very
+  # slow-loris guard those deadlines exist to provide. Asserted against a live
+  # sandbox so a 400 cannot be a disguised 404.
+  for cf_exec_bad in -1 0 300001; do
+    hd POST "/api/v1/sandboxes/$cf_exec_id/exec" \
+      "{\"cmd\":[\"true\"],\"timeout_ms\":$cf_exec_bad}"
+    assert_status 400 "exec timeout_ms=$cf_exec_bad -> 400"
+    assert_body_exact '{"error":"timeout_ms out of range"}' "timeout_ms=$cf_exec_bad body exact"
+  done
+  # The bound is inclusive at both ends.
+  hd POST "/api/v1/sandboxes/$cf_exec_id/exec" '{"cmd":["true"],"timeout_ms":1}'
+  assert_status 200 "exec timeout_ms=1 accepted (lower bound inclusive)"
+  # ...and the streamed arm shares the check, so it cannot be the way around it.
+  hd POST "/api/v1/sandboxes/$cf_exec_id/exec?stream=1" '{"cmd":["true"],"timeout_ms":-1}'
+  assert_status 400 "streamed exec timeout_ms=-1 -> 400"
+
+  hd POST /api/v1/sandboxes/sb-cf0000000000000000deadbeef/exec '{"cmd":["true"]}'
   assert_status 404 "exec on unknown sandbox"
   hd DELETE "/api/v1/sandboxes/$cf_exec_id"
   assert_status 204 "exec-case sandbox cleaned up"

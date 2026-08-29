@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # GET /v1/vms wraps records in {"vms":[...]} (element shape is goldened in
 # case 04 against a VM the suite itself creates).
 ag GET /v1/vms

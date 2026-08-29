@@ -18,6 +18,19 @@
    double dash — so `--` stays unambiguous — and never all digits: the
    all-digit namespace is reserved for dynamic port-in-hostname labels
    (`8069--<id>`). Sandbox ids contain only single dashes by construction.
+
+   > **Amended 2026-08-29 (v4 security hardening).** The label budget is now
+   > load-bearing for a security property, not just for DNS. The gateway
+   > authenticates **nothing** on an inbound ingress request, so the hostname
+   > label *is* the capability that reaches a tenant's service — and the old id
+   > carried a monotonic `seq` tail, which disclosed every other tenant's
+   > position in the issuance stream and spent label budget that entropy needed
+   > more. Ids are now `"<prefix>-" + 26 hex chars` from `crypto/rand`
+   > (`state.IDRandomBytes = 13`, 104 bits), and the seq counter — still
+   > persisted, since it is part of the state format — is out of the id. The
+   > arithmetic is exact and leaves nothing spare: 32 (longest expose name) + 2
+   > (`--`) + 29 (`sb-` + 26 hex) = 63, the DNS single-label maximum. Widening
+   > either bound requires re-checking it.
 2. **An expose is a route row plus one worker DNAT rule.** hearthd stores
    `{name, guest_port, node_port}` on the sandbox (snapshot-persisted in
    both stores — the SQLite table gained two columns with an idempotent

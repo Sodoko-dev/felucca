@@ -15,6 +15,18 @@ import (
 	"github.com/alpham/infra-saas/hearth/internal/model"
 )
 
+// Every accepted expose burns one port from the worker's fleet-wide
+// 20000-29999 pool, which every VM of every tenant on that node draws from,
+// and nothing gives a named one back (the lifecycle sweep only GCs the
+// all-digit dynamic ones). Without a cap a single in-quota sandbox can loop
+// distinct names until the node has no ports left for anybody else, so both
+// counts are bounded: per sandbox, and per tenant so the sum across a
+// tenant's sandboxes cannot drain a node either.
+const (
+	maxExposesPerSandbox = 16
+	maxExposesPerTenant  = 128
+)
+
 // validExposeName: lowercase [a-z0-9-], 1..=32, no leading/trailing dash and
 // no "--" (the label separator must stay unambiguous), not all digits
 // (all-digit labels are the dynamic port-in-hostname namespace).
@@ -133,6 +145,18 @@ func (srv *Server) exposeSandbox(w http.ResponseWriter, r *http.Request, id, ten
 	srv.exposeCommon(w, r, id, tenant, req.Name, req.Port, false)
 }
 
+// tenantExposeCount totals a tenant's exposes across all of its sandboxes.
+// Caller must hold the state lock.
+func (srv *Server) tenantExposeCount(tenantID string) int {
+	n := 0
+	for _, sb := range srv.st.Sandboxes {
+		if sb.TenantID == tenantID {
+			n += len(sb.Exposes)
+		}
+	}
+	return n
+}
+
 // exposeCommon is the shared expose path for the named API and the dynamic
 // ensure-route path (which uses the all-digit name namespace). dynamic only
 // changes the success status code shape (200 route view vs 201 expose view).
@@ -175,6 +199,21 @@ func (srv *Server) exposeCommon(w http.ResponseWriter, r *http.Request, id, tena
 			writeJSON(w, 409, []byte(`{"error":"name already exposed with a different port"}`))
 			return
 		}
+	}
+	// Only a new name reaches the agent's port pool, so the caps go after the
+	// name scan — an idempotent repeat must not start failing at the limit.
+	if len(sb.Exposes) >= maxExposesPerSandbox {
+		srv.st.Unlock()
+		writeJSON(w, 429, []byte(`{"error":"expose limit reached for this sandbox"}`))
+		return
+	}
+	// The tenant total is keyed on the sandbox's owner, not the caller: the
+	// dynamic ensure-route path calls in as admin on a tenant's sandbox. Admin
+	// itself is unmetered, matching the sandbox quota gate.
+	if sb.TenantID != adminTenant && srv.tenantExposeCount(sb.TenantID) >= maxExposesPerTenant {
+		srv.st.Unlock()
+		writeJSON(w, 429, []byte(`{"error":"expose limit reached for this tenant"}`))
+		return
 	}
 	srv.st.Unlock()
 
@@ -219,6 +258,65 @@ func (srv *Server) exposeCommon(w http.ResponseWriter, r *http.Request, id, tena
 		writeJSON(w, 200, b)
 	} else {
 		writeJSON(w, 201, b)
+	}
+}
+
+// reExposeFork re-creates a forked parent's ingress on the child (same names
+// and guest ports, fresh node ports). The fork path is the THIRD writer of
+// sb.Exposes, so it takes the same exposeMu and honours the same two caps as
+// exposeCommon.
+//
+// The per-sandbox cap is inherited (a parent can hold at most
+// maxExposesPerSandbox), but the per-tenant total is NOT: without this check a
+// tenant with a large or unset max_sandboxes forks a 16-expose parent over and
+// over until the worker's shared 20000-29999 node-port pool is empty and every
+// other tenant on that node 502s. Both caps are re-read per expose because the
+// loop itself is what moves the totals.
+//
+// Best-effort per expose, matching the fork contract: a skipped or failed one
+// degrades that single URL, not the fork.
+func (srv *Server) reExposeFork(agentAddr, childID string, parentExposes []model.Expose, reqID string) {
+	if len(parentExposes) == 0 {
+		return
+	}
+	srv.exposeMu.Lock()
+	defer srv.exposeMu.Unlock()
+
+	for _, e := range parentExposes {
+		srv.st.Lock()
+		child := srv.st.FindSandbox(childID)
+		if child == nil {
+			// Deleted mid-fork; the agent-side rules die with the VM.
+			srv.st.Unlock()
+			return
+		}
+		if len(child.Exposes) >= maxExposesPerSandbox {
+			srv.st.Unlock()
+			slog.Warn("fork: re-expose skipped, sandbox expose cap reached",
+				"sandbox", childID, "expose", e.Name, "request_id", reqID)
+			return
+		}
+		// Keyed on the child's owner, like exposeCommon: admin is unmetered.
+		if child.TenantID != adminTenant && srv.tenantExposeCount(child.TenantID) >= maxExposesPerTenant {
+			tenantID := child.TenantID
+			srv.st.Unlock()
+			slog.Warn("fork: re-expose skipped, tenant expose cap reached",
+				"sandbox", childID, "tenant", tenantID, "expose", e.Name, "request_id", reqID)
+			// Every later expose would hit the same total.
+			return
+		}
+		srv.st.Unlock()
+
+		nodePort, err := srv.agentExpose(agentAddr, childID, e.GuestPort, reqID)
+		if err != nil {
+			slog.Warn("fork: re-expose failed", "sandbox", childID, "expose", e.Name, "err", err, "request_id", reqID)
+			continue
+		}
+		srv.st.Lock()
+		if c := srv.st.FindSandbox(childID); c != nil {
+			c.Exposes = append(c.Exposes, model.Expose{Name: e.Name, GuestPort: e.GuestPort, NodePort: nodePort})
+		}
+		srv.st.Unlock()
 	}
 }
 

@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Agent sleep/wake: exact ok bodies; sleeping VM has no pid; wake reports
 # integer wake_ms and the VM runs again.
 # Never sleep a mid-boot guest: the snapshot would be poisoned (guest panics

@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Node JSON shape: key set, types, computed status. Golden is the first
 # node element (volatile values type-asserted and erased by normalize.jq).
 hd GET /api/v1/nodes

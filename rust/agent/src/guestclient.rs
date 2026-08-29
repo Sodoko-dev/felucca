@@ -8,14 +8,35 @@
 
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 /// Cap on a single response line (defensive; guest caps stdout/stderr at 1 MiB each).
 const MAX_RESPONSE: usize = 4 * 1024 * 1024;
 /// Firecracker guest-agent vsock port (per §1).
 const GUEST_PORT: u32 = 52;
+/// Cap on Firecracker's own `OK <port>` / `ERROR <n>` handshake reply. It is
+/// read a byte at a time so nothing beyond the newline is buffered (the
+/// streamed path hands the raw socket on), which is only affordable because
+/// the line is a dozen bytes and comes from Firecracker, not the guest.
+const MAX_HANDSHAKE: usize = 128;
+
+/// Guest round-trips in flight across the whole node.
+///
+/// The tenant is root inside their VM and can replace the guest agent with a
+/// listener of their choosing, so the work each round-trip costs the agent is
+/// theirs to pick — and the agent's runtime serves every other tenant on the
+/// node. The permit is taken inside the caller's deadline, so waiting for a
+/// slot surfaces as that call's timeout rather than a spurious failure.
+const MAX_CONCURRENT_GUEST_CALLS: usize = 32;
+static GUEST_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_GUEST_CALLS);
+
+/// A held guest round-trip permit; the slot is released when it is dropped.
+/// The streamed path hands one to its caller, which must keep it alive for as
+/// long as the guest connection is being read.
+pub type GuestSlot = tokio::sync::SemaphorePermit<'static>;
 
 #[derive(Debug)]
 pub struct GuestError(pub String);
@@ -42,9 +63,13 @@ async fn round_trip(dir: &str, request_line: &str, deadline_ms: u64) -> Result<S
 }
 
 async fn round_trip_inner(uds: &str, request_line: &str) -> Result<String> {
-    let mut stream = UnixStream::connect(uds)
+    // Held for the whole exchange, including the connect: an unslotted client
+    // must not even open the socket.
+    let _slot = acquire_slot().await?;
+    let stream = UnixStream::connect(uds)
         .await
         .map_err(|e| GuestError(format!("connect {}: {}", uds, e)))?;
+    let mut stream = BufReader::new(stream);
 
     // Firecracker hybrid-vsock handshake: ask to connect to the guest port.
     let connect = format!("CONNECT {}\n", GUEST_PORT);
@@ -55,7 +80,7 @@ async fn round_trip_inner(uds: &str, request_line: &str) -> Result<String> {
 
     // Read a single line; Firecracker replies `OK <assigned_port>\n` on success,
     // or closes / errors when no guest is listening on the port.
-    let ok_line = read_line(&mut stream).await?;
+    let ok_line = read_handshake_line(stream.get_mut()).await?;
     if !ok_line.starts_with("OK ") {
         return Err(GuestError(format!("handshake: expected 'OK <port>', got {:?}", ok_line)));
     }
@@ -70,13 +95,23 @@ async fn round_trip_inner(uds: &str, request_line: &str) -> Result<String> {
         .await
         .map_err(|e| GuestError(format!("write request: {}", e)))?;
 
-    let resp = read_line(&mut stream).await?;
+    let resp = read_response_line(&mut stream).await?;
     Ok(resp)
 }
 
-/// Read one `\n`-terminated line (the `\n` is stripped), capped at MAX_RESPONSE.
-async fn read_line(stream: &mut UnixStream) -> Result<String> {
-    let mut buf: Vec<u8> = Vec::with_capacity(256);
+/// Take a guest round-trip slot, or report the wait as the caller's failure.
+async fn acquire_slot() -> Result<GuestSlot> {
+    GUEST_SLOTS
+        .acquire()
+        .await
+        .map_err(|_| GuestError("guest round-trip semaphore closed".into()))
+}
+
+/// Read Firecracker's handshake reply one byte at a time, so nothing past the
+/// newline is consumed — `exec_stream` hands the raw socket to its caller and
+/// any over-read byte would be a guest frame lost. Bounded by MAX_HANDSHAKE.
+async fn read_handshake_line(stream: &mut UnixStream) -> Result<String> {
+    let mut buf: Vec<u8> = Vec::with_capacity(MAX_HANDSHAKE);
     let mut byte = [0u8; 1];
     loop {
         let n = stream
@@ -84,7 +119,6 @@ async fn read_line(stream: &mut UnixStream) -> Result<String> {
             .await
             .map_err(|e| GuestError(format!("read: {}", e)))?;
         if n == 0 {
-            // EOF before newline.
             if buf.is_empty() {
                 return Err(GuestError("connection closed before any data".into()));
             }
@@ -94,9 +128,36 @@ async fn read_line(stream: &mut UnixStream) -> Result<String> {
             break;
         }
         buf.push(byte[0]);
-        if buf.len() > MAX_RESPONSE {
-            return Err(GuestError(format!("response exceeded {} bytes", MAX_RESPONSE)));
+        if buf.len() > MAX_HANDSHAKE {
+            return Err(GuestError(format!("handshake exceeded {} bytes", MAX_HANDSHAKE)));
         }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Read one `\n`-terminated line (the `\n` is stripped), capped at MAX_RESPONSE.
+///
+/// Buffered, and bounded by `take` rather than by checking after each byte:
+/// this content is entirely the tenant's to choose, and a byte-at-a-time loop
+/// let one 4 MiB newline-free answer cost four million read syscalls and as
+/// many wakeups on the runtime every other tenant shares. The same answer is
+/// now ~1000 reads.
+async fn read_response_line<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Result<String> {
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    // +1 so a line of exactly MAX_RESPONSE bytes still reads its terminator.
+    let mut limited = reader.take(MAX_RESPONSE as u64 + 1);
+    let n = limited
+        .read_until(b'\n', &mut buf)
+        .await
+        .map_err(|e| GuestError(format!("read: {}", e)))?;
+    if n == 0 && buf.is_empty() {
+        return Err(GuestError("connection closed before any data".into()));
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    } else if buf.len() > MAX_RESPONSE {
+        // Cap reached with no terminator in sight.
+        return Err(GuestError(format!("response exceeded {} bytes", MAX_RESPONSE)));
     }
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
@@ -124,7 +185,15 @@ pub async fn exec(dir: &str, cmd: &[String], timeout_ms: u64) -> Result<serde_js
 /// (`{"stream":...,"data":...}` chunks, then one `{"done":true,...}` line) and
 /// closes. Only the setup is bounded here (10s); the caller owns the
 /// data-phase deadline, sized to the command's timeout.
-pub async fn exec_stream(dir: &str, cmd: &[String], timeout_ms: u64) -> Result<UnixStream> {
+///
+/// The returned `GuestSlot` is this call's round-trip permit: it must stay
+/// alive for as long as the stream is read, or the concurrency bound only
+/// covers the handshake.
+pub async fn exec_stream(
+    dir: &str,
+    cmd: &[String],
+    timeout_ms: u64,
+) -> Result<(UnixStream, GuestSlot)> {
     let request = serde_json::json!({
         "op": "exec",
         "cmd": cmd,
@@ -136,6 +205,7 @@ pub async fn exec_stream(dir: &str, cmd: &[String], timeout_ms: u64) -> Result<U
     let uds = format!("{}/v.sock", dir);
 
     let setup = async {
+        let slot = acquire_slot().await?;
         let mut stream = UnixStream::connect(&uds)
             .await
             .map_err(|e| GuestError(format!("connect {}: {}", uds, e)))?;
@@ -144,7 +214,7 @@ pub async fn exec_stream(dir: &str, cmd: &[String], timeout_ms: u64) -> Result<U
             .write_all(connect.as_bytes())
             .await
             .map_err(|e| GuestError(format!("write CONNECT: {}", e)))?;
-        let ok_line = read_line(&mut stream).await?;
+        let ok_line = read_handshake_line(&mut stream).await?;
         if !ok_line.starts_with("OK ") {
             return Err(GuestError(format!(
                 "handshake: expected 'OK <port>', got {:?}",
@@ -157,7 +227,7 @@ pub async fn exec_stream(dir: &str, cmd: &[String], timeout_ms: u64) -> Result<U
             .write_all(req.as_bytes())
             .await
             .map_err(|e| GuestError(format!("write request: {}", e)))?;
-        Ok(stream)
+        Ok((stream, slot))
     };
     match timeout(Duration::from_millis(10_000), setup).await {
         Ok(r) => r,
@@ -287,7 +357,7 @@ mod tests {
         .await;
 
         let cmd = vec!["true".to_string()];
-        let mut stream = exec_stream(&dir_path, &cmd, 5_000).await.expect("stream setup");
+        let (mut stream, _slot) = exec_stream(&dir_path, &cmd, 5_000).await.expect("stream setup");
         let mut buf = String::new();
         stream.read_to_string(&mut buf).await.unwrap();
         let lines: Vec<&str> = buf.lines().collect();
@@ -351,5 +421,154 @@ mod tests {
         let parent = std::path::Path::new(&uds).parent().unwrap().to_str().unwrap();
         let err = exec(parent, &["true".to_string()], 1000).await.unwrap_err();
         assert!(err.0.contains("connect"), "expected connect error, got: {}", err.0);
+    }
+
+    // ---- L8: bounded, buffered reads and a concurrency ceiling ----
+
+    /// Fake server that answers with `body` and never terminates the line.
+    async fn endless_line_server(uds: String, body: Vec<u8>) {
+        let listener = UnixListener::bind(&uds).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = srv_read_line(&mut stream).await; // CONNECT 52
+            stream.write_all(b"OK 1\n").await.unwrap();
+            let _ = srv_read_line(&mut stream).await; // request line
+            let _ = stream.write_all(&body).await;
+            let _ = stream.shutdown().await;
+        });
+    }
+
+    #[tokio::test]
+    async fn test_response_over_the_cap_is_rejected_not_buffered_forever() {
+        // The tenant is root inside the VM and picks what comes back here, so
+        // a newline-free answer must hit the cap instead of being read to EOF.
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_str().unwrap().to_string();
+        endless_line_server(format!("{}/v.sock", dir_path), vec![b'a'; MAX_RESPONSE + 4096]).await;
+
+        let err = exec(&dir_path, &["true".to_string()], 10_000).await.unwrap_err();
+        assert!(
+            err.0.contains("exceeded"),
+            "expected the cap to fire, got: {}",
+            err.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_large_response_under_the_cap_round_trips_intact() {
+        // Proves the buffered reader is not lossy at size: the same payload
+        // used to cost one syscall per byte.
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_str().unwrap().to_string();
+        let filler = "x".repeat(1024 * 1024);
+        let mut body = format!(
+            "{{\"ok\":true,\"exit_code\":0,\"stdout\":\"{}\",\"stderr\":\"\"}}",
+            filler
+        )
+        .into_bytes();
+        body.push(b'\n');
+        endless_line_server(format!("{}/v.sock", dir_path), body).await;
+
+        let resp = exec(&dir_path, &["true".to_string()], 30_000).await.expect("exec ok");
+        assert_eq!(resp["stdout"].as_str().unwrap().len(), filler.len());
+    }
+
+    #[tokio::test]
+    async fn test_handshake_line_is_capped() {
+        // Firecracker's reply is a dozen bytes; a peer that never terminates
+        // it must not be read forever either.
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_str().unwrap().to_string();
+        let uds = format!("{}/v.sock", dir_path);
+        let listener = UnixListener::bind(&uds).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = srv_read_line(&mut stream).await;
+            let _ = stream.write_all(&vec![b'O'; MAX_HANDSHAKE + 64]).await;
+            let _ = stream.shutdown().await;
+        });
+
+        let err = exec(&dir_path, &["true".to_string()], 5_000).await.unwrap_err();
+        assert!(
+            err.0.contains("handshake exceeded"),
+            "expected the handshake cap to fire, got: {}",
+            err.0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_round_trips_are_capped() {
+        // Was: nothing bounded concurrent execs, so a tenant could schedule
+        // arbitrarily many guest reads on the runtime every tenant shares.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_str().unwrap().to_string();
+        let uds = format!("{}/v.sock", dir_path);
+        let listener = UnixListener::bind(&uds).unwrap();
+
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        {
+            let (live, peak) = (Arc::clone(&live), Arc::clone(&peak));
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else { break };
+                    let (live, peak) = (Arc::clone(&live), Arc::clone(&peak));
+                    tokio::spawn(async move {
+                        let n = live.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(n, Ordering::SeqCst);
+                        let _ = srv_read_line(&mut stream).await;
+                        let _ = stream.write_all(b"OK 1\n").await;
+                        let _ = srv_read_line(&mut stream).await;
+                        // Hold the connection open long enough that every
+                        // permitted caller overlaps with the others.
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        let _ = stream.write_all(b"{\"ok\":true}\n").await;
+                        let _ = stream.shutdown().await;
+                        live.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            });
+        }
+
+        let mut tasks = Vec::new();
+        for _ in 0..(MAX_CONCURRENT_GUEST_CALLS * 2) {
+            let d = dir_path.clone();
+            tasks.push(tokio::spawn(async move {
+                let _ = exec(&d, &["true".to_string()], 30_000).await;
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        let observed = peak.load(Ordering::SeqCst);
+        assert!(
+            observed <= MAX_CONCURRENT_GUEST_CALLS,
+            "peak concurrent guest round-trips {} exceeded the cap {}",
+            observed,
+            MAX_CONCURRENT_GUEST_CALLS
+        );
+        // The cap must actually be reached, or the test proves nothing.
+        assert!(observed > 1, "expected real overlap, saw {}", observed);
+    }
+
+    #[tokio::test]
+    async fn test_slot_is_released_after_a_failed_round_trip() {
+        // A permit leaked on the error path would wedge the node after
+        // MAX_CONCURRENT_GUEST_CALLS unreachable guests: the next caller waits
+        // on a slot that is never coming back. More failures than there are
+        // permits must still all complete.
+        let (_dir, uds) = tmp_uds("nope");
+        let parent = std::path::Path::new(&uds).parent().unwrap().to_str().unwrap();
+        let all = tokio::time::timeout(Duration::from_secs(30), async {
+            for _ in 0..(MAX_CONCURRENT_GUEST_CALLS + 4) {
+                assert!(exec(parent, &["true".to_string()], 1000).await.is_err());
+            }
+        })
+        .await;
+        assert!(all.is_ok(), "a leaked permit wedged the guest client");
     }
 }

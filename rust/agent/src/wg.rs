@@ -37,6 +37,15 @@ pub struct JoinInfo {
     /// don't fall back to a default the hub may not listen on.
     #[serde(default = "default_api_port")]
     pub api_port: u16,
+    /// This node's own hearthd→agent credential, minted by the same exchange.
+    ///
+    /// Transient, and `skip_serializing` is the point: it is persisted to its
+    /// own 0600 file (config::save_node_token) so the credential lives in
+    /// exactly ONE place on disk, and so the register route — which issues the
+    /// same token and never writes wg.json — has somewhere to put a rotation.
+    /// Absent from an older hearthd's response, which serde defaults to "".
+    #[serde(default, skip_serializing)]
+    pub agent_token: String,
 }
 
 fn default_api_port() -> u16 {
@@ -462,7 +471,33 @@ mod tests {
             server_endpoint: "hub.example.com:51820".into(),
             keepalive_s: 25,
             api_port: 8080,
+            agent_token: "hearth_nt_9f2c1b8a7d4e6f0312a5b9c8d7e6f504".into(),
         }
+    }
+
+    #[test]
+    fn test_join_state_never_persists_the_node_credential() {
+        // The node token has exactly one home on disk — its own 0600 file.
+        // wg.json is 0600 too, but two copies of a credential is two places to
+        // rotate and two places to leak.
+        let json = serde_json::to_string(&good()).expect("serialize");
+        assert!(!json.contains("agent_token"), "{}", json);
+        assert!(!json.contains("hearth_nt_"), "{}", json);
+    }
+
+    #[test]
+    fn test_join_response_carries_the_node_credential() {
+        // Was: the agent parsed the overlay grant and dropped the credential
+        // hearthd minted in the same exchange, so hearthd's calls to this node
+        // (hearth_nt_...) hit an agent that only knew the shared token.
+        let body = r#"{"overlay_ip":"10.100.0.2","overlay_prefix":24,"server_overlay_ip":"10.100.0.1","server_pubkey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","server_endpoint":"hub:51820","keepalive_s":25,"agent_token":"hearth_nt_abc"}"#;
+        let info: JoinInfo = serde_json::from_str(body).expect("parse");
+        assert_eq!(info.agent_token, "hearth_nt_abc");
+        assert!(validate_join_info(&info).is_ok());
+        // An older hearthd omits it: still a valid grant, no credential.
+        let old = r#"{"overlay_ip":"10.100.0.2","overlay_prefix":24,"server_overlay_ip":"10.100.0.1","server_pubkey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","server_endpoint":"hub:51820","keepalive_s":25}"#;
+        let info: JoinInfo = serde_json::from_str(old).expect("parse");
+        assert!(info.agent_token.is_empty());
     }
 
     #[test]

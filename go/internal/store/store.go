@@ -34,6 +34,10 @@ type APIKey struct {
 	KeyHash   string `json:"-"`
 	Prefix    string `json:"prefix"`
 	CreatedAt int64  `json:"created_at"`
+	// ExpiresAt bounds how long a leaked key stays useful: unix seconds, 0
+	// means never. Enforced in LookupKeyByHash's WHERE clause so an expired
+	// key stops authenticating without any caller having to check.
+	ExpiresAt int64  `json:"expires_at"`
 	RevokedAt *int64 `json:"revoked_at"`
 }
 
@@ -49,6 +53,31 @@ type JoinToken struct {
 	CreatedAt int64  `json:"created_at"`
 	UsedAt    *int64 `json:"used_at"`
 	NodeHint  string `json:"node_hint"` // optional operator label, e.g. "hetzner-1"
+}
+
+// NodeCred is the credential hearthd presents when it dials ONE worker agent.
+//
+// It is the only credential that leaves the control plane outbound, and it is
+// deliberately NOT the admin API token: an agent address is attacker-supplied
+// (POST /api/v1/agents/register), so every dial is a decision about where to
+// deliver a bearer secret. Per-node tokens make a harvested one worth exactly
+// one worker instead of the whole control plane.
+//
+// Host is the credential KEY, an opaque string the server layer derives from a
+// node's dial target. It is "host:port" (see server.nodeCredKey): the identity a
+// credential stands for is an agent endpoint, and two agents on one host are two
+// nodes with two credentials. Rows written before that — keyed on the bare host —
+// are still readable and are migrated to the wider key on first use.
+//
+// Unlike APIKey/JoinToken this stores the secret itself, not a hash: hearthd is
+// the CLIENT here and has to be able to present it. A Legacy row carries no
+// token and means "this address was enrolled before per-node credentials
+// existed — keep using the shared token until it re-enrolls".
+type NodeCred struct {
+	Host      string `json:"host"`
+	Token     string `json:"-"`
+	Legacy    bool   `json:"legacy"`
+	CreatedAt int64  `json:"created_at"`
 }
 
 // WgPeer is an enrolled worker's WireGuard identity + overlay address.
@@ -118,10 +147,18 @@ type Store interface {
 
 	// API keys.
 	CreateKey(k *APIKey) error
-	// LookupKeyByHash returns the owning tenant id for an active (non-revoked)
-	// key hash, or "" when unknown/revoked.
+	// LookupKeyByHash returns the owning tenant id for an active (non-revoked,
+	// unexpired) key hash, or "" when unknown/revoked/expired.
 	LookupKeyByHash(hash string) (string, error)
+	// ListKeys returns a tenant's keys newest first, never the hash. Without
+	// it a key id lost from the one-shot creation response is unrecoverable
+	// and the key therefore unrevokable short of raw SQL.
+	ListKeys(tenantID string) ([]*APIKey, error)
 	RevokeKey(id string, now int64) (bool, error)
+	// RevokeKeyByHash revokes the key matching a presented secret's hash and
+	// reports its id — the remediation path for a leak where the operator
+	// holds the secret but not the id.
+	RevokeKeyByHash(hash string, now int64) (string, bool, error)
 
 	// Join tokens (one-time, JoinTokenTTL lifetime).
 	CreateJoinToken(t *JoinToken) error
@@ -131,6 +168,37 @@ type Store interface {
 	// ConsumeJoinToken atomically marks the token used and returns true iff
 	// it was valid, unused, and unexpired (single conditional UPDATE).
 	ConsumeJoinToken(hash string, now int64) (bool, error)
+
+	// Node credentials (the per-node hearthd→agent bearer token).
+	// GetNodeCred returns nil, nil when the host has none — which means
+	// hearthd has no credential to offer that address and must dial it
+	// without one.
+	GetNodeCred(host string) (*NodeCred, error)
+	// PutNodeCred upserts by host. A re-enrollment ROTATES the node's
+	// credential: the join token that authorizes it is one-time and
+	// operator-issued, so re-enrolling is also the recovery path for a worker
+	// that lost its copy.
+	PutNodeCred(c *NodeCred) error
+	// DeleteNodeCred removes one credential row, reporting whether it existed.
+	// Used to retire a row keyed on the bare host once it has been rewritten
+	// under the "host:port" key — leaving it would keep a SECOND agent on the
+	// same host resolving to the first one's credential, which is the whole
+	// point of widening the key.
+	DeleteNodeCred(host string) (bool, error)
+	// ListNodeCreds returns every credential row. hearthd loads them once at
+	// startup to build the in-memory token→node index that authenticates
+	// INBOUND agent calls, so a heartbeat never costs a database read.
+	ListNodeCreds() ([]*NodeCred, error)
+	// SeedLegacyNodeCreds grandfathers a pre-existing fleet onto the shared
+	// token, exactly ONCE per database, and reports how many rows it wrote
+	// (0 on every later call). Callers pass the hosts of the nodes the store
+	// loaded at startup — the fleet as of the previous shutdown.
+	//
+	// The once-only bound is the security property: hearthd offers the shared
+	// admin token only to a host with a Legacy row, so if "no credential yet"
+	// could mint one, registering any address would still hand the
+	// control-plane key to it.
+	SeedLegacyNodeCreds(hosts []string, now int64) (int, error)
 
 	// WireGuard peers.
 	// CreateWgPeer upserts by pubkey: a re-join with the same key keeps its

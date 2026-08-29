@@ -4,7 +4,20 @@
 # Exercises: auth, create+ip, sleep/wake (+latency), fork, both nodes, metrics.
 set -u
 
-TOKEN="${1:-hearth-lab-token}"
+# The lab token authenticates a root-privileged agent API, so it is never a
+# literal in the repo: argument, then HEARTH_TOKEN, then a file kept outside
+# the tree. Whatever the lab stack was started with has to match.
+TOKEN_FILE="${HEARTH_TOKEN_FILE:-$HOME/.config/hearth/lab-token}"
+TOKEN="${1:-${HEARTH_TOKEN:-}}"
+if [ -z "$TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
+  TOKEN="$(tr -d " \t\r\n" < "$TOKEN_FILE")"
+fi
+if [ -z "$TOKEN" ]; then
+  echo "ERROR: no lab token." >&2
+  echo "  Pass it as \$1, export HEARTH_TOKEN, or write it to $TOKEN_FILE" >&2
+  echo "  (generate one with: openssl rand -hex 32)" >&2
+  exit 1
+fi
 CP_VM=infra-saas-lab
 API=http://127.0.0.1:8080
 PASS=0; FAIL=0

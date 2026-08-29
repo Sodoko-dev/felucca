@@ -37,10 +37,11 @@
   <!-- Modal portal (populated by app.js) -->
   <div id="modals"></div>
 
+  <!-- The FOUC reveal lives in app.js because the console's CSP is
+       script-src 'self' with no 'unsafe-inline': an inline <script> would never
+       run. The <style> block above is a different directive — style-src is
+       'self' 'unsafe-inline', so inline CSS is permitted and that block does
+       apply. Script and style are not held to the same policy here. -->
   <script src="app.js"></script>
-  <script>
-    // Reveal app after JS loads to prevent FOUC
-    document.getElementById('app').classList.add('ready');
-  </script>
 </body>
 </html>

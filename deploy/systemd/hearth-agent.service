@@ -7,6 +7,14 @@ Documentation=https://github.com/alpham/infra-saas/docs/DEPLOYMENT.md
 # install.sh ships modules-load.d/hearth.conf.
 After=network-online.target systemd-modules-load.service
 Wants=network-online.target
+# The host firewall is not optional. The agent's API answers on the bridge
+# gateway that every guest routes through, and guest->host packets hit the
+# INPUT hook, which the agent's own forward-chain isolation never sees — so
+# without the hearth0 drop a tenant with root in their own sandbox reaches the
+# node's root control API. install.sh writes /etc/hearth/firewall.nft and the
+# hearth-firewall unit; a node without them must not serve the API.
+Requires=hearth-firewall.service
+After=hearth-firewall.service
 # Firecracker must be present before the agent starts.
 ConditionPathExists=/usr/local/bin/firecracker
 
@@ -32,6 +40,12 @@ Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=60s
 TimeoutStopSec=60s
+
+# Snapshot files are tenant memory: mem.bin under {data_dir}/instances/<id>/ is
+# a verbatim dump of the guest's RAM, and every Firecracker child inherits this
+# umask for the files and sockets it creates. The default 0022 would leave them
+# 0644 and readable by any local account on the worker.
+UMask=0077
 
 # Device access — /dev/kvm for Firecracker microVMs; /dev/net/tun for the
 # per-VM tap devices (both `ip tuntap add` and Firecracker itself open it,

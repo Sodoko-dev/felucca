@@ -1,12 +1,13 @@
+# shellcheck shell=bash
 # v4 P1 cross-tenant network isolation: tenant_id in POST /v1/vms (flows to
 # meta.json) feeds the nft tenant-pair set rebuilt on create/fork/delete.
 # Guests of different tenants on one node must not reach each other,
 # same-tenant guests must, and egress (bridge gateway, the CIDR's .1) must
 # still work. No golden: ping output is host/timing dependent; assertions are
 # on exit_code only.
-CF_ISO_A="sb-cf000004-90004"
-CF_ISO_B="sb-cf000005-90005"
-CF_ISO_C="sb-cf000006-90006"
+CF_ISO_A="sb-cf000000000000000000000004"
+CF_ISO_B="sb-cf000000000000000000000005"
+CF_ISO_C="sb-cf000000000000000000000006"
 # Self-cleaning entries (see 04-create.sh).
 ag DELETE "/v1/vms/$CF_ISO_A"
 ag DELETE "/v1/vms/$CF_ISO_B"

@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Lifecycle actions are empty-200 and the state transitions are observable:
 # pause/resume on the parent, stop/start (cold boot) on the fork child.
 hd POST "/api/v1/sandboxes/$CF_SB_ID/pause"

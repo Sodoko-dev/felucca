@@ -32,21 +32,21 @@ flowchart TB
     end
 
     subgraph hearthd["hearthd — control plane (Go, :8080)"]
-        AUTH["Bearer-token guard<br/>(optional, constant-time;<br/>healthz/metrics/UI stay open)"]
+        AUTH["Bearer-token guard<br/>(required, constant-time,<br/>per-source failure throttle;<br/>only /healthz + UI files open)"]
         STATIC["Static file server<br/>(serves ui/, index.html fallback)"]
         API["REST API v1+v2+v3.1<br/>(JSON over HTTP/1.1;<br/>sleep · wake · fork · exec verbs)"]
         SCHED["Scheduler<br/>(ready node with lowest vm_count)"]
         REG["Node registry<br/>(register / heartbeat + pool_size,<br/>down after 15s silence)"]
         STATE[("SQLite WAL (v4)<br/>(snapshot tx per mutation;<br/>tenants · api_keys · usage_events;<br/>one-time state.json import)")]
-        METRICS["/metrics<br/>(Prometheus text:<br/>wake_ms, forks, pool, states)"]
+        METRICS["/metrics<br/>(Prometheus text:<br/>wake_ms, forks, pool, states)<br/>admin token required"]
     end
 
     subgraph agent["hearth-agent — per worker (Rust, :9090)"]
-        AAPI["Agent REST API<br/>(/v1/vms · sleep · wake · fork · exec)"]
+        AAPI["Agent REST API<br/>(/v1/vms · sleep · wake · fork · exec)<br/>bound to the management address,<br/>never 0.0.0.0 by default"]
         VMM["VM manager<br/>(spawn firecracker, configure over UDS,<br/>snapshot/restore, track pids)"]
         GC["Guest client (v3.1)<br/>(hybrid vsock: CONNECT 52,<br/>exec + set_ip on fork)"]
         POOL["Warm pool<br/>(pool_size paused VMs,<br/>claim on create, async refill)"]
-        NET["Networking<br/>(bridge hearth0 + tap per VM,<br/>sequential IP, nft masquerade,<br/>cross-tenant nft isolation — v4 P1)"]
+        NET["Networking<br/>(bridge hearth0 + tap per VM,<br/>sequential IP, nft masquerade,<br/>cross-tenant nft isolation — v4 P1;<br/>guest→host input fence, per-tap<br/>anti-spoof, bridge L2 + IPv6 fence)"]
         HB["Heartbeat loop<br/>(every 5s: mem_free,<br/>vm_count, pool_size)"]
     end
 
@@ -66,7 +66,7 @@ flowchart TB
     API --> SCHED
     API --> REG
     API --> METRICS
-    SCHED -->|"proxy create/lifecycle<br/>REST + token over private L2"| AAPI
+    SCHED -->|"proxy create/lifecycle<br/>REST + per-node bearer<br/>over private L2 / wg overlay"| AAPI
     REG <--> |"register + heartbeat"| HB
     API <--> STATE
     AAPI --> VMM
@@ -80,6 +80,38 @@ flowchart TB
     HG --- UVM
     VMM --> ASSETS
 ```
+
+**Auth posture (v4 hardening):** there is no "auth off" mode that a deployment can fall into by
+accident. Both binaries **refuse to start** on an empty, placeholder (`REPLACE_WITH…`,
+`hearth-lab-token`) or short token — under 32 chars for `hearthd`, under 16 for `hearth-agent`
+(`config.ValidateAuth` / `config::validate_token`). Open mode exists only as the explicitly named
+`hearthd --insecure-no-auth`, which logs a WARN at every start and a second, louder one when the
+bind is not loopback; **`hearth-agent` has no equivalent flag** — its API execs into every guest on
+the node. `/metrics` is admin-token-gated (§9); only `/healthz` and the static UI files are open.
+Failed credentials are counted per source address: past 10 failures the wait doubles and a further
+failure inside that window is answered 429 with `Retry-After` (capped at 60 s, or 2 s when the key
+provably stands for many clients — the shipped loopback-behind-Caddy shape). **The credential is
+checked before the guard is consulted, so a correct token is always served**: the backoff can only
+shape the answer to an attempt that already failed, and no amount of anonymous guessing can lock a
+credential holder out. Quiet time is the only thing that forgives a record (one failure per 15 s); a
+success deliberately does not, because a wipe-on-success is reachable by anyone sharing the key. The
+source key is the connection peer unless the peer is inside the configured `trusted_proxies` CIDR
+list (default **empty** — no forwarded header is believed; `X-Real-IP` additionally needs
+`trust_x_real_ip`, default false, which hearthd refuses to start with unless a proxy is declared);
+see [DEPLOYMENT.md §7.1](DEPLOYMENT.md#71-forwarded-client-addresses-required-reading).
+
+**Host-side network fences (v4 hardening, per worker):** the tenant `forward` ruleset only ever sees
+IPv4 between guests, so three more fences sit around the bridge. A `hearth input` chain
+default-drops everything arriving on `hearth0` except ICMP and replies to host-initiated flows —
+guests route through the bridge gateway, so without it every host service on a wildcard bind is one
+hop from inside a sandbox, and the agent port is named in its own explicit drop rule. A `bridge
+hearth forward` chain accepts only ARP and IPv4 between bridge ports and drops the rest, closing the
+pure-L2 path (most importantly link-local IPv6, which guest kernels autoconfigure); IPv6 is also
+disabled on the bridge itself. Per tap, a `netdev` ingress chain with `policy drop` pins the guest's
+source MAC, its ARP sender MAC **and** ARP sender IP, and its IPv4 source address — without the ARP
+pin a guest could move a victim's address in the bridge FDB. `hearth-agent` **refuses to serve**
+when networking is on and any of these are not in force (`netfilter_ready`): a worker with no
+isolation would otherwise keep accepting tenant placements silently.
 
 **Hot-path principle (kept from the baseline plan):** sandboxes are *not* k8s pods. The agent drives
 Firecracker directly; the control plane only does placement and proxying. v2 delivers this: the warm
@@ -106,11 +138,11 @@ The same binaries serve two topologies, differing **only by configuration**
 flowchart LR
     subgraph prod["Production (remote servers — deploy/ + DEPLOYMENT.md)"]
         direction LR
-        PROXY["Reverse proxy (caddy/nginx)<br/>TLS termination<br/>only 443 exposed"]
+        PROXY["Reverse proxy (caddy/nginx)<br/>TLS termination<br/>only 443 exposed<br/>must set X-Forwarded-For;<br/>hearthd must list it in trusted_proxies"]
         HDP["hearthd (systemd, hearth user)<br/>/etc/hearth/hearthd.json<br/>HEARTH_TOKEN"]
         W1["worker 1..N (systemd, root)<br/>hearth-agent + firecracker<br/>/dev/kvm, CAP_NET_ADMIN"]
         PROXY --> HDP
-        HDP <-->|"private network only<br/>:9090 + bearer token"| W1
+        HDP <-->|"private network only<br/>:9090 + per-node bearer"| W1
     end
 ```
 
@@ -223,12 +255,27 @@ sequenceDiagram
         F-->>A: 204 — guest boots (serial.log)
     end
     A-->>H: 201 {state: running, ip: 10.231.0.x}
-    H->>H: persist working set to SQLite (one tx; v4 — was state.json)
+    H->>H: persist working set to SQLite (one tx, v4 — was state.json)
     H-->>U: 201 sandbox JSON
     Note over U,H: UI poll picks up the new<br/>sandbox within 3s
 ```
 
 On error at any agent step the sandbox is marked `error` and surfaced in the UI/API.
+
+**Input bounds on this path (v4 hardening).** Every request body is capped at **1 MiB** before any
+route sees it (`http.MaxBytesReader`, applied ahead of the bearer gate so the unauthenticated node-
+join route is covered too). `name` and `namespace` — including a fork child's `name` — must be
+1..64 bytes of printable ASCII with `< > " ' &` refused outright (they are rendered by the operator
+console), else **400** `{"error":"invalid name"}` / `{"error":"invalid namespace"}`. An `exec`
+`timeout_ms` outside `[1, 300000]` is refused with **400** `{"error":"timeout_ms out of range"}` and
+never reaches the agent — it is not clamped, because a negative value used to become an already-
+expired deadline.
+
+**Sandbox and node ids** are `"<prefix>-" + 26 hex chars` — 13 bytes from `crypto/rand`, 104 bits.
+The persisted `seq` counter still advances but is no longer part of the id: a monotonic tail
+disclosed every other tenant's position in the issuance stream, and a sandbox id is a real bearer
+capability because it lands in the public ingress label `<expose-name>--<id>` (ADR-0007), which the
+gateway does not otherwise authenticate.
 
 ---
 
@@ -381,8 +428,46 @@ sequenceDiagram
 
 The scheduler reads `vm_count` from heartbeats, so placement freshness is bounded by the 5s
 heartbeat interval (known wart: rapid back-to-back creates can land on one node). Registration
-and heartbeats carry the bearer token when auth is enabled. Sleeping VMs survive agent restarts:
-the agent reconciles instance dirs and `meta.json` on startup.
+and heartbeats carry the bearer token — always, since there is no auth-off mode to fall into.
+Sleeping VMs survive agent restarts: the agent reconciles instance dirs and `meta.json` on startup.
+
+**The per-node credential (v4 hardening).** A node's `addr` is caller-supplied, so every outbound
+dial is a decision about where to deliver a secret; sending the cluster admin token made "point
+hearthd at a host I control" equivalent to "hand me the admin key". And requiring that same token
+back on register/heartbeat meant every worker in the fleet held it. Enrollment with a one-time join
+token — over the wg overlay (`POST /api/v1/nodes/join`) or by passing `join_token` to
+`POST /api/v1/agents/register` — mints a per-node bearer (`hearth_nt_…`) that replaces the admin
+token on **both** legs:
+
+- hearthd stores it keyed on the node's **`host:port`** (two agents on one host are two nodes; rows
+  written under the earlier bare-host key are migrated on first use) and presents **that**, and
+  nothing else, on every proxy call to that node — structurally, via `nodeDial`, whose only
+  constructor resolves the credential from the node's identity so no call site can substitute
+  `cfg.Token`. An address with no credential row gets **no** bearer, which is the case a forged
+  registration lands in.
+- `hearth-agent` persists the issued credential to `<data_dir>/node-token` (0600, refusing to start
+  if it is readable more widely), presents it outbound on the two agent routes, and accepts it
+  inbound alongside its configured `token`. There is deliberately no fallback the other way: a
+  rejected node token is never retried with the shared one, or making a single request fail would
+  downgrade the agent into handing over the fleet key.
+
+The fleet already in the store when the schema arrived is grandfathered onto the shared token
+exactly once (`SeedLegacyNodeCreds`, bounded by a `node_creds_seeded` marker) so that "this node has
+no credential" is not a state an attacker can create on demand.
+
+Inbound, a node credential is its own **principal** — not a tenant string. It reaches an explicit
+allowlist of two routes (register, heartbeat) and 404s elsewhere, may act only for its own address,
+hostname and node id, and cannot spend a join token. Resolution is an in-memory sha256 index built
+at startup, so authenticating the fleet's highest-rate traffic costs no store read (`nodeTokenIndex`).
+
+> **What this does not cover.** Workers still need the shared token configured: template image
+> pulls (`GET /api/v1/images/{name}`) are admin-only and a node credential cannot reach them
+> (verified: `Manager::new` receives `cfg.token` and `curl_download` presents it). A worker
+> compromise is still an admin-token compromise until that path has its own credential.
+>
+> `hearth-agent` also does not send the `node_token` proof-of-possession field, so re-enrolling an
+> overlay worker means giving it a fresh WireGuard key — see
+> [DEPLOYMENT.md §6.7](DEPLOYMENT.md#67-per-node-agent-credentials).
 
 ---
 
@@ -390,12 +475,16 @@ the agent reconciles instance dirs and `meta.json` on startup.
 
 ```mermaid
 flowchart TD
-    START(["page load"]) --> TOK["?token= → localStorage,<br/>stripped from URL;<br/>Authorization header on every fetch"]
+    START(["page load"]) --> PURGE["purge any hearth_token left<br/>in local/sessionStorage by an<br/>older build; strip and IGNORE ?token="]
+    PURGE --> TOK["token lives in a module-scoped<br/>variable that dies with the tab;<br/>Authorization header on every fetch"]
     TOK --> R0["initial render"]
-    R0 --> P["poll /api/v1/nodes + /sandboxes<br/>every 3s"]
+    R0 -->|"no token: do NOT poll"| BANNER
+    R0 -->|token set| P["poll /api/v1/nodes + /sandboxes<br/>every 3s"]
     P -->|fetch fails| MOCK["mock mode:<br/>built-in demo data,<br/>amber MOCK DATA badge"]
     MOCK --> P
     P -->|"401"| BANNER["auth banner:<br/>paste token inline → retry"]
+    P -->|"429 + Retry-After"| THROTTLED["THROTTLED badge:<br/>countdown, polling paused"]
+    THROTTLED --> BANNER
     BANNER --> P
     P -->|fetch ok| DIFF{"structural change?<br/>(ignores volatile fields:<br/>last_heartbeat, mem_free_mib)"}
     DIFF -->|yes: create/delete/state/node change| FULL["full render()<br/>(rebuild view, entry animations)"]
@@ -406,6 +495,20 @@ flowchart TD
 
 This split is what fixed the visible flicker: heartbeats mutate every poll, so only genuinely
 structural changes rebuild the DOM; volatile values are patched into existing elements.
+
+**Where the console keeps the token (v4 hardening).** In a module-scoped variable that dies with the
+tab — **never** `localStorage` or `sessionStorage`, because web storage hands the cluster admin
+token to any script on the origin and turns one XSS into a stolen admin credential. A `?token=` in
+the URL is **stripped and ignored, never accepted**: by the time the page runs, that value is
+already in the browser's history entry and in the access log of every proxy in front of hearthd, so
+it is a token to rotate rather than a token to use. An upgraded console also purges any
+`hearth_token` an older build left in web storage. The paste-in banner is the only way in — and with
+no token the console does **not** poll at all, because every attempt would be a counted auth failure
+against the per-source throttle, and an unattended 3 s timer walks a shared source key past the
+threshold in ~20 seconds. That no longer locks the operator out — a correct token is served
+regardless — but it turns every unauthenticated answer on that key, the console's own next attempt
+included, into a 429. Banner text is built as DOM nodes with `textContent`, never `innerHTML`, since
+those messages carry server-supplied numbers.
 
 ---
 
@@ -451,7 +554,7 @@ migration record in [ADR-0003](adr/ADR-0003-go-rust-port.md)):
 | `fork` | parent snapshot + rootfs/mem copy + own tap via `network_overrides`, `parent_id` set |
 | Warm pool | `pool_size` paused VMs per agent; matching create claims one, async refill |
 | Guest networking | bridge `hearth0` + per-VM tap + sequential IP (`net_cidr`) + nftables masquerade; `ip` populated; host→guest ping verified |
-| Auth | optional bearer token (`HEARTH_TOKEN`/config/flag); 401 without; constant-time compare; UI `?token=` support |
+| Auth | bearer token (`HEARTH_TOKEN`/config/flag); 401 without; constant-time compare. **Hardened in v4** (see "Auth posture", §1): both binaries refuse to start without a real token, `/metrics` is admin-gated, failures are throttled per source address, and the console takes its token from a paste-in banner only — `?token=` is stripped and ignored, web storage is never used |
 | Production config | flags > env (`HEARTH_*`) > `--config` JSON > defaults; no hardcoded paths; static binaries for **aarch64 + x86_64**; systemd units + installer in `deploy/`, guide in `DEPLOYMENT.md` |
 
 v3.1 — **live in the lab** (rolled out and verified 2026-06-11: conformance **132/0** + verify-v2
@@ -475,7 +578,35 @@ v4 — multi-tenant, deploy-anywhere, product-ready (in progress; plan P0–P6,
 | P3 | Multi-service ingress: named exposes (route row + worker nft DNAT, node ports 20000-29999), `hearth-gw` reverse proxy (Host `name--id` routing, WebSocket passthrough, 503 wake page, dynamic port-in-hostname opt-in, per-tenant edge limits) | **live in the lab 2026-06-12** — conformance **227/0** (new `hearthd/19-expose`, +34 checks), verify-v2 **21/0**; live e2e: HTTP + WebSocket 101 through gw→DNAT→guest on the direct worker, dynamic route over the wg overlay worker, sleep→wake page→recovery, fork child URLs serving; design in [ADR-0007](adr/ADR-0007-sandbox-ingress.md); contract in API-V2 §3d; wildcard TLS + auto-wake deferred (external infra / P5) |
 | P4 | Templates & bigger guests: template entity + rootfs capture pipeline (`build-template.sh`, docker-base/odoo-v18 provision scripts), sha256-addressed pull-and-cache image distribution, grow-only `disk_gb` resize (caps 16 vCPU/32 GiB/128 GB), per-template warm pools (top-up + drain, sha-matched claims), per-tenant disk quota | **live in the lab 2026-06-12** — conformance **266/0** (new `hearthd/20-templates`, +39 checks incl. capture → cross-node pull → boot-from-captured-image proof), verify-v2 **21/0**, cargo 117/0; docker-base built via the public API on the systemd fleet; design in [ADR-0008](adr/ADR-0008-templates-and-image-distribution.md); contract in API-V2 §3e |
 | P5 | Streaming exec (`?stream=1` SSE over guest NDJSON), lifecycle policies (per-tenant + per-sandbox idle auto-sleep / asleep-TTL auto-delete; gateway auto-wake + dynamic-expose GC), usage aggregation (`GET /tenants/{id}/usage` + exec-only retention), per-template tenant visibility, worker image-cache GC, gratuitous-ARP fork fix, zero-dep TS SDK + `hearth-verify.sh` | **live in the lab 2026-06-13** — conformance **326/0** (new `hearthd/21-stream-exec`, `22-lifecycle`, `23-template-visibility`, +60 checks), verify-v2 **21/0**, cargo **41/0 guest + 121/0 agent**; design in [ADR-0009](adr/ADR-0009-streaming-lifecycle-usage.md); contract in API-V2 §3f; kata-lab-0 vz crashes #8–#9 under the heavier capture/VM churn (healed by stop -f + start; clean re-run) |
-| P6 | Observability & bench: structured logs (Go `slog`, Rust `tracing`) with `X-Hearth-Request-Id` propagated hearthd→agent, latency histograms (`hearth_{wake,exec,create}_duration_ms`) on open `/metrics`, per-tenant gauges behind the authed `GET /api/v1/metrics/tenants`, Grafana dashboard (`deploy/grafana/`), `scripts/bench.sh` p50/p95 published in BENCHMARKS.md; HA + uffd CoW fork delivered as groundwork docs (docs/HA-GROUNDWORK.md, research/uffd-cow-fork.md), implementation deferred | **live in the lab 2026-08-09** — conformance **342/0** (new `hearthd/24-observability`), verify-v2 **21/0**, cargo **121/0 agent + 41/0 guest**; design in [ADR-0010](adr/ADR-0010-observability-and-bench.md); contract in API-V2 §3g/§7 |
+| P6 | Observability & bench: structured logs (Go `slog`, Rust `tracing`) with `X-Hearth-Request-Id` propagated hearthd→agent, latency histograms (`hearth_{wake,exec,create}_duration_ms`) on `/metrics` (open when P6 shipped; **admin-gated since the v4 hardening pass** — ADR-0010 amendment), per-tenant gauges behind the authed `GET /api/v1/metrics/tenants`, Grafana dashboard (`deploy/grafana/`), `scripts/bench.sh` p50/p95 published in BENCHMARKS.md; HA + uffd CoW fork delivered as groundwork docs (docs/HA-GROUNDWORK.md, research/uffd-cow-fork.md), implementation deferred | **live in the lab 2026-08-09** — conformance **342/0** (new `hearthd/24-observability`), verify-v2 **21/0**, cargo **121/0 agent + 41/0 guest**; design in [ADR-0010](adr/ADR-0010-observability-and-bench.md); contract in API-V2 §3g/§7 |
+
+### v4 security hardening (post-P6)
+
+Successive adversarial review passes over the shipped v4 surface. Each item below is enforced in code
+(or, where noted, in configuration because code cannot see the difference), and each falsified a
+claim this document used to make. Two of them falsified a *remediation* rather than the original
+design — which is why the ordering row and the config-residual row below are stated as explicitly as
+they are:
+
+| Area | What changed | Where |
+|---|---|---|
+| Auth is not optional | Empty / placeholder / short tokens are a **startup failure** in both binaries (32 chars hearthd, 16 agent); `--insecure-no-auth` is the named loopback-lab opt-out, hearthd only, WARN'd at every start | `config.ValidateAuth`, `config::validate_token`, `cmd/hearthd/main.go` |
+| `/metrics` closed | Admin bearer required; tenant keys get 404. The scrape names every worker, reports live fleet counts, and takes the global state lock | `server.handle` |
+| Brute-force throttle | Per-source failure counting on both credential gates (bearer + node join), 429 + `Retry-After`, quiet-time decay instead of success-clears; wait capped at 2 s when the key stands for many clients | `authThrottle` |
+| Throttle cannot deny service | The credential is authenticated **before** the backoff is consulted, so a correct token is always served and anonymous guessing on a shared key cannot lock the control plane out. Ordering it the other way was itself the regression a later review found | `gateAuth`, `refuse` |
+| Forwarded client IP | `X-Forwarded-For` honoured **only** from peers inside `trusted_proxies`, default empty; right-to-left chain walk (left-most, client-written entry never used); malformed CIDR is fatal at startup. `X-Real-IP` needs the separate `trust_x_real_ip` (default false), which is a startup failure without a declared proxy | `Server.clientIP`, `ValidateTrustedProxies` |
+| Residual closed by config, not code | hearthd cannot distinguish a forwarded header its proxy wrote from one it copied through. An edge proxy listed in `trusted_proxies` **must** overwrite `X-Forwarded-For` (`header_up …{remote_host}` / `proxy_set_header … $remote_addr`) or clients pick their own throttle key | [DEPLOYMENT.md §7.1](DEPLOYMENT.md#71-forwarded-client-addresses-required-reading) |
+| Console token handling | Module-scoped variable only; `?token=` stripped and ignored; old web-storage copies purged; no polling without a token | `ui/app.js` |
+| Agent listener | No wildcard by default — the management address plus loopback; `bind_any` is the opt-out; refuses a bind inside the guest CIDR | `rust/agent/src/main.rs` |
+| Host-side fences | Guest→host input chain, per-tap anti-spoof (MAC + ARP sender MAC/IP + IPv4 source), bridge L2 fence, IPv6 off on the bridge; agent refuses to serve if they are not in force | `rust/agent/src/net.rs` |
+| Unguessable ids | 26 hex chars from `crypto/rand` (104 bits); the `seq` counter left the id | `state.nextID` |
+| Input bounds | 1 MiB body cap ahead of every route; `name`/`namespace` 1..64 printable ASCII without `< > " ' &`; `timeout_ms` outside `[1,300000]` → 400 | `server.handle`, `validDisplayName` |
+| Key lifecycle | API keys can carry an expiry (`expires_in_s`, max 1 year) and are listable by an admin (`GET /api/v1/tenants/{id}/keys`) so a leaked secret can be matched by prefix and revoked | `tenants.go`, API-V2 §3b |
+| Per-node agent credential | `hearth_nt_…` minted at enrollment, keyed on `host:port`, used in **both** directions: hearthd presents it dialing the node, the node presents it on register/heartbeat, and the agent persists it 0600 and accepts it inbound. The shared token is still needed for image pulls — see §6 | `agentTokenFor`, `nodeDial`, `join.go`, `rust/agent/src/registration.rs` |
+| A node is not a tenant | A node credential is its own principal with an **allowlist** of two routes, bound to its own address / hostname / node id, and barred from spending a join token. Squeezing it into the tenant string (where admin is `""`) would have put it one typo from being a second admin | `principal`, `serveAPI`, `nodeMayRegister` |
+| Re-join proof of possession | A join token authorizes *an* enrollment, not a *specific node*, and the pubkey is caller-written — so re-joining an enrolled pubkey must present that node's current credential (`node_token`) or get 409, else a token holder could rotate a live worker off the control plane | `nodeTokenMatches`, `join.go` |
+| Pre-auth store pressure | Credential lookups reachable before authentication are bounded (`maxCredLookups` = 4) in front of the single sqlite connection, and node tokens resolve from an in-memory sha256 index with no store read at all | `credGate`, `nodeTokenIndex` |
+| Attacker-sized request heads | `MaxHeaderBytes` 16 KiB (Go's default is 1 MiB) and the `X-Forwarded-For` walk is bounded to 16 hops without ever splitting the whole header — the parse runs on the pre-auth path | `cmd/hearthd/main.go`, `Server.clientIP` |
 
 Remaining beyond v4:
 

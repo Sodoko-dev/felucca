@@ -1,6 +1,6 @@
 # ADR-0005 — Cross-tenant network isolation via a single nft pair set
 
-- Status: Accepted
+- Status: Accepted, **extended 2026-08-29** (see the amendment below)
 - Date: 2026-06-12
 - Context: second phase (P1) of the v4 "multi-tenant, deploy-anywhere,
   product-ready" plan. Consumes the `tenant_id` that P0 records in the agent's
@@ -45,6 +45,54 @@
    1..=64) is defense-in-depth, not the primary injection guard. A missing or
    invalid tenant id is treated as "no tenant": the VM joins no pair and is
    therefore isolated from **all** peers — the failure mode is fail-closed.
+
+## Amendment — 2026-08-29 (v4 security hardening): three more fences
+
+The decision above stands unchanged, but the security review found it was not
+the whole fence. The `ip` `forward` chain polices exactly one path — IPv4,
+guest-to-guest, across the bridge — and three other paths reached around it.
+All three are now closed in `rust/agent/src/net.rs`, and `netfilter_ready()`
+returns true only when **every** one of them is confirmed; with networking on
+and any of them missing, `hearth-agent` **refuses to serve** rather than accept
+tenant placements onto a node with no isolation.
+
+1. **Guest → host (`ip hearth input`, `ensure_guest_input_filter`).** Guests
+   route to the world through the bridge gateway, so traffic they aim *at the
+   host itself* lands on the INPUT hook, which the forward chain never sees —
+   every host service on a wildcard bind was one curl from inside any sandbox,
+   the agent's own root API included. The chain accepts anything arriving on a
+   different interface, then explicitly drops `tcp dport <agent port>` from
+   `hearth0`, then permits only ICMP (gateway pings, path-MTU discovery) and
+   `ct state established,related` before a trailing `iifname hearth0 drop`.
+   Chain policy stays `accept` deliberately — this is a shared hook, and a drop
+   policy would cut the host's own SSH; the trailing drop fails closed for guest
+   traffic only. No DHCP or DNS holes: guests are addressed from the kernel
+   command line and resolve through NAT'd egress.
+2. **Non-IPv4 between guests (`bridge hearth forward`, `ensure_bridge_l2_filter`).**
+   The pair set is `ipv4_addr . ipv4_addr` in the `ip` family, so it only ever
+   sees IPv4. Two guests on one bridge exchange every *other* ethertype by pure
+   L2 switching — most importantly IPv6, which any guest kernel autoconfigures
+   as a link-local address on eth0 and which no tenant rule covered. The bridge-
+   family chain (priority -200) accepts ARP and IPv4 between `hearth0` ports and
+   drops the rest; IPv6 is separately disabled on the bridge
+   (`ensure_ipv6_disabled`).
+3. **Source-address spoofing (`netdev hearth <tap>`, `ensure_tap_antispoof`).**
+   Membership is keyed on the guest's IP, so a guest that simply *claims* another
+   tenant's address rides that tenant's allow pair. A per-tap ingress chain with
+   `policy drop` pins the guest's `ether saddr`, its `arp saddr ether` **and**
+   `arp saddr ip`, and its `ip saddr`. The ARP sender-MAC pin is not decoration:
+   the bridge learns from that field, so without it a guest can move a victim's
+   address onto its own port in the FDB and receive the victim's traffic. If the
+   ruleset cannot be rendered (tap, IP or MAC failing validation) nothing is
+   pinned and the call reports failure rather than leaving the tap open.
+
+This partially reverses the "ebtables / L2 filtering on the bridge" rejection
+below. What was rejected there — expressing *tenant pair semantics* in L2 — is
+still rejected, and the pair set remains the tenant boundary. What the L2 chain
+does is narrower and complementary: it confines guest-to-guest traffic to the
+ethertypes the `ip` chain can actually adjudicate. It also introduces no second
+toolchain, which was half the original objection: it is nft, in the `bridge`
+family, loaded through the same `nft -f -` path as everything else.
 
 ## Alternatives considered
 

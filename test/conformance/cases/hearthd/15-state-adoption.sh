@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Local-only: a candidate hearthd binary must adopt the live state.json —
 # same node ids and sandbox ids (agents never re-register, so losing node ids
 # strands the fleet). Runs only when CANDIDATE_HEARTHD points at a binary and
@@ -9,6 +10,14 @@ elif [ ! -x "${CANDIDATE_HEARTHD}" ]; then
 else
   cf_state_src="${ADOPT_STATE_PATH:-/var/lib/hearth/state.json}"
   cf_tmp=$(mktemp -d)
+  # The redirect running unprivileged is the point, not an oversight: sudo is
+  # here for the READ of a root-owned 0600 state.json, while the copy must end
+  # up owned by us because the candidate hearthd below runs as this user and
+  # rewrites that path (state.Persist writes state.json.tmp and renames over
+  # it). ShellCheck's suggested `| sudo tee` would make the copy root-owned and
+  # is the wrong fix. mktemp -d is 0700, so the fleet inventory is not exposed
+  # while the case runs; the trailing rm -rf removes it either way.
+  # shellcheck disable=SC2024
   if ! sudo cat "$cf_state_src" > "$cf_tmp/state.json" 2>/dev/null; then
     bad "cannot read $cf_state_src (set ADOPT_STATE_PATH?)"
   else

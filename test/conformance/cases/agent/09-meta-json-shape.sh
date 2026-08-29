@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Local-only: on the agent host, every instances/*/meta.json must have the
 # exact key set {id,name,dir_id,vcpus,mem_mib,pid,slot,ip,state} with nullable
 # fields present-as-null (the Rust agent's adoption contract).

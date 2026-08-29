@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Sleep: 200 with the sandbox JSON, state=sleeping, and the state sticks.
 # Never sleep a mid-boot guest: the snapshot would be poisoned (guest panics
 # on resume) — wait until the guest agent answers first.

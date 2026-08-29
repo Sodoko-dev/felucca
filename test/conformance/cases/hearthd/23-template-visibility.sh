@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Per-template tenant visibility (v4 P5.4, ADR-0008 deferral): a template
 # created with "tenant" is visible to (and usable by) only that tenant; the
 # admin sees everything; public ("" tenant) templates stay visible to all.
