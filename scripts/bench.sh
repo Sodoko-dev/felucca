@@ -3,7 +3,13 @@
 #
 # Usage:
 #   bash scripts/bench.sh <hearthd-endpoint> [admin-token]
-#   e.g. bash scripts/bench.sh http://127.0.0.1:8080 hearth-lab-token
+#   e.g. bash scripts/bench.sh http://127.0.0.1:8080 "$(cat ~/.config/hearth/lab-token)"
+#
+# The admin token is REQUIRED and must be the one hearthd was started with:
+# every operation below is a /api/v1 call, and hearthd refuses to start without
+# a real token, so there is no unauthenticated endpoint to benchmark. Pass it
+# as $2, export HEARTH_TOKEN, or keep it in $HEARTH_TOKEN_FILE (default
+# ~/.config/hearth/lab-token) — the same contract as the other lab scripts.
 #
 # Env knobs:
 #   N                 — iterations per operation (default: 10)
@@ -16,11 +22,36 @@ set -u
 # ── Args ─────────────────────────────────────────────────────────────────────
 ENDPOINT="${1:-}"
 TOKEN="${2:-${HEARTH_TOKEN:-}}"
+TOKEN_FILE="${HEARTH_TOKEN_FILE:-${HOME:-}/.config/hearth/lab-token}"
 if [ -z "$ENDPOINT" ]; then
   printf 'usage: %s <hearthd-endpoint> [admin-token]\n' "$0" >&2
-  printf '  e.g. %s http://127.0.0.1:8080 hearth-lab-token\n' "$0" >&2
+  printf '  e.g. %s http://127.0.0.1:8080 "$(cat ~/.config/hearth/lab-token)"\n' "$0" >&2
+  printf '  the token may also come from HEARTH_TOKEN or HEARTH_TOKEN_FILE\n' >&2
   exit 2
 fi
+if [ -z "$TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
+  TOKEN="$(tr -d ' \t\r\n' < "$TOKEN_FILE")"
+fi
+# Fail here rather than at the preflight: an empty token authorizes nobody now
+# (it is not "auth off"), so a tokenless run would just be a 401 wearing a
+# benchmark's clothes. HEARTH_INSECURE_NO_AUTH=1 is the explicit opt-out, for a
+# hearthd started with --insecure-no-auth.
+if [ -z "$TOKEN" ] && [ "${HEARTH_INSECURE_NO_AUTH:-0}" != "1" ]; then
+  printf 'error: no admin token.\n' >&2
+  printf '  Pass it as the second argument, export HEARTH_TOKEN, or write it to %s\n' "$TOKEN_FILE" >&2
+  printf '  (generate one with: openssl rand -hex 32).\n' >&2
+  printf '  It must be the token hearthd was STARTED with — hearthd refuses to start\n' >&2
+  printf '  without a real one. For a loopback lab on --insecure-no-auth, re-run with\n' >&2
+  printf '  HEARTH_INSECURE_NO_AUTH=1.\n' >&2
+  exit 2
+fi
+case "$(printf '%s' "$TOKEN" | tr '[:upper:]' '[:lower:]')" in
+  *replace_with*|hearth-lab-token)
+    printf 'error: that token is a shipped placeholder — it is published in this repo, and\n' >&2
+    printf '       hearthd refuses to start with it, so nothing is listening on it.\n' >&2
+    printf '  Generate a real one with: openssl rand -hex 32\n' >&2
+    exit 2 ;;
+esac
 ENDPOINT="${ENDPOINT%/}"    # strip trailing slash
 
 N="${N:-10}"
@@ -179,6 +210,11 @@ printf '    /healthz 200 OK\n'
 hd_req GET /api/v1/nodes
 if [ "$HD_STATUS" != "200" ]; then
   printf 'error: GET /api/v1/nodes -> %s  (bad token or wrong endpoint)\n' "$HD_STATUS" >&2
+  case "$HD_STATUS" in
+    401) printf '  401: the token is not the one hearthd was started with.\n' >&2 ;;
+    429) printf '  429: hearthd is throttling this source after repeated failed credentials;\n' >&2
+         printf '       wait for the Retry-After window and re-run with the right token.\n' >&2 ;;
+  esac
   exit 1
 fi
 printf '    GET /api/v1/nodes 200 OK\n'

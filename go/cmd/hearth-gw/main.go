@@ -20,6 +20,40 @@ import (
 	"github.com/alpham/infra-saas/hearth/internal/gateway"
 )
 
+// Listener bounds for the ingress server. This process is the INTERNET-FACING
+// tenant ingress: everything below is what an unauthenticated client can make
+// hearth-gw spend before it has proved anything. hearthd's three listeners carry
+// the same discipline (cmd/hearthd/main.go), and main_test.go here is the
+// structural guard, mirroring TestEveryListenerIsBounded there.
+//
+// Why these and not hearthd's set: hearth-gw is a reverse proxy in front of
+// tenant services, and ReverseProxy carries WebSocket upgrades and streaming
+// responses natively. A ReadTimeout would kill a long-lived upload or an upgraded
+// connection mid-flight, and a WriteTimeout would cut every stream at the
+// deadline — so those two stay off, deliberately, and the slow-client bounds are
+// carried by the header and idle timeouts instead, which apply only while the
+// connection is NOT in the middle of a request.
+const (
+	// maxHeaderBytes caps the request head (request line + all headers). Go's
+	// default is 1 MiB PER CONNECTION, three orders of magnitude past anything a
+	// proxied request needs, and it is attacker-controlled work available to any
+	// client that can open a socket: every request's Host header is parsed and
+	// split here. 16 KiB matches hearthd and leaves generous room for cookies and
+	// a proxy chain.
+	maxHeaderBytes = 16 << 10
+
+	// readHeaderTimeout bounds header dribbling — the slow-loris case — without
+	// touching the body, so it is safe on a streaming proxy.
+	readHeaderTimeout = 10 * time.Second
+
+	// idleTimeout bounds an established keep-alive connection that is NOT in the
+	// middle of a request. Without it a client can hold connections (and their
+	// buffers) open indefinitely at no cost, which is the cheap half of the
+	// slow-loris family that ReadHeaderTimeout does not cover. It never applies
+	// to an in-flight request, so a long-lived proxied stream is unaffected.
+	idleTimeout = 120 * time.Second
+)
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -76,8 +110,20 @@ func main() {
 	srv := &http.Server{
 		Addr:              *listen,
 		Handler:           gw,
-		ReadHeaderTimeout: 10 * time.Second,
-		// No WriteTimeout: WebSocket/longpolling connections are long-lived.
+		MaxHeaderBytes:    maxHeaderBytes,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+		// ReadTimeout and WriteTimeout are DELIBERATELY unset on this listener,
+		// and the zeros are written out rather than omitted so the decision is
+		// visible here and the structural guard in main_test.go can insist the
+		// choice keeps being made. They are whole-request deadlines: this is a
+		// reverse proxy for tenant services, so a ReadTimeout would cut a long
+		// upload and a WriteTimeout would cut every WebSocket upgrade, SSE
+		// stream and long-poll at the deadline. The slow-client bounds live in
+		// ReadHeaderTimeout and IdleTimeout above, neither of which can fire
+		// during an in-flight request.
+		ReadTimeout:  0,
+		WriteTimeout: 0,
 	}
 	slog.Info("hearth-gw listening", "addr", *listen, "domain", *domain, "hearthd", *hearthd)
 	if err := srv.ListenAndServe(); err != nil {

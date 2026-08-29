@@ -1,6 +1,8 @@
 # ADR-0006 — WireGuard hub-and-spoke overlay and one-time node join
 
-- Status: Accepted
+- Status: Accepted, **extended 2026-08-29** (join now also mints a per-node
+  agent credential, used in both directions and adopted by the agent — see the
+  amendment below)
 - Date: 2026-06-12
 - Context: third phase (P2, "deploy anywhere") of the v4 plan. Workers must
   join a hearthd that is not on their L2 segment — across clouds and behind
@@ -68,6 +70,75 @@
    `modules-load.d/hearth.conf` preloads `br_netfilter` + `wireguard`
    because `ProtectKernelModules=true` forbids the services loading them
    (load-bearing for ADR-0005's isolation).
+
+## Amendment — 2026-08-29 (v4 security hardening): enrollment mints a per-node agent credential
+
+The join exchange gained one job. Until the hardening pass, hearthd presented
+the **cluster admin token** on every proxy call to a worker. A node's `addr` is
+caller-supplied (`POST /api/v1/agents/register`), so every outbound dial was a
+decision about where to deliver that secret, and "talk hearthd into dialing a
+host I control" was equivalent to "hand me the admin key" — one harvested token
+being remote root on the entire fleet.
+
+- Enrollment now mints `hearth_nt_<secret>` (its own prefix, so it is
+  distinguishable at a glance from an admin token, a tenant key `hearth_sk_`,
+  and a join token `hearth_jt_`), stores it keyed on the node's **`host:port`**,
+  and returns it **once** in an additive `agent_token` field. Both enrollment
+  paths do it: `POST /api/v1/nodes/join` (Decision 2 above) and
+  `POST /api/v1/agents/register` when it carries a `join_token`.
+- The key includes the **port**. Keying on the bare host made one credential
+  stand for every agent on an address, which is wider than the identity it
+  authorizes — two agents on one host are two nodes, and "worth one worker" has
+  to mean one worker. Rows written under the old bare-host key are migrated to
+  the wider key the first time that node is dialed, so an upgrade does not
+  strand an enrolled fleet.
+- Ordering follows Decision 2's consume-last rule exactly: the credential is
+  persisted **before** `ConsumeJoinToken`, so a store failure leaves the token
+  usable and the operator un-stranded.
+- hearthd then presents that credential, and only that credential, when dialing
+  the node (`Server.agentTokenForHost`). An address with **no** credential row
+  gets no bearer at all — which is the case a forged registration lands in.
+- Re-join rotates it, and that is the deliberate recovery path for a worker that
+  lost its copy: the join token authorizing the exchange is one-time and
+  operator-issued.
+- The pre-existing fleet is grandfathered onto the shared token exactly once
+  (`SeedLegacyNodeCreds`, bounded by a `node_creds_seeded` marker in `meta`), so
+  "this node has no credential" is not a state an attacker can manufacture by
+  registering a new address.
+
+- **The credential runs in both directions.** Presenting a per-node token
+  outbound while still demanding the admin token back on register/heartbeat
+  would have left every worker holding the fleet key — half the finding. The
+  agent therefore presents its own credential on `POST /api/v1/agents/register`
+  and `POST /api/v1/agents/heartbeat`, persists it to `<data_dir>/node-token`
+  (0600, and it refuses to start on a file readable more widely), and accepts it
+  inbound alongside its configured `token` so a rotation needs no restart.
+  There is deliberately **no** fallback from the node token back to the shared
+  one: if a rejected node token were retried with `cfg.token`, anyone who could
+  make one request fail could downgrade the agent into handing over the fleet
+  key.
+- **Inbound, a node is its own principal**, not a tenant string. It reaches an
+  allowlist of exactly those two routes and 404s elsewhere; within them it may
+  act only for its own address, its own hostname and its own node id, and it may
+  not spend a join token (enrolling is the operator's act). Modelling it as a
+  tenant id — where the admin is the empty string — would have put a node one
+  typo away from being a second administrator.
+- **Re-join requires proof of possession.** A join token says *an operator
+  authorized an enrollment*; it does not say *which node*, and the pubkey naming
+  the node is caller-written. So a re-join under an already-enrolled pubkey must
+  also present that node's current credential as `node_token`, or it is refused
+  with `409` — otherwise any token holder could rotate a live worker's
+  credential and take it off the control plane. Recovery for a worker that lost
+  its credential is a **fresh WireGuard key**: that is a first join, needs no
+  proof, and costs an attacker the one thing they cannot forge.
+
+> **Two limits worth stating.** `hearth-agent` does not send `node_token` (its
+> join body is `pubkey` + `hostname` only), so re-enrolling an overlay worker
+> means removing both `wg.json` and `wg.key` and joining fresh. And workers
+> still need the shared token configured: template image pulls
+> (`GET /api/v1/images/{name}`) are admin-only and a node credential cannot
+> reach them, so a worker compromise is still an admin-token compromise. Both
+> are open items, not oversights in the write-up.
 
 ## Rejected alternatives
 

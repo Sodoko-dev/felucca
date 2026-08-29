@@ -5,6 +5,7 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -17,6 +18,52 @@ import (
 	"github.com/alpham/infra-saas/hearth/internal/store"
 	"github.com/alpham/infra-saas/hearth/internal/wg"
 )
+
+// rejoinAuthorized decides whether a re-join — a join naming a pubkey that is
+// already enrolled — may rotate that node's credential.
+//
+// The proof is possession of the credential hearthd CURRENTLY hands that node:
+// its own hearth_nt_ token once it has one, or the shared token while it is
+// still grandfathered. One rule for both, resolved through the very function
+// that decides what goes on the wire (agentTokenFor), so "prove you are that
+// node" cannot drift from "this is what hearthd believes that node holds".
+//
+// An address with NO credential yet is authorized without proof, and that is not
+// a hole: there is nothing to take away, so this cannot be the availability
+// lever the check exists to close. It is also the case a legitimate retry lands
+// in — the peer row is persisted before the kernel install, so a worker retrying
+// after `wg add peer` failed has a peer and no credential — and the case of a
+// node enrolled before per-node credentials existed, whose whole point is to
+// re-join and get one.
+//
+// That "no credential yet" case has to be the DEFINITE one, though, and it is
+// why this reads a nodeCredState rather than an empty string. agentTokenFor
+// returns "" for three different things, only one of which is "there is nothing
+// to prove": the other two are "the credential store could not be read" and, for
+// a grandfathered node, "the shared token is itself empty". Reading either as
+// authorization would mean a transient store error — or one an attacker can
+// induce by loading the very store this route reads — silently switches the
+// possession check OFF, and a join-token holder can rotate another node's
+// credential again. Anything short of credAbsent therefore refuses: a re-join is
+// retryable, an evicted worker is not.
+func (srv *Server) rejoinAuthorized(overlayIP, presented string) bool {
+	current, state := srv.resolveNodeCred(overlayIP, agentPort)
+	switch state {
+	case credAbsent:
+		return true
+	case credResolved:
+		// An empty credential proves nothing and must never match an empty
+		// (or any) presented token.
+		if current == "" || presented == "" {
+			return false
+		}
+		return subtle.ConstantTimeCompare([]byte(current), []byte(presented)) == 1
+	default: // credUnknown
+		slog.Error("re-join refused: the node credential store could not be read, so possession of this node's credential cannot be checked",
+			"overlay_ip", overlayIP)
+		return false
+	}
+}
 
 // createJoinToken mints a one-time node-enrollment token (admin only; routing
 // guards in serveAPI). The secret is shown exactly once; only its sha256 is
@@ -61,12 +108,21 @@ func (srv *Server) createJoinToken(w http.ResponseWriter, r *http.Request) {
 // token), and the token is consumed LAST — only after the peer is persisted
 // and installed — so transient failures never burn it. Re-joining with an
 // already-enrolled pubkey returns the same overlay address.
+//
+// This route is reachable without any established credential, so it carries the
+// same per-source brute-force guard as the bearer gate — and the same rule: the
+// guard is consulted only AFTER a credential has failed (srv.refuse). A valid
+// join token is never refused because someone else guessed wrong, which matters
+// most here: the throttle key in the shipped topology is one shared 127.0.0.1,
+// and a worker that cannot enroll is a worker that never joins the fleet.
 func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
+	src := srv.throttleSource(r)
+
 	// Credential shape check before anything is revealed or parsed.
 	const prefix = "Bearer "
 	auth := r.Header.Get("Authorization")
 	if !strings.HasPrefix(auth, prefix) || !strings.HasPrefix(auth[len(prefix):], "hearth_jt_") {
-		writeJSON(w, 401, []byte(`{"error":"unauthorized"}`))
+		srv.refuse(w, src, 401, `{"error":"unauthorized"}`)
 		return
 	}
 	tokenHash := hashSecret(auth[len(prefix):])
@@ -79,6 +135,10 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		PubKey   string `json:"pubkey"`
 		Hostname string `json:"hostname"`
+		// NodeToken is the node's CURRENT hearth_nt_ credential, and it is
+		// required only to RE-join: an already-enrolled pubkey. See the
+		// possession check below.
+		NodeToken string `json:"node_token"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, []byte(`{"error":"bad json"}`))
@@ -88,8 +148,11 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, []byte(`{"error":"invalid pubkey"}`))
 		return
 	}
-	if len(req.Hostname) > 128 {
-		writeJSON(w, 400, []byte(`{"error":"hostname too long (max 128)"}`))
+	// The same cap agentRegister applies (validNodeHostname). It stays a bare
+	// length check here: this hostname is a label on the wg peer row, not the
+	// key a node record is appended under, and an empty one is a legal join.
+	if len(req.Hostname) > maxHostnameLen {
+		writeJSON(w, 400, []byte(`{"error":"hostname too long (max `+maxHostnameLenStr+`)"}`))
 		return
 	}
 
@@ -108,12 +171,28 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 	defer srv.joinMu.Unlock()
 
 	now := time.Now().Unix()
-	if ok, err := srv.db.CheckJoinToken(tokenHash, now); err != nil {
+	// The one store read an unauthenticated caller reaches on this route, and
+	// therefore bounded like the bearer gate's: see credGate. joinMu already
+	// serializes joins, so at most one slot is ever held here.
+	release, ok := srv.credLookups.acquire(r.Context())
+	if !ok {
+		return // caller hung up
+	}
+	// Deferred release, scoped by the closure to the store call alone: the rest
+	// of this handler does much slower work (the kernel `wg` install above all)
+	// and must not sit on a lookup slot, but a panic inside CheckJoinToken must
+	// not strand one either. See authenticate for what a stranded slot costs.
+	tokenOK, err := func() (bool, error) {
+		defer release()
+		return srv.db.CheckJoinToken(tokenHash, now)
+	}()
+	if err != nil {
 		slog.Error("check join token", "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
-	} else if !ok {
-		writeJSON(w, 401, []byte(`{"error":"invalid, used, or expired join token"}`))
+	}
+	if !tokenOK {
+		srv.refuse(w, src, 401, `{"error":"invalid, used, or expired join token"}`)
 		return
 	}
 
@@ -126,6 +205,27 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		// Re-join keeps its address — but only while it's still inside the
 		// configured subnet (an operator subnet change invalidates old rows).
 		overlayIP = existing.OverlayIP
+		// ...and it has to PROVE it is that node.
+		//
+		// A join token says "an operator authorized an enrollment". It does not
+		// say WHICH node, and the pubkey naming the node is written by the
+		// caller. So a holder of any valid token could re-join under an existing
+		// worker's public key, and the credential rotation below would replace
+		// that worker's token with one it never receives: hearthd then 401s on
+		// every call to it and the node is off the control plane, from a
+		// credential that never established it. Possession of the node's current
+		// token is the cheapest thing that actually distinguishes the node from
+		// someone who merely knows its (public!) key.
+		//
+		// A worker that lost its credential re-enrolls under a FRESH wireguard
+		// key, which is a first join and needs no proof. That is the recovery
+		// path, and it costs the attacker the one thing they cannot forge.
+		if !srv.rejoinAuthorized(overlayIP, req.NodeToken) {
+			slog.Warn("re-join refused: no proof of possession for an already-enrolled pubkey",
+				"overlay_ip", overlayIP, "hostname", req.Hostname)
+			srv.refuse(w, src, 409, `{"error":"pubkey already enrolled: re-join must present the node's current agent token as node_token, or enroll with a fresh wireguard key"}`)
+			return
+		}
 	} else {
 		peers, err := srv.db.ListWgPeers()
 		if err != nil {
@@ -161,6 +261,24 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, []byte(`{"error":"wg peer install failed"}`))
 		return
 	}
+	// Mint this node's own hearthd→agent credential, keyed on the overlay
+	// address it will advertise. It replaces the shared admin token on every
+	// control-plane call to this worker, so a token harvested off one node
+	// (or off an address someone talked hearthd into dialing) is worth that
+	// node and nothing else. A re-join rotates it: the join token authorizing
+	// this exchange is one-time and operator-issued, which also makes re-join
+	// the recovery path for a worker that lost its copy.
+	//
+	// The address is keyed with the agent's own port: validNodeAddr accepts a
+	// new node address on no other, so this is the endpoint this worker will
+	// register and the one hearthd will dial.
+	agentToken := newNodeToken()
+	if err := srv.putNodeCred(overlayIP, agentPort, agentToken, now); err != nil {
+		// Before the token is burned, so the worker can retry.
+		slog.Error("persist node credential", "overlay_ip", overlayIP, "err", err)
+		writeJSON(w, 500, []byte(`{"error":"store error"}`))
+		return
+	}
 	// Enrollment fully succeeded — burn the token now. A consume race is
 	// excluded by joinMu; a false result here means the token was somehow
 	// redeemed elsewhere, which must fail the request.
@@ -170,6 +288,9 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// AgentToken is additive: an agent from before per-node credentials
+	// ignores the unknown field and keeps requiring the shared token, which
+	// is what its grandfathered credential row still hands it.
 	body, _ := json.Marshal(struct {
 		OverlayIP       string `json:"overlay_ip"`
 		OverlayPrefix   int    `json:"overlay_prefix"`
@@ -177,6 +298,7 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		ServerPubKey    string `json:"server_pubkey"`
 		ServerEndpoint  string `json:"server_endpoint"`
 		KeepaliveS      int    `json:"keepalive_s"`
-	}{overlayIP, prefixLen, serverIP.String(), srv.wgPubKey, srv.cfg.WgEndpoint, int(srv.cfg.WgKeepalive)})
+		AgentToken      string `json:"agent_token"`
+	}{overlayIP, prefixLen, serverIP.String(), srv.wgPubKey, srv.cfg.WgEndpoint, int(srv.cfg.WgKeepalive), agentToken})
 	writeJSON(w, 200, body)
 }

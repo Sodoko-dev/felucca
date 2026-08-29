@@ -258,6 +258,28 @@ func TestExecStreamForwardedBody(t *testing.T) {
 	}
 }
 
+func TestExecStreamTimeoutRange(t *testing.T) {
+	// The stream arm derives its own connection deadline from timeout_ms, so
+	// the range check must land before the branch — not only on the buffered
+	// path.
+	fa := &execAgent{frames: []string{`{"done":true,"ok":true,"exit_code":0,"truncated":false}`}}
+	srv, id := newExecStreamTestServer(t, fa, model.StateRunning)
+
+	w := doRequest(srv.Handler(), "POST", "/api/v1/sandboxes/"+id+"/exec?stream=1",
+		`{"cmd":["sleep","999999"],"timeout_ms":-9300000000000}`, adminAuth)
+	if w.Code != 400 {
+		t.Fatalf("negative timeout on stream arm: got %d body %s", w.Code, w.Body.String())
+	}
+	var m map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &m)
+	if m["error"] != "timeout_ms out of range" {
+		t.Errorf("error body: %v", m)
+	}
+	if fa.body() != "" {
+		t.Error("agent must not be called with an out-of-range timeout")
+	}
+}
+
 func TestExecBufferedUnchanged(t *testing.T) {
 	// Regression guard: without ?stream=1 the route stays the buffered JSON
 	// proxy and the forwarded body omits the stream flag.

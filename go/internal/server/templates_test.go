@@ -403,6 +403,47 @@ func TestCaptureFromSandbox(t *testing.T) {
 	}
 }
 
+// createTemplate echoes captureRootfs's message into the response body, so a
+// failed capture must not hand an admin token holder the host's filesystem
+// layout.
+func TestCaptureErrorsHideHostPaths(t *testing.T) {
+	srv, fa, nodeID := newTemplateTestServer(t)
+	h := srv.Handler()
+	fa.rootfs = []byte("captured-rootfs-bytes")
+
+	srv.st.Lock()
+	sb := srv.st.CreateSandbox("builder", "default", nodeID, 1, 256, time.Now().Unix())
+	id := sb.ID
+	srv.st.Unlock()
+	srv.st.SetSandboxState(id, model.StateStopped)
+
+	// images_dir under a regular file: MkdirAll fails with an ENOTDIR whose
+	// error string names the full host path.
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv.cfg.ImagesDir = filepath.Join(blocker, "images")
+
+	w := doRequest(h, "POST", "/api/v1/templates", `{"name":"snap","from_sandbox":"`+id+`"}`, adminAuth)
+	if w.Code != 500 {
+		t.Fatalf("capture into a broken images dir: got %d %s, want 500", w.Code, w.Body.String())
+	}
+	if body := w.Body.String(); body != `{"error":"capture failed"}` {
+		t.Errorf("500 body: got %s, want the fixed message", body)
+	} else if strings.Contains(body, blocker) {
+		t.Errorf("500 body leaks a host path: %s", body)
+	}
+
+	// The descriptive non-500 messages stay: they name only the sandbox's own
+	// state and callers depend on them.
+	srv.st.SetSandboxState(id, model.StateRunning)
+	w2 := doRequest(h, "POST", "/api/v1/templates", `{"name":"snap2","from_sandbox":"`+id+`"}`, adminAuth)
+	if w2.Code != 409 || !strings.Contains(w2.Body.String(), "must be stopped") {
+		t.Errorf("409 message: got %d %s", w2.Code, w2.Body.String())
+	}
+}
+
 func TestDeleteTemplate(t *testing.T) {
 	srv, fa, nodeID := newTemplateTestServer(t)
 	h := srv.Handler()

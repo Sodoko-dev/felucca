@@ -3,9 +3,15 @@
 # null-vs-omitted drift produces a <BAD-*> marker or a missing key, which the
 # golden diff catches. Key order is irrelevant (-S sorts); key SET is strict.
 
+# Ids are "<prefix>-<26 hex>": 13 crypto/rand bytes, and NO trailing sequence
+# component. The old "<prefix>-<8 hex>-<seq>" shape is a failure here on
+# purpose — the seq published every other tenant's position in the id stream,
+# and a sandbox id is a bearer capability (it is half of the public ingress
+# label "<name>--<id>", which the gateway authenticates nothing else on). The
+# width is asserted, not just the charset: fewer hex digits is less entropy.
 def nid:
   if . == null then null
-  elif (type == "string" and test("^(sb|node)-[0-9a-f]{8}-[0-9]+$")) then "<ID>"
+  elif (type == "string" and test("^(sb|node)-[0-9a-f]{26}$")) then "<ID>"
   else "<BAD-ID:\(tostring)>" end;
 
 def nnum(tag):

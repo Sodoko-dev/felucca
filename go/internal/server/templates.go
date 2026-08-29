@@ -416,9 +416,16 @@ func (srv *Server) serveImage(w http.ResponseWriter, r *http.Request, name strin
 
 // ---- Rootfs capture ----
 
+// captureFailed is the one message the 500 paths return: createTemplate puts
+// captureRootfs's message straight into the response body, so anything the
+// host's filesystem told us stays in the log.
+const captureFailed = "capture failed"
+
 // captureRootfs streams a stopped sandbox's rootfs from its agent into
 // images_dir/<image>.ext4, hashing in flight. Returns the sha256 hex and
-// byte size, or an HTTP status + message describing why it can't.
+// byte size, or an HTTP status + message describing why it can't. The
+// messages reach the caller verbatim, so they name only the sandbox's own
+// state — never a path or an OS error.
 func (srv *Server) captureRootfs(sandboxID, image string) (sha string, size int64, status int, errMsg string) {
 	srv.st.Lock()
 	sb := srv.st.FindSandbox(sandboxID)
@@ -447,7 +454,10 @@ func (srv *Server) captureRootfs(sandboxID, image string) (sha string, size int6
 		return "", 0, 409, "image file already exists"
 	}
 	if err := os.MkdirAll(srv.cfg.ImagesDir, 0o755); err != nil {
-		return "", 0, 500, "images dir: " + err.Error()
+		// An OS error string carries the images_dir layout and host
+		// filesystem state; it belongs in the log, not on the wire.
+		slog.Error("capture: images dir", "dir", srv.cfg.ImagesDir, "err", err)
+		return "", 0, 500, captureFailed
 	}
 
 	// O_EXCL on the fixed .partial path doubles as the per-image capture
@@ -468,7 +478,8 @@ func (srv *Server) captureRootfs(sandboxID, image string) (sha string, size int6
 		if os.IsExist(err) {
 			return "", 0, 409, "capture already in progress"
 		}
-		return "", 0, 500, "tmp file: " + err.Error()
+		slog.Error("capture: partial file", "path", tmp, "err", err)
+		return "", 0, 500, captureFailed
 	}
 
 	host, port := agentclient.SplitHostPort(agentAddr)
@@ -477,10 +488,13 @@ func (srv *Server) captureRootfs(sandboxID, image string) (sha string, size int6
 	if err != nil {
 		f.Close()
 		os.Remove(tmp)
-		return "", 0, 500, "request: " + err.Error()
+		slog.Error("capture: build request", "url", url, "err", err)
+		return "", 0, 500, captureFailed
 	}
-	if srv.cfg.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+srv.cfg.Token)
+	// The node's own credential, never cfg.Token — this is an outbound dial to
+	// a caller-supplied address like every other one (see agentTokenForHost).
+	if tok := srv.agentTokenForHost(host); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 	resp, err := imageClient.Do(req)
 	if err != nil {
@@ -504,7 +518,8 @@ func (srv *Server) captureRootfs(sandboxID, image string) (sha string, size int6
 	}
 	if err := os.Rename(tmp, dst); err != nil {
 		os.Remove(tmp)
-		return "", 0, 500, "rename: " + err.Error()
+		slog.Error("capture: publish image", "from", tmp, "to", dst, "err", err)
+		return "", 0, 500, captureFailed
 	}
 	return hex.EncodeToString(h.Sum(nil)), n, 0, ""
 }

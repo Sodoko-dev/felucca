@@ -5,7 +5,20 @@
 # there); agent suite targets kata-lab-0 over the user-v2 network.
 set -u
 
-TOKEN="${1:-hearth-lab-token}"
+# The lab token authenticates a root-privileged agent API, so it is never a
+# literal in the repo: argument, then HEARTH_TOKEN, then a file kept outside
+# the tree. Whatever the lab stack was started with has to match.
+TOKEN_FILE="${HEARTH_TOKEN_FILE:-$HOME/.config/hearth/lab-token}"
+TOKEN="${1:-${HEARTH_TOKEN:-}}"
+if [ -z "$TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
+  TOKEN="$(tr -d " \t\r\n" < "$TOKEN_FILE")"
+fi
+if [ -z "$TOKEN" ]; then
+  echo "ERROR: no lab token." >&2
+  echo "  Pass it as \$1, export HEARTH_TOKEN, or write it to $TOKEN_FILE" >&2
+  echo "  (generate one with: openssl rand -hex 32)" >&2
+  exit 1
+fi
 MODE="${2:-run}"
 CP_VM=infra-saas-lab
 # Agent-suite target: resolve kata-lab-0's CURRENT user-v2 address at run

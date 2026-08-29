@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Sandbox ingress (v4 P3): named multi-service expose, the admin route table,
 # and the dynamic port-in-hostname ensure gate. Self-cleaning: every sandbox
 # created here is deleted (worker DNAT rules die with the VM via the agent's

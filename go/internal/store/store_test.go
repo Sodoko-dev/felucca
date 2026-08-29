@@ -1,8 +1,11 @@
 package store_test
 
 import (
+	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/alpham/infra-saas/hearth/internal/model"
 	"github.com/alpham/infra-saas/hearth/internal/state"
@@ -17,6 +20,29 @@ func open(t *testing.T) *store.SQLite {
 	}
 	t.Cleanup(func() { db.Close() })
 	return db
+}
+
+// poisonScan swaps tbl for a view over the same rows whose WHERE clause raises
+// a SQLite error on the row named "poison" and on no other. Reading the view
+// therefore hands back the earlier rows and then dies mid-iteration — the
+// shape of a driver/IO failure, SQLITE_BUSY, or on-disk corruption during a
+// startup scan.
+func poisonScan(t *testing.T, path, tbl, nameCol string) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer raw.Close()
+	for _, stmt := range []string{
+		fmt.Sprintf(`ALTER TABLE %s RENAME TO %s_rows`, tbl, tbl),
+		fmt.Sprintf(`CREATE VIEW %s AS SELECT * FROM %s_rows
+		             WHERE %s <> 'poison' OR json_extract(%s, '$.x') IS NULL`, tbl, tbl, nameCol, nameCol),
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			t.Fatalf("poison %s: %v", tbl, err)
+		}
+	}
 }
 
 func strp(s string) *string { return &s }
@@ -117,6 +143,54 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	}
 }
 
+// A scan that dies part-way through must surface as an error. SaveSnapshot is
+// a full delete-and-reinsert, so a short load reported as success takes every
+// unread sandbox with it on the very next mutation while its microVM keeps
+// running as an orphan.
+func TestLoadIntoShortScanIsAnError(t *testing.T) {
+	for _, tc := range []struct {
+		table, nameCol string
+		fill           func(st *state.State, name string)
+	}{
+		{"sandboxes", "name", func(st *state.State, name string) {
+			st.Sandboxes = append(st.Sandboxes, &model.Sandbox{
+				ID: "sb-" + name, Name: name, Namespace: "default",
+				State: model.StateRunning, VCPUs: 1, MemMiB: 256, CreatedAt: 1,
+			})
+		}},
+		{"nodes", "hostname", func(st *state.State, name string) {
+			st.Nodes = append(st.Nodes, &model.Node{
+				ID: "node-" + name, Hostname: name, Addr: "1.2.3.4:9090",
+				CPUs: 4, MemTotalMiB: 8000, MemFreeMiB: 4000,
+			})
+		}},
+	} {
+		t.Run(tc.table, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "test.db")
+			db, err := store.OpenSQLite(path)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			defer db.Close()
+
+			st := state.New()
+			for _, name := range []string{"ok-1", "ok-2", "poison", "ok-3"} {
+				tc.fill(st, name)
+			}
+			if err := db.SaveSnapshot(st); err != nil {
+				t.Fatalf("save: %v", err)
+			}
+			poisonScan(t, path, tc.table, tc.nameCol)
+
+			got := state.New()
+			if err := db.LoadInto(got); err == nil {
+				t.Fatalf("LoadInto reported success on a broken scan; loaded %d nodes / %d sandboxes of 4",
+					len(got.Nodes), len(got.Sandboxes))
+			}
+		})
+	}
+}
+
 func TestTenantsAndKeys(t *testing.T) {
 	db := open(t)
 
@@ -161,6 +235,164 @@ func TestTenantsAndKeys(t *testing.T) {
 	}
 	if ok, _ := db.RevokeKey("key-1", 100); ok {
 		t.Error("double revoke should report not found")
+	}
+}
+
+// An expired key must stop authenticating on its own, with no call-site
+// change: expiry is what bounds the window a leaked key is useful in.
+func TestAPIKeyExpiry(t *testing.T) {
+	db := open(t)
+	if err := db.CreateTenant(&store.Tenant{ID: "tn-1", Name: "acme", CreatedAt: 1}); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+
+	now := time.Now().Unix()
+	for _, k := range []*store.APIKey{
+		{ID: "key-never", TenantID: "tn-1", KeyHash: "hash-never", Prefix: "hearth_sk_nv", CreatedAt: now},
+		{ID: "key-live", TenantID: "tn-1", KeyHash: "hash-live", Prefix: "hearth_sk_lv", CreatedAt: now, ExpiresAt: now + 3600},
+		{ID: "key-expired", TenantID: "tn-1", KeyHash: "hash-expired", Prefix: "hearth_sk_ex", CreatedAt: now - 7200, ExpiresAt: now - 1},
+	} {
+		if err := db.CreateKey(k); err != nil {
+			t.Fatalf("create %s: %v", k.ID, err)
+		}
+	}
+
+	if tid, err := db.LookupKeyByHash("hash-never"); err != nil || tid != "tn-1" {
+		t.Errorf("expires_at 0 should never expire: %q, %v", tid, err)
+	}
+	if tid, err := db.LookupKeyByHash("hash-live"); err != nil || tid != "tn-1" {
+		t.Errorf("unexpired key: %q, %v", tid, err)
+	}
+	if tid, _ := db.LookupKeyByHash("hash-expired"); tid != "" {
+		t.Errorf("expired key still authenticates as %q", tid)
+	}
+
+	// Expiry is not revocation: the operator can still burn the row.
+	id, ok, err := db.RevokeKeyByHash("hash-expired", now)
+	if err != nil || !ok || id != "key-expired" {
+		t.Errorf("revoke expired key: %q, %v, %v", id, ok, err)
+	}
+}
+
+// ListKeys + RevokeKeyByHash are the recovery path for a leaked secret: the
+// key id is shown once at creation, so without them a key whose id was lost
+// can only be revoked with raw SQL against hearth.db.
+func TestListKeysAndRevokeByHash(t *testing.T) {
+	db := open(t)
+	for _, tn := range []*store.Tenant{
+		{ID: "tn-1", Name: "acme", CreatedAt: 1},
+		{ID: "tn-2", Name: "other", CreatedAt: 1},
+	} {
+		if err := db.CreateTenant(tn); err != nil {
+			t.Fatalf("create tenant %s: %v", tn.ID, err)
+		}
+	}
+	// Year 2100: far enough out that the live-key assertions below are about
+	// listing and revocation, not about expiry.
+	const farFuture int64 = 4102444800
+	for _, k := range []*store.APIKey{
+		{ID: "key-old", TenantID: "tn-1", KeyHash: "hash-old", Prefix: "hearth_sk_od", CreatedAt: 10},
+		{ID: "key-new", TenantID: "tn-1", KeyHash: "hash-new", Prefix: "hearth_sk_nw", CreatedAt: 20, ExpiresAt: farFuture},
+		{ID: "key-other", TenantID: "tn-2", KeyHash: "hash-other", Prefix: "hearth_sk_ot", CreatedAt: 30},
+	} {
+		if err := db.CreateKey(k); err != nil {
+			t.Fatalf("create %s: %v", k.ID, err)
+		}
+	}
+
+	keys, err := db.ListKeys("tn-1")
+	if err != nil || len(keys) != 2 {
+		t.Fatalf("list keys: %d, %v", len(keys), err)
+	}
+	if keys[0].ID != "key-new" || keys[1].ID != "key-old" {
+		t.Errorf("list order: [%s %s]; want newest first", keys[0].ID, keys[1].ID)
+	}
+	if keys[0].ExpiresAt != farFuture || keys[1].ExpiresAt != 0 {
+		t.Errorf("expires_at: %d, %d; want %d, 0", keys[0].ExpiresAt, keys[1].ExpiresAt, farFuture)
+	}
+	for _, k := range keys {
+		if k.KeyHash != "" {
+			t.Errorf("%s: listing leaked the key hash %q", k.ID, k.KeyHash)
+		}
+		if k.RevokedAt != nil {
+			t.Errorf("%s: revoked_at should be nil, got %d", k.ID, *k.RevokedAt)
+		}
+	}
+
+	// Revoking by secret must burn exactly the presented key, and no other
+	// tenant's rows may be visible or reachable through the listing.
+	id, ok, err := db.RevokeKeyByHash("hash-old", 55)
+	if err != nil || !ok || id != "key-old" {
+		t.Fatalf("revoke by hash: %q, %v, %v", id, ok, err)
+	}
+	if tid, _ := db.LookupKeyByHash("hash-old"); tid != "" {
+		t.Error("revoked key still resolves")
+	}
+	if tid, _ := db.LookupKeyByHash("hash-new"); tid != "tn-1" {
+		t.Error("sibling key should be untouched")
+	}
+	if _, ok, _ := db.RevokeKeyByHash("hash-old", 56); ok {
+		t.Error("double revoke by hash should report not found")
+	}
+	if _, ok, err := db.RevokeKeyByHash("hash-nobody", 57); ok || err != nil {
+		t.Errorf("unknown hash: %v, %v", ok, err)
+	}
+
+	keys, _ = db.ListKeys("tn-1")
+	if len(keys) != 2 || keys[1].RevokedAt == nil || *keys[1].RevokedAt != 55 {
+		t.Errorf("revoked key should still be listed with revoked_at: %+v", keys[1])
+	}
+	if other, _ := db.ListKeys("tn-2"); len(other) != 1 || other[0].ID != "key-other" {
+		t.Errorf("list is not tenant-scoped: %+v", other)
+	}
+}
+
+// The expires_at migration has to be safe on a database written before the
+// column existed: keys issued then must keep working (0 = never expires), and
+// re-opening must not fail or rewrite them.
+func TestAPIKeyExpiryMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE api_keys (
+		   id         TEXT PRIMARY KEY,
+		   tenant_id  TEXT NOT NULL REFERENCES tenants(id),
+		   key_hash   TEXT NOT NULL UNIQUE,
+		   prefix     TEXT NOT NULL,
+		   created_at INTEGER NOT NULL,
+		   revoked_at INTEGER
+		 )`,
+		`INSERT INTO api_keys (id, tenant_id, key_hash, prefix, created_at, revoked_at)
+		 VALUES ('key-legacy', 'tn-1', 'hash-legacy', 'hearth_sk_lg', 1, NULL)`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			t.Fatalf("legacy schema: %v", err)
+		}
+	}
+	raw.Close()
+
+	// Twice: the ALTER is expected to be a no-op on the second open.
+	for i := 0; i < 2; i++ {
+		db, err := store.OpenSQLite(path)
+		if err != nil {
+			t.Fatalf("open %d: %v", i, err)
+		}
+		if i == 0 {
+			if err := db.CreateTenant(&store.Tenant{ID: "tn-1", Name: "acme", CreatedAt: 1}); err != nil {
+				t.Fatalf("create tenant: %v", err)
+			}
+		}
+		if tid, err := db.LookupKeyByHash("hash-legacy"); err != nil || tid != "tn-1" {
+			t.Errorf("open %d: pre-migration key stopped working: %q, %v", i, tid, err)
+		}
+		keys, err := db.ListKeys("tn-1")
+		if err != nil || len(keys) != 1 || keys[0].ID != "key-legacy" || keys[0].ExpiresAt != 0 {
+			t.Errorf("open %d: migrated key: %+v, %v", i, keys, err)
+		}
+		db.Close()
 	}
 }
 
@@ -297,5 +529,124 @@ func TestMigrationFromJSON(t *testing.T) {
 	}
 	if got.Seq != 3 || len(got.Sandboxes) != 1 || got.Sandboxes[0].ID != "sb-legacy" {
 		t.Errorf("migrated state: seq=%d sandboxes=%+v", got.Seq, got.Sandboxes)
+	}
+}
+
+// ---- Node credentials ----
+
+func TestNodeCredRoundTripAndRotation(t *testing.T) {
+	db := open(t)
+
+	if c, err := db.GetNodeCred("10.100.0.2"); err != nil || c != nil {
+		t.Fatalf("absent cred: got %+v err %v, want nil nil", c, err)
+	}
+	if err := db.PutNodeCred(&store.NodeCred{Host: "10.100.0.2", Token: "hearth_nt_one", CreatedAt: 10}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	c, err := db.GetNodeCred("10.100.0.2")
+	if err != nil || c == nil || c.Token != "hearth_nt_one" || c.Legacy {
+		t.Fatalf("get: %+v err %v", c, err)
+	}
+	// A re-enrollment rotates in place rather than accumulating rows.
+	if err := db.PutNodeCred(&store.NodeCred{Host: "10.100.0.2", Token: "hearth_nt_two", CreatedAt: 20}); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	c, err = db.GetNodeCred("10.100.0.2")
+	if err != nil || c == nil || c.Token != "hearth_nt_two" || c.CreatedAt != 20 {
+		t.Fatalf("after rotation: %+v err %v", c, err)
+	}
+}
+
+// ListNodeCreds feeds the in-memory index that authenticates INBOUND agent
+// calls, and DeleteNodeCred retires a row keyed under the old bare-host layout
+// once it has been rewritten. Both are load-bearing: a listing that missed a row
+// would silently stop that node authenticating, and a delete that did not delete
+// would leave a second agent on the same host inheriting the first's credential.
+func TestListAndDeleteNodeCreds(t *testing.T) {
+	db := open(t)
+
+	if creds, err := db.ListNodeCreds(); err != nil || len(creds) != 0 {
+		t.Fatalf("empty store: %d creds err=%v", len(creds), err)
+	}
+	for _, c := range []*store.NodeCred{
+		{Host: "10.100.0.2:9090", Token: "hearth_nt_a", CreatedAt: 10},
+		{Host: "10.100.0.3:9090", Token: "hearth_nt_b", CreatedAt: 20},
+		{Host: "10.100.0.4:9090", Legacy: true, CreatedAt: 30},
+	} {
+		if err := db.PutNodeCred(c); err != nil {
+			t.Fatalf("put %s: %v", c.Host, err)
+		}
+	}
+	creds, err := db.ListNodeCreds()
+	if err != nil || len(creds) != 3 {
+		t.Fatalf("list: %d creds err=%v, want 3", len(creds), err)
+	}
+	seen := map[string]*store.NodeCred{}
+	for _, c := range creds {
+		seen[c.Host] = c
+	}
+	if c := seen["10.100.0.2:9090"]; c == nil || c.Token != "hearth_nt_a" {
+		t.Errorf("listed row lost its token: %+v", c)
+	}
+	if c := seen["10.100.0.4:9090"]; c == nil || !c.Legacy || c.Token != "" {
+		t.Errorf("legacy row: %+v, want tokenless and flagged", c)
+	}
+
+	ok, err := db.DeleteNodeCred("10.100.0.3:9090")
+	if err != nil || !ok {
+		t.Fatalf("delete: ok=%v err=%v", ok, err)
+	}
+	if c, err := db.GetNodeCred("10.100.0.3:9090"); err != nil || c != nil {
+		t.Errorf("row survived the delete: %+v err=%v", c, err)
+	}
+	// Idempotent: retiring an already-retired row is not an error.
+	if ok, err := db.DeleteNodeCred("10.100.0.3:9090"); err != nil || ok {
+		t.Errorf("second delete: ok=%v err=%v, want false nil", ok, err)
+	}
+	if creds, err := db.ListNodeCreds(); err != nil || len(creds) != 2 {
+		t.Errorf("after delete: %d creds err=%v, want 2", len(creds), err)
+	}
+}
+
+// Grandfathering a pre-existing fleet onto the shared token has to be a
+// one-shot: if a later start could re-seed from whatever is in the snapshot by
+// then, an address someone registered after the upgrade would be promoted onto
+// the control-plane admin token — the hole per-node credentials close.
+func TestSeedLegacyNodeCredsRunsOnce(t *testing.T) {
+	db := open(t)
+
+	n, err := db.SeedLegacyNodeCreds([]string{"198.51.100.7", "198.51.100.8"}, 100)
+	if err != nil || n != 2 {
+		t.Fatalf("first seed: n=%d err=%v, want 2", n, err)
+	}
+	for _, host := range []string{"198.51.100.7", "198.51.100.8"} {
+		c, err := db.GetNodeCred(host)
+		if err != nil || c == nil || !c.Legacy || c.Token != "" {
+			t.Errorf("seeded %s: %+v err %v, want a tokenless legacy row", host, c, err)
+		}
+	}
+
+	n2, err := db.SeedLegacyNodeCreds([]string{"203.0.113.9"}, 200)
+	if err != nil || n2 != 0 {
+		t.Fatalf("second seed: n=%d err=%v, want 0", n2, err)
+	}
+	if c, err := db.GetNodeCred("203.0.113.9"); err != nil || c != nil {
+		t.Errorf("host offered to a later seed: %+v err %v, want nil", c, err)
+	}
+}
+
+// A fresh database grandfathers nobody, and the marker still lands so the
+// first node it ever sees is not promoted onto the shared token either.
+func TestSeedLegacyNodeCredsOnFreshDatabase(t *testing.T) {
+	db := open(t)
+
+	if n, err := db.SeedLegacyNodeCreds(nil, 100); err != nil || n != 0 {
+		t.Fatalf("fresh seed: n=%d err=%v, want 0", n, err)
+	}
+	if n, err := db.SeedLegacyNodeCreds([]string{"203.0.113.9"}, 200); err != nil || n != 0 {
+		t.Fatalf("seed after a fresh install: n=%d err=%v, want 0", n, err)
+	}
+	if c, err := db.GetNodeCred("203.0.113.9"); err != nil || c != nil {
+		t.Errorf("credential on a fresh install: %+v err %v, want nil", c, err)
 	}
 }

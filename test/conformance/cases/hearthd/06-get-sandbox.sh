@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # GET by id returns the same shape; the list endpoint wraps sandboxes in
 # {"sandboxes":[...]} and contains the one we created.
 hd GET "/api/v1/sandboxes/$CF_SB_ID"

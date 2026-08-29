@@ -1,5 +1,6 @@
 {
-  "bind": "0.0.0.0:8080",
+  "_bind_note": "PICK ONE. 127.0.0.1:8080 is correct for the Caddy-fronted single node this repo documents (DEPLOYMENT.md 6.3 and 7): Caddy terminates TLS and proxies over loopback, and the installed firewall drops 8080 from anywhere else. It is WRONG for a WireGuard-overlay fleet: enrolled agents reach hearthd at its overlay IP over plain HTTP inside the tunnel, so bind the overlay address instead (e.g. 10.100.0.1:8080) or every agent registration is refused. The host part is honoured now, so this value is the listener, not a hint.",
+  "bind": "127.0.0.1:8080",
   "state_path": "/var/lib/hearth/state.json",
   "ui_dir": "/usr/share/hearth/ui",
   "token": "REPLACE_WITH_OUTPUT_OF__openssl_rand_-hex_32",

@@ -12,7 +12,7 @@ pub mod reconcile;
 use crate::fc;
 use crate::ipalloc::{Allocator, Cidr};
 use crate::net;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use meta::{ExposeEntry, Meta, VmState};
 use serde::Deserialize;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
@@ -54,6 +54,42 @@ pub struct Vm {
 
 /// Default template image; pre-P4 metas and requests without `image` map here.
 pub const DEFAULT_IMAGE: &str = "ubuntu-base";
+
+/// Strict VM-id check, the same discipline `image::valid_image_name` applies
+/// for the same reason: an id becomes `{data_dir}/instances/{id}` and every
+/// file under it (rootfs.ext4, serial.log, meta.json, fc.sock, v.sock,
+/// vmstate.bin, mem.bin). `[A-Za-z0-9._-]`, 1..=64, no leading '.' or '-' and
+/// no ".." — so an id can only ever name a direct child of the instances
+/// directory, never traverse out of it.
+///
+/// The character class is wider than an image name's (ids from hearthd are
+/// mixed case, e.g. `sb-<hex>`), but the traversal-relevant rules are identical.
+pub fn valid_vm_id(id: &str) -> bool {
+    if id.is_empty() || id.len() > 64 {
+        return false;
+    }
+    let first = id.as_bytes()[0];
+    if first == b'.' || first == b'-' {
+        return false;
+    }
+    if id.contains("..") {
+        return false;
+    }
+    id.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+/// The instance directory for a dir id, or None when the id is not a plain
+/// path component. Every path the manager derives goes through here: the
+/// handlers reject bad ids first, but a path built from an unvalidated id is a
+/// root-level write and a recursive delete on the worker, so it is re-checked
+/// at the point of use rather than trusted.
+fn instance_path(data_dir: &str, dir_id: &str) -> Option<String> {
+    if !valid_vm_id(dir_id) {
+        return None;
+    }
+    Some(format!("{}/instances/{}", data_dir, dir_id))
+}
 
 /// All create parameters in one place (v4 P4 grew the list past comfortable
 /// positional args). `image` is pre-validated by the server handler;
@@ -276,7 +312,9 @@ pub enum ExecOutcome {
 /// `ExecOutcome`'s status mapping; success carries the live frame stream.
 pub enum ExecStreamOutcome {
     /// Handshake + request sent — the stream yields the guest's NDJSON frames.
-    Ok(tokio::net::UnixStream),
+    /// The `GuestSlot` is this exec's round-trip permit and must be held for
+    /// as long as the stream is read.
+    Ok(tokio::net::UnixStream, crate::guestclient::GuestSlot),
     NotFound,
     NotRunning,
     Unavailable,
@@ -359,14 +397,52 @@ impl Manager {
         }
     }
 
-    /// Reconcile persisted instances from data_dir/instances/*.
+    /// Reconcile persisted instances from data_dir/instances/*, then re-pin the
+    /// taps of every guest adopted with a live Firecracker still on one.
+    ///
+    /// The pin is host state, not VM state: the netdev chains are gone after a
+    /// host reboot, and an agent upgraded in place adopts guests that were
+    /// started before the pin existed. Without this, those ports stay on the
+    /// bridge unfiltered for the whole life of the sandbox — the one window an
+    /// attacker does not have to trigger, they only have to outlive.
+    ///
+    /// A guest whose NIC carries some other MAC (one Firecracker chose for it
+    /// under a pre-pin agent) loses its network here rather than keeping an
+    /// unfiltered port; a stop/start re-boots it onto the derived MAC. That
+    /// direction is deliberate — the tap comes down when it cannot be pinned.
     pub async fn reconcile(&self) {
-        let mut g = self.inner.lock().await;
-        let vms = {
-            let alloc_opt = g.allocator.as_mut();
-            reconcile::reconcile(&self.data_dir, alloc_opt)
+        let adopted = {
+            let mut g = self.inner.lock().await;
+            let vms = {
+                let alloc_opt = g.allocator.as_mut();
+                reconcile::reconcile(&self.data_dir, alloc_opt)
+            };
+            g.vms = vms;
+            taps_to_repin(&g.vms)
         };
-        g.vms = vms;
+        if !self.net_on { return; }
+        // Outside the state lock: these shell out to ip/nft.
+        for (id, slot, ip) in adopted {
+            let (tap, mac) = tap_pin_for_slot(slot);
+            if !ensure_pinned_tap(&tap, Some(&ip), &mac) {
+                error!(
+                    vm = %id,
+                    tap = %tap,
+                    "adopted VM's tap could not be pinned — the port has been torn \
+                     down, so this guest has no network until it is restarted"
+                );
+            }
+        }
+    }
+
+    /// Whether this node's guest network fences are in force. Cheap enough
+    /// for a health handler or a 5s heartbeat.
+    ///
+    /// A `--net off` node has no guest network at all, so there is nothing to
+    /// isolate and nothing to report as broken — the underlying atomics only
+    /// mean anything once host networking has been set up.
+    pub fn isolation_ok(&self) -> bool {
+        !self.net_on || net::netfilter_ready()
     }
 
     /// Rebuild the cross-tenant isolation ruleset from the current VM list
@@ -375,8 +451,12 @@ impl Manager {
     /// serialized so concurrent create/fork/delete can't interleave nft
     /// commands; each rebuild snapshots at its start, so the last one to run
     /// leaves the freshest state.
-    pub async fn refresh_isolation(&self) {
-        if !self.net_on { return; }
+    ///
+    /// Returns false when isolation is NOT in force afterwards — the caller
+    /// that triggered the rebuild must not leave a VM running on a node where
+    /// every sandbox shares one flat network.
+    pub async fn refresh_isolation(&self) -> bool {
+        if !self.net_on { return true; }
         let _guard = self.ruleset_lock.lock().await;
         let members: Vec<(String, String)> = {
             let g = self.inner.lock().await;
@@ -386,7 +466,7 @@ impl Manager {
                 })
                 .collect()
         };
-        net::rebuild_isolation(&members);
+        net::rebuild_isolation(&members)
     }
 
     /// Rebuild the ingress DNAT ruleset from the current VM list (every expose
@@ -503,7 +583,7 @@ impl Manager {
             out.push_str(&format!("\"mem_mib\":{},", v.mem_mib));
             out.push_str("\"ip\":");
             match &v.ip {
-                Some(ip) => { out.push('"'); out.push_str(ip); out.push('"'); }
+                Some(ip) => out.push_str(&fc::json_str(ip)),
                 None => out.push_str("null"),
             }
             out.push_str(",\"pid\":");
@@ -533,7 +613,8 @@ impl Manager {
         if v.state != VmState::Stopped {
             return Err(RootfsError::NotStopped);
         }
-        let path = format!("{}/instances/{}/rootfs.ext4", self.data_dir, v.dir_id);
+        let dir = instance_path(&self.data_dir, &v.dir_id).ok_or(RootfsError::NotFound)?;
+        let path = format!("{}/rootfs.ext4", dir);
         if !g.capturing.insert(id.to_string()) {
             return Err(RootfsError::CaptureInProgress);
         }
@@ -548,26 +629,28 @@ impl Manager {
 
     // ---- paths ----
 
+    /// The on-disk dir id for `id`. An unknown id falls back to itself, which
+    /// is why `instance_path` must validate what comes out: the fallback is
+    /// exactly the case where a caller-supplied string becomes a path
+    /// component with no VM record vouching for it.
     fn dir_id_for_sync(vms: &[Vm], id: &str) -> String {
         vms.iter().find(|v| v.id == id).map(|v| v.dir_id.clone()).unwrap_or_else(|| id.to_string())
     }
 
-    fn instance_dir_sync(vms: &[Vm], data_dir: &str, id: &str) -> String {
-        let dir_id = Self::dir_id_for_sync(vms, id);
-        format!("{}/instances/{}", data_dir, dir_id)
+    fn instance_dir_sync(vms: &[Vm], data_dir: &str, id: &str) -> Option<String> {
+        instance_path(data_dir, &Self::dir_id_for_sync(vms, id))
     }
 
-    fn sock_path_sync(vms: &[Vm], data_dir: &str, id: &str) -> String {
-        let dir_id = Self::dir_id_for_sync(vms, id);
-        format!("{}/instances/{}/fc.sock", data_dir, dir_id)
+    fn sock_path_sync(vms: &[Vm], data_dir: &str, id: &str) -> Option<String> {
+        Self::instance_dir_sync(vms, data_dir, id).map(|d| format!("{}/fc.sock", d))
     }
 
-    async fn instance_dir(&self, id: &str) -> String {
+    async fn instance_dir(&self, id: &str) -> Option<String> {
         let g = self.inner.lock().await;
         Self::instance_dir_sync(&g.vms, &self.data_dir, id)
     }
 
-    async fn sock_path(&self, id: &str) -> String {
+    async fn sock_path(&self, id: &str) -> Option<String> {
         let g = self.inner.lock().await;
         Self::sock_path_sync(&g.vms, &self.data_dir, id)
     }
@@ -593,15 +676,35 @@ impl Manager {
     // ---- create ----
 
     pub async fn create(self: &Arc<Self>, spec: &CreateSpec) -> Result<(), String> {
+        // Rejected before a record exists, so a bad id never reaches the
+        // instances tree even as a Creating placeholder.
+        if !valid_vm_id(&spec.id) {
+            return Err("InvalidId".into());
+        }
         // Try to claim a warm-pool VM of the exact requested shape
         // (image + vcpus + mem + disk); else cold boot.
         if self.claim_from_pool(spec).await? {
-            self.refresh_isolation().await;
-            return Ok(());
+            return self.commit_or_isolate(&spec.id).await;
         }
         self.cold_create(spec, VmState::Running, None).await?;
-        self.refresh_isolation().await;
-        Ok(())
+        self.commit_or_isolate(&spec.id).await
+    }
+
+    /// Publish a freshly created VM into the tenant ruleset, or tear it down.
+    ///
+    /// A VM that is running while the isolation transaction is not in force
+    /// sits on a flat network with every other tenant on the node, and nothing
+    /// on either tenant's side would show it. Refusing the create is the only
+    /// answer that fails closed; hearthd retries elsewhere.
+    async fn commit_or_isolate(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        if self.refresh_isolation().await {
+            return Ok(());
+        }
+        warn!(vm = %id, "cross-tenant isolation is not in force; removing the new vm");
+        if let Err(e) = self.delete(id).await {
+            warn!(vm = %id, err = %e, "isolation rollback failed");
+        }
+        Err("IsolationFailed".into())
     }
 
     /// Cold-boot a fresh VM. `force_slot` reuses a specific slot (pool refill).
@@ -652,8 +755,8 @@ impl Manager {
     ) -> Result<(), String> {
         let id = spec.id.as_str();
         let (vcpus, mem_mib) = (spec.vcpus, spec.mem_mib);
-        let dir_path = self.instance_dir(id).await;
-        std::fs::create_dir_all(&dir_path).map_err(|e| e.to_string())?;
+        let dir_path = self.instance_dir(id).await.ok_or("InvalidId")?;
+        create_instance_dir(&dir_path).map_err(|e| e.to_string())?;
 
         // Pull-and-cache the template image first (no-op when already local).
         self.ensure_image(&spec.image, spec.image_sha256.as_deref()).await?;
@@ -682,21 +785,25 @@ impl Manager {
                 }
             };
             slot = Some(s);
-            let tap = net::tap_name(s);
-            if !net::ensure_tap(&tap) {
+            ip_str = {
+                let g = self.inner.lock().await;
+                Self::ip_for_slot(&g, s)
+            };
+            // Cold boot sets the NIC's MAC itself (configure_guest), so the
+            // L2 half of the pin applies from the first frame.
+            let (tap, mac) = tap_pin_for_slot(s);
+            if !ensure_pinned_tap(&tap, ip_str.as_deref(), &mac) {
                 let mut g = self.inner.lock().await;
                 Self::free_slot(&mut g, s);
                 return Err("TapSetupFailed".into());
             }
-            let g = self.inner.lock().await;
-            ip_str = Self::ip_for_slot(&g, s);
         }
 
         let (pid, vsock_on) = self.spawn_and_configure(id, &dir_path, &rootfs_dst, vcpus, mem_mib, slot, ip_str.as_deref()).await?;
 
         // For pool/paused final state: pause now.
         if final_state == VmState::Pooled || final_state == VmState::Paused {
-            let sock = self.sock_path(id).await;
+            let sock = self.sock_path(id).await.ok_or("InvalidId")?;
             fc::patch_vm_state(&sock, "Paused").await
                 .map_err(|e| e.to_string())?;
         }
@@ -907,14 +1014,12 @@ impl Manager {
         slot: Option<u32>,
         ip: Option<&str>,
     ) -> Result<(i32, bool), String> {
-        let sock = self.sock_path(id).await;
+        let sock = self.sock_path(id).await.ok_or("InvalidId")?;
         // Remove stale socket.
         let _ = std::fs::remove_file(&sock);
 
         let log_path = format!("{}/serial.log", dir_path);
-        let log_file = std::fs::OpenOptions::new()
-            .write(true).create(true).truncate(true)
-            .open(&log_path)
+        let log_file = open_serial_log(&log_path)
             .map_err(|e| format!("open serial.log: {}", e))?;
 
         let log_fd = log_file.into_raw_fd();
@@ -999,8 +1104,11 @@ impl Manager {
 
         if self.net_on {
             if let Some(s) = slot {
-                let tap = net::tap_name(s);
-                fc::put_network_interface(sock, &tap).await
+                // The MAC the tap's anti-spoof chain matches on, from the same
+                // derivation the pin used. It must be set here or the
+                // `ether saddr` pin would drop every frame.
+                let (tap, mac) = tap_pin_for_slot(s);
+                fc::put_network_interface(sock, &tap, &mac).await
                     .map_err(|e| e.to_string())?;
             }
         }
@@ -1031,7 +1139,7 @@ impl Manager {
                 _ => return Err(format!("InvalidState: {}", v.state.as_str())),
             }
         }
-        let sock = self.sock_path(id).await;
+        let sock = self.sock_path(id).await.ok_or("InvalidId")?;
         fc::patch_vm_state(&sock, "Paused").await.map_err(|e| e.to_string())?;
         self.set_state(id, VmState::Paused).await;
         self.write_meta(id).await
@@ -1047,7 +1155,7 @@ impl Manager {
                 _ => return Err(format!("InvalidState: {}", v.state.as_str())),
             }
         }
-        let sock = self.sock_path(id).await;
+        let sock = self.sock_path(id).await.ok_or("InvalidId")?;
         fc::patch_vm_state(&sock, "Resumed").await.map_err(|e| e.to_string())?;
         self.set_state(id, VmState::Running).await;
         self.write_meta(id).await
@@ -1063,8 +1171,8 @@ impl Manager {
             v.pid
         };
 
-        let sock = self.sock_path(id).await;
-        let dir_path = self.instance_dir(id).await;
+        let sock = self.sock_path(id).await.ok_or("InvalidId")?;
+        let dir_path = self.instance_dir(id).await.ok_or("InvalidId")?;
 
         fc::patch_vm_state(&sock, "Paused").await.map_err(|e| e.to_string())?;
 
@@ -1086,25 +1194,41 @@ impl Manager {
 
     /// Spawn firecracker → snapshot/load. Returns wake latency in ms.
     pub async fn wake_vm(self: &Arc<Self>, id: &str) -> Result<u64, String> {
-        let slot = {
+        let (slot, ip) = {
             let g = self.inner.lock().await;
             let v = g.vms.iter().find(|v| v.id == id).ok_or("NotFound")?;
             if v.state == VmState::Running { return Ok(0); }
-            v.slot
+            (v.slot, v.ip.clone())
         };
 
         let start = Instant::now();
-        let dir_path = self.instance_dir(id).await;
+        let dir_path = self.instance_dir(id).await.ok_or("InvalidId")?;
 
-        // Re-assert tap exists (idempotent).
+        // Re-assert tap exists (idempotent) and re-pin it, MAC included: the
+        // nft chains do not survive a host reboot.
+        //
+        // The MAC is safe to pin here because the slot survives sleep/wake
+        // (read from the record above, and `put_snapshot_load`'s network
+        // override only renames the host device), so the NIC restored from the
+        // snapshot still carries the MAC `configure_guest` gave it at cold
+        // boot — the same `guest_mac_for_slot(slot)`. This used to pass "" and
+        // render no `ether saddr` rule, which made sleep/wake a tenant-driven
+        // API for putting one's own VM into an L2-unpinned state and then
+        // sourcing frames as a victim to steal their inbound traffic.
+        //
+        // A snapshot taken by a pre-pin agent carries a Firecracker-chosen MAC
+        // instead and goes dark on wake until a stop/start cold-boots it onto
+        // the derived one. Dark is the correct direction for that trade.
         if self.net_on {
             if let Some(s) = slot {
-                let tap = net::tap_name(s);
-                net::ensure_tap(&tap);
+                let (tap, mac) = tap_pin_for_slot(s);
+                if !ensure_pinned_tap(&tap, ip.as_deref(), &mac) {
+                    return Err("TapSetupFailed".into());
+                }
             }
         }
 
-        let sock = self.sock_path(id).await;
+        let sock = self.sock_path(id).await.ok_or("InvalidId")?;
         let _ = std::fs::remove_file(&sock);
         // A SIGKILLed FC (sleep) leaves the vsock host UDS behind; the restore
         // re-binds the snapshot-baked path and fails with EADDRINUSE if the
@@ -1112,9 +1236,7 @@ impl Manager {
         let _ = std::fs::remove_file(format!("{}/v.sock", dir_path));
 
         let log_path = format!("{}/serial.log", dir_path);
-        let log_file = std::fs::OpenOptions::new()
-            .write(true).create(true).truncate(true)
-            .open(&log_path)
+        let log_file = open_serial_log(&log_path)
             .map_err(|e| format!("open serial.log: {}", e))?;
 
         let log_fd = log_file.into_raw_fd();
@@ -1173,14 +1295,20 @@ impl Manager {
     /// spawn child FC and restore. Child inherits parent's guest-internal IP
     /// (v2 documented caveat; fixed in v3).
     pub async fn fork(self: &Arc<Self>, parent_id: &str, child_id: &str, child_name: &str) -> Result<Option<String>, String> {
+        if !valid_vm_id(child_id) {
+            return Err("InvalidId".into());
+        }
         let (parent_was_running, parent_vcpus, parent_mem_mib, parent_vsock, parent_tenant_id, parent_image, parent_image_sha256, parent_disk_gb) = {
             let g = self.inner.lock().await;
             let p = g.vms.iter().find(|v| v.id == parent_id).ok_or("NotFound")?;
             (p.state == VmState::Running, p.vcpus, p.mem_mib, p.vsock, p.tenant_id.clone(), p.image.clone(), p.image_sha256.clone(), p.disk_gb)
         };
 
-        let parent_dir = self.instance_dir(parent_id).await;
-        let parent_sock = self.sock_path(parent_id).await;
+        let parent_dir = self.instance_dir(parent_id).await.ok_or("InvalidId")?;
+        let parent_sock = self.sock_path(parent_id).await.ok_or("InvalidId")?;
+        // The child id comes from the request BODY, not a URL capture, so it
+        // is validated here as well as at the handler.
+        let child_dir = instance_path(&self.data_dir, child_id).ok_or("InvalidId")?;
 
         // 1) Ensure parent snapshot exists.
         let parent_state = {
@@ -1202,8 +1330,7 @@ impl Manager {
         }
 
         // 2) Create child instance dir; reflink rootfs + copy mem.bin.
-        let child_dir = format!("{}/instances/{}", self.data_dir, child_id);
-        std::fs::create_dir_all(&child_dir).map_err(|e| e.to_string())?;
+        create_instance_dir(&child_dir).map_err(|e| e.to_string())?;
 
         let parent_rootfs = format!("{}/rootfs.ext4", parent_dir);
         let child_rootfs = format!("{}/rootfs.ext4", child_dir);
@@ -1257,25 +1384,33 @@ impl Manager {
                 Self::claim_slot(&mut g).ok_or("IpPoolExhausted")?
             };
             child_slot = Some(s);
-            let tap = net::tap_name(s);
-            if !net::ensure_tap(&tap) {
+            child_ip = {
+                let g = self.inner.lock().await;
+                Self::ip_for_slot(&g, s)
+            };
+            // Pinned to the child's OWN MAC before its Firecracker is even
+            // spawned, not after the in-guest re-MAC below: the clone restores
+            // still carrying the parent's L2 identity, and a window in which it
+            // can source frames under any MAC is exactly the hole. The pin
+            // holds the clone's frames off the bridge until the guest takes the
+            // MAC that matches it — and the re-MAC travels over vsock, not over
+            // this tap, so it is unaffected.
+            let (tap, mac) = tap_pin_for_slot(s);
+            if !ensure_pinned_tap(&tap, child_ip.as_deref(), &mac) {
                 let mut g = self.inner.lock().await;
                 Self::free_slot(&mut g, s);
+                drop(g);
                 self.set_state(child_id, VmState::Error).await;
                 return Err("TapSetupFailed".into());
             }
-            let g = self.inner.lock().await;
-            child_ip = Self::ip_for_slot(&g, s);
         }
 
         // 4) Spawn child FC and restore.
-        let child_sock = format!("{}/instances/{}/fc.sock", self.data_dir, child_id);
+        let child_sock = format!("{}/fc.sock", child_dir);
         let _ = std::fs::remove_file(&child_sock);
 
         let log_path = format!("{}/serial.log", child_dir);
-        let log_file = std::fs::OpenOptions::new()
-            .write(true).create(true).truncate(true)
-            .open(&log_path)
+        let log_file = open_serial_log(&log_path)
             .map_err(|e| format!("open serial.log: {}", e))?;
 
         let log_fd = log_file.into_raw_fd();
@@ -1344,21 +1479,49 @@ impl Manager {
 
         // Fork re-IP: the child restored with the parent's guest-internal IP.
         // If it has a working vsock, tell the guest to reconfigure eth0 to its
-        // own allocated IP. Best-effort per contract: a failure only warns.
+        // own allocated IP. Best-effort per contract: neither this nor the
+        // re-MAC below fails the fork — but neither is load-bearing for
+        // isolation any more either, because the tap was pinned before the
+        // child's Firecracker was spawned.
         if parent_vsock {
-            if let (Some(ip), true) = (child_ip.as_deref(), self.net_on) {
+            if let (Some(ip), Some(s), true) = (child_ip.as_deref(), child_slot, self.net_on) {
                 // The child is a memory-clone, so it also inherits the parent's
                 // guest MAC. Two ports with one MAC make the bridge FDB flap
                 // and one guest goes dark — give the child its own
                 // locally-administered MAC BEFORE re-IPing (plain exec; no
-                // guest-agent contract change needed).
-                let mac = child_mac(child_slot, now_ms());
+                // guest-agent contract change needed). It is the slot's derived
+                // MAC, the same value its tap was pinned to above, rather than
+                // a clock-salted one the pin could never match.
+                //
+                // This is the guest catching up to the pin, not the pin waiting
+                // on the guest: the tap is already filtering. A failure here
+                // therefore leaves the child isolated rather than free to
+                // source frames as its parent — the previous order added the L2
+                // rule only `if re_mac_ok`, and dropped that call's result, so
+                // a failed exec silently left the port L2-unpinned.
+                let (_, mac) = tap_pin_for_slot(s);
                 let cmd: Vec<String> = ["ip", "link", "set", "dev", "eth0", "address", mac.as_str()]
                     .iter().map(|s| s.to_string()).collect();
-                match crate::guestclient::exec(&child_dir, &cmd, 5_000).await {
-                    Ok(v) if v.get("exit_code").and_then(|c| c.as_i64()) == Some(0) => {}
-                    Ok(v) => warn!(vm = %child_id, err = %v, "fork re-MAC failed (best-effort)"),
-                    Err(e) => warn!(vm = %child_id, err = %e, "fork re-MAC failed (best-effort)"),
+                let re_mac_ok = match crate::guestclient::exec(&child_dir, &cmd, 5_000).await {
+                    Ok(v) => {
+                        let ok = v.get("exit_code").and_then(|c| c.as_i64()) == Some(0);
+                        if !ok {
+                            warn!(vm = %child_id, resp = %v, "fork re-MAC command returned non-zero");
+                        }
+                        ok
+                    }
+                    Err(e) => {
+                        warn!(vm = %child_id, err = %e, "fork re-MAC exec failed");
+                        false
+                    }
+                };
+                if !re_mac_ok {
+                    error!(
+                        vm = %child_id,
+                        mac = %mac,
+                        "fork re-MAC failed — the child still carries its parent's MAC and \
+                         its tap stays pinned, so it has NO network until it is restarted"
+                    );
                 }
                 let gw = crate::ipalloc::fmt_ip(self.cidr.gateway());
                 match crate::guestclient::set_ip(&child_dir, ip, self.cidr.prefix, &gw).await {
@@ -1366,10 +1529,21 @@ impl Manager {
                     Err(e) => warn!(vm = %child_id, err = %e, "fork re-IP failed (best-effort)"),
                 }
             }
+        } else if self.net_on && child_slot.is_some() {
+            // No guest agent, so nothing can re-MAC or re-IP this clone from
+            // the host side. It keeps its parent's MAC and address, and its own
+            // tap's pin drops both — where before it would have shared the
+            // parent's L2 identity on the bridge and flapped its FDB entry.
+            warn!(
+                vm = %child_id,
+                "forked without a guest agent: the child still carries its parent's MAC \
+                 and address, and its tap is pinned to its own, so it has no network \
+                 until the guest reconfigures itself"
+            );
         }
         // The child's allocated (post-re-IP) address must join its tenant's
         // pair set before the fork returns.
-        self.refresh_isolation().await;
+        self.commit_or_isolate(child_id).await?;
         Ok(child_ip)
     }
 
@@ -1392,7 +1566,9 @@ impl Manager {
         if !vsock {
             return ExecOutcome::Unavailable;
         }
-        let dir = format!("{}/instances/{}", self.data_dir, dir_id);
+        let Some(dir) = instance_path(&self.data_dir, &dir_id) else {
+            return ExecOutcome::NotFound;
+        };
         match crate::guestclient::exec(&dir, cmd, timeout_ms).await {
             Ok(v) => ExecOutcome::Ok(v),
             // Connect/handshake/round-trip failure → guest agent unavailable.
@@ -1423,9 +1599,11 @@ impl Manager {
         if !vsock {
             return ExecStreamOutcome::Unavailable;
         }
-        let dir = format!("{}/instances/{}", self.data_dir, dir_id);
+        let Some(dir) = instance_path(&self.data_dir, &dir_id) else {
+            return ExecStreamOutcome::NotFound;
+        };
         match crate::guestclient::exec_stream(&dir, cmd, timeout_ms).await {
-            Ok(s) => ExecStreamOutcome::Ok(s),
+            Ok((s, slot)) => ExecStreamOutcome::Ok(s, slot),
             Err(e) => ExecStreamOutcome::Failed(e.0),
         }
     }
@@ -1549,7 +1727,7 @@ impl Manager {
             old
         };
 
-        let sock = self.sock_path(id).await;
+        let sock = self.sock_path(id).await.ok_or("InvalidId")?;
         if let Err(e) = fc::patch_vm_state(&sock, "Resumed").await {
             // Pool VM is unusable (FC likely dead). Retag the record back,
             // mark it error, and let the caller fall through to a cold boot.
@@ -1650,13 +1828,17 @@ impl Manager {
             (v.vcpus, v.mem_mib, v.slot, v.ip.clone())
         };
 
-        let dir_path = self.instance_dir(id).await;
+        let dir_path = self.instance_dir(id).await.ok_or("InvalidId")?;
         let rootfs_dst = format!("{}/rootfs.ext4", dir_path);
 
+        // Cold boot: configure_guest sets the NIC's MAC, so the full pin
+        // (address, ARP and L2) applies from the first frame.
         if self.net_on {
             if let Some(s) = slot {
-                let tap = net::tap_name(s);
-                net::ensure_tap(&tap);
+                let (tap, mac) = tap_pin_for_slot(s);
+                if !ensure_pinned_tap(&tap, ip.as_deref(), &mac) {
+                    return Err("TapSetupFailed".into());
+                }
             }
         }
 
@@ -1685,15 +1867,25 @@ impl Manager {
         if self.net_on {
             if let Some(s) = slot {
                 let tap = net::tap_name(s);
+                // Before the tap goes: the pin is keyed on the device name,
+                // which the next VM to claim this slot will reuse.
+                net::clear_tap_antispoof(&tap);
                 net::delete_tap(&tap);
                 let mut g = self.inner.lock().await;
                 Self::free_slot(&mut g, s);
             }
         }
 
-        let dir_path = self.instance_dir(id).await;
-        if let Err(e) = std::fs::remove_dir_all(&dir_path) {
-            warn!(path = %dir_path, err = %e, "remove_dir_all failed");
+        // An id that is not a plain path component never reaches remove_dir_all:
+        // delete does not require the VM to exist, so this is the one call in
+        // the manager that would recursively delete an attacker-chosen path.
+        match self.instance_dir(id).await {
+            Some(dir_path) => {
+                if let Err(e) = std::fs::remove_dir_all(&dir_path) {
+                    warn!(path = %dir_path, err = %e, "remove_dir_all failed");
+                }
+            }
+            None => warn!(vm = %id, "delete: rejected id that is not a valid path component"),
         }
 
         {
@@ -1702,7 +1894,11 @@ impl Manager {
                 g.vms.remove(pos);
             }
         }
-        self.refresh_isolation().await;
+        // Teardown does not fail on a broken ruleset: the VM is already gone,
+        // and returning an error here would only make delete non-idempotent.
+        if !self.refresh_isolation().await {
+            warn!(vm = %id, "cross-tenant isolation not in force after delete");
+        }
         // The VM's exposes die with it: rebuild from the remaining members.
         self.refresh_ingress().await;
         // Idempotent: unknown id is fine (no error).
@@ -1796,8 +1992,7 @@ impl Manager {
             }
         };
 
-        let dir_id = meta.dir_id.clone();
-        let dir_path = format!("{}/instances/{}", self.data_dir, dir_id);
+        let dir_path = instance_path(&self.data_dir, &meta.dir_id).ok_or("InvalidId")?;
         let meta_path = format!("{}/meta.json", dir_path);
         let json = meta.to_json();
         std::fs::write(&meta_path, json.as_bytes())
@@ -1808,12 +2003,112 @@ impl Manager {
 
 // ---- utilities ----
 
+/// Emit `"key":"value"` with the value escaped. `name` reaches us verbatim
+/// from a tenant's sandbox-create request, so a raw push let a name like
+/// `x","state":"running","pid":1,"z":"` forge fields in this document or make
+/// it unparseable. Every other JSON writer in the agent escapes (meta.rs,
+/// fc.rs, registration.rs); this one now shares fc.rs's escaper.
 fn push_kv_str(out: &mut String, key: &str, val: &str) {
-    out.push('"');
-    out.push_str(key);
-    out.push_str("\":\"");
-    out.push_str(val);
-    out.push('"');
+    out.push_str(&fc::json_str(key));
+    out.push(':');
+    out.push_str(&fc::json_str(val));
+}
+
+/// The tap name and the MAC every path must pin for one slot.
+///
+/// One derivation, one choke point: cold create, start, wake, fork and startup
+/// adoption all pin through this, so no path can quietly pin a different L2
+/// identity than the one `configure_guest` gave the NIC — or, as wake and fork
+/// once did, none at all. Pure for unit tests.
+fn tap_pin_for_slot(slot: u32) -> (String, net::GuestMac) {
+    (net::tap_name(slot), net::guest_mac_for_slot(slot))
+}
+
+/// The taps that must be re-pinned when persisted records are adopted at
+/// startup: every VM with a live Firecracker still attached to a tap.
+///
+/// The netdev chains do not survive a host reboot, and an in-place agent
+/// upgrade adopts guests that were started before the pin existed at all —
+/// either way their ports sit on the bridge unfiltered until they are stopped
+/// and started again, which for a long-lived sandbox is never. Sleeping and
+/// stopped VMs are excluded: they hold no tap now and are pinned by `wake`/
+/// `start` before they get one. Pure for unit tests.
+fn taps_to_repin(vms: &[Vm]) -> Vec<(String, u32, String)> {
+    vms.iter()
+        .filter(|v| matches!(v.state, VmState::Running | VmState::Paused))
+        .filter_map(|v| Some((v.id.clone(), v.slot?, v.ip.clone()?)))
+        .collect()
+}
+
+/// Bring a guest's tap up and pin it to the address that slot was allocated.
+/// Returns false when the port is NOT pinned, which the caller must treat as
+/// a failure to bring the VM up.
+///
+/// The tenant ruleset keys on `ip saddr . ip daddr`, and both of those are
+/// addresses the guest configures for itself. Without a filter at the tap's
+/// own ingress a guest can add a same-tenant peer's address and reach that
+/// tenant's VMs, or ARP for any victim's address and receive the ingress
+/// DNAT'd to it. A tap on the bridge that could not be pinned is exactly the
+/// dangerous state, so a failure tears it back down rather than leaving it.
+///
+/// `guest_mac` is not optional, on any path. It used to be, and the two paths
+/// that passed "" — wake and fork — rendered a chain with no `ether saddr`
+/// rule at all: that guest still could not claim another address, but it could
+/// emit frames carrying another tenant's MAC, which moves that tenant's FDB
+/// entry onto this port and delivers their inbound traffic here. Sleep/wake is
+/// tenant-driven, so an attacker could put their own VM into that state on
+/// demand. The MAC is derived from the slot (`tap_pin_for_slot`), and the slot
+/// survives sleep, wake and fork, so every path has one.
+fn ensure_pinned_tap(tap: &str, ip: Option<&str>, guest_mac: &net::GuestMac) -> bool {
+    if !net::ensure_tap(tap) {
+        return false;
+    }
+    // No allocated address means nothing to pin the port to, so the guest
+    // behind it could claim any.
+    let Some(ip) = ip else {
+        warn!(tap = %tap, "tap has no allocated address to pin");
+        net::delete_tap(tap);
+        return false;
+    };
+    if !net::ensure_tap_antispoof(tap, ip, guest_mac) {
+        net::clear_tap_antispoof(tap);
+        net::delete_tap(tap);
+        return false;
+    }
+    true
+}
+
+/// Create an instance directory 0700, tightening one an older agent left
+/// world-traversable.
+///
+/// Everything a tenant owns lands in here: rootfs.ext4, vmstate.bin and
+/// mem.bin — a verbatim dump of the guest's RAM — plus the Firecracker API
+/// socket and the guest vsock, both created by the FC child inheriting our
+/// umask. Under the default 0022 that directory is 0755 and any local account
+/// on the worker can read another tenant's memory or drive their VM. The mode
+/// goes on the directory rather than each file so FC's own files are covered
+/// too. Same explicit-mode discipline as wg.rs's key and state files.
+fn create_instance_dir(path: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
+    // recursive(true) is a no-op on an existing directory, which is exactly
+    // the upgrade case: instance dirs outlive the agent that made them.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Open (and truncate) an instance's serial.log 0600. The guest writes its
+/// console here, which routinely carries boot secrets and application logs.
+fn open_serial_log(path: &str) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
 }
 
 /// `cp --reflink=auto src dst` (CoW when possible, plain copy fallback).
@@ -1845,18 +2140,6 @@ fn kill_and_reap(pid: i32) {
     }
 }
 
-/// Locally-administered unicast MAC for a fork child (0a:68:…): three salt
-/// bytes from the clock plus the tap slot, unique enough per bridge.
-fn child_mac(slot: Option<u32>, salt: u64) -> String {
-    format!(
-        "0a:68:{:02x}:{:02x}:{:02x}:{:02x}",
-        (salt >> 16) as u8,
-        (salt >> 8) as u8,
-        salt as u8,
-        slot.unwrap_or(0) as u8
-    )
-}
-
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -1869,6 +2152,388 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    // ---- id validation (the id is a filesystem path component) ----
+
+    #[test]
+    fn test_valid_vm_id_accepts_the_ids_we_actually_issue() {
+        assert!(valid_vm_id("sb-0123456789ab"));
+        assert!(valid_vm_id("sb-aabbccdd-1"));
+        assert!(valid_vm_id("pool-18f3a2b1c9d"));
+        assert!(valid_vm_id("vm-1"));
+        assert!(valid_vm_id("A"));
+        assert!(valid_vm_id("a.b_c-d"));
+        assert!(valid_vm_id(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn test_valid_vm_id_rejects_traversal() {
+        // Was: these went straight into {data_dir}/instances/<id>, giving a
+        // root-level write and a recursive delete anywhere the unit allows.
+        assert!(!valid_vm_id("../../../../etc/hearth"));
+        // axum percent-decodes :id captures, so this is what the handler sees.
+        assert!(!valid_vm_id("../../../etc/hearth"));
+        assert!(!valid_vm_id(".."));
+        assert!(!valid_vm_id("."));
+        assert!(!valid_vm_id("a/b"));
+        assert!(!valid_vm_id("/etc/hearth"));
+        assert!(!valid_vm_id("a..b"));
+        assert!(!valid_vm_id(""));
+        assert!(!valid_vm_id(&"a".repeat(65)));
+        // Leading '.' / '-' are hidden files and option smuggling.
+        assert!(!valid_vm_id(".hidden"));
+        assert!(!valid_vm_id("-rf"));
+        // Nothing outside the class, including separators and NULs.
+        assert!(!valid_vm_id("vm 1"));
+        assert!(!valid_vm_id("vm\n1"));
+        assert!(!valid_vm_id("vm\01"));
+        assert!(!valid_vm_id("vm$(id)"));
+    }
+
+    #[test]
+    fn test_instance_path_refuses_to_leave_the_instances_dir() {
+        assert_eq!(
+            instance_path("/srv/hearth", "vm-1").as_deref(),
+            Some("/srv/hearth/instances/vm-1")
+        );
+        assert!(instance_path("/srv/hearth", "../../etc/hearth").is_none());
+        assert!(instance_path("/srv/hearth", "").is_none());
+    }
+
+    fn mgr_for(data_dir: String) -> Arc<Manager> {
+        Manager::new(
+            data_dir,
+            false,
+            Cidr { base: 0x0AE7_0000, prefix: 24 },
+            0,
+            "http://cp".into(),
+            "tok".into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_delete_traversal_id_does_not_remove_anything_outside_instances() {
+        // DELETE /v1/vms/..%2F..%2F..%2Fetc%2Fhearth used to reach
+        // remove_dir_all on the decoded path without the VM having to exist.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        let data_dir = format!("{}/srv", root);
+        std::fs::create_dir_all(format!("{}/instances", data_dir)).unwrap();
+        let victim = format!("{}/etc/hearth", root);
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(format!("{}/agent.json", victim), b"token").unwrap();
+
+        let mgr = mgr_for(data_dir);
+        mgr.delete("../../etc/hearth").await.expect("delete is idempotent");
+
+        assert!(std::fs::metadata(&victim).is_ok(), "config dir must survive");
+        assert!(std::fs::metadata(format!("{}/agent.json", victim)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_rejects_traversal_id_before_touching_the_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        let data_dir = format!("{}/srv", root);
+        std::fs::create_dir_all(format!("{}/instances", data_dir)).unwrap();
+
+        let mgr = mgr_for(data_dir.clone());
+        let spec = CreateSpec {
+            id: "../../etc/hearth".into(),
+            name: "x".into(),
+            vcpus: 1,
+            mem_mib: 256,
+            tenant_id: None,
+            image: DEFAULT_IMAGE.into(),
+            image_sha256: None,
+            disk_gb: 0,
+        };
+        assert_eq!(mgr.create(&spec).await.unwrap_err(), "InvalidId");
+        // No record, and nothing created outside the instances tree.
+        assert!(mgr.list_json().await.contains("\"vms\":[]"));
+        assert!(std::fs::metadata(format!("{}/etc", root)).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fork_rejects_traversal_child_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        std::fs::create_dir_all(format!("{}/instances", data_dir)).unwrap();
+        let mgr = mgr_for(data_dir);
+        // Rejected before the parent lookup, so an unknown parent is not what
+        // this asserts.
+        assert_eq!(
+            mgr.fork("vm-1", "../../etc/hearth", "child").await.unwrap_err(),
+            "InvalidId"
+        );
+    }
+
+    // ---- per-tap anti-spoof wiring ----
+
+    #[test]
+    fn test_fc_nic_mac_is_the_mac_the_tap_is_pinned_to() {
+        // Was: the NIC was attached with no guest_mac at all, so there was no
+        // stable L2 identity to filter on. The two derivations must stay the
+        // same value — a NIC configured with any other MAC has every frame
+        // dropped by its own tap's pin.
+        for slot in [0u32, 1, 3, 253] {
+            let (tap, mac) = tap_pin_for_slot(slot);
+            let body = fc::build_network_interface(&tap, &mac);
+            assert!(
+                body.contains(&format!("\"guest_mac\":\"{}\"", mac)),
+                "slot {slot}: {body}"
+            );
+            assert!(body.contains(&format!("\"host_dev_name\":\"{}\"", tap)));
+        }
+    }
+
+    #[test]
+    fn test_every_path_pins_a_slot_to_one_tap_and_one_mac() {
+        // create, start, wake, fork and startup adoption all pin through
+        // `tap_pin_for_slot`, so none of them can pin a different L2 identity
+        // than `configure_guest` gave the NIC — and, since a GuestMac has no
+        // empty inhabitant, none of them can pin no identity at all. That was
+        // the residual hole: `ensure_pinned_tap(&tap, ip, "")` on the wake and
+        // fork paths compiled, and rendered a chain with no `ether saddr` rule.
+        for slot in [0u32, 1, 7, 253] {
+            let (tap, mac) = tap_pin_for_slot(slot);
+            assert_eq!(tap, net::tap_name(slot));
+            assert_eq!(mac, net::guest_mac_for_slot(slot));
+            assert!(!mac.as_str().is_empty(), "slot {slot} pinned to no MAC");
+        }
+        // Distinct per slot, or one tenant's pin would admit another's frames.
+        assert_ne!(tap_pin_for_slot(7).1, tap_pin_for_slot(8).1);
+        assert_ne!(tap_pin_for_slot(7).0, tap_pin_for_slot(8).0);
+    }
+
+    #[test]
+    fn test_fork_re_mac_targets_the_pinned_mac() {
+        // The fork child used to get a clock-salted MAC, which no per-tap pin
+        // could ever match. It must be the slot's derived MAC, and the same one
+        // a cold boot would give that slot — the fork path now takes both from
+        // `tap_pin_for_slot(child_slot)` rather than re-deriving from an
+        // `unwrap_or(0)` that would have re-MACed to slot 0's address.
+        let slot = 7u32;
+        assert_eq!(tap_pin_for_slot(slot).1, net::guest_mac_for_slot(slot));
+        assert_ne!(net::guest_mac_for_slot(slot), net::guest_mac_for_slot(slot + 1));
+    }
+
+    #[test]
+    fn test_tap_is_created_before_it_is_pinned_on_every_path() {
+        // The netdev chain binds to the tap itself
+        // (`hook ingress device "hth-N"`), so if the device does not exist yet
+        // `nft -f -` rejects the ENTIRE transaction with ENOENT — not just the
+        // chain line. `ensure_tap_antispoof` then returns false and
+        // `ensure_pinned_tap` tears the port back down, which is the right
+        // fail-closed direction but means a path that pins before it creates
+        // can never bring a guest up at all.
+        //
+        // The inverse is the dangerous one: a path that creates a tap and
+        // never pins it leaves a port on the bridge with no ingress filter,
+        // and the guest behind it can claim any tenant's IP or MAC. Ordering
+        // is therefore not a convention to remember — both calls are funnelled
+        // through `ensure_pinned_tap`, which is the only place either name
+        // appears. This test is what keeps that true: a second call site, or a
+        // reordering inside the funnel, fails here rather than in production.
+        //
+        // Scanning the source is deliberate. The alternative is mocking the
+        // `ip`/`nft` subprocesses, which would test the mock; the property
+        // being defended is structural ("there is exactly one call site"), so
+        // the check is structural too.
+        let src = include_str!("mod.rs");
+        let prod = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production half of mod.rs");
+        // Comments discuss these functions by name; only real calls count.
+        let code: String = prod
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let create = code.match_indices("net::ensure_tap(").collect::<Vec<_>>();
+        let pin = code
+            .match_indices("net::ensure_tap_antispoof(")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            create.len(),
+            1,
+            "expected exactly one net::ensure_tap call site, found {} — every tap \
+             must be created inside ensure_pinned_tap so it cannot skip the pin",
+            create.len()
+        );
+        assert_eq!(
+            pin.len(),
+            1,
+            "expected exactly one net::ensure_tap_antispoof call site, found {} — a \
+             second one could run before the tap exists, where nft rejects the whole \
+             transaction and the pin silently does not apply",
+            pin.len()
+        );
+
+        // Both inside ensure_pinned_tap, creation first.
+        let fn_start = code
+            .find("fn ensure_pinned_tap(")
+            .expect("ensure_pinned_tap must exist: it is the funnel both calls go through");
+        let fn_end = code[fn_start..]
+            .find("\nfn ")
+            .map(|o| fn_start + o)
+            .unwrap_or(code.len());
+        assert!(
+            create[0].0 > fn_start && create[0].0 < fn_end,
+            "net::ensure_tap is called outside ensure_pinned_tap"
+        );
+        assert!(
+            pin[0].0 > fn_start && pin[0].0 < fn_end,
+            "net::ensure_tap_antispoof is called outside ensure_pinned_tap"
+        );
+        assert!(
+            create[0].0 < pin[0].0,
+            "ensure_pinned_tap pins the tap before creating it: nft rejects a netdev \
+             chain whose device does not exist, so the guest would never come up"
+        );
+    }
+
+    #[test]
+    fn test_taps_to_repin_covers_every_adopted_live_guest() {
+        // Nothing re-pinned an adopted VM's tap: the netdev chains are gone
+        // after a host reboot, and an agent upgraded in place adopts guests
+        // started before the pin existed, so those ports stayed unfiltered on
+        // the bridge for the life of the sandbox.
+        let mut running = pooled_vm("sb-run", DEFAULT_IMAGE, 1, 256, 0);
+        running.state = VmState::Running;
+        running.slot = Some(3);
+        running.ip = Some("10.231.0.5".into());
+        let mut paused = pooled_vm("sb-paused", DEFAULT_IMAGE, 1, 256, 0);
+        paused.state = VmState::Paused;
+        paused.slot = Some(4);
+        paused.ip = Some("10.231.0.6".into());
+        // No live tap of their own: `wake`/`start` pin these before they get one.
+        let mut sleeping = pooled_vm("sb-sleep", DEFAULT_IMAGE, 1, 256, 0);
+        sleeping.state = VmState::Sleeping;
+        sleeping.slot = Some(5);
+        let mut stopped = pooled_vm("sb-stop", DEFAULT_IMAGE, 1, 256, 0);
+        stopped.state = VmState::Stopped;
+        stopped.slot = Some(6);
+        // Running but holding no address — nothing to pin the port to.
+        let mut no_ip = pooled_vm("sb-noip", DEFAULT_IMAGE, 1, 256, 0);
+        no_ip.state = VmState::Running;
+        no_ip.slot = Some(7);
+        no_ip.ip = None;
+
+        let repin = taps_to_repin(&[running, paused, sleeping, stopped, no_ip]);
+        assert_eq!(
+            repin,
+            vec![
+                ("sb-run".to_string(), 3u32, "10.231.0.5".to_string()),
+                ("sb-paused".to_string(), 4u32, "10.231.0.6".to_string()),
+            ]
+        );
+        // And each one is re-pinned to the same tap+MAC its cold boot used.
+        let (tap, mac) = tap_pin_for_slot(repin[0].1);
+        assert_eq!(tap, "hth-3");
+        assert_eq!(mac, net::guest_mac_for_slot(3));
+    }
+
+    #[tokio::test]
+    async fn test_isolation_status_is_vacuously_true_with_networking_off() {
+        // A --net off node has no guest network to fence, so it must not
+        // report itself unisolated to the health probe or the heartbeat, and
+        // creates on it must not be failed closed.
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = mgr_for(dir.path().to_str().unwrap().to_string());
+        assert!(mgr.isolation_ok());
+        assert!(mgr.refresh_isolation().await);
+    }
+
+    // ---- /v1/vms JSON escaping ----
+
+    #[tokio::test]
+    async fn test_list_json_escapes_a_forging_name() {
+        // Was: push_kv_str concatenated the raw value, so this name — which a
+        // tenant chooses freely on sandbox create — forged state/pid fields.
+        let forge = r#"x","state":"running","pid":1,"z":""#;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = mgr_for(dir.path().to_str().unwrap().to_string());
+        {
+            let mut g = mgr.inner.lock().await;
+            let mut vm = pooled_vm("sb-1", DEFAULT_IMAGE, 1, 256, 0);
+            vm.name = forge.to_string();
+            vm.state = VmState::Stopped;
+            vm.pid = None;
+            g.vms.push(vm);
+        }
+
+        let body = mgr.list_json().await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("body must parse");
+        let vm = &parsed["vms"][0];
+        // The payload survives as data, inert: it is the name and nothing else.
+        assert_eq!(vm["name"], serde_json::json!(forge));
+        assert_eq!(vm["state"], serde_json::json!("stopped"));
+        assert_eq!(vm["pid"], serde_json::Value::Null);
+        assert_eq!(parsed["vms"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_json_escapes_control_characters_in_id_and_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = mgr_for(dir.path().to_str().unwrap().to_string());
+        {
+            let mut g = mgr.inner.lock().await;
+            let mut vm = pooled_vm("sb-1", DEFAULT_IMAGE, 1, 256, 0);
+            vm.name = "line\nbreak\ttab\\slash\"quote".into();
+            g.vms.push(vm);
+        }
+        let body = mgr.list_json().await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("body must parse");
+        assert_eq!(
+            parsed["vms"][0]["name"],
+            serde_json::json!("line\nbreak\ttab\\slash\"quote")
+        );
+        assert_eq!(parsed["vms"][0]["ip"], serde_json::json!("10.231.0.2"));
+    }
+
+    // ---- instance dir / serial.log permissions ----
+
+    #[test]
+    fn test_instance_dir_is_root_only() {
+        use std::os::unix::fs::PermissionsExt;
+        // Was: create_dir_all with no mode → 0755 under the default umask, so
+        // any local account could read mem.bin (the guest's whole RAM).
+        let dir = tempfile::tempdir().unwrap();
+        let path = format!("{}/instances/vm-1", dir.path().to_str().unwrap());
+        create_instance_dir(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "got {:o}", mode);
+        // The parent the recursive create made is not a way around it either.
+        let parent = format!("{}/instances", dir.path().to_str().unwrap());
+        let pmode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(pmode, 0o700, "got {:o}", pmode);
+    }
+
+    #[test]
+    fn test_instance_dir_tightens_a_world_readable_dir_from_an_older_agent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = format!("{}/vm-old", dir.path().to_str().unwrap());
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        create_instance_dir(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "got {:o}", mode);
+    }
+
+    #[test]
+    fn test_serial_log_is_root_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = format!("{}/serial.log", dir.path().to_str().unwrap());
+        let f = open_serial_log(&path).unwrap();
+        drop(f);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "got {:o}", mode);
+    }
 
     #[test]
     fn test_node_port_alloc_lowest_free() {

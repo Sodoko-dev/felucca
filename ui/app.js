@@ -1,7 +1,8 @@
 /* ============================================================
    HEARTH CONSOLE — app.js  (v2)
    Pure vanilla JS SPA. No build step, no dependencies.
-   Polls /api/v1/* every 3s; falls back to mock data gracefully.
+   Polls /api/v1/* every 3s once a token is set, and never shows
+   anything but live data without saying so in the header.
    ============================================================ */
 
 'use strict';
@@ -20,26 +21,39 @@ const STATE_COLORS = {
 };
 
 /* --- Bearer token ----------------------------------------- */
-/* Read ?token= on boot, store in localStorage, strip from URL */
-(function initToken() {
+/* This is the cluster admin token. It lives in a module-scoped variable and
+   dies with the tab: web storage would hand it to any script on the origin,
+   which is exactly what turns one XSS into a stolen admin credential. The
+   401 banner is the only way in. */
+let bearerToken = null;
+
+/* Consoles before this change persisted the token; clear it so an upgraded
+   console does not leave the old credential sitting in storage. */
+(function purgeStoredToken() {
+  try {
+    localStorage.removeItem('hearth_token');
+    sessionStorage.removeItem('hearth_token');
+  } catch (_) { /* storage unavailable — nothing to purge */ }
+})();
+
+/* A ?token= has already been written to browser history and to the access log
+   of every proxy in front of hearthd, so it is never accepted as a
+   credential — it is only scrubbed out of the URL. Paste it into the banner. */
+(function scrubTokenFromUrl() {
   const params = new URLSearchParams(window.location.search);
-  const t = params.get('token');
-  if (t) {
-    localStorage.setItem('hearth_token', t);
-    params.delete('token');
-    const newSearch = params.toString();
-    const newUrl = window.location.pathname + (newSearch ? '?' + newSearch : '') + window.location.hash;
-    history.replaceState(null, '', newUrl);
-  }
+  if (!params.has('token')) return;
+  params.delete('token');
+  const search = params.toString();
+  history.replaceState(null, '',
+    window.location.pathname + (search ? '?' + search : '') + window.location.hash);
 })();
 
 function getToken() {
-  return localStorage.getItem('hearth_token') || null;
+  return bearerToken;
 }
 
 function setToken(t) {
-  if (t) localStorage.setItem('hearth_token', t);
-  else localStorage.removeItem('hearth_token');
+  bearerToken = t || null;
 }
 
 function authHeaders() {
@@ -49,29 +63,95 @@ function authHeaders() {
   return h;
 }
 
-/* Show/hide the 401 auth banner */
-function show401Banner() {
-  let banner = document.getElementById('auth-banner');
-  if (banner) return; // already shown
+/* --- Status banner ---------------------------------------- */
+/* One banner, one badge, and between them they always say what the operator is
+   looking at. `kind` picks the copy; the paste box only appears when supplying
+   a token is the actual remedy. Built as DOM nodes, not innerHTML: the messages
+   carry server-supplied numbers and this file is served under a CSP with
+   script-src 'self', so hand-built markup here would be the one place a string
+   could still become markup. */
+const BANNER_ID = 'auth-banner';
+
+/* A banner the operator dismissed does not come back for the same condition —
+   the header badge keeps saying it, and clicking that badge reopens this. */
+let bannerDismissed = null;
+
+function removeBanner() {
+  document.getElementById(BANNER_ID)?.remove();
+}
+
+function showBanner(kind, message, opts = {}) {
+  if (bannerDismissed === kind) return null;
+  let banner = document.getElementById(BANNER_ID);
+  if (banner && banner.dataset.kind === kind) {
+    // Never rebuild a banner that is already up: the operator may be mid-paste
+    // in the token box, and the retry countdown rewrites this text every poll.
+    const msgEl = banner.querySelector('.auth-banner-msg');
+    if (msgEl) msgEl.textContent = message;
+    return banner;
+  }
+  if (banner) banner.remove();
+
   banner = document.createElement('div');
-  banner.id = 'auth-banner';
+  banner.id = BANNER_ID;
   banner.className = 'auth-banner';
-  banner.innerHTML = `
-    <span class="auth-banner-msg">401 Unauthorized — bearer token required</span>
-    <input class="auth-banner-input" id="auth-token-input" type="password"
-           placeholder="Paste token here…" autocomplete="off" spellcheck="false"/>
-    <button class="auth-banner-btn" id="auth-token-apply">Apply</button>
-    <button class="auth-banner-dismiss" id="auth-banner-dismiss">${SVG.close}</button>
-  `;
-  document.body.insertBefore(banner, document.getElementById('app'));
-  document.getElementById('auth-token-apply').addEventListener('click', () => {
-    const val = document.getElementById('auth-token-input').value.trim();
-    if (!val) return;
-    setToken(val);
+  banner.dataset.kind = kind;
+
+  const msg = document.createElement('span');
+  msg.className = 'auth-banner-msg';
+  msg.textContent = message;
+  banner.appendChild(msg);
+
+  if (opts.tokenInput) {
+    const input = document.createElement('input');
+    input.className = 'auth-banner-input';
+    input.id = 'auth-token-input';
+    input.type = 'password';
+    input.placeholder = 'Paste token here…';
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+
+    const apply = document.createElement('button');
+    apply.className = 'auth-banner-btn';
+    apply.id = 'auth-token-apply';
+    apply.textContent = 'Apply';
+
+    const applyToken = () => {
+      const val = input.value.trim();
+      if (!val) return;
+      setToken(val);
+      // A token pasted while hearthd is throttling this source must not sit
+      // behind the old backoff — the console caused those failures, and the
+      // operator has now supplied the fix.
+      rateLimitedUntil = 0;
+      bannerDismissed = null;
+      removeBanner();
+      poll();
+    };
+    apply.addEventListener('click', applyToken);
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') applyToken(); });
+    banner.append(input, apply);
+  }
+
+  const dismiss = document.createElement('button');
+  dismiss.className = 'auth-banner-dismiss';
+  dismiss.id = 'auth-banner-dismiss';
+  dismiss.innerHTML = SVG.close; // a build-time constant, never server data
+  dismiss.addEventListener('click', () => {
+    bannerDismissed = kind;
     banner.remove();
-    poll(); // retry immediately
   });
-  document.getElementById('auth-banner-dismiss').addEventListener('click', () => banner.remove());
+  banner.appendChild(dismiss);
+
+  document.body.insertBefore(banner, document.getElementById('app'));
+  return banner;
+}
+
+/* Reopen whatever the current condition is — bound to the header badge, so a
+   dismissed banner is always one click away. */
+function reopenBanner() {
+  bannerDismissed = null;
+  applyStatus();
 }
 
 /* --- Mock data -------------------------------------------- */
@@ -262,9 +342,14 @@ const state = {
   view: 'fleet',
   nodes: [],
   sandboxes: [],
+  /* What the rows below actually are. Exactly one of:
+     live | mock | no-token | unauthorized | rate-limited | unreachable | error
+     Everything except `live` is announced in the header AND in a banner. */
+  dataMode: 'no-token',
+  statusDetail: null,
   isMock: false,
+  everLive: false,
   lastPoll: null,
-  pollError: null,
   nsFilter: '__all__',
   sbSearch: '',
   sbStateFilter: '__all__',
@@ -285,7 +370,21 @@ function getNsBadgeClass(ns) {
   return `ns-badge-${nsColorCache[ns]}`;
 }
 
-/* --- API / fetch with mock fallback ----------------------- */
+/* --- API / fetch ------------------------------------------ */
+/* hearthd answers a throttled source with 429 + Retry-After in seconds
+   (gateAuth, go/internal/server/server.go). Its OTHER 429 — quota exceeded on
+   create/fork — carries no Retry-After, so the header is what separates "wait"
+   from "you are over your limit". Returns 0 when this is not a throttle. */
+function retryAfterMs(res) {
+  const raw = res.headers && res.headers.get ? res.headers.get('Retry-After') : null;
+  const secs = parseInt(raw || '', 10);
+  return Number.isFinite(secs) && secs > 0 ? Math.min(secs, 300) * 1000 : 0;
+}
+
+/* Every failure is classified rather than collapsed, because the caller has to
+   tell the operator which one it is: 401 needs a token, 429 needs a wait, a
+   dead socket needs someone to look at hearthd. Folding all three into "mock"
+   is what let the console quietly show a fabricated fleet. */
 async function apiFetch(path) {
   const headers = {};
   const t = getToken();
@@ -295,14 +394,35 @@ async function apiFetch(path) {
       headers,
       signal: AbortSignal.timeout(2500),
     });
-    if (res.status === 401) { show401Banner(); return { data: null, mock: true }; }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    state.pollError = null;
-    return { data, mock: false };
+    if (res.status === 401) return { ok: false, reason: 'unauthorized', status: 401 };
+    if (res.status === 429) {
+      return { ok: false, reason: 'rate-limited', status: 429, retryAfterMs: retryAfterMs(res) };
+    }
+    if (!res.ok) return { ok: false, reason: 'error', status: res.status };
+    return { ok: true, data: await res.json() };
   } catch (err) {
-    return { data: null, mock: true, err };
+    return { ok: false, reason: 'unreachable', err };
   }
+}
+
+/* Writes share the classification but not the poll loop: a 429 here is far
+   more likely to be the quota gate, which is the caller's answer and not a
+   console-wide condition. */
+function noteWriteFailure(res) {
+  if (res.status === 401) {
+    setDataMode('unauthorized');
+    return { error: '401 Unauthorized' };
+  }
+  if (res.status === 429) {
+    const ms = retryAfterMs(res);
+    if (ms > 0) {
+      rateLimitedUntil = Date.now() + ms;
+      setDataMode('rate-limited', Math.ceil(ms / 1000));
+      return { error: `429 rate limited — retry in ${Math.ceil(ms / 1000)}s` };
+    }
+    return { error: '429 quota exceeded' };
+  }
+  return null;
 }
 
 async function apiPost(path, body) {
@@ -315,7 +435,8 @@ async function apiPost(path, body) {
       body: body ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(5000),
     });
-    if (res.status === 401) { show401Banner(); return { error: '401 Unauthorized' }; }
+    const failed = noteWriteFailure(res);
+    if (failed) return failed;
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const text = await res.text();
     return { data: text ? JSON.parse(text) : null, mock: false };
@@ -335,7 +456,8 @@ async function apiDelete(path) {
       headers,
       signal: AbortSignal.timeout(5000),
     });
-    if (res.status === 401) { show401Banner(); return { error: '401 Unauthorized' }; }
+    const failed = noteWriteFailure(res);
+    if (failed) return failed;
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return { ok: true };
   } catch (err) {
@@ -343,25 +465,123 @@ async function apiDelete(path) {
   }
 }
 
+/* --- Status: what the operator is actually looking at ------ */
+/* Copy for every non-live mode, in one table so the badge, the LIVE indicator
+   and the banner can never disagree about which one is in force. */
+function statusFor(mode, detail) {
+  switch (mode) {
+    case 'no-token':
+      return { badge: 'No token', live: 'NO TOKEN', kind: 'auth', tokenInput: true,
+               msg: 'Bearer token required — the console is not polling until you paste one' };
+    case 'unauthorized':
+      return { badge: 'Unauthorized', live: 'NO AUTH', kind: 'auth', tokenInput: true,
+               msg: '401 Unauthorized — token rejected. Polling is paused so repeated retries do not throttle you.' };
+    case 'rate-limited':
+      // The paste box belongs here too: the usual reason hearthd is throttling
+      // this source is that a wrong token was being retried, and the operator
+      // must be able to supply the right one without waiting out the backoff
+      // their own console produced.
+      return { badge: 'Rate limited', live: 'THROTTLED', kind: 'rate-limited', tokenInput: true,
+               msg: `429 Rate limited by hearthd — retrying in ${detail}s. Paste a token to retry now.` };
+    case 'unreachable':
+      return { badge: 'Stale', live: 'STALE', kind: 'offline',
+               msg: `Control plane unreachable — the fleet below was last read at ${detail}` };
+    case 'error':
+      return { badge: 'Error', live: 'ERROR', kind: 'offline',
+               msg: `Control plane returned HTTP ${detail} — the fleet below may be out of date` };
+    case 'mock':
+      return { badge: 'Mock data', live: 'MOCK', kind: 'offline',
+               msg: 'MOCK DATA — the control plane was never reached; nothing below is real' };
+    default:
+      return { badge: '', live: 'LIVE', kind: null, msg: '' };
+  }
+}
+
+/* The single place that records what is on screen. Every exit from poll() goes
+   through it, so "LIVE" is never displayed for data that did not come from
+   hearthd on this poll. */
+function setDataMode(mode, detail) {
+  state.dataMode = mode;
+  state.statusDetail = detail ?? null;
+  state.isMock = mode === 'mock';
+  applyStatus();
+}
+
+function applyStatus() {
+  const s = statusFor(state.dataMode, state.statusDetail);
+
+  const badge = document.getElementById('mock-badge');
+  if (badge) {
+    badge.textContent = s.badge || '';
+    badge.classList.toggle('hidden', !s.badge);
+  }
+  const text = document.getElementById('live-text');
+  const dot = document.getElementById('live-dot');
+  if (text) text.textContent = s.live;
+  if (dot) dot.classList.toggle('stale', state.dataMode !== 'live');
+
+  if (!s.kind) {
+    bannerDismissed = null;
+    removeBanner();
+    return;
+  }
+  showBanner(s.kind, s.msg, { tokenInput: !!s.tokenInput });
+}
+
 /* --- Poll ------------------------------------------------- */
+/* Self-rescheduling rather than a bare setInterval. A fixed 3s interval polls
+   whether or not a token is set, and hearthd counts every failed attempt
+   against the source address: ten failures is five polls, so an unattended
+   console locked out its own operator inside twenty seconds and then rejected
+   the correct token for up to a minute. Nothing is sent until there is a
+   credential to send, and a 429 is waited out instead of fed. */
+let pollTimer = null;
+let rateLimitedUntil = 0;
+
+function schedulePoll(delayMs = POLL_INTERVAL_MS) {
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = setTimeout(() => { pollTimer = null; poll(); }, delayMs);
+}
+
 async function poll() {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+
+  // No credential: do not touch the API at all. Every request would be a
+  // counted auth failure, and the operator is still looking for the token.
+  // The Apply button restarts the loop, so there is nothing to reschedule.
+  if (!getToken()) {
+    const wasLoading = state.loading;
+    state.loading = false;
+    setDataMode('no-token');
+    // Clearing `loading` without re-rendering would leave the skeleton rows on
+    // screen — shimmering placeholders that read as a fleet still loading.
+    if (wasLoading) render();
+    return;
+  }
+
+  const wait = rateLimitedUntil - Date.now();
+  if (wait > 0) {
+    setDataMode('rate-limited', Math.ceil(wait / 1000));
+    schedulePoll(wait + 250);
+    return;
+  }
+
   const [nodesRes, sbRes] = await Promise.all([
     apiFetch('/nodes'),
     apiFetch('/sandboxes'),
   ]);
 
+  const failure = [nodesRes, sbRes].find(r => !r.ok);
+  if (failure) {
+    handlePollFailure(failure);
+    return;
+  }
+
   let changed = false;
 
-  if (nodesRes.mock || sbRes.mock) {
-    if (!state.isMock) {
-      state.isMock = true;
-      state.nodes = MOCK_NODES;
-      state.sandboxes = MOCK_SANDBOXES;
-      changed = true;
-      simulateMockActivity();
-    }
-  } else {
-    state.isMock = false;
+  {
+    state.everLive = true;
+    setDataMode('live');
     const newNodes = nodesRes.data.nodes || [];
     const newSbs   = sbRes.data.sandboxes || [];
     // Heartbeats/memory churn on every agent heartbeat; a full re-render for
@@ -385,6 +605,61 @@ async function poll() {
     updateNodeCardsInPlace();
     updateHeartbeats();
   }
+  schedulePoll();
+}
+
+/* One exit per failure class. Each one names itself on screen; none of them
+   substitutes fabricated data for a fleet the operator believes is real. */
+function handlePollFailure(failure) {
+  // Clearing `loading` without re-rendering would leave the skeleton rows up —
+  // shimmering placeholders that read as a fleet still on its way in.
+  const wasLoading = state.loading;
+  state.loading = false;
+  let needsRender = wasLoading;
+
+  switch (failure.reason) {
+    case 'unauthorized':
+      // The token we hold is not accepted. Stop the loop rather than replay it
+      // every 3s: the retries are what walk hearthd's backoff up to a minute,
+      // and the fix is a human pasting a different token (which restarts it).
+      setDataMode('unauthorized');
+      break;
+
+    case 'rate-limited': {
+      // Honour hearthd's Retry-After. Without a header, back off well past the
+      // poll interval — anything shorter just extends the lockout.
+      const ms = failure.retryAfterMs || POLL_INTERVAL_MS * 5;
+      rateLimitedUntil = Date.now() + ms;
+      setDataMode('rate-limited', Math.ceil(ms / 1000));
+      schedulePoll(ms + 250);
+      break;
+    }
+
+    default:
+      // Unreachable or a server error. Keep the last real fleet on screen and
+      // mark it stale; only a console that has NEVER reached hearthd falls
+      // back to MOCK_* — that is the design/demo case, and it says so.
+      if (state.everLive) {
+        setDataMode(failure.reason === 'error' ? 'error' : 'unreachable',
+                    failure.reason === 'error' ? failure.status : lastPollClock());
+      } else {
+        if (!state.isMock) {
+          state.nodes = MOCK_NODES;
+          state.sandboxes = MOCK_SANDBOXES;
+          simulateMockActivity();
+          needsRender = true;
+        }
+        setDataMode('mock');
+      }
+      schedulePoll();
+      break;
+  }
+
+  if (needsRender) render();
+}
+
+function lastPollClock() {
+  return state.lastPoll ? new Date(state.lastPoll).toLocaleTimeString() : 'never';
 }
 
 /* Patch volatile node data (heartbeat age, memory) into the existing DOM
@@ -412,9 +687,12 @@ function updateNodeCardsInPlace() {
   });
 }
 
-/* Simulate live mock activity */
+/* Simulate live mock activity. Started at most once — mock mode can be entered
+   more than once now, and a second interval would double the churn. */
+let mockActivityTimer = null;
 function simulateMockActivity() {
-  setInterval(() => {
+  if (mockActivityTimer) return;
+  mockActivityTimer = setInterval(() => {
     if (!state.isMock) return;
     state.nodes.forEach(n => {
       if (n.status === 'ready') {
@@ -491,11 +769,17 @@ const SVG = {
 };
 
 /* --- Toast system ----------------------------------------- */
+/* Nearly every toast embeds a tenant-chosen sandbox name, so the message is
+   set as text — it must never be parsed as markup. */
 function toast(msg, type = 'info', duration = 3500) {
   const container = document.getElementById('toast-container');
   const el = document.createElement('div');
   el.className = `toast ${type}`;
-  el.innerHTML = `<div class="toast-dot"></div><span>${msg}</span>`;
+  const dot = document.createElement('div');
+  dot.className = 'toast-dot';
+  const text = document.createElement('span');
+  text.textContent = msg;
+  el.append(dot, text);
   container.appendChild(el);
   setTimeout(() => {
     el.classList.add('dismissing');
@@ -514,11 +798,6 @@ function navigate(view) {
 
 /* --- Header ----------------------------------------------- */
 function renderHeader() {
-  const nsList = getNamespaces();
-  const nsOpts = ['__all__', ...nsList].map(ns =>
-    `<option value="${ns}" ${state.nsFilter === ns ? 'selected' : ''}>${ns === '__all__' ? 'All namespaces' : ns}</option>`
-  ).join('');
-
   return `
     <div class="header-brand">
       <svg class="brand-logo" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -567,14 +846,13 @@ function renderHeader() {
 
     <div class="ns-filter-wrap">
       <span class="ns-filter-label">NS</span>
-      <select class="ns-filter-select" id="ns-filter">
-        ${nsOpts}
-      </select>
+      <select class="ns-filter-select" id="ns-filter"></select>
     </div>
 
-    <div id="mock-badge" class="mock-badge ${state.isMock ? '' : 'hidden'}">
-      Mock data
-    </div>
+    <!-- Filled by applyStatus(): says which of live/mock/stale/throttled/
+         unauthorized the rows below actually are. Click reopens the banner. -->
+    <div id="mock-badge" class="mock-badge hidden" role="button" tabindex="0"
+         title="Show console status"></div>
 
     <div class="header-stats">
       <div class="stat-chip">
@@ -622,30 +900,38 @@ function updateHeaderStats() {
   if (el('stat-sb-running'))  el('stat-sb-running').textContent  = running;
   if (el('stat-sb-sleeping')) el('stat-sb-sleeping').textContent = sleeping;
 
-  const mockBadge = el('mock-badge');
-  if (mockBadge) mockBadge.classList.toggle('hidden', !state.isMock);
-
+  applyStatus();
   updateNsFilter();
 }
 
-function updateNsFilter() {
-  const sel = document.getElementById('ns-filter');
+/* Namespaces are tenant-chosen strings. Options are built as DOM nodes so a
+   namespace can never be parsed as markup — a `</option></select><img …>`
+   payload would otherwise break out of the select and execute. */
+function fillNsSelect(sel, want) {
   if (!sel) return;
-  const nsList = getNamespaces();
   const current = sel.value;
-  const opts = ['__all__', ...nsList].map(ns =>
-    `<option value="${ns}" ${(state.nsFilter === ns) ? 'selected' : ''}>${ns === '__all__' ? 'All namespaces' : ns}</option>`
-  ).join('');
-  sel.innerHTML = opts;
-  if (current && [...sel.options].find(o => o.value === current)) {
-    sel.value = current;
-  }
+  sel.replaceChildren(...['__all__', ...getNamespaces()].map(ns =>
+    new Option(ns === '__all__' ? 'All namespaces' : ns, ns)
+  ));
+  const has = v => v && [...sel.options].some(o => o.value === v);
+  sel.value = has(current) ? current : (has(want) ? want : '__all__');
+}
+
+function updateNsFilter() {
+  fillNsSelect(document.getElementById('ns-filter'), state.nsFilter);
+  fillNsSelect(document.getElementById('tree-ns-filter'), state.treeNs);
 }
 
 function updateLiveIndicator() {
   const dot = document.getElementById('live-dot');
   const text = document.getElementById('live-text');
   if (!dot || !text) return;
+  // Any non-live mode has already named itself; do not overwrite it with a
+  // clock-based verdict that would read LIVE while the data is fabricated.
+  if (state.dataMode !== 'live') {
+    applyStatus();
+    return;
+  }
   const age = state.lastPoll ? (Date.now() - state.lastPoll) / 1000 : 999;
   const stale = age > 10;
   dot.classList.toggle('stale', stale);
@@ -1002,11 +1288,6 @@ function renderSandboxRow(sb) {
 
 /* --- Fork Tree view --------------------------------------- */
 function renderTree() {
-  const nsList = getNamespaces();
-  const nsOpts = ['__all__', ...nsList].map(ns =>
-    `<option value="${ns}" ${state.treeNs === ns ? 'selected' : ''}>${ns === '__all__' ? 'All namespaces' : ns}</option>`
-  ).join('');
-
   return `
     <div class="view-enter">
       <div class="page-header">
@@ -1016,9 +1297,7 @@ function renderTree() {
           <div class="page-subtitle">Parent-child sandbox relationships by namespace</div>
         </div>
         <div class="page-actions">
-          <select class="filter-select" id="tree-ns-filter">
-            ${nsOpts}
-          </select>
+          <select class="filter-select" id="tree-ns-filter"></select>
         </div>
       </div>
 
@@ -1061,7 +1340,14 @@ function renderTreeContent() {
   `;
 }
 
+/* An SVG id has to be a bare identifier, so escaping the namespace into it is
+   not enough — the grid pattern gets a generated id instead and the tenant
+   string never reaches the id or the url(#…) reference. */
+let gridPatternSeq = 0;
+
 function renderNsTree(ns, sandboxes) {
+  const gridId = `grid-${gridPatternSeq++}`;
+
   // Build adjacency
   const byId = {};
   sandboxes.forEach(sb => { byId[sb.id] = sb; });
@@ -1146,9 +1432,8 @@ function renderNsTree(ns, sandboxes) {
     const shortId   = sb.id.slice(-8);
 
     return `
-      <g class="tree-node-group" data-sb-id="${sb.id}"
-         transform="translate(${x}, ${y})"
-         onclick="window._treeNodeClick('${sb.id}')">
+      <g class="tree-node-group" data-sb-id="${escAttr(sb.id)}"
+         transform="translate(${x}, ${y})">
         <rect class="tree-node-rect ${stateClass}" width="${NODE_W}" height="${NODE_H}"/>
         <!-- state color accent -->
         <rect x="0" y="0" width="3" height="${NODE_H}" rx="2.5" ry="2.5" fill="${stateColor}" opacity="0.7"/>
@@ -1178,11 +1463,11 @@ function renderNsTree(ns, sandboxes) {
           >
             <!-- Grid lines -->
             <defs>
-              <pattern id="grid-${ns}" width="40" height="40" patternUnits="userSpaceOnUse">
+              <pattern id="${gridId}" width="40" height="40" patternUnits="userSpaceOnUse">
                 <path d="M 40 0 L 0 0 0 40" fill="none" stroke="rgba(255,255,255,0.025)" stroke-width="1"/>
               </pattern>
             </defs>
-            <rect width="${svgW}" height="${svgH}" fill="url(#grid-${ns})"/>
+            <rect width="${svgW}" height="${svgH}" fill="url(#${gridId})"/>
             ${edges.join('\n')}
             ${nodes}
           </svg>
@@ -1217,7 +1502,7 @@ function renderNewSandboxModal() {
       <div class="modal">
         <div class="modal-header">
           <span class="modal-title">New Sandbox</span>
-          <button class="modal-close" onclick="closeModal('modal-new-sandbox')">${SVG.close}</button>
+          <button class="modal-close" data-modal-close="modal-new-sandbox">${SVG.close}</button>
         </div>
         <div class="modal-body">
           <div class="form-group">
@@ -1231,8 +1516,7 @@ function renderNewSandboxModal() {
           <div class="form-group">
             <label class="form-label">vCPUs</label>
             <div class="slider-wrap">
-              <input class="form-slider" type="range" min="1" max="4" value="1" step="1" id="new-sb-vcpus"
-                     oninput="document.getElementById('new-sb-vcpus-val').textContent=this.value"/>
+              <input class="form-slider" type="range" min="1" max="4" value="1" step="1" id="new-sb-vcpus"/>
               <span class="slider-value" id="new-sb-vcpus-val">1</span>
             </div>
           </div>
@@ -1240,7 +1524,7 @@ function renderNewSandboxModal() {
             <label class="form-label">Memory</label>
             <div class="mem-options" id="mem-opts">
               ${[128, 256, 512, 1024, 2048].map((m, i) => `
-                <div class="mem-option ${i === 2 ? 'selected' : ''}" data-mem="${m}" onclick="selectMem(${m})">
+                <div class="mem-option ${i === 2 ? 'selected' : ''}" data-mem="${m}">
                   ${m >= 1024 ? m/1024 + ' GiB' : m + ' MiB'}
                 </div>
               `).join('')}
@@ -1253,7 +1537,7 @@ function renderNewSandboxModal() {
           </div>
         </div>
         <div class="modal-footer">
-          <button class="btn btn-secondary" onclick="closeModal('modal-new-sandbox')">Cancel</button>
+          <button class="btn btn-secondary" data-modal-close="modal-new-sandbox">Cancel</button>
           <button class="btn btn-primary" id="btn-create-sandbox">
             ${SVG.plus} Create
           </button>
@@ -1269,13 +1553,13 @@ function renderConfirmModal() {
       <div class="modal">
         <div class="modal-header">
           <span class="modal-title" id="confirm-title">Confirm action</span>
-          <button class="modal-close" onclick="closeModal('modal-confirm')">${SVG.close}</button>
+          <button class="modal-close" data-modal-close="modal-confirm">${SVG.close}</button>
         </div>
         <div class="modal-body">
           <p class="confirm-text" id="confirm-body">Are you sure?</p>
         </div>
         <div class="modal-footer">
-          <button class="btn btn-secondary" onclick="closeModal('modal-confirm')">Cancel</button>
+          <button class="btn btn-secondary" data-modal-close="modal-confirm">Cancel</button>
           <button class="btn btn-danger" id="btn-confirm-ok">Confirm</button>
         </div>
       </div>
@@ -1289,7 +1573,7 @@ function renderForkModal() {
       <div class="modal">
         <div class="modal-header">
           <span class="modal-title">Fork Sandbox</span>
-          <button class="modal-close" onclick="closeModal('modal-fork')">${SVG.close}</button>
+          <button class="modal-close" data-modal-close="modal-fork">${SVG.close}</button>
         </div>
         <div class="modal-body">
           <div class="form-group">
@@ -1301,7 +1585,7 @@ function renderForkModal() {
           </div>
         </div>
         <div class="modal-footer">
-          <button class="btn btn-secondary" onclick="closeModal('modal-fork')">Cancel</button>
+          <button class="btn btn-secondary" data-modal-close="modal-fork">Cancel</button>
           <button class="btn btn-primary" id="btn-fork-ok">
             ${SVG.fork} Fork
           </button>
@@ -1311,11 +1595,11 @@ function renderForkModal() {
   `;
 }
 
-window.selectMem = function(m) {
+function selectMem(m) {
   document.querySelectorAll('.mem-option').forEach(el => {
     el.classList.toggle('selected', parseInt(el.dataset.mem) === m);
   });
-};
+}
 
 /* --- Actions ---------------------------------------------- */
 async function sandboxAction(action, sbId) {
@@ -1537,6 +1821,14 @@ function attachListeners() {
     }
   });
 
+  // Status badge — the way back to a dismissed banner (with no token, nothing
+  // polls, so nothing else would ever re-offer the paste box).
+  const statusBadge = document.getElementById('mock-badge');
+  statusBadge?.addEventListener('click', reopenBanner);
+  statusBadge?.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); reopenBanner(); }
+  });
+
   // Sandbox view specifics
   attachSandboxViewListeners();
 
@@ -1548,6 +1840,23 @@ function attachListeners() {
     overlay.addEventListener('click', e => {
       if (e.target === overlay) closeModal(overlay.id);
     });
+  });
+
+  // Modal controls. These were inline onclick/oninput attributes; the CSP the
+  // console is served under has no 'unsafe-inline' for scripts, so every
+  // handler has to be registered here.
+  document.querySelectorAll('[data-modal-close]').forEach(btn => {
+    btn.addEventListener('click', () => closeModal(btn.dataset.modalClose));
+  });
+
+  const vcpus = document.getElementById('new-sb-vcpus');
+  vcpus?.addEventListener('input', () => {
+    const out = document.getElementById('new-sb-vcpus-val');
+    if (out) out.textContent = vcpus.value;
+  });
+
+  document.querySelectorAll('#mem-opts .mem-option').forEach(opt => {
+    opt.addEventListener('click', () => selectMem(parseInt(opt.dataset.mem, 10)));
   });
 
   // Keyboard: Escape — attach only once to avoid stacking handlers
@@ -1609,16 +1918,25 @@ function attachTreeViewListeners() {
   document.getElementById('tree-ns-filter')?.addEventListener('change', e => {
     state.treeNs = e.target.value;
     const treeContent = document.getElementById('fork-tree-content');
-    if (treeContent) treeContent.innerHTML = renderTreeContent();
+    if (treeContent) {
+      treeContent.innerHTML = renderTreeContent();
+      attachTreeNodeListeners();
+    }
+  });
+  attachTreeNodeListeners();
+}
+
+function attachTreeNodeListeners() {
+  document.querySelectorAll('.tree-node-group[data-sb-id]').forEach(g => {
+    g.addEventListener('click', () => treeNodeClick(g.getAttribute('data-sb-id')));
   });
 }
 
-// Tree node click handler (global to work with SVG onclick)
-window._treeNodeClick = function(sbId) {
+function treeNodeClick(sbId) {
   const sb = state.sandboxes.find(s => s.id === sbId);
   if (!sb) return;
   toast(`${sb.name} — ${sb.state} (${sb.id})`, 'info', 2500);
-};
+}
 
 /* --- Main render ------------------------------------------ */
 function render() {
@@ -1650,25 +1968,28 @@ function render() {
 }
 
 /* --- Escape helpers --------------------------------------- */
+/* ' is escaped too: without it this is only safe inside double-quoted
+   attributes, and one single-quoted attribute anywhere reopens the hole. */
 function escHtml(str) {
   return String(str)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 function escAttr(str) { return escHtml(str); }
 
 /* --- Boot ------------------------------------------------- */
 document.addEventListener('DOMContentLoaded', () => {
+  // Reveal app after JS loads to prevent FOUC
+  document.getElementById('app')?.classList.add('ready');
+
   // Initial skeleton render
   render();
 
-  // First poll
-  poll().then(() => {
-    // Start polling loop
-    setInterval(() => {
-      poll();
-    }, POLL_INTERVAL_MS);
-  });
+  // poll() reschedules itself on every path that should continue, and stops on
+  // the ones that should not (no token, rejected token). A setInterval here
+  // would poll straight through both.
+  poll();
 });

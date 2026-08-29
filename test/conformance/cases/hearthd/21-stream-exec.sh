@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Streamed exec (v4 P5.1): POST /sandboxes/{id}/exec?stream=1 returns SSE
 # whose data: payloads are JSON frames — {"stream":"stdout"|"stderr","data"}
 # chunks, then one terminal {"done":true,...}. The buffered path must be

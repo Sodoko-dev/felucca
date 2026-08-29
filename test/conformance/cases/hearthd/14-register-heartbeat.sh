@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Agent registration contract, exercised WITHOUT polluting the fleet: we
 # re-register an existing node with its own current values, which must be an
 # idempotent-by-hostname update that preserves the node id (the live agents
@@ -27,6 +28,7 @@ hd POST /api/v1/agents/heartbeat "{\"id\":\"$cf_rid\",\"mem_free_mib\":$cf_mf,\"
 assert_status 200 "heartbeat for known node"
 assert_body_empty "heartbeat response"
 
-hd POST /api/v1/agents/heartbeat '{"id":"node-00000000-0","mem_free_mib":1,"vm_count":0,"pool_size":0}'
+# Well-formed (node- + 26 hex, the shape hearthd mints) but never registered.
+hd POST /api/v1/agents/heartbeat '{"id":"node-cf0000000000000000deadbeef","mem_free_mib":1,"vm_count":0,"pool_size":0}'
 assert_status 404 "heartbeat for unknown node"
 assert_body_exact '{"error":"unknown node"}' "unknown-node body exact"

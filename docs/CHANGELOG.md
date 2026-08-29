@@ -562,6 +562,109 @@ request id followed from an API call through hearthd's journal into the
 owning agent's journal; bench table in BENCHMARKS.md. Zero vz crashes under the bench's ~90 VM
 operations; one kata-lab-1 wedge during the verify diagnosis (above).
 
+## v4 security hardening (2026-08-29, Go+Rust) — successive adversarial rounds
+
+Several review passes over the shipped v4 surface. What makes this entry worth
+reading is that **two of them found a vulnerability introduced by the previous
+round's remediation**, so the notes below record the ordering constraints, not
+just the features.
+
+**Auth, and what a credential reaches**
+
+- Both binaries refuse to start on an empty, placeholder (`REPLACE_WITH…`,
+  `hearth-lab-token`) or short token — 32 chars hearthd, 16 agent. An empty
+  token authorizes nobody. Open mode is only the named `hearthd
+  --insecure-no-auth`, WARN'd at every start and again on a non-loopback bind.
+- `bind`'s host part is honoured (it used to be discarded, so a configured
+  `127.0.0.1:8080` still served the world). A bind hearthd cannot honour
+  literally is fatal; an overlay-unreachable bind is a loud startup WARN.
+- `/metrics` is admin-gated. Tenant keys get 404, not 403.
+- **Per-node agent credentials, both directions.** Enrollment with a one-time
+  join token mints `hearth_nt_…`, keyed on the node's `host:port`. hearthd
+  presents it dialing that node — structurally, through a `nodeDial` whose only
+  constructor derives the credential from the node's identity, so no call site
+  can put `cfg.Token` on the wire (the earlier procedural rule was obeyed at
+  nine sites and missed at the two in the lifecycle sweep, shipping the fleet
+  admin key to every node on a 15s timer). The agent persists it to
+  `<data_dir>/node-token` 0600, refuses to start if it is readable more widely,
+  presents it on register/heartbeat, and accepts it inbound alongside the shared
+  token — with no fallback back to the shared token, or one forced failure would
+  downgrade the agent into handing over the fleet key.
+- **A node is its own principal, not a tenant string.** Node credentials reach
+  an allowlist of two routes (register, heartbeat) and 404 elsewhere; within
+  them they are bound to their own address, hostname and node id and may not
+  spend a join token. Modelling a node as a tenant id — where admin is `""` —
+  would have put it one typo from being a second admin.
+- **Re-join proof of possession**: a join token authorizes *an* enrollment, not
+  a *specific node*, and the pubkey is caller-written, so re-joining an enrolled
+  pubkey without that node's current `node_token` is a 409. Recovery is a fresh
+  WireGuard key.
+- Grandfathering is bounded to **once per database** (`node_creds_seeded`), so
+  "this node has no credential yet" is not a state an attacker can create by
+  registering an address.
+- Node authentication costs no store read (in-memory sha256 index); the
+  remaining pre-auth store reads are bounded at 4 in flight, because
+  `store/sqlite.go` caps the pool at one connection.
+
+**The brute-force guard, and its two regressions**
+
+- Failed credentials are counted per source address on both credential gates.
+  Past 10 failures the wait doubles (1s, 2s, 4s…), capped at 60s — or **2s**
+  when the key provably stands for many clients, which the shipped
+  loopback-behind-Caddy topology always does.
+- **A later round's finding, in one line: the credential must be evaluated
+  BEFORE the backoff.** Ordering it the other way — the shape an earlier
+  remediation had —
+  was a global unauthenticated denial of service: `gateAuth` runs on every
+  `/api/` path, the shipped config declares no trusted proxy so every client
+  shares one `127.0.0.1` key, and each failure refreshed the decay clock. One
+  anonymous client sending a bad bearer every ~10s held the entire control
+  plane, operators and worker nodes included, in a 429 that never expired. A
+  correct token is now always served.
+- **And the round after that: a success must NOT clear the record.** A wipe-on-success
+  is reachable by anyone sharing the key, so the console's own authenticated
+  poll reset whatever a guesser behind the same proxy had accumulated. Only
+  quiet time forgives now — one failure per 15s.
+- The guard's own eviction is ranked (unpenalized first, then lowest count) so a
+  spray across forged sources evicts itself rather than flushing established
+  records.
+
+**Forwarded client addresses — closed by configuration, not code**
+
+- `X-Forwarded-For` is honoured only from peers inside `trusted_proxies`
+  (default **empty**); the chain is walked right-to-left, bounded to 16 hops and
+  never split whole (a ~1 MiB run of commas used to build a ~500k-element slice
+  per unauthenticated request); a malformed CIDR is fatal at startup.
+- `X-Real-IP` got its own opt-in, `trust_x_real_ip` (default **false**), because
+  it carries no chain of custody: hearthd cannot tell a value the proxy wrote
+  from one it forwarded verbatim. Setting it without `trusted_proxies` is a
+  startup failure.
+- `MaxHeaderBytes` dropped from Go's 1 MiB default to 16 KiB — the XFF parse is
+  on the pre-auth path.
+- **The residual is not closable in code.** hearthd cannot distinguish a header
+  its proxy *wrote* from one the proxy *forwarded*. An edge proxy listed in
+  `trusted_proxies` must overwrite `X-Forwarded-For`
+  (`header_up X-Forwarded-For {remote_host}` / `proxy_set_header
+  X-Forwarded-For $remote_addr`); nginx's bare `proxy_pass` forwards the
+  client's own header verbatim, and the commonly-copied
+  `$proxy_add_x_forwarded_for` appends rather than replaces. DEPLOYMENT.md §7.1
+  is now written as a requirement with an operator-runnable check.
+
+**Everything else operator-visible**
+
+- Unguessable ids (104 bits from `crypto/rand`), a 1 MiB body cap ahead of every
+  route including the pre-auth join route, bounded display names, API-key
+  expiry + listing, agent listener off the wildcard by default, host-side
+  guest→host fences the agent refuses to serve without.
+
+Docs: DEPLOYMENT.md §6.2 (throttle), §6.7 (per-node credentials), §7.1
+(forwarded addresses), API-V2.md §6, ARCHITECTURE.md "v4 security hardening",
+ADR-0004 and ADR-0006 amendments. Three previous doc passes each left a stale
+claim behind — most recently "a throttled source is refused even with the
+correct token", which survived a sweep that edited the paragraph around it — so
+this round re-verified every authentication, throttling and 429 statement in
+`docs/` against the source rather than against the previous text.
+
 ## Backlog (v3+, in order)
 
 branch (uffd CoW fork of running VMs) → cross-tenant nftables isolation →

@@ -11,7 +11,28 @@
 set -euo pipefail
 
 PHASE="${1:?phase required: inject|roll-agents|roll-hearthd|goldens|verify}"
-TOKEN="${TOKEN:-hearth-lab-token}"
+
+# The lab token authenticates a root-privileged agent API, so it is never a
+# literal in the repo: TOKEN/HEARTH_TOKEN from the environment, then a file
+# kept outside the tree.
+TOKEN_FILE="${HEARTH_TOKEN_FILE:-$HOME/.config/hearth/lab-token}"
+TOKEN="${TOKEN:-${HEARTH_TOKEN:-}}"
+if [ -z "$TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
+  TOKEN="$(tr -d " \t\r\n" < "$TOKEN_FILE")"
+fi
+if [ -z "$TOKEN" ]; then
+  echo "ERROR: no lab token." >&2
+  echo "  export TOKEN=..., export HEARTH_TOKEN=..., or write it to $TOKEN_FILE" >&2
+  echo "  (generate one with: openssl rand -hex 32)" >&2
+  exit 1
+fi
+# The phases below splice the token into `bash -c` strings over limactl, so a
+# token carrying shell metacharacters would execute rather than authenticate.
+case "$TOKEN" in
+  *[!A-Za-z0-9._-]*)
+    echo "ERROR: lab token has characters outside [A-Za-z0-9._-]; use a hex token." >&2
+    exit 1 ;;
+esac
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 CP_VM=infra-saas-lab
 GUEST_BIN_VM='$HOME/.cargo-target/hearth-guest/aarch64-unknown-linux-musl/release/hearth-guest'

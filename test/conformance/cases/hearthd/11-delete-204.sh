@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Delete: 204 empty; a deleted sandbox is gone (404 with the exact body).
 hd DELETE "/api/v1/sandboxes/$CF_CHILD_ID"
 assert_status 204 "DELETE child"

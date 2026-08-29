@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Lifecycle policies + usage aggregation (v4 P5.2/P5.3): per-tenant idle
 # auto-sleep defaults, per-sandbox overrides, asleep-TTL auto-delete, and
 # GET /tenants/{id}/usage. The hearthd sweep runs every 15s, so each policy

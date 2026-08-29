@@ -97,6 +97,12 @@ gateway already handles streaming responses (FlushInterval).
   footprint to anyone who can scrape it (the rest of the API avoids exactly
   this existence/sizing leak). The authenticated usage endpoint serves
   per-tenant data instead; an authenticated metrics surface is deferred to P6.
+  *(Amended 2026-08-29: "the open `/metrics` endpoint" describes P5, not the
+  code today — `/metrics` requires the admin token since the v4 hardening pass,
+  and P6 delivered the authenticated surface as `GET /api/v1/metrics/tenants`.
+  The rejection itself still holds: tenant-labeled series stay off `/metrics`
+  regardless, because the admin scrape credential is a wider audience than the
+  tenant-inventory data warrants. See the ADR-0010 amendment.)*
 - Exec attempts now append an `"exec"` usage event (one INSERT per exec) —
   transition pairs cannot count execs, and per-tenant exec counts were a P5
   deliverable. Reachability: admin for any tenant; a tenant key for exactly

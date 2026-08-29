@@ -1,8 +1,33 @@
 # ADR-0010 — Observability, bench, and HA groundwork
 
-Status: accepted (v4 P6, 2026-08-09). Implements PLAN-v4.md Phase 6 minus the
-two explicitly-deferred tracks (HA implementation, uffd CoW fork), which get
-groundwork documents instead of code.
+Status: accepted (v4 P6, 2026-08-09), **amended 2026-08-29**. Implements
+PLAN-v4.md Phase 6 minus the two explicitly-deferred tracks (HA implementation,
+uffd CoW fork), which get groundwork documents instead of code.
+
+> **Amendment — 2026-08-29 (v4 security hardening): `/metrics` is no longer
+> open.** The decision recorded below kept `/metrics` unauthenticated and put
+> only the per-tenant gauges behind auth. That half of the decision is
+> **reversed**: `/metrics` now requires the **admin** bearer token and answers
+> 404 to a tenant key, like every other fleet-wide surface. Everything else in
+> this ADR stands — including `GET /api/v1/metrics/tenants`, which remains the
+> separate admin surface for the tenant-labeled series.
+>
+> Why it was wrong: the reasoning below weighed only the *tenant-inventory*
+> leak and treated the fleet-wide series as harmless. They are not. The open
+> scrape named every worker in `hostname` labels (a target list for the node
+> agents, which are root on their hosts), reported live fleet counts and
+> capacity, and — because rendering it takes the global state lock — handed
+> anyone who could reach the port a cheap lock-contention lever against the
+> control plane's hot path. Prometheus supports `bearer_token` natively, so the
+> cost of closing it is one scrape-config line.
+>
+> Operational consequence: an existing unauthenticated Prometheus job **breaks**
+> at upgrade and starts logging 401s. Scrape config in `deploy/grafana/`;
+> operator-facing detail in DEPLOYMENT.md §6.2, migration note in §11.
+>
+> Marked here rather than rewritten in place: this file records what was decided
+> and why, and a decision that was reversed for a reason worth remembering is
+> more useful annotated than erased. The paragraphs below are the original text.
 
 ## Decision
 
@@ -35,6 +60,9 @@ and prefetch agent calls are traceable too. No wire-shape change — headers
 only; pre-P6 agents simply ignore the header (mixed-fleet safe).
 
 ### Metrics — histograms on the open endpoint, tenant series behind auth
+
+*(REVERSED in part — see the 2026-08-29 amendment at the top: `/metrics` is
+admin-gated now. The histograms and their bounds are unchanged.)*
 
 - `/metrics` (open, unauthenticated — unchanged) gains three hand-rolled
   Prometheus histograms: `hearth_wake_duration_ms`,
@@ -106,6 +134,10 @@ for the comparison table is the marketing artifact this exists for.
   binary is unchanged.
 - /metrics stays safe-by-default; operators who want tenant dashboards make
   an explicit authenticated choice.
+  *(Amended 2026-08-29: "safe-by-default" was wrong about the fleet-wide series
+  too — `/metrics` now requires the admin token, so BOTH scrape jobs need
+  `bearer_token` and an existing open scrape breaks at upgrade. See the
+  amendment at the top.)*
 - Histogram state resets on restart (documented; standard practice).
 - Bench numbers become a per-release ritual — stale numbers in
   `docs/BENCHMARKS.md` should be treated as a release blocker, not decor.

@@ -32,7 +32,12 @@ and [Sprites](https://sprites.dev) (see `docs/research/`), self-hosted on your o
 - `docs/API-V3-EXEC.md` — v3.1 contract: vsock exec + fork re-IP (guest agent protocol)
 - `docs/ARCHITECTURE.md` — full architecture with diagrams (`docs/architecture-preview.html` to view)
 - `docs/DEPLOYMENT.md` — production deployment, builds, upgrades
-- `docs/adr/` — ADR-0000 (original plan), ADR-0001 (Zig, superseded), ADR-0002 (no k8s), ADR-0003 (Go+Rust port)
+- `docs/adr/` — ADR-0000 (original plan), ADR-0001 (Zig, superseded by ADR-0003), ADR-0002 (no k8s),
+  ADR-0003 (Go+Rust port), ADR-0004 (tenancy + SQLite), ADR-0005 (cross-tenant network isolation),
+  ADR-0006 (wg overlay + node join), ADR-0007 (sandbox ingress), ADR-0008 (templates + images),
+  ADR-0009 (streaming exec, lifecycle, usage), ADR-0010 (observability + bench).
+  Several carry **2026-08-29 amendments** from the v4 security hardening — ADR-0010's `/metrics`
+  decision was reversed outright; ADR-0004/0005/0006/0007 were extended.
 - `docs/research/` — Modal / Northflank / Sprites research reports
 
 ## Quick start
@@ -49,9 +54,34 @@ limactl shell infra-saas-lab -- bash -c \
    CARGO_TARGET_DIR=\$HOME/.cargo-target/hearth-agent \
    cargo build --release --target aarch64-unknown-linux-musl"
 
-# verify the running lab end-to-end
-bash scripts/verify-v2.sh hearth-lab-token        # 17 system checks incl. wake latency
-bash scripts/conformance-lab.sh hearth-lab-token  # full API contract suite
+# one-time: mint the lab token. `hearth-lab-token` is a known placeholder now
+# and both binaries refuse to start on it — the lab runs on a real secret,
+# same as production (deploy/config/local-lab.md).
+mkdir -p ~/.config/hearth
+openssl rand -hex 32 > ~/.config/hearth/lab-token
+chmod 0600 ~/.config/hearth/lab-token
+
+# verify the running lab end-to-end (scripts read the token from that file,
+# or take it as $1 / $HEARTH_TOKEN)
+bash scripts/verify-v2.sh          # 17 system checks incl. wake latency
+bash scripts/conformance-lab.sh    # full API contract suite
 
 # see docs/DEPLOYMENT.md for production installs (deploy/install.sh)
 ```
+
+> **Auth is not optional.** `hearthd` and `hearth-agent` refuse to start on an
+> empty, too-short or placeholder token; `/metrics` needs the admin token; and
+> the console takes its token from a paste-in banner only — never from
+> `localStorage` or a `?token=` URL. Details in
+> [`docs/DEPLOYMENT.md` §6](docs/DEPLOYMENT.md#6-tokens-auth-and-bind-addresses).
+
+> **Running hearthd behind a reverse proxy?** Read
+> [`docs/DEPLOYMENT.md` §7.1](docs/DEPLOYMENT.md#71-forwarded-client-addresses-required-reading)
+> first. hearthd ignores `X-Forwarded-For` unless the peer is inside
+> `trusted_proxies` (default: empty, trust nothing). List a proxy there **only**
+> if it overwrites the header (`header_up X-Forwarded-For {remote_host}` in
+> Caddy, `proxy_set_header X-Forwarded-For $remote_addr` in nginx — nginx's bare
+> `proxy_pass` forwards the client's own header verbatim). hearthd cannot tell a
+> header its proxy wrote from one it copied through, so this is closed by
+> configuration or not at all: half of it, in the wrong direction, lets any
+> client choose its own throttle key.

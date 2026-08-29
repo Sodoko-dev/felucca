@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/alpham/infra-saas/hearth/internal/agentclient"
 	"github.com/alpham/infra-saas/hearth/internal/model"
 	"github.com/alpham/infra-saas/hearth/internal/store"
 )
@@ -83,8 +82,12 @@ func (srv *Server) LifecycleLoop(stop <-chan struct{}) {
 // under the state lock, the (slow) agent calls happen after it is released.
 func (srv *Server) lifecycleSweep(now int64) {
 	type action struct {
-		id    string
-		sleep bool // false = delete
+		id string
+		// tenant is the owner at decision time. It is not used to decide
+		// anything — only to key the unreachable set, so that one tenant's
+		// transport failure cannot defer a co-tenant's reclamation. See below.
+		tenant string
+		sleep  bool // false = delete
 	}
 	var acts []action
 
@@ -107,77 +110,165 @@ func (srv *Server) lifecycleSweep(now int64) {
 		return t
 	}
 
-	srv.st.Lock()
-	for _, sb := range srv.st.Sandboxes {
-		switch sb.State {
-		case model.StateRunning:
-			idle := effectivePolicy(sb.IdleSleepS, lookup(sb.TenantID), false)
-			if idle <= 0 {
-				continue
-			}
-			last := sb.LastActivity
-			if last == 0 {
-				last = sb.CreatedAt
-			}
-			if now-last >= idle {
-				acts = append(acts, action{sb.ID, true})
-			}
-		case model.StateSleeping:
-			if sb.SleptAt == 0 {
-				// Sleeper adopted from a pre-P5 snapshot: stamp now, so a
-				// TTL counts from the upgrade — never retroactively.
-				sb.SleptAt = now
-				continue
-			}
-			ttl := effectivePolicy(sb.AsleepDeleteS, lookup(sb.TenantID), true)
-			if ttl > 0 && now-sb.SleptAt >= ttl {
-				acts = append(acts, action{sb.ID, false})
+	func() {
+		srv.st.Lock()
+		defer srv.st.Unlock()
+		for _, sb := range srv.st.Sandboxes {
+			switch sb.State {
+			case model.StateRunning:
+				idle := effectivePolicy(sb.IdleSleepS, lookup(sb.TenantID), false)
+				if idle <= 0 {
+					continue
+				}
+				last := sb.LastActivity
+				if last == 0 {
+					last = sb.CreatedAt
+				}
+				if now-last >= idle {
+					acts = append(acts, action{sb.ID, sb.TenantID, true})
+				}
+			case model.StateSleeping:
+				if sb.SleptAt == 0 {
+					// Sleeper adopted from a pre-P5 snapshot: stamp now, so a
+					// TTL counts from the upgrade — never retroactively.
+					sb.SleptAt = now
+					continue
+				}
+				ttl := effectivePolicy(sb.AsleepDeleteS, lookup(sb.TenantID), true)
+				if ttl > 0 && now-sb.SleptAt >= ttl {
+					acts = append(acts, action{sb.ID, sb.TenantID, false})
+				}
 			}
 		}
-	}
-	srv.st.Unlock()
+	}()
 
-	for _, a := range acts {
-		if a.sleep {
-			srv.autoSleep(a.id, now)
-		} else {
-			srv.autoDelete(a.id)
+	// unreachable collects, for THIS sweep only, the (node, tenant) pairs whose
+	// agent could not be reached at all (a transport failure, not an answer). It
+	// bounds what one dead node costs the sweep.
+	//
+	// The actions run sequentially and each dials through a client with a 30s
+	// timeout, so a permanently-gone node holding K expired sandboxes used to
+	// cost K x 30s EVERY pass: the 15s ticker just dropped its ticks and
+	// auto-sleep enforcement for every other tenant queued behind that one node.
+	// The number of expired sandboxes on a node is tenant-controllable and
+	// unbounded; the number of nodes is not. Skipping the rest of a node's
+	// actions once its agent has proved unreachable turns the first into the
+	// second.
+	//
+	// The TENANT is in the key, and that is not incidental. Keyed on the node
+	// alone, one transport failure deferred auto-sleep AND auto-delete for every
+	// remaining sandbox on that node — co-tenants included — for the whole pass.
+	// A tenant who can keep their own node's agent timing out once per sweep
+	// (their workload is what makes it time out) would then suppress idle
+	// reclamation for everyone else on that node indefinitely, and idle
+	// reclamation is the mechanism that frees that node's RAM. So the skip is
+	// scoped to the tenant whose action actually proved the node unreachable.
+	//
+	// The cost that buys back is bounded and not tenant-controllable: at most one
+	// dial per (dead node, tenant with sandboxes on it) per sweep, where the
+	// tenant count is an operator-provisioned number, instead of one per expired
+	// sandbox, which any single tenant can inflate at will.
+	//
+	// It keys on a TRANSPORT failure and nothing else. An agent that ANSWERS —
+	// 500, 409, anything — is reachable and cheap, and its refusal is about that
+	// one sandbox; treating those as "node is down" would let one permanently
+	// failing sandbox defer its neighbours on a healthy node forever.
+	//
+	// Nothing is abandoned: an action skipped here is retried on the next sweep,
+	// exactly as a failed one is. See autoDelete on why the record stays.
+	unreachable := map[nodeTenant]bool{}
+
+	// Rotate where the pass starts. acts is built in deterministic state order,
+	// so a fixed start means the same sandboxes are always enforced first and,
+	// whenever a sweep runs long enough for the 15s ticker to drop a tick, the
+	// same tail is always the part that loses it — permanently, to the same
+	// tenants. Whoever sits at the head of the state order would starve everyone
+	// behind them. Rotating gives every action an equal share of the head across
+	// successive sweeps; nothing else about the pass depends on the order.
+	off := 0
+	if len(acts) > 0 {
+		off = int(srv.sweepSeq.Add(1) % uint64(len(acts)))
+	}
+	// Sleeps before deletes. Both are bounded above, but auto-sleep is the
+	// deadline-carrying half (a sandbox burning a node's RAM past its idle
+	// policy), while a delete is of something already asleep — so if a sweep is
+	// going to run long, it runs long after the sleeps, not before them.
+	for i := range acts {
+		if a := acts[(i+off)%len(acts)]; a.sleep {
+			srv.autoSleep(a.id, a.tenant, now, unreachable)
 		}
 	}
+	for i := range acts {
+		if a := acts[(i+off)%len(acts)]; !a.sleep {
+			srv.autoDelete(a.id, a.tenant, unreachable)
+		}
+	}
+}
+
+// nodeTenant is the key of the per-sweep unreachable set: a node's agent address
+// and the tenant whose action proved it unreachable. See lifecycleSweep for why
+// the tenant belongs in the key.
+type nodeTenant struct {
+	addr   string
+	tenant string
+}
+
+// nodeUnreachable records a hearthd→agent transport failure against addr, for
+// this tenant, for the remainder of one sweep. err is the dial error: only a
+// transport failure counts (resp is nil), never a status the agent answered with.
+func nodeUnreachable(unreachable map[nodeTenant]bool, addr, tenant string, err error) {
+	if unreachable == nil || err == nil || addr == "" {
+		return
+	}
+	unreachable[nodeTenant{addr, tenant}] = true
 }
 
 // autoSleep is the sweep's twin of the sleep handler: best-effort (an agent
 // failure is just retried by the next sweep), and it GCs the sandbox's
 // dynamic (ensure-created, all-digit-named) exposes — the ADR-0007 deferral.
 // The next gateway request re-ensures them; auto-wake makes that seamless.
-func (srv *Server) autoSleep(id string, now int64) {
+// unreachable is the sweep's per-pass set of (node, tenant) pairs whose agent
+// could not be reached; see lifecycleSweep.
+func (srv *Server) autoSleep(id, tenant string, now int64, unreachable map[nodeTenant]bool) {
 	agentAddr, state := srv.agentAddrAndState(id)
 	if state != model.StateRunning || agentAddr == "" {
 		return // raced a manual transition or lost the node; next sweep re-decides
 	}
+	if unreachable[nodeTenant{agentAddr, tenant}] {
+		// This tenant already timed this node out once this sweep; retried next
+		// pass. A co-tenant on the same node is unaffected — see lifecycleSweep.
+		return
+	}
 	// Each sweep action is its own traceable actor: the ID lets operators
 	// correlate agent sleep calls with this sandbox's sweep decision.
 	sweepID := newTraceID("sweep")
-	host, port := agentclient.SplitHostPort(agentAddr)
-	resp, err := agentclient.Request(host, port, http.MethodPost, "/v1/vms/"+id+"/sleep", nil, srv.cfg.Token, sweepID)
+	// Through the dial choke point like every other hearthd→agent call: the
+	// sweep gets THIS node's credential, never the control-plane admin token.
+	// It used to pass srv.cfg.Token, which made "set idle_sleep_s: 5 on a
+	// sandbox scheduled to a node I control" a 20-second recovery of the fleet
+	// admin key — see nodeDial.
+	resp, err := srv.dialNode(agentAddr).do(http.MethodPost, "/v1/vms/"+id+"/sleep", nil, sweepID)
 	if err != nil || resp.Status >= 300 {
+		nodeUnreachable(unreachable, agentAddr, tenant, err)
 		slog.Warn("lifecycle: auto-sleep agent call failed", "sandbox", id)
 		return
 	}
 
 	srv.st.SetSandboxState(id, model.StateSleeping)
 	var dynamic []model.Expose
-	srv.st.Lock()
-	if sb := srv.st.FindSandbox(id); sb != nil {
-		sb.SleptAt = now
-		srv.recordUsage(sb, "slept")
-		for _, e := range sb.Exposes {
-			if isAllDigits(e.Name) {
-				dynamic = append(dynamic, e)
+	func() {
+		srv.st.Lock()
+		defer srv.st.Unlock()
+		if sb := srv.st.FindSandbox(id); sb != nil {
+			sb.SleptAt = now
+			srv.recordUsage(sb, "slept")
+			for _, e := range sb.Exposes {
+				if isAllDigits(e.Name) {
+					dynamic = append(dynamic, e)
+				}
 			}
 		}
-	}
-	srv.st.Unlock()
+	}()
 	for _, e := range dynamic {
 		srv.dropExpose(id, e, sweepID)
 	}
@@ -187,29 +278,78 @@ func (srv *Server) autoSleep(id string, now int64) {
 	slog.Info("lifecycle: auto-slept sandbox", "sandbox", id, "reason", "idle")
 }
 
-// autoDelete is the sweep's twin of the delete handler (same best-effort
-// agent semantics).
-func (srv *Server) autoDelete(id string) {
+// autoDelete is the sweep's twin of the delete handler.
+//
+// It is NOT best-effort about the agent call, and that is the whole point. It
+// used to ignore the result ("_, _ =") and remove the sandbox regardless, which
+// meant any failure to reach the worker left a live microVM there with no
+// control-plane record: still holding vCPUs, memory and its nft DNAT rules,
+// unbillable, and unreachable by every API path — an orphan nobody would look
+// for. The credential split made that reachable on a 15-second timer rather
+// than only by operator action, but the bug was never really about credentials:
+// a node rebooting, a network blip, an agent restart all produced it.
+//
+// A failed call therefore leaves the record exactly as it was. The sandbox is
+// still asleep and still past its TTL, so the NEXT sweep retries — the state
+// machine is the retry loop, and no VM is abandoned by a transient failure. A
+// node that is permanently gone stops the retries from ever succeeding, which is
+// why the manual handler keeps an explicit ?force=1 (see deleteSandbox): the
+// sweep never abandons a VM on its own, and an operator always has a way to
+// resolve a record that can no longer be completed.
+//
+// The retry is bounded, though. Each attempt dials through a client with a 30s
+// timeout, so K expired sandboxes on a node that is permanently gone would cost
+// the sweep K x 30s on every pass — one dead node starving auto-sleep for every
+// other tenant. unreachable (see lifecycleSweep) collapses that to one dial per
+// dead node per TENANT per sweep. The record is still kept; only the redundant
+// attempts by the same tenant against an agent that has already proved
+// unreachable this pass are skipped.
+func (srv *Server) autoDelete(id, tenant string, unreachable map[nodeTenant]bool) {
 	var agentAddr string
-	srv.st.Lock()
-	sb := srv.st.FindSandbox(id)
-	if sb == nil || sb.State != model.StateSleeping {
-		srv.st.Unlock()
-		return // raced a manual transition; next sweep re-decides
-	}
-	usage := *sb
-	if sb.NodeID != nil {
-		if node := srv.st.FindNode(*sb.NodeID); node != nil {
-			agentAddr = node.Addr
+	var usage model.Sandbox
+	if !func() bool {
+		srv.st.Lock()
+		defer srv.st.Unlock()
+		sb := srv.st.FindSandbox(id)
+		if sb == nil || sb.State != model.StateSleeping {
+			return false // raced a manual transition; next sweep re-decides
 		}
+		usage = *sb
+		if sb.NodeID != nil {
+			if node := srv.st.FindNode(*sb.NodeID); node != nil {
+				agentAddr = node.Addr
+			}
+		}
+		return true
+	}() {
+		return
 	}
-	srv.st.Unlock()
+
+	if unreachable[nodeTenant{agentAddr, tenant}] {
+		// This tenant already timed this node out once this sweep. The record
+		// stays exactly as a failed attempt would leave it, and the next sweep
+		// retries. A co-tenant on the same node is unaffected.
+		slog.Warn("lifecycle: auto-delete deferred, this node's agent was already unreachable for this tenant this sweep; retrying next sweep",
+			"sandbox", id, "node", agentAddr)
+		return
+	}
 
 	// Each sweep action is its own traceable actor.
 	sweepID := newTraceID("sweep")
 	if agentAddr != "" {
-		host, port := agentclient.SplitHostPort(agentAddr)
-		_, _ = agentclient.Request(host, port, http.MethodDelete, "/v1/vms/"+id, nil, srv.cfg.Token, sweepID)
+		// Per-node credential, never srv.cfg.Token — see autoSleep and nodeDial.
+		resp, err := srv.dialNode(agentAddr).do(http.MethodDelete, "/v1/vms/"+id, nil, sweepID)
+		// A 404 means the VM is already gone on the worker: the record follows it.
+		if err != nil || (resp.Status >= 300 && resp.Status != 404) {
+			status := 0
+			if resp != nil {
+				status = resp.Status
+			}
+			nodeUnreachable(unreachable, agentAddr, tenant, err)
+			slog.Warn("lifecycle: auto-delete agent call failed, keeping the sandbox so its VM is not orphaned; retrying next sweep",
+				"sandbox", id, "node", agentAddr, "request_id", sweepID, "status", status, "err", err)
+			return
+		}
 	}
 	srv.st.RemoveSandbox(id)
 	if err := srv.persist(); err != nil {
@@ -228,21 +368,23 @@ func (srv *Server) dropExpose(id string, e model.Expose, reqID string) {
 
 	var agentAddr string
 	shared := false
-	srv.st.Lock()
-	if sb := srv.st.FindSandbox(id); sb != nil {
-		if sb.NodeID != nil {
-			if node := srv.st.FindNode(*sb.NodeID); node != nil {
-				agentAddr = node.Addr
+	func() {
+		srv.st.Lock()
+		defer srv.st.Unlock()
+		if sb := srv.st.FindSandbox(id); sb != nil {
+			if sb.NodeID != nil {
+				if node := srv.st.FindNode(*sb.NodeID); node != nil {
+					agentAddr = node.Addr
+				}
+			}
+			for _, other := range sb.Exposes {
+				if other.Name != e.Name && other.GuestPort == e.GuestPort {
+					shared = true
+					break
+				}
 			}
 		}
-		for _, other := range sb.Exposes {
-			if other.Name != e.Name && other.GuestPort == e.GuestPort {
-				shared = true
-				break
-			}
-		}
-	}
-	srv.st.Unlock()
+	}()
 
 	if agentAddr != "" && !shared {
 		if err := srv.agentUnexpose(agentAddr, id, e.GuestPort, reqID); err != nil {
@@ -250,8 +392,13 @@ func (srv *Server) dropExpose(id string, e model.Expose, reqID string) {
 			return
 		}
 	}
-	srv.st.Lock()
-	if sb := srv.st.FindSandbox(id); sb != nil {
+	func() {
+		srv.st.Lock()
+		defer srv.st.Unlock()
+		sb := srv.st.FindSandbox(id)
+		if sb == nil {
+			return
+		}
 		kept := sb.Exposes[:0]
 		for _, other := range sb.Exposes {
 			if other.Name != e.Name {
@@ -262,8 +409,7 @@ func (srv *Server) dropExpose(id string, e model.Expose, reqID string) {
 		if len(sb.Exposes) == 0 {
 			sb.Exposes = nil
 		}
-	}
-	srv.st.Unlock()
+	}()
 }
 
 // agentAddrAndState returns the sandbox's current state and its node's agent
@@ -314,12 +460,14 @@ func (srv *Server) routesActivity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().Unix()
-	srv.st.Lock()
-	for _, id := range req.SandboxIDs {
-		if sb := srv.st.FindSandbox(id); sb != nil {
-			sb.LastActivity = now
+	func() {
+		srv.st.Lock()
+		defer srv.st.Unlock()
+		for _, id := range req.SandboxIDs {
+			if sb := srv.st.FindSandbox(id); sb != nil {
+				sb.LastActivity = now
+			}
 		}
-	}
-	srv.st.Unlock()
+	}()
 	writeEmpty(w, 204)
 }

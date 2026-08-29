@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Agent delete: 204 empty, VM gone from the list; delete is idempotent —
 # unknown ids also get 204 (observed Zig reference behavior).
 ag DELETE "/v1/vms/$CF_VM2"
@@ -13,6 +14,9 @@ if printf '%s' "$R_BODY" | jq -e --arg a "$CF_VM1" --arg b "$CF_VM2" \
 else
   bad "deleted VMs still listed: $R_BODY"
 fi
-ag DELETE /v1/vms/sb-deadbeef-99999
+# Well-formed but never-created id: still 204. Idempotence is about the VM not
+# existing, not about the id being unparseable — a MALFORMED id is a 400
+# instead (agent case 12).
+ag DELETE /v1/vms/sb-cf0000000000000000deadbeef
 assert_status 204 "DELETE unknown VM (idempotent)"
 assert_body_empty "idempotent delete response"

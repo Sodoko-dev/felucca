@@ -3,7 +3,7 @@
 //! Port of Manager.reconcile / Manager.reconcileOne in backend/src/agent/vm.zig,
 //! branch-for-branch.
 
-use super::{Vm, VmState};
+use super::{valid_vm_id, Vm, VmState};
 use crate::ipalloc::Allocator;
 use crate::vm::meta::Meta;
 use std::path::Path;
@@ -46,6 +46,13 @@ fn reconcile_one(data_dir: &str, dir_name: &str, alloc: Option<&mut Allocator>) 
     let vm_name = meta.name.clone();
     // The on-disk dir name is authoritative for dir_id.
     let dir_id = meta.dir_id.clone();
+    // Adopting a record whose id or dir_id is not a plain path component would
+    // re-introduce the traversal the create path now rejects: every later
+    // write for this VM derives its path from these two strings.
+    if !valid_vm_id(&id) || !valid_vm_id(&dir_id) {
+        warn!(dir = %dir_name, "reconcile: skipped (id or dir_id is not a valid path component)");
+        return None;
+    }
     let vcpus = meta.vcpus;
     let mem_mib = meta.mem_mib;
     let slot = meta.slot;
@@ -220,6 +227,24 @@ mod tests {
         let vm = vms.iter().find(|v| v.id == "vm-sl").expect("vm-sl");
         assert_eq!(vm.state, VmState::Sleeping);
         assert_eq!(vm.pid, None);
+    }
+
+    #[test]
+    fn test_traversal_dir_id_is_not_adopted() {
+        // A meta whose dir_id escapes the instances tree must not become a
+        // live record: every later write for that VM derives its path from it.
+        let tmp = make_temp_dir();
+        let data_dir = tmp.path().to_str().unwrap();
+        let instances_dir = tmp.path().join("instances");
+        fs::create_dir_all(&instances_dir).unwrap();
+
+        let meta = r#"{"id":"vm-evil","name":"vm-evil","dir_id":"../../etc/hearth","vcpus":1,"mem_mib":256,"pid":null,"slot":null,"ip":null,"state":"stopped"}"#;
+        write_meta(&instances_dir, "vm-evil", meta);
+        let bad_id = r#"{"id":"../../etc/hearth","name":"x","dir_id":"vm-evil2","vcpus":1,"mem_mib":256,"pid":null,"slot":null,"ip":null,"state":"stopped"}"#;
+        write_meta(&instances_dir, "vm-evil2", bad_id);
+
+        let vms = reconcile(data_dir, None);
+        assert!(vms.is_empty(), "traversal ids must not be adopted: {:?}", vms);
     }
 
     #[test]

@@ -15,7 +15,9 @@ mod vm;
 mod wg;
 
 use crate::ipalloc::Cidr;
-use crate::registration::{detect_advertise_addr, heartbeat_loop, NodeId};
+use crate::registration::{
+    adopt_node_token, detect_advertise_addr, heartbeat_loop, NodeId, NodeToken,
+};
 use crate::server::{build_router, AppState};
 use crate::vm::{pool::{liveness_loop, pool_loop}, Manager};
 use std::collections::HashMap;
@@ -50,7 +52,45 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let env: HashMap<String, String> = std::env::vars().collect();
 
-    let mut cfg = config::load(&args, &env);
+    let mut cfg = match config::load(&args, &env) {
+        Ok(c) => c,
+        Err(e) => {
+            fatal(&e);
+        }
+    };
+
+    // This API execs into every guest on the node and streams their disks, so
+    // an agent with no real credential is worse than an agent that is down.
+    // Refuse the empty token and the placeholders shipped in the repo rather
+    // than serving root-equivalent endpoints behind a public constant.
+    if let Err(e) = config::validate_token(&cfg.token) {
+        fatal(&format!("auth token: {e}"));
+    }
+
+    // This node's OWN credential, if hearthd has issued one. hearthd stopped
+    // reusing the fleet admin token as its hearthd→agent bearer: it mints a
+    // per-node token at enrollment and presents THAT. The agent accepts it
+    // inbound alongside the configured shared token, and presents it outbound
+    // on the agent routes instead of the fleet key.
+    //
+    // No file = never enrolled, or a deployment older than per-node
+    // credentials: the shared token carries both directions and the fleet
+    // keeps working. That fallback is the whole rollout story, so it must not
+    // be an error. A file that exists but cannot be used IS one — validate
+    // first, then fatal, so the guards above apply to this credential too and
+    // an agent never starts on one that hearthd's calls will not match.
+    let node_token: NodeToken = Arc::new(RwLock::new(String::new()));
+    match config::load_node_token(&cfg.data_dir) {
+        Ok(Some(t)) => {
+            *node_token.write().expect("fresh lock") = t;
+            info!(
+                path = %config::node_token_path(&cfg.data_dir),
+                "loaded this node's own control-plane credential"
+            );
+        }
+        Ok(None) => {}
+        Err(e) => fatal(&format!("node token: {e}")),
+    }
 
     // WireGuard overlay (v4 P2): a persisted enrollment reconfigures the
     // tunnel on every boot; --join + --join-token performs first enrollment.
@@ -100,6 +140,17 @@ async fn main() {
                     // consumed, and without wg.json the next boot would
                     // crash-loop on a burned token weeks later instead.
                     fatal(&format!("wg joined but state not persisted: {e}"));
+                }
+                // The same exchange mints this node's hearthd→agent credential
+                // (a re-join rotates it). Same reasoning as wg.json, and the
+                // stakes are higher: hearthd has already switched to this
+                // token, so losing it silently means every control-plane call
+                // to this node 401s from the next boot onward.
+                if !info.agent_token.is_empty() {
+                    if let Err(e) = adopt_node_token(&cfg.data_dir, &node_token, &info.agent_token)
+                    {
+                        fatal(&format!("wg joined but node credential unusable: {e}"));
+                    }
                 }
                 Some(info)
             }
@@ -154,6 +205,14 @@ async fn main() {
         cidr = %cfg.net_cidr,
         pool = cfg.pool_size,
         auth = if !cfg.token.is_empty() { "on" } else { "off" },
+        // Which credential this node answers to and dials out with. "shared"
+        // is the grandfathered case; re-enrolling with a join token moves it
+        // to "own". Never the value itself.
+        node_cred = if node_token.read().map(|t| !t.is_empty()).unwrap_or(false) {
+            "own"
+        } else {
+            "shared"
+        },
         "hearth-agent startup"
     );
 
@@ -168,13 +227,26 @@ async fn main() {
         cfg.token.clone(),
     );
 
-    // Host networking + IP allocator.
+    // Host networking + IP allocator. The port goes in first: the guest→host
+    // fence installed during bridge setup names it in its drop rule.
+    net::set_agent_port(cfg.port);
     mgr.setup_host().await;
 
     // Reconcile persisted instances, then rebuild tenant isolation for
     // adopted VMs (the nft sets don't survive an agent-host reboot).
     mgr.reconcile().await;
     mgr.refresh_isolation().await;
+    // Refuse to serve tenants on a node whose fences are not up. Without them
+    // every sandbox here shares one flat network, and nothing on the tenant's
+    // side would show it — hearthd would keep placing new tenants on a worker
+    // with no isolation at all. Run `--net off` to serve unnetworked guests
+    // deliberately instead.
+    if cfg.net && !net::netfilter_ready() {
+        fatal(
+            "cross-tenant isolation is not in force on this node (see the errors above) — \
+             refusing to serve tenants",
+        );
+    }
     // Ingress DNAT rules don't survive a host reboot either; rebuild them
     // from the exposes persisted in meta.json.
     mgr.refresh_ingress().await;
@@ -187,8 +259,14 @@ async fn main() {
         let aa = cfg.advertise_addr.clone();
         let tok = cfg.token.clone();
         let nid = Arc::clone(&node_id);
+        // The node token, not cfg.token, is what goes on the wire to
+        // /api/v1/agents/register and /api/v1/agents/heartbeat once hearthd
+        // has issued one — so a compromised worker no longer yields the fleet
+        // key. data_dir is where a rotation issued mid-run is persisted.
+        let ntok = Arc::clone(&node_token);
+        let ddir = cfg.data_dir.clone();
         tokio::spawn(async move {
-            heartbeat_loop(mgr2, cp, aa, cfg.port, tok, nid).await;
+            heartbeat_loop(mgr2, cp, aa, cfg.port, tok, nid, ntok, ddir).await;
         });
     }
 
@@ -212,13 +290,55 @@ async fn main() {
     let state = AppState {
         mgr: Arc::clone(&mgr),
         token: cfg.token.clone(),
+        // Same handle the registration loop writes rotations into, so the
+        // inbound gate accepts a freshly issued credential without a restart.
+        node_token: Arc::clone(&node_token),
     };
     let app = build_router(state);
 
-    let bind_addr = format!("0.0.0.0:{}", cfg.port);
+    // Never the wildcard by default: 0.0.0.0 includes the bridge gateway that
+    // every guest routes through, which puts this root API one curl away from
+    // inside any tenant's sandbox. An explicit host in `bind` wins; otherwise
+    // we listen on the management address we advertise to the control plane.
+    // `bind_any` is the deliberate opt-out for operators who front the agent
+    // with their own firewall.
+    let bind_ip = if cfg.bind_any {
+        "0.0.0.0".to_string()
+    } else {
+        match config::bind_host(&cfg.bind) {
+            "" => cfg.advertise_addr.clone(),
+            host => host.to_string(),
+        }
+    };
+    if cfg.net && config::addr_in_guest_cidr(&bind_ip, cidr) {
+        fatal(&format!(
+            "refusing to listen on {} — it is inside the guest CIDR {}, which every sandbox can route to",
+            bind_ip, cfg.net_cidr
+        ));
+    }
+    let bind_addr = config::join_host_port(&bind_ip, cfg.port);
     let listener = TcpListener::bind(&bind_addr).await
         .unwrap_or_else(|e| panic!("bind {}: {}", bind_addr, e));
     info!(addr = %bind_addr, "listening");
+
+    // Loopback is served alongside the management address, not instead of it:
+    // local health checks and the rollout scripts use 127.0.0.1:<port>, and no
+    // guest can route there. This is why dropping the wildcard costs nothing.
+    if !cfg.bind_any && bind_ip != "127.0.0.1" {
+        let loopback = format!("127.0.0.1:{}", cfg.port);
+        match TcpListener::bind(&loopback).await {
+            Ok(l) => {
+                info!(addr = %loopback, "listening");
+                let app2 = app.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(l, app2).await {
+                        error!(err = %e, "loopback listener stopped");
+                    }
+                });
+            }
+            Err(e) => warn!(addr = %loopback, err = %e, "loopback listener unavailable"),
+        }
+    }
 
     axum::serve(listener, app).await
         .unwrap_or_else(|e| panic!("serve: {}", e));

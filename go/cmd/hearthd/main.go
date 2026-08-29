@@ -1,10 +1,10 @@
 // hearthd — Hearth control plane (Go port).
-// Listens on 0.0.0.0:<port>, exposes the REST API, schedules sandboxes onto
-// agents, serves the static UI, and persists in-memory state to a JSON file.
+// Listens on the configured bind address, exposes the REST API, schedules
+// sandboxes onto agents, serves the static UI, and persists in-memory state to
+// a JSON file.
 package main
 
 import (
-	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -20,6 +20,14 @@ import (
 	"github.com/alpham/infra-saas/hearth/internal/wg"
 )
 
+// maxHeaderBytes caps the request head (request line + all headers) on every
+// listener. Go's default is 1 MiB, which is three orders of magnitude more than
+// any request hearthd serves needs and is per-request attacker-controlled work:
+// X-Forwarded-For is parsed on the auth path, so a ~1 MiB header was a ~1 MiB
+// allocation an unauthenticated client could ask for at will. 16 KiB leaves
+// generous room for a bearer, a trace id and a proxy chain.
+const maxHeaderBytes = 16 << 10
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
@@ -27,6 +35,49 @@ func main() {
 	if err != nil {
 		slog.Error("config", "err", err)
 		os.Exit(1)
+	}
+
+	// A bind hearthd cannot honour literally is fatal: the listener must be
+	// the one the operator wrote, never a wildcard hearthd substituted for a
+	// host it failed to parse.
+	if err := cfg.ValidateBind(); err != nil {
+		slog.Error("bind", "err", err)
+		os.Exit(1)
+	}
+
+	// Malformed trusted-proxy CIDRs are fatal for the same reason: the
+	// operator believes forwarded client addresses are honoured, and silently
+	// dropping the entry changes who the throttle counts.
+	if err := cfg.ValidateTrustedProxies(); err != nil {
+		slog.Error("trusted-proxies", "err", err)
+		os.Exit(1)
+	}
+
+	// The admin API is remote root on every worker in the fleet, so refuse to
+	// listen without a usable token — same reasoning as the wg-overlay guard
+	// below, applied to every deployment. Open mode exists only when the
+	// operator names it.
+	if err := cfg.ValidateAuth(); err != nil {
+		slog.Error("auth", "err", err)
+		os.Exit(1)
+	}
+	if cfg.InsecureNoAuth {
+		slog.Warn("INSECURE MODE: --insecure-no-auth is set, the admin API accepts every caller unauthenticated — loopback binds and lab use only",
+			"bind", cfg.Bind, "addr", cfg.ListenAddr())
+		// Worth saying twice: off-box reachability turns the lab escape hatch
+		// into an open control plane, which is remote root on every worker.
+		if host, _, err := net.SplitHostPort(cfg.ListenAddr()); err == nil {
+			if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+				slog.Warn("INSECURE MODE on a non-loopback address: every host that can route here has full admin access", "addr", cfg.ListenAddr())
+			}
+		}
+	}
+
+	// A bind that cannot be reached at hearthd's overlay address takes the
+	// whole enrolled fleet offline without a single error on this side: agents
+	// just get connection refused. Cheap to say here, expensive to find later.
+	if problem := cfg.OverlayBindProblem(); problem != "" {
+		slog.Warn("OVERLAY UNREACHABLE: "+problem, "bind", cfg.Bind, "addr", cfg.ListenAddr(), "wg_ip", cfg.WgIP)
 	}
 
 	// Ensure the db directory exists (best effort).
@@ -64,7 +115,16 @@ func main() {
 			slog.Warn("could not initialize store", "err", err)
 		}
 	} else if err := db.LoadInto(st); err != nil {
-		slog.Warn("could not load state", "path", cfg.DBPath, "err", err)
+		// Fatal, not a warning. LoadInto appends as it scans and does not
+		// clear what it already appended, so a failed load leaves a partially
+		// populated working set — and the first mutation calls persist(), whose
+		// SaveSnapshot deletes every row before reinserting the ones in memory.
+		// Serving from a short load therefore destroys the rest of the database
+		// on the next write. Refusing to start is recoverable by an operator;
+		// a truncated sandboxes table is not.
+		slog.Error("could not load state: refusing to start rather than serve a partial working set the first write would make permanent",
+			"path", cfg.DBPath, "err", err)
+		os.Exit(1)
 	}
 
 	srv := server.New(cfg, st, db)
@@ -118,15 +178,16 @@ func main() {
 	// hourly usage-event retention. Runs for the process lifetime.
 	go srv.LifecycleLoop(make(chan struct{}))
 
-	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
+	addr := cfg.ListenAddr()
 	slog.Info("hearthd listening", "addr", addr, "ui_dir", cfg.UIDir, "db", cfg.DBPath,
-		"auth", map[bool]string{true: "on", false: "off"}[cfg.Token != ""])
+		"auth", map[bool]string{true: "off (--insecure-no-auth)", false: "on"}[cfg.InsecureNoAuth])
 
 	httpSrv := &http.Server{
-		Addr:         addr,
-		Handler:      srv.Handler(),
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
+		Addr:           addr,
+		Handler:        srv.Handler(),
+		ReadTimeout:    30 * time.Second,
+		WriteTimeout:   60 * time.Second,
+		MaxHeaderBytes: maxHeaderBytes,
 	}
 
 	// Optional Let's Encrypt TLS (v4 P2.3). Empty tls_domain means plain
@@ -145,11 +206,12 @@ func main() {
 
 		// :443 — public TLS endpoint, same handler/timeouts as the plain server.
 		tlsSrv := &http.Server{
-			Addr:         ":443",
-			Handler:      srv.Handler(),
-			ReadTimeout:  30 * time.Second,
-			WriteTimeout: 60 * time.Second,
-			TLSConfig:    m.TLSConfig(),
+			Addr:           ":443",
+			Handler:        srv.Handler(),
+			ReadTimeout:    30 * time.Second,
+			WriteTimeout:   60 * time.Second,
+			MaxHeaderBytes: maxHeaderBytes,
+			TLSConfig:      m.TLSConfig(),
 		}
 		go func() {
 			// Cert/key paths empty: certificates come from autocert.
@@ -160,8 +222,19 @@ func main() {
 		}()
 
 		// :80 — ACME HTTP-01 challenges + redirect everything else to https.
+		// Same bounds as the other two listeners: this one is public whenever
+		// tls_domain is set, and it used to be a bare http.ListenAndServe with
+		// Go's 1 MiB header default and no timeouts at all — the one listener
+		// the maxHeaderBytes invariant did not actually cover.
+		acmeSrv := &http.Server{
+			Addr:           ":80",
+			Handler:        m.HTTPHandler(nil),
+			ReadTimeout:    30 * time.Second,
+			WriteTimeout:   60 * time.Second,
+			MaxHeaderBytes: maxHeaderBytes,
+		}
 		go func() {
-			if err := http.ListenAndServe(":80", m.HTTPHandler(nil)); err != nil {
+			if err := acmeSrv.ListenAndServe(); err != nil {
 				slog.Error("tls listen :80", "err", err)
 				os.Exit(1)
 			}

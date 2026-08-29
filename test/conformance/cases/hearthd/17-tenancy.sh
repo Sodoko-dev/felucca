@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Tenancy: admin CRUD for tenants/keys, tenant-scoped sandbox visibility,
 # cross-tenant isolation (404, not 401), and quota enforcement (429 + "quota"
 # in body). Requires HEARTH_TOKEN to be the admin key. Uses req_as for all
@@ -46,6 +47,79 @@ else
   CF_T1_KEY2_ID=""
 fi
 
+# ── Block 3b: admin lists a tenant's keys (the revocation recovery path) ─────
+# Without a listing, DELETE /api/v1/keys/{id} is unusable for a leaked key
+# whose id nobody kept, and the only remediation left is raw SQL against the
+# database. The listing must therefore identify a key WITHOUT being able to
+# reconstruct it: `prefix` is the secret's first 14 chars ("hearth_sk_" + 4),
+# enough to match a leaked value against a row, useless for guessing the rest.
+if [ -n "$CF_T1_ID" ]; then
+  hd GET "/api/v1/tenants/$CF_T1_ID/keys"
+  assert_status 200 "GET /api/v1/tenants/{id}/keys (admin)"
+  assert_jq '.keys | type == "array" and length >= 2' "both cf-t1 keys are listed"
+  # Inside `.keys | ...` the dot is the array, so both sides of the comparison
+  # count the same thing (a `(.keys | length)` after the pipe would be an error).
+  assert_jq '.keys | (map(select((.id | type) == "string" and (.prefix | length) == 14)) | length) == length' \
+    "every listed key carries an id and a 14-char prefix"
+  assert_jq '[.keys[] | keys_unsorted[]] | unique == ["created_at","expires_at","id","prefix","revoked_at"]' \
+    "key view has exactly {id,prefix,created_at,expires_at,revoked_at}"
+  # The secret and its verifier must not be reachable from the listing.
+  if printf '%s' "$R_BODY" | grep -qF "$CF_T1_KEY"; then
+    bad "the full api_key is present in the key listing"
+  else
+    ok "full api_key absent from the listing"
+  fi
+  if printf '%s' "$R_BODY" | grep -qE '"(key_hash|hash|secret|api_key)"'; then
+    bad "the key listing exposes a hash/secret field"
+  else
+    ok "no hash or secret field in the key listing"
+  fi
+  # The prefix really is the first 14 chars of the issued secret — that is what
+  # makes it usable for matching a leak.
+  cf_t1_pfx="${CF_T1_KEY:0:14}"
+  assert_jq "[.keys[] | select(.prefix == \"$cf_t1_pfx\")] | length == 1" \
+    "the first key's prefix matches the secret it was minted from"
+
+  hd GET "/api/v1/tenants/tn-cf-nonexistent/keys"
+  assert_status 404 "GET keys of an unknown tenant -> 404"
+fi
+if [ -n "$CF_T1_KEY" ] && [ -n "$CF_T1_ID" ]; then
+  # A tenant reading its own key list would hand every holder of one key the
+  # ids of all the others; the whole /api/v1/tenants surface is admin-only.
+  req_as "$CF_T1_KEY" "$HEARTH_API" GET "/api/v1/tenants/$CF_T1_ID/keys"
+  if [ "$R_STATUS" != "200" ]; then
+    ok "GET own keys with a tenant key -> non-200 ($R_STATUS, expect 404)"
+  else
+    bad "GET /api/v1/tenants/{id}/keys with a tenant key: expected non-200, got 200"
+  fi
+fi
+
+# ── Block 3c: keys may carry an expiry, and an expired key is dead ──────────
+# An expiring key is the only way to hand out a credential that stops working
+# on its own; if expiry were recorded but not enforced it would be worse than
+# no expiry at all, because the operator would believe the key was gone.
+CF_T1_KEY_EXP=""
+if [ -n "$CF_T1_ID" ]; then
+  hd POST "/api/v1/tenants/$CF_T1_ID/keys" '{"expires_in_s":-1}'
+  assert_status 400 "expires_in_s=-1 -> 400"
+  hd POST "/api/v1/tenants/$CF_T1_ID/keys" '{"expires_in_s":31536001}'
+  assert_status 400 "expires_in_s beyond the one-year cap -> 400"
+
+  cf_now=$(date +%s)
+  hd POST "/api/v1/tenants/$CF_T1_ID/keys" '{"expires_in_s":1}'
+  assert_status 201 "POST keys with expires_in_s=1 -> 201"
+  assert_jq "(.expires_at | type) == \"number\" and .expires_at >= $cf_now and .expires_at <= $((cf_now + 60))" \
+    "expires_at is the mint time plus the requested TTL"
+  CF_T1_KEY_EXP=$(printf '%s' "$R_BODY" | jq -r '.api_key // empty')
+fi
+if [ -n "$CF_T1_KEY_EXP" ]; then
+  sleep 2
+  req_as "$CF_T1_KEY_EXP" "$HEARTH_API" GET /api/v1/sandboxes
+  assert_unauthorized "expired key is refused exactly like a revoked one"
+else
+  skip "skipping expired-key block (expiring key unavailable)"
+fi
+
 # ── Block 4: admin lists tenants ─────────────────────────────────────────────
 hd GET /api/v1/tenants
 assert_status 200 "GET /api/v1/tenants (admin)"
@@ -68,6 +142,15 @@ fi
 if [ -n "$CF_T1_KEY2_ID" ]; then
   hd DELETE "/api/v1/keys/$CF_T1_KEY2_ID"
   assert_status 204 "DELETE /api/v1/keys/{id} (revoke rotated key)"
+  # Revocation is visible in the listing — an operator has to be able to see
+  # that the key they revoked is the one that died.
+  if [ -n "$CF_T1_ID" ]; then
+    hd GET "/api/v1/tenants/$CF_T1_ID/keys"
+    assert_jq "[.keys[] | select(.id == \"$CF_T1_KEY2_ID\" and .revoked_at != null)] | length == 1" \
+      "revoked key shows revoked_at in the listing"
+  fi
+  hd DELETE "/api/v1/keys/$CF_T1_KEY2_ID"
+  assert_status 404 "DELETE an already-revoked key -> 404"
 else
   skip "skipping key-revoke block (CF_T1_KEY2_ID unavailable)"
 fi

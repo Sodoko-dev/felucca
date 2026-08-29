@@ -1,13 +1,19 @@
-# Observability (v4 P6): histogram series on the open /metrics, the
-# tenant-inventory leak guard (ADR-0009/0010 — no tenant-labeled series on
-# the unauthenticated endpoint), the authenticated admin metrics surface,
-# and X-Hearth-Request-Id minting. Deliberately boots NO VMs — presence and
-# auth semantics only, so this case stays cheap and vz-crash-proof.
+# shellcheck shell=bash
+# Observability (v4 P6): histogram series on /metrics, the tenant-inventory
+# leak guard (ADR-0009/0010 — no tenant-labeled series on the fleet scrape),
+# the authenticated admin metrics surface, and X-Hearth-Request-Id minting.
+# Deliberately boots NO VMs — presence and auth semantics only, so this case
+# stays cheap and vz-crash-proof.
+#
+# /metrics is admin-gated now (case 13 pins that ladder). The leak guard below
+# is UNCHANGED by that: tenant-labeled series stay off the fleet scrape even
+# though it is authenticated, because the scrape credential is handed to a
+# Prometheus that does not need the tenant inventory.
 CF_OB_RUN="$$"
 
-# ── Block 1: open /metrics — histograms present, tenant series absent ───────
-hd GET /metrics '' none
-assert_status 200 "GET /metrics (open)"
+# ── Block 1: /metrics — histograms present, tenant series absent ────────────
+hd GET /metrics
+assert_status 200 "GET /metrics (admin)"
 for cf_ob_h in hearth_wake_duration_ms hearth_exec_duration_ms hearth_create_duration_ms; do
   if printf '%s' "$R_BODY" | grep -q "^${cf_ob_h}_bucket"; then
     ok "$cf_ob_h histogram present"
@@ -20,11 +26,11 @@ for cf_ob_h in hearth_wake_duration_ms hearth_exec_duration_ms hearth_create_dur
     bad "$cf_ob_h +Inf bucket missing"
   fi
 done
-# Leak guard: tenant-labeled series must NEVER appear on the open endpoint.
+# Leak guard: tenant-labeled series must NEVER appear on the fleet scrape.
 if printf '%s' "$R_BODY" | grep -q "hearth_tenant_"; then
-  bad "tenant-labeled series leaked onto the open /metrics"
+  bad "tenant-labeled series leaked onto the fleet /metrics"
 else
-  ok "no hearth_tenant_* on the open /metrics (leak guard)"
+  ok "no hearth_tenant_* on the fleet /metrics (leak guard)"
 fi
 # Legacy wake counters stay (pre-P6 dashboards).
 if printf '%s' "$R_BODY" | grep -q "^hearth_wake_ms_sum"; then
@@ -34,8 +40,12 @@ else
 fi
 
 # ── Block 2: admin metrics surface auth ladder ──────────────────────────────
-hd GET /api/v1/metrics/tenants '' none
-assert_status 401 "GET /api/v1/metrics/tenants without token -> 401"
+if [ "${HEARTH_INSECURE_NO_AUTH:-0}" = "1" ]; then
+  skip "HEARTH_INSECURE_NO_AUTH=1; admin-surface auth ladder needs a credential"
+else
+  hd GET /api/v1/metrics/tenants '' none
+  assert_unauthorized "GET /api/v1/metrics/tenants without token"
+fi
 hd GET /api/v1/metrics/tenants
 assert_status 200 "GET /api/v1/metrics/tenants (admin)"
 if printf '%s' "$R_BODY" | grep -q "hearth_tenant_sandboxes"; then
@@ -54,6 +64,16 @@ if [ -n "$CF_OB_KEY" ]; then
   else
     bad "tenant key on admin metrics: expected 404, got $R_STATUS"
   fi
+  # The fleet scrape is admin-only too: a valid tenant credential is not a
+  # scrape credential, and it gets the same 404 as any other admin surface —
+  # never 403, which would confirm the endpoint exists.
+  req_as "$CF_OB_KEY" "$HEARTH_API" GET /metrics
+  if [ "$R_STATUS" = "404" ]; then
+    ok "tenant key gets 404 on /metrics"
+  else
+    bad "tenant key on /metrics: expected 404, got $R_STATUS"
+  fi
+  assert_body_exact '{"error":"not found"}' "tenant-key /metrics body exact"
 fi
 
 # ── Block 3: request-id minting (raw curl — lib req() discards headers) ─────

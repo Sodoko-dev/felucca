@@ -32,6 +32,26 @@ All v1 endpoints unchanged. New:
 
 Sandbox JSON gains no new required fields; `ip` is now populated when networking is on (string, e.g. `"10.231.0.12"`), still `null` when `--net off`.
 
+### 2b. Request bounds and id shape (v4 hardening)
+
+Applies to every hearthd route, not only the ones above.
+
+| Rule | Behaviour |
+|---|---|
+| Request body size | Capped at **1 MiB** (`http.MaxBytesReader`), applied before any route is dispatched — including `POST /api/v1/nodes/join`, which runs ahead of the bearer gate |
+| `name`, `namespace` (create **and** fork child names) | 1..64 bytes, printable ASCII (0x20–0x7e), with `<`, `>`, `"`, `'`, `&` refused outright — these strings are rendered by the operator console. Otherwise **400** `{"error":"invalid name"}` / `{"error":"invalid namespace"}`. `namespace` defaults to `"default"` when absent |
+| `timeout_ms` on exec | Outside `[1, 300000]` → **400** `{"error":"timeout_ms out of range"}`, and the request never reaches the agent. **Refused, not clamped**: a negative value used to become an already-expired deadline. Absent → 30000. Both the buffered and `?stream=1` arms enforce it |
+
+**Id shape.** Sandbox and node ids are `"<prefix>-"` + **26 hex chars** — 13
+bytes from `crypto/rand`, 104 bits (`sb-…`, `node-…`). The persisted `seq`
+counter still advances, but it is **no longer part of the id**: a monotonic tail
+disclosed every other tenant's position in the issuance stream, and it cost
+label budget that entropy needs more — a sandbox id is a genuine bearer
+capability, because it appears in the public ingress label `<name>--<id>` (§3d)
+which the gateway does not otherwise authenticate. Clients must treat ids as
+opaque; nothing in the wire contract constrains their length or alphabet beyond
+this.
+
 ## 3. Agent endpoints (hearth-agent :9090)
 
 New, mirroring the control plane: `POST /v1/vms/{id}/sleep`, `POST /v1/vms/{id}/wake`,
@@ -54,8 +74,15 @@ States and sandbox JSON are unchanged; tenancy is enforced purely through scopin
 |---|---|---|---|
 | POST | `/api/v1/tenants` | `{"name", "max_sandboxes", "max_vcpus", "max_mem_mib", "max_disk_gb"}` (0 = unlimited) | 201 `{"tenant":{...},"api_key":"hearth_sk_…","key_id":"key-…"}` — the key is shown **once**. Duplicate name → 409. |
 | GET | `/api/v1/tenants` | — | 200 `{"tenants":[...]}` |
-| POST | `/api/v1/tenants/{id}/keys` | — | 201 `{"api_key":"hearth_sk_…","key_id":"key-…"}` (rotation: mint new, then revoke old) |
+| POST | `/api/v1/tenants/{id}/keys` | `{"expires_in_s"}` (optional; 0/absent = never expires, max 1 year) | 201 `{"api_key":"hearth_sk_…","key_id":"key-…","expires_at":<unix s, 0 = never>}` (rotation: mint new, then revoke old) |
+| GET | `/api/v1/tenants/{id}/keys` | — | 200 `{"keys":[{"id","prefix","created_at","expires_at","revoked_at"}]}` — never the secret or its hash |
 | DELETE | `/api/v1/keys/{id}` | — | 204; revocation is immediate. Unknown/already-revoked → 404. |
+
+The listing is the recovery path for a leaked key whose `key_id` nobody kept:
+`prefix` is the secret's first 14 chars (`hearth_sk_` + 4), enough to match a
+leaked value against a row and revoke it, useless for guessing the rest.
+Without it, `DELETE /api/v1/keys/{id}` is unusable and the only remediation is
+raw SQL. An expired key is rejected exactly like a revoked one (401).
 
 Scoping rules (apply to every sandbox route): a tenant key sees and acts on only its
 own sandboxes; foreign and unknown ids are indistinguishable (**404**, body
@@ -79,12 +106,19 @@ sharing its L2 segment. Design + deferred items: [ADR-0006](adr/ADR-0006-wiregua
 | Method | Path | Auth | Body | Result |
 |---|---|---|---|---|
 | POST | `/api/v1/join-tokens` | admin | `{"node_hint"?}` (≤64 chars) | 201 `{"id":"jt-…","token":"hearth_jt_…"}` — token shown **once**, sha256-only at rest, TTL 24h, single-use. Tenant keys → 404. (Minting works even with the overlay off; the token just can't be redeemed until it's on.) |
-| POST | `/api/v1/nodes/join` | the join token itself as bearer (routed before the normal bearer gate) | `{"pubkey","hostname"}` (44-char base64 pubkey) | 200 `{"overlay_ip","overlay_prefix","server_overlay_ip","server_pubkey","server_endpoint","keepalive_s"}`. Bad/used/expired token → uniform 401; overlay off → 503 (after the credential check); bad body → 400 **without** consuming the token. |
+| POST | `/api/v1/nodes/join` | the join token itself as bearer (routed before the normal bearer gate) | `{"pubkey","hostname","node_token"?}` (44-char base64 pubkey) | 200 `{"overlay_ip","overlay_prefix","server_overlay_ip","server_pubkey","server_endpoint","keepalive_s","agent_token"}`. `agent_token` is this node's own `hearth_nt_…` credential, shown **once**; a re-join mints a fresh one and retires the old. Bad/used/expired token → uniform 401; **already-enrolled pubkey without a matching `node_token` → 409** (see below); overlay off → 503 (after the credential check); bad body → 400 **without** consuming the token. |
 
 Semantics: the token is consumed **last** (after the peer row is persisted and
 the kernel peer is installed), so no failure mode burns it. Re-join with the
 same pubkey keeps the allocated overlay IP (while it fits the configured
-subnet). The agent enrolls with `--join <url> --join-token <tok>`, persists the
+subnet) — but must **prove possession** of that node's current credential in
+`node_token`, because a join token authorizes *an* enrollment without naming
+*which* node and the pubkey is caller-written; otherwise a token holder could
+rotate a live worker's credential out from under it. Unproven re-joins get
+`409`. `hearth-agent` does not send `node_token` (its body is `pubkey` +
+`hostname` only), so the supported re-enrollment is a **fresh WireGuard key**:
+remove `{data_dir}/wg.json` *and* `{data_dir}/wg.key` before restarting with a
+new join token. The agent enrolls with `--join <url> --join-token <tok>`, persists the
 grant to `{data_dir}/wg.json` (0600), and on every later boot brings the tunnel
 up from the file (which takes precedence over `--join`) and registers over the
 overlay (`advertise_addr` = its overlay IP). An unreadable or corrupt `wg.json`
@@ -222,10 +256,11 @@ stays on plain stderr by design.
 
 **Admin metrics surface** — `GET /api/v1/metrics/tenants` (admin token only;
 404 to tenant keys) serves the per-tenant Prometheus gauges
-(`hearth_tenant_{sandboxes,running,vcpus,mem_mib,disk_gb}`) that are
-deliberately kept OFF the open `/metrics` (tenant-inventory leak —
-ADR-0009). Scrape it as a second Prometheus job with bearer credentials;
-dashboard + scrape config in `deploy/grafana/`.
+(`hearth_tenant_{sandboxes,running,vcpus,mem_mib,disk_gb}`). They are kept
+off `/metrics` even though `/metrics` is itself admin-gated now (§7): the
+tenant inventory is a narrower audience than the fleet scrape credential —
+ADR-0009, and the ADR-0010 amendment that closed `/metrics`. **Both** jobs
+need `bearer_token`; dashboard + scrape config in `deploy/grafana/`.
 
 **Bench** — `scripts/bench.sh <endpoint> [token]` measures p50/p95 for
 create (cold + pool-claim), exec (buffered + stream first-frame), wake, and
@@ -259,6 +294,20 @@ fork; lab numbers live in [BENCHMARKS.md](BENCHMARKS.md).
   joins no pair and is isolated from all peers. Egress NAT and host↔guest traffic are
   unaffected. Tenant networks are node-scoped until the P2 overlay (per-node CIDRs are
   node-local). Design: [ADR-0005](adr/ADR-0005-cross-tenant-network-isolation.md).
+- **Three more fences around the bridge (v4 hardening)**, because the tenant `forward`
+  ruleset only ever sees IPv4 guest-to-guest traffic:
+  - `ip hearth input` — guest→host. Guests route through the bridge gateway, and that
+    traffic lands on the INPUT hook the forward chain never sees. Drops everything
+    arriving on `hearth0` except ICMP and `ct state established,related`, with the
+    agent's own port in an explicit drop rule.
+  - `bridge hearth forward` — accepts only ARP and IPv4 between bridge ports, dropping
+    the rest (link-local IPv6 above all). IPv6 is also disabled on `hearth0`.
+  - `netdev hearth <tap>` — one `policy drop` chain per tap pinning that guest's source
+    MAC, ARP sender MAC, ARP sender IP, and IPv4 source address. Without the ARP pin a
+    guest can move a victim's address in the bridge FDB onto its own port.
+
+  With `net = on`, the agent **refuses to serve** if any of these is not in force —
+  a node with no isolation must not keep accepting placements.
 
 ## 6. Configuration & production deployment (both binaries)
 
@@ -277,18 +326,89 @@ localhost/Lima paths — local lab and remote servers differ only by config.
 - **hearthd** template keys (v4 P4): `images_dir` (`HEARTH_IMAGES_DIR`,
   `--images-dir`, default `/var/lib/hearth/images`) — where template images
   live (captures land here; workers pull from `/api/v1/images/{name}`).
-- **hearth-agent** keys: `bind` (`HEARTH_AGENT_BIND`, default `0.0.0.0:9090`),
+- **hearthd** proxy keys: `trusted_proxies` (`HEARTH_TRUSTED_PROXIES`,
+  `--trusted-proxies`) — CIDRs whose `X-Forwarded-For` is honoured when hearthd
+  resolves the client address (the throttle key below). JSON array in the config
+  file, comma-separated for env/flag; a bare IP is normalised to `/32`/`/128`.
+  **Default empty = trust nothing** (use the connection peer); a malformed entry
+  is a startup failure, not a skipped line. Chain walk is right-to-left, stopping
+  at the first untrusted hop — the left-most (client-written) entry is never
+  used. `trust_x_real_ip` (`HEARTH_TRUST_X_REAL_IP`, `--trust-x-real-ip`,
+  **default false**) is a separate opt-in for `X-Real-IP`: while it is false that
+  header is ignored from every peer, declared or not, because it carries no chain
+  of custody. Setting it with `trusted_proxies` empty is a **startup failure**.
+  DEPLOYMENT.md §7.1 has the Caddy and nginx directives that must accompany
+  `trusted_proxies` — an edge proxy that forwards the client's own header while
+  being listed as trusted hands every client its own throttle key, and no code
+  in hearthd can detect that.
+- **hearth-agent** keys: `bind` (`HEARTH_AGENT_BIND`, default `0.0.0.0:9090` —
+  but the wildcard is **not honoured verbatim**; see below), `bind_any`
+  (`HEARTH_BIND_ANY`, `--bind-any`, default **off**),
   `control_plane` (`HEARTH_CONTROL_PLANE`, e.g. `https://hearth.example.com` or `http://192.168.104.3:8080`),
   `advertise_addr` (`HEARTH_ADVERTISE_ADDR`; **if unset, auto-detect** the source IP used to reach
   the control plane), `data_dir` (`HEARTH_DATA_DIR`, default `/srv/ignis`), `token` (`HEARTH_TOKEN`),
   `pool_size`, `net`, `net_cidr`, `join_url`/`join_token` (`HEARTH_JOIN_URL`/`HEARTH_JOIN_TOKEN`,
   `--join`/`--join-token` — first-boot enrollment only; the persisted `wg.json` wins afterwards).
-- **Auth**: when `token` is set on hearthd, every `/api/*` and agent-registration request requires
-  `Authorization: Bearer <token>`; agents send it on register/heartbeat; hearthd sends it on proxy
-  calls to agents (agents verify when their own `token` is set). `/healthz`, `/metrics`, and static
-  UI stay open. Constant-time comparison. TLS: in-binary autocert when `tls_domain` is set
-  (v4 P2.3, see above); a reverse proxy (caddy/nginx) remains a valid alternative —
-  both documented in DEPLOYMENT.md.
+- **The agent does not bind the wildcard by default.** `0.0.0.0` (or `::`, `*`,
+  or an empty host) in `bind` is treated as "unset" and the listener uses the
+  node's `advertise_addr` instead, **plus** `127.0.0.1` on the same port. A
+  concrete host in `bind` is honoured as written. The wildcard includes the
+  bridge gateway every guest routes through, which would put this root API one
+  curl away from inside any tenant's sandbox; `bind_any` is the named opt-out
+  for operators who front the agent with their own firewall. A `bind` that
+  resolves to an address **inside `net_cidr`** is a startup failure.
+- **Auth**: every `/api/*` and agent-registration request requires
+  `Authorization: Bearer <token>`. `/metrics` requires the **admin** token (a tenant key gets 404);
+  `/healthz` and static UI stay open. Constant-time comparison. TLS: in-binary autocert when
+  `tls_domain` is set (v4 P2.3, see above); a reverse proxy (caddy/nginx) remains a valid
+  alternative — both documented in DEPLOYMENT.md.
+- **Three principals, and a node is not a tenant.** The admin token is unrestricted; a tenant API
+  key (`hearth_sk_`) reaches its own sandboxes; a **node credential** (`hearth_nt_`) reaches an
+  explicit allowlist of two routes — `POST /api/v1/agents/register` and
+  `POST /api/v1/agents/heartbeat` — and 404s on everything else. Within those two it is bound to
+  its own node: register only **its own address** (403 otherwise), never a hostname another node
+  holds (403), heartbeat only **its own node id** (404 otherwise, the same answer as an unknown
+  id), and it may **not** spend a `join_token` (403 — enrolling is the operator's act). Node
+  authentication costs **no store read**: tokens are resolved through an in-memory sha256 index
+  built at startup and updated on every rotation.
+- **The per-node credential is used in BOTH directions, not just outbound.** A node's address is
+  caller-supplied, so dialing it with the admin key made "point hearthd at a host I control" equal
+  to "hand me the admin key"; requiring the admin token back on register/heartbeat meant every
+  worker held the fleet key. Enrollment with a one-time join token (`POST /api/v1/nodes/join`, or
+  `POST /api/v1/agents/register` carrying `join_token`) mints `hearth_nt_<48 hex>` and returns it
+  **once** as an additive `agent_token` field. hearthd stores it keyed on the node's
+  **`host:port`** (two agents on one host are two nodes; rows written under the older bare-host key
+  are migrated on first use) and presents only that when dialing. `hearth-agent` persists it to
+  `<data_dir>/node-token` mode 0600, presents it outbound on the two agent routes, and accepts it
+  inbound alongside its configured `token`; it never falls back to the shared token after the node
+  token is rejected. A node with no credential row is dialed with **no** bearer. Nodes present
+  before the change are grandfathered onto the shared token exactly once.
+  ⚠️ The worker still needs the shared token configured: **template image pulls**
+  (`GET /api/v1/images/{name}`) are admin-only and a node credential cannot reach them. See
+  DEPLOYMENT.md §6.7.
+- **No token is no longer "auth off"**: an empty `token` authorizes nobody, and both binaries
+  **refuse to start** on an empty, placeholder (`REPLACE_WITH…`, `hearth-lab-token`) or short
+  token — under 32 chars for hearthd, under 16 for the agent. Open mode is a deliberate,
+  named choice: `hearthd --insecure-no-auth` (loopback labs; logged as a WARN at every start).
+  The agent has no equivalent flag. `bind`'s host part is honoured, so a configured
+  `127.0.0.1:8080` really is loopback-only — see DEPLOYMENT.md §6.3 for which topology wants which.
+- **Brute-force guard**: failed credentials are counted per source address, on both credential
+  gates (the bearer gate — every `/api/*` path and `/metrics` — and `POST /api/v1/nodes/join`).
+  Past 10 failures the wait doubles (1s, 2s, 4s …) and a *further failure inside that window* is
+  answered **429** `{"error":"too many failed attempts"}` with `Retry-After` (whole seconds,
+  minimum 1). **The credential is evaluated first and a correct token is always served** — the
+  guard shapes the answer to an attempt that already failed, so it can never refuse a request
+  that would have succeeded, and one anonymous client cannot deny the control plane to everyone
+  who shares its key. (An earlier revision evaluated the backoff first and did exactly that; any
+  text claiming a correct token is refused while throttled is stale.) Distinguish this 429 from
+  the quota 429 by the header: the quota response carries none. A success does **not** clear the
+  record — only quiet time decays it (one forgiven failure per 15s), because a wipe-on-success is
+  reachable by anyone sharing the key. The wait is capped at 60s for a source hearthd can
+  attribute to one client, and at **2s** when the key provably stands for many (peer is a declared
+  proxy that forwarded nothing attributable, or nothing is declared and the peer is
+  loopback/private — the shipped topology). "Shared" is decided from config and peer address only,
+  never from a header. The source key is the connection peer unless that peer is inside
+  `trusted_proxies` *and* forwarded a hop the chain can attest to.
 - Build targets: `zig build -Dtarget=aarch64-linux-musl` **and** `-Dtarget=x86_64-linux-musl`
   must both produce static binaries (production servers are typically x86_64).
 
@@ -307,11 +427,15 @@ hearth_create_duration_ms_{bucket,sum,count}  histogram (v4 P6; to 201, cold+cla
 ```
 
 Histogram state is in-memory (resets on restart — standard Prometheus
-counter semantics). Per-tenant gauges are deliberately **not** emitted here:
-`/metrics` is unauthenticated, so tenant-labeled series would leak the
-tenant inventory and per-tenant footprint. They are served by the
-**authenticated** `GET /api/v1/metrics/tenants` surface instead (§3g);
-per-tenant billable history stays on `GET /api/v1/tenants/{id}/usage` (§3f).
+counter semantics). `/metrics` itself now requires the **admin** bearer token:
+the scrape names every worker in hostname labels, reports live fleet counts,
+and takes the global state lock, so an open endpoint is both reconnaissance and
+a lock-contention lever for anyone who can reach the port. Scrape it with
+`bearer_token`. Per-tenant gauges stay off it regardless (ADR-0009) — a
+tenant-labeled series set leaks the tenant inventory to every holder of the
+admin scrape credential, and belongs on the separate
+`GET /api/v1/metrics/tenants` surface (§3g); per-tenant billable history stays
+on `GET /api/v1/tenants/{id}/usage` (§3f).
 
 ## 8. UI requirements
 
@@ -319,6 +443,21 @@ per-tenant billable history stays on `GET /api/v1/tenants/{id}/usage` (§3f).
 - Row actions: sleep (running/paused), wake (sleeping), fork (running/paused/sleeping — opens
   the existing fork modal, now functional), all via the endpoints above; show `wake_ms` in a toast.
 - `ip` column shows the address when present.
-- Optional bearer token: read from `localStorage.hearth_token` or `?token=` query param (which
-  stores it and strips it from the URL); attach `Authorization: Bearer` to all API fetches; on
-  401 show a non-blocking banner prompting for a token.
+- Bearer token: held in a module-scoped variable that dies with the tab. **Not** read from
+  `localStorage`/`sessionStorage` (web storage hands the admin token to any script on the
+  origin) and **not** accepted from `?token=` (that value is already in browser history and in
+  every fronting proxy's access log — the console strips it from the URL and ignores it).
+  The paste-in banner is the only entry point; an upgraded console also purges any
+  `hearth_token` an older build left in storage.
+- Attach `Authorization: Bearer` to all API fetches. **Do not poll without a token**: each
+  attempt is counted by hearthd's per-source brute-force guard (§6), so a 3s timer with no
+  credential walks a shared source key past the threshold in ~20s. That does not cost the
+  operator their own access (a correct token is served regardless), but it turns every
+  unauthenticated answer on that key — including anyone else behind the same proxy address —
+  into a `429`, and it buries the real 401 the operator needs to see.
+- Distinguish live from not-live at all times. A header badge plus a banner name the state —
+  `LIVE`, `NO TOKEN`, `NO AUTH` (401), `THROTTLED` (429, with the `Retry-After` countdown),
+  `STALE` (last good data retained), `MOCK` (fixtures; the control plane was never reached).
+  Silently substituting fixtures for a fleet the operator believes is real is a defect.
+- 429 is two different answers: with `Retry-After` it is the auth throttle (wait); without, it
+  is the tenant quota gate (the caller's own answer).
