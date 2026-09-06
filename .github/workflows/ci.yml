@@ -1,0 +1,117 @@
+# Hearth CI — runs on every pull request and on pushes to main.
+#
+# What runs here is exactly what the repo documents as the local check
+# (go/README.md "Build & test", docs/DEPLOYMENT.md build commands,
+# sdk/ts/package.json scripts, scripts/verify-units.sh), on GitHub-hosted
+# Linux runners. Nothing here needs /dev/kvm.
+#
+# Deliberately NOT here: test/conformance (needs a live hearthd + hearth-agent
+# with Firecracker, i.e. the lab fleet), scripts/verify-v2.sh, bench.sh.
+# Those stay lab-only until self-hosted KVM runners exist.
+#
+# Formatter gates (gofmt / cargo fmt / clippy) are intentionally absent: the
+# tree does not currently pass them, and adding the gate belongs in its own PR
+# together with the reformat, not silently inside the CI bootstrap.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A new push to the same PR cancels the run that is still in flight.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  go:
+    name: hearthd + hearth-gw (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test ./...
+      - name: static cross-builds (the shipped shape, CGO off)
+        run: |
+          for arch in amd64 arm64; do
+            for bin in hearthd hearth-gw; do
+              CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+                go build -trimpath -ldflags='-s -w' -o "/tmp/$bin-$arch" "./cmd/$bin"
+            done
+          done
+          ls -l /tmp/hearthd-* /tmp/hearth-gw-*
+
+  rust:
+    name: ${{ matrix.crate }} (Rust)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [agent, guest]
+    defaults:
+      run:
+        working-directory: rust/${{ matrix.crate }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/${{ matrix.crate }}
+      - name: cargo test
+        run: cargo test --locked
+      - name: static musl release build (the shipped shape)
+        # Both crates are dependency-free static binaries (DEPLOYMENT.md);
+        # this proves the musl target still links, on the runner's arch.
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          ls -l target/x86_64-unknown-linux-musl/release/hearth-${{ matrix.crate }}
+
+  sdk-ts:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # No lockfile is committed (package-lock.json is gitignored), so this
+      # is `npm install`, not `npm ci`. The SDK has zero runtime deps; only
+      # typescript and @types/node are pulled.
+      - name: npm install
+        run: npm install --no-audit --no-fund
+      - name: npm test
+        run: npm test
+      - name: npm run build
+        run: npm run build
+
+  systemd-units:
+    name: systemd units (systemd-analyze verify)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: verify deploy/systemd/*.service against a staged root
+        run: bash scripts/verify-units.sh
