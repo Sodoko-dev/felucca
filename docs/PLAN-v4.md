@@ -2,7 +2,29 @@
 
 ## Context
 
-Hearth v3.1 is feature-complete and lab-verified (conformance 132/0, verify-v2 21/0) but single-tenant, single-node, lab-grade. The goal now is a **public, scaled deployment** whose competitive edge is the gap found in competitor issue trackers: *self-hosted/bare-metal-flexible microVM sandboxes with hardware isolation and fork* (E2B's top-requested unmet feature; Daytona only offers it with container isolation). **Deployment flexibility is itself the product**: control plane, gateway, and workers must be placeable on any mix of bare metal, nested-virt cloud VMs, and NAT'd home-lab hardware.
+Hearth v3.1 is feature-complete and lab-verified (conformance 132/0, verify-v2 21/0) but single-tenant, single-node, lab-grade. The goal now is a **public, scaled deployment** whose competitive edge is the gap found in competitor issue trackers: *self-hosted/bare-metal-flexible microVM sandboxes with hardware isolation and fork* (E2B's top-requested unmet feature). **Deployment flexibility is itself the product**: control plane, gateway, and workers must be placeable on any mix of bare metal, nested-virt cloud VMs, and NAT'd home-lab hardware.
+
+> **Competitive landscape re-checked 2026-09-06** (primary sources; supersedes the
+> earlier "Daytona only forks with container isolation" claim, which is now wrong).
+> *Live fork of a running VM with memory + processes* is shipped as a **hosted**
+> feature by Daytona (Linux VM class, stable since 0.202.0 / July 2026, latency
+> unpublished), Morph Cloud (<250 ms, parent keeps running) and boxd (100–200 ms).
+> E2B pauses/resumes the *same* sandbox only (no fork; open feature request);
+> Sprites forks storage only (~90 s, child cold-boots); Modal restores snapshots
+> into new gVisor containers; Northflank's pause is scale-to-zero (RAM lost).
+> **None of them is self-hostable with fork**: Daytona's AGPL line was archived
+> June 2026 at v0.190.0 without the VM class; E2B's Apache-2.0 infra self-hosts
+> but needs Nomad + Consul + Postgres + ClickHouse + registry + Cloudflare on a
+> flat VPC and has no fork; Kata Containers exposes no snapshot/restore API at all
+> (its own Limitations.md), so Kata-on-Firecracker cannot sleep/wake/fork;
+> firecracker-containerd and microsandbox are single-node. No product documents
+> NAT'd home-lab workers. Hearth's measured position (BENCHMARKS.md, nested-virt
+> lab): wake p50 75 ms is competitive with every published resume figure; fork
+> p50 1.1 s / p95 1.9 s is 5–10× behind the hosted leaders — the uffd CoW fork
+> (research/uffd-cow-fork.md, target p95 <100 ms; note its "10–20 s" baseline
+> was an estimate made before bench.sh existed) is the one engineering gap that
+> matters. Hosted pricing clusters at ~$0.10–0.17/h for a 2 vCPU / 4 GB sandbox,
+> so price is not the differentiator; self-hosted + mixed/NAT'd fleet + fork is.
 
 First consumer: **Sodoko** (`../odoo-engineer-kosuke`) — Lovable-for-Odoo. Each sandbox runs a full self-hosted Odoo system (odoo v17/18/19-CE + postgres + agent-server, extendable with Traccar/Chatwoot) as a docker-compose stack *inside* the microVM, with AI agents exec'ing in-guest and end users reaching the Odoo web UI via per-sandbox public URLs (today: traefik `dynamic-sandboxes.yml`; sandboxes prototyped on Sprites — Hearth replaces that). Direction may broaden to more products/users, so everything is built tenant-generic.
 
