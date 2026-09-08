@@ -14,3 +14,6 @@ sdk/ts/node_modules/
 sdk/ts/dist/
 sdk/ts/.test-dist/
 sdk/ts/package-lock.json
+
+# Enola code-graph snapshots (generated)
+.enola/
