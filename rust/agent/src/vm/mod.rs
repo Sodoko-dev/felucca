@@ -1,4 +1,4 @@
-//! Firecracker microVM lifecycle manager for hearth-agent (v2).
+//! Firecracker microVM lifecycle manager for felucca-agent (v2).
 //!
 //! Port of backend/src/agent/vm.zig — Manager struct, all lifecycle methods.
 //! Data layout: {data_dir}/instances/{dir_id}/ with rootfs.ext4, fc.sock,
@@ -62,7 +62,7 @@ pub const DEFAULT_IMAGE: &str = "ubuntu-base";
 /// no ".." — so an id can only ever name a direct child of the instances
 /// directory, never traverse out of it.
 ///
-/// The character class is wider than an image name's (ids from hearthd are
+/// The character class is wider than an image name's (ids from feluccad are
 /// mixed case, e.g. `sb-<hex>`), but the traversal-relevant rules are identical.
 pub fn valid_vm_id(id: &str) -> bool {
     if id.is_empty() || id.len() > 64 {
@@ -106,7 +106,7 @@ pub struct CreateSpec {
     pub disk_gb: u32,
 }
 
-/// One hearthd-managed warm-pool template (v4 P4). `image_sha256` may be
+/// One feluccad-managed warm-pool template (v4 P4). `image_sha256` may be
 /// empty ("trust the local file"); `count` is the refill target.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PoolSpec {
@@ -324,7 +324,7 @@ pub enum ExecStreamOutcome {
 struct Inner {
     vms: Vec<Vm>,
     allocator: Option<Allocator>,
-    /// v4 P4: hearthd-managed warm-pool templates (set via PUT /v1/pools or
+    /// v4 P4: feluccad-managed warm-pool templates (set via PUT /v1/pools or
     /// the register response). The legacy config pool (pool_target) is NOT in
     /// this list — it is a separate always-present default spec.
     template_pools: Vec<PoolSpec>,
@@ -554,7 +554,7 @@ impl Manager {
         g.vms.iter().filter(|v| v.state == VmState::Pooled).count() as u32
     }
 
-    /// Replace the hearthd-managed template pools (PUT /v1/pools / register
+    /// Replace the feluccad-managed template pools (PUT /v1/pools / register
     /// response). Applied atomically or not at all: every spec is validated
     /// before any state changes. The legacy config pool (pool_target) is
     /// unaffected. The 5s refill loop picks the new set up on its next tick.
@@ -695,7 +695,7 @@ impl Manager {
     /// A VM that is running while the isolation transaction is not in force
     /// sits on a flat network with every other tenant on the node, and nothing
     /// on either tenant's side would show it. Refusing the create is the only
-    /// answer that fails closed; hearthd retries elsewhere.
+    /// answer that fails closed; feluccad retries elsewhere.
     async fn commit_or_isolate(self: &Arc<Self>, id: &str) -> Result<(), String> {
         if self.refresh_isolation().await {
             return Ok(());
@@ -944,7 +944,7 @@ impl Manager {
     /// v4 P5.4 (ADR-0008 deferral): collect image-cache entries nothing
     /// references anymore. Referenced = the image of any VM record (in-flight
     /// `Creating` records are inserted BEFORE ensure_image runs, so creates
-    /// are covered) or of any hearthd-pushed pool spec; `DEFAULT_IMAGE` is
+    /// are covered) or of any feluccad-pushed pool spec; `DEFAULT_IMAGE` is
     /// never collected (deploy-provisioned base). `min_age_secs` gates on
     /// mtime so a file being pulled or just published is never a candidate
     /// (tests pass 0). Each candidate is re-checked under its per-image
@@ -1070,10 +1070,10 @@ impl Manager {
         Ok((pid, vsock_on))
     }
 
-    /// True when `{data_dir}/images/.hearth-guest-v1` exists: the rootfs has the
+    /// True when `{data_dir}/images/.felucca-guest-v1` exists: the rootfs has the
     /// guest agent baked in, so cold boots should attach a vsock device.
     fn guest_agent_marker_present(&self) -> bool {
-        let marker = format!("{}/images/.hearth-guest-v1", self.data_dir);
+        let marker = format!("{}/images/.felucca-guest-v1", self.data_dir);
         Path::new(&marker).exists()
     }
 
@@ -1365,7 +1365,7 @@ impl Manager {
                 // Child inherits parent's tenant_id.
                 tenant_id: parent_tenant_id.clone(),
                 // Exposes are NOT inherited: the parent's node ports keep
-                // pointing at the parent; hearthd re-exposes the child.
+                // pointing at the parent; feluccad re-exposes the child.
                 exposes: Vec::new(),
                 // The child's rootfs is a reflink of the parent's — same
                 // image and disk size for accounting (no image interaction).
@@ -1611,7 +1611,7 @@ impl Manager {
     // ---- warm pool ----
 
     /// The full refill plan: the legacy config pool (always present when
-    /// pool_target > 0, exactly the pre-P4 shape) plus the hearthd-managed
+    /// pool_target > 0, exactly the pre-P4 shape) plus the feluccad-managed
     /// template pools.
     async fn pool_specs(&self) -> Vec<PoolSpec> {
         let mut specs = Vec::new();
@@ -2170,13 +2170,13 @@ mod tests {
     fn test_valid_vm_id_rejects_traversal() {
         // Was: these went straight into {data_dir}/instances/<id>, giving a
         // root-level write and a recursive delete anywhere the unit allows.
-        assert!(!valid_vm_id("../../../../etc/hearth"));
+        assert!(!valid_vm_id("../../../../etc/felucca"));
         // axum percent-decodes :id captures, so this is what the handler sees.
-        assert!(!valid_vm_id("../../../etc/hearth"));
+        assert!(!valid_vm_id("../../../etc/felucca"));
         assert!(!valid_vm_id(".."));
         assert!(!valid_vm_id("."));
         assert!(!valid_vm_id("a/b"));
-        assert!(!valid_vm_id("/etc/hearth"));
+        assert!(!valid_vm_id("/etc/felucca"));
         assert!(!valid_vm_id("a..b"));
         assert!(!valid_vm_id(""));
         assert!(!valid_vm_id(&"a".repeat(65)));
@@ -2193,11 +2193,11 @@ mod tests {
     #[test]
     fn test_instance_path_refuses_to_leave_the_instances_dir() {
         assert_eq!(
-            instance_path("/srv/hearth", "vm-1").as_deref(),
-            Some("/srv/hearth/instances/vm-1")
+            instance_path("/srv/felucca", "vm-1").as_deref(),
+            Some("/srv/felucca/instances/vm-1")
         );
-        assert!(instance_path("/srv/hearth", "../../etc/hearth").is_none());
-        assert!(instance_path("/srv/hearth", "").is_none());
+        assert!(instance_path("/srv/felucca", "../../etc/felucca").is_none());
+        assert!(instance_path("/srv/felucca", "").is_none());
     }
 
     fn mgr_for(data_dir: String) -> Arc<Manager> {
@@ -2213,18 +2213,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_traversal_id_does_not_remove_anything_outside_instances() {
-        // DELETE /v1/vms/..%2F..%2F..%2Fetc%2Fhearth used to reach
+        // DELETE /v1/vms/..%2F..%2F..%2Fetc%2Ffelucca used to reach
         // remove_dir_all on the decoded path without the VM having to exist.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap().to_string();
         let data_dir = format!("{}/srv", root);
         std::fs::create_dir_all(format!("{}/instances", data_dir)).unwrap();
-        let victim = format!("{}/etc/hearth", root);
+        let victim = format!("{}/etc/felucca", root);
         std::fs::create_dir_all(&victim).unwrap();
         std::fs::write(format!("{}/agent.json", victim), b"token").unwrap();
 
         let mgr = mgr_for(data_dir);
-        mgr.delete("../../etc/hearth").await.expect("delete is idempotent");
+        mgr.delete("../../etc/felucca").await.expect("delete is idempotent");
 
         assert!(std::fs::metadata(&victim).is_ok(), "config dir must survive");
         assert!(std::fs::metadata(format!("{}/agent.json", victim)).is_ok());
@@ -2239,7 +2239,7 @@ mod tests {
 
         let mgr = mgr_for(data_dir.clone());
         let spec = CreateSpec {
-            id: "../../etc/hearth".into(),
+            id: "../../etc/felucca".into(),
             name: "x".into(),
             vcpus: 1,
             mem_mib: 256,
@@ -2263,7 +2263,7 @@ mod tests {
         // Rejected before the parent lookup, so an unknown parent is not what
         // this asserts.
         assert_eq!(
-            mgr.fork("vm-1", "../../etc/hearth", "child").await.unwrap_err(),
+            mgr.fork("vm-1", "../../etc/felucca", "child").await.unwrap_err(),
             "InvalidId"
         );
     }
@@ -2638,7 +2638,7 @@ mod tests {
 
     #[test]
     fn test_pool_spec_wire_shape() {
-        // The pinned two-sided contract: hearthd sends this exact shape.
+        // The pinned two-sided contract: feluccad sends this exact shape.
         let body = r#"[{"image":"odoo-v18","image_sha256":"","vcpus":2,"mem_mib":2048,"disk_gb":8,"count":2}]"#;
         let specs: Vec<PoolSpec> = serde_json::from_str(body).expect("parse pool specs");
         assert_eq!(specs.len(), 1);

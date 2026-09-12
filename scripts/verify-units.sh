@@ -9,11 +9,11 @@
 # checkout always fails, for two reasons that are about the checkout and not
 # about the units:
 #
-#   1. "Command /usr/local/bin/hearthd is not executable" — verify stats every
-#      ExecStart against the machine it runs on, and a dev box has no Hearth
+#   1. "Command /usr/local/bin/feluccad is not executable" — verify stats every
+#      ExecStart against the machine it runs on, and a dev box has no Felucca
 #      binaries installed.
-#   2. "Unit hearth-firewall.service not found" — hearth-agent.service has
-#      Requires=hearth-firewall.service (deliberate: DEPLOYMENT.md §8, a worker
+#   2. "Unit felucca-firewall.service not found" — felucca-agent.service has
+#      Requires=felucca-firewall.service (deliberate: DEPLOYMENT.md §8, a worker
 #      without the host firewall must refuse to serve), and verify resolves
 #      that against the system unit path.
 #
@@ -49,8 +49,8 @@ ROOT="$(mktemp -d)"
 trap 'rm -rf "${ROOT}"' EXIT
 
 mkdir -p "${ROOT}/usr/lib/systemd" "${ROOT}/etc/systemd/system" \
-         "${ROOT}/usr/local/bin" "${ROOT}/usr/sbin" "${ROOT}/etc/hearth" \
-         "${ROOT}/srv/hearth"
+         "${ROOT}/usr/local/bin" "${ROOT}/usr/sbin" "${ROOT}/etc/felucca" \
+         "${ROOT}/srv/felucca"
 cp -a "${SYS_UNIT_DIR}" "${ROOT}/usr/lib/systemd/system"
 cp "${UNIT_DIR}"/*.service "${ROOT}/etc/systemd/system/"
 
@@ -71,15 +71,15 @@ for b in "${BINS[@]}"; do
 done
 
 # The ruleset the firewall unit applies; a file, not an executable.
-: > "${ROOT}/etc/hearth/firewall.nft"
+: > "${ROOT}/etc/felucca/firewall.nft"
 
-# hearthd/hearth-gw run as a dedicated non-root user that a dev box does not
+# feluccad/felucca-gw run as a dedicated non-root user that a dev box does not
 # have. verify only warns about that, but the warning is noise, so declare it.
 mkdir -p "${ROOT}/etc"
-grep -q '^hearth:' "${ROOT}/etc/passwd" 2>/dev/null || \
-    echo 'hearth:x:9999:9999::/nonexistent:/usr/sbin/nologin' >> "${ROOT}/etc/passwd"
-grep -q '^hearth:' "${ROOT}/etc/group" 2>/dev/null || \
-    echo 'hearth:x:9999:' >> "${ROOT}/etc/group"
+grep -q '^felucca:' "${ROOT}/etc/passwd" 2>/dev/null || \
+    echo 'felucca:x:9999:9999::/nonexistent:/usr/sbin/nologin' >> "${ROOT}/etc/passwd"
+grep -q '^felucca:' "${ROOT}/etc/group" 2>/dev/null || \
+    echo 'felucca:x:9999:' >> "${ROOT}/etc/group"
 
 units=()
 for f in "${UNIT_DIR}"/*.service; do units+=("$(basename "$f")"); done

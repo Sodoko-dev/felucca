@@ -1,0 +1,31 @@
+[Unit]
+Description=Felucca host firewall rules
+Documentation=https://github.com/alpham/infra-saas/docs/DEPLOYMENT.md
+# This unit is the enforcement point for DEPLOYMENT.md §8, not a convenience:
+# felucca-agent.service has Requires=felucca-firewall.service, so a worker whose
+# rules are missing refuses to serve its API at all. The agent listens on the
+# bridge gateway that every guest routes through, and guest->host packets hit
+# the INPUT hook, which the agent's own forward-chain isolation never sees —
+# without the felucca0 drop a tenant with root in their own sandbox reaches the
+# node's root control API.
+#
+# The rules themselves are generated per-role by deploy/install.sh into
+# /etc/felucca/firewall.nft (worker: drop guest->host + restrict 9090 to the
+# control plane; control plane: restrict 8080). They live in their own
+# `inet felucca_host` table so they never collide with the agent's `ip felucca`
+# table or with whatever else the host runs.
+Before=felucca-agent.service feluccad.service
+
+[Service]
+# oneshot + RemainAfterExit so the ruleset is applied once at boot and the unit
+# then counts as active for the Requires= above. A failure here is meant to
+# keep felucca-agent down rather than let it serve unfiltered.
+Type=oneshot
+RemainAfterExit=true
+# install.sh rewrites this path when nft lives somewhere other than /usr/sbin.
+ExecStart=/usr/sbin/nft -f /etc/felucca/firewall.nft
+# Leading '-' so a stop with the table already gone is not a unit failure.
+ExecStop=-/usr/sbin/nft delete table inet felucca_host
+
+[Install]
+WantedBy=multi-user.target

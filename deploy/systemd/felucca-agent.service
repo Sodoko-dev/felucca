@@ -1,0 +1,93 @@
+[Unit]
+Description=Felucca worker agent (felucca-agent)
+Documentation=https://github.com/alpham/infra-saas/docs/DEPLOYMENT.md
+# systemd-modules-load preloads br_netfilter (cross-tenant isolation is
+# SILENTLY OFF without it — the agent logs an error if missing) and wireguard
+# (--join). ProtectKernelModules below forbids the agent loading them itself;
+# install.sh ships modules-load.d/felucca.conf.
+After=network-online.target systemd-modules-load.service
+Wants=network-online.target
+# The host firewall is not optional. The agent's API answers on the bridge
+# gateway that every guest routes through, and guest->host packets hit the
+# INPUT hook, which the agent's own forward-chain isolation never sees — so
+# without the felucca0 drop a tenant with root in their own sandbox reaches the
+# node's root control API. install.sh writes /etc/felucca/firewall.nft and the
+# felucca-firewall unit; a node without them must not serve the API.
+Requires=felucca-firewall.service
+After=felucca-firewall.service
+# Firecracker must be present before the agent starts.
+ConditionPathExists=/usr/local/bin/firecracker
+
+[Service]
+Type=simple
+
+# The agent MUST run as root: it creates tap interfaces, programs nftables,
+# sets ip_forward, and opens /dev/kvm.  PrivilegeEscalation is constrained by
+# the capability allow-list below instead of DynamicUser / non-root.
+User=root
+Group=root
+
+# Config and env
+EnvironmentFile=-/etc/felucca/agent.env
+# Log verbosity (v4 P6, tracing): RUST_LOG overrides the default "info" —
+# e.g. RUST_LOG=debug in agent.env for a debugging session. Journald captures
+# the structured key=value output; grep by request_id to follow one feluccad
+# API call into this agent.
+ExecStart=/usr/local/bin/felucca-agent --config /etc/felucca/felucca-agent.json
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=60s
+TimeoutStopSec=60s
+
+# Snapshot files are tenant memory: mem.bin under {data_dir}/instances/<id>/ is
+# a verbatim dump of the guest's RAM, and every Firecracker child inherits this
+# umask for the files and sockets it creates. The default 0022 would leave them
+# 0644 and readable by any local account on the worker.
+UMask=0077
+
+# Device access — /dev/kvm for Firecracker microVMs; /dev/net/tun for the
+# per-VM tap devices (both `ip tuntap add` and Firecracker itself open it,
+# and DevicePolicy=closed applies to every process in the cgroup).
+DeviceAllow=/dev/kvm rw
+DeviceAllow=/dev/net/tun rw
+DevicePolicy=closed
+
+# Capabilities required for tap/bridge/nftables setup.
+# All others are dropped.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+# Hardening (compatible with root + CAP_NET_ADMIN)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=false
+ProtectKernelModules=true
+ProtectControlGroups=false
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+# @sandbox: Firecracker hardens itself with per-thread seccomp filters via
+# seccomp(2), which @system-service does not allow — without it every FC
+# child dies with SIGSYS right after its API socket comes up (audit
+# type=1326 syscall=277/seccomp on aarch64).
+SystemCallFilter=@system-service @network-io @sandbox
+
+# Writable paths for VM instances, kernels, images. (No /run/felucca: nothing
+# uses it — FC API sockets live under {data_dir}/instances/<id>/ — and a
+# missing ReadWritePaths entry fails mount namespacing on every boot with
+# 226/NAMESPACE, /run being tmpfs.) Every entry must exist before start
+# (install.sh creates them); a non-default data_dir needs a drop-in that
+# RESETS the list:  ReadWritePaths=  then  ReadWritePaths=<dir> /etc/felucca
+ReadWritePaths=/srv/felucca /etc/felucca
+
+# Resource limits — each Firecracker child needs an FD for its unix socket
+LimitNOFILE=524288
+
+[Install]
+WantedBy=multi-user.target

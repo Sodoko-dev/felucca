@@ -2,7 +2,7 @@
 //!
 //! Background task every 5s tops every pool up to its target: the legacy
 //! config pool (pool_size generic 1 vcpu/256 MiB ubuntu-base VMs) plus the
-//! hearthd-managed template pools (v4 P4, PUT /v1/pools). All pooled VMs are
+//! feluccad-managed template pools (v4 P4, PUT /v1/pools). All pooled VMs are
 //! state "pooled" on disk with names pool-<hex-ts>.
 
 use std::sync::Arc;
@@ -16,7 +16,7 @@ pub async fn pool_loop(mgr: Arc<Manager>) {
     loop {
         mgr.refill_pool().await;
         // Image-cache GC (v4 P5.4) piggybacks here: every 120 ticks (~10 min),
-        // first sweep one full interval after start so reconcile and hearthd's
+        // first sweep one full interval after start so reconcile and feluccad's
         // post-register pool push have long since landed. The hour age gate
         // keeps anything recently pulled or published out of reach.
         tick += 1;

@@ -1,4 +1,4 @@
-# Hearth v2 — API & Configuration Contract
+# Felucca v2 — API & Configuration Contract
 
 This is the binding contract between backend, UI, and deployment work for v2.
 v1 behavior is unchanged unless stated. See ARCHITECTURE.md for v1.
@@ -17,10 +17,10 @@ running|paused --sleep--> sleeping --wake--> running
 **`start` semantics (tightened in v3.1):** `start` is a cold boot and is only valid
 from `stopped` or `error` (`running` → 200 no-op). From `paused` use `resume`, from
 `sleeping` use `wake`; the agent answers **409** `{"error":"InvalidState: ..."}` and
-hearthd forwards the 409 body. (Previously `start` on a paused VM spawned a second
+feluccad forwards the 409 body. (Previously `start` on a paused VM spawned a second
 Firecracker over the live instance, orphaning it — that path is now refused.)
 
-## 2. New/changed control-plane endpoints (hearthd :8080)
+## 2. New/changed control-plane endpoints (feluccad :8080)
 
 All v1 endpoints unchanged. New:
 
@@ -34,7 +34,7 @@ Sandbox JSON gains no new required fields; `ip` is now populated when networking
 
 ### 2b. Request bounds and id shape (v4 hardening)
 
-Applies to every hearthd route, not only the ones above.
+Applies to every feluccad route, not only the ones above.
 
 | Rule | Behaviour |
 |---|---|
@@ -52,7 +52,7 @@ which the gateway does not otherwise authenticate. Clients must treat ids as
 opaque; nothing in the wire contract constrains their length or alphabet beyond
 this.
 
-## 3. Agent endpoints (hearth-agent :9090)
+## 3. Agent endpoints (felucca-agent :9090)
 
 New, mirroring the control plane: `POST /v1/vms/{id}/sleep`, `POST /v1/vms/{id}/wake`,
 `POST /v1/vms/{id}/fork` (body `{"id","name"}` for the child). Existing endpoints unchanged.
@@ -60,26 +60,26 @@ v4: `POST /v1/vms` accepts an optional `"tenant_id"` (recorded in `meta.json`, i
 fork children and pool claims; feeds per-tenant network isolation). The `/v1/vms` list shape
 is unchanged — tenancy is never exposed on the wire.
 
-## 3b. Tenancy & API keys (v4, hearthd)
+## 3b. Tenancy & API keys (v4, feluccad)
 
 States and sandbox JSON are unchanged; tenancy is enforced purely through scoping.
 
-- **Admin**: the configured bearer token (`HEARTH_TOKEN`/`--token`) — unrestricted,
+- **Admin**: the configured bearer token (`FELUCCA_TOKEN`/`--token`) — unrestricted,
   unmetered; required for all `/api/v1/tenants*`, `/api/v1/keys/*`, `/api/v1/nodes`,
   and `/api/v1/agents/*` routes (tenant keys get **404** on those, not 403).
-- **Tenant API keys**: `hearth_sk_<48 hex>`; only the SHA-256 is stored. Sent as a
+- **Tenant API keys**: `felucca_sk_<48 hex>`; only the SHA-256 is stored. Sent as a
   normal bearer token. Unknown/revoked keys → 401.
 
 | Method | Path | Body | Result |
 |---|---|---|---|
-| POST | `/api/v1/tenants` | `{"name", "max_sandboxes", "max_vcpus", "max_mem_mib", "max_disk_gb"}` (0 = unlimited) | 201 `{"tenant":{...},"api_key":"hearth_sk_…","key_id":"key-…"}` — the key is shown **once**. Duplicate name → 409. |
+| POST | `/api/v1/tenants` | `{"name", "max_sandboxes", "max_vcpus", "max_mem_mib", "max_disk_gb"}` (0 = unlimited) | 201 `{"tenant":{...},"api_key":"felucca_sk_…","key_id":"key-…"}` — the key is shown **once**. Duplicate name → 409. |
 | GET | `/api/v1/tenants` | — | 200 `{"tenants":[...]}` |
-| POST | `/api/v1/tenants/{id}/keys` | `{"expires_in_s"}` (optional; 0/absent = never expires, max 1 year) | 201 `{"api_key":"hearth_sk_…","key_id":"key-…","expires_at":<unix s, 0 = never>}` (rotation: mint new, then revoke old) |
+| POST | `/api/v1/tenants/{id}/keys` | `{"expires_in_s"}` (optional; 0/absent = never expires, max 1 year) | 201 `{"api_key":"felucca_sk_…","key_id":"key-…","expires_at":<unix s, 0 = never>}` (rotation: mint new, then revoke old) |
 | GET | `/api/v1/tenants/{id}/keys` | — | 200 `{"keys":[{"id","prefix","created_at","expires_at","revoked_at"}]}` — never the secret or its hash |
 | DELETE | `/api/v1/keys/{id}` | — | 204; revocation is immediate. Unknown/already-revoked → 404. |
 
 The listing is the recovery path for a leaked key whose `key_id` nobody kept:
-`prefix` is the secret's first 14 chars (`hearth_sk_` + 4), enough to match a
+`prefix` is the secret's first 15 chars (`felucca_sk_` + 4), enough to match a
 leaked value against a row and revoke it, useless for guessing the rest.
 Without it, `DELETE /api/v1/keys/{id}` is unusable and the only remediation is
 raw SQL. An expired key is rejected exactly like a revoked one (401).
@@ -92,21 +92,21 @@ the parent's tenant. Every lifecycle transition appends a row to the append-only
 `usage_events` metering table (created/started/stopped/paused/resumed/slept/woken/
 forked/deleted, with the sandbox shape) — aggregation endpoints arrive in a later phase.
 
-Durable state moved from `state.json` to **SQLite (WAL)** at `--db`/`HEARTH_DB`/`db_path`
-(default `/var/lib/hearth/hearth.db`). On first boot with an empty store, a legacy
+Durable state moved from `state.json` to **SQLite (WAL)** at `--db`/`FELUCCA_DB`/`db_path`
+(default `/var/lib/felucca/felucca.db`). On first boot with an empty store, a legacy
 `state.json` (from `--state`) is imported once and renamed `*.imported`. Wire formats
-are unchanged; the conformance suite passes unmodified, plus new `hearthd/17-tenancy`
+are unchanged; the conformance suite passes unmodified, plus new `feluccad/17-tenancy`
 cases pin the scoping/quota behavior.
 
-## 3c. WireGuard overlay & node join (v4 P2, hearthd + agent)
+## 3c. WireGuard overlay & node join (v4 P2, feluccad + agent)
 
-Workers join a remote hearthd over a hub-and-spoke WireGuard overlay instead of
+Workers join a remote feluccad over a hub-and-spoke WireGuard overlay instead of
 sharing its L2 segment. Design + deferred items: [ADR-0006](adr/ADR-0006-wireguard-overlay-and-node-join.md).
 
 | Method | Path | Auth | Body | Result |
 |---|---|---|---|---|
-| POST | `/api/v1/join-tokens` | admin | `{"node_hint"?}` (≤64 chars) | 201 `{"id":"jt-…","token":"hearth_jt_…"}` — token shown **once**, sha256-only at rest, TTL 24h, single-use. Tenant keys → 404. (Minting works even with the overlay off; the token just can't be redeemed until it's on.) |
-| POST | `/api/v1/nodes/join` | the join token itself as bearer (routed before the normal bearer gate) | `{"pubkey","hostname","node_token"?}` (44-char base64 pubkey) | 200 `{"overlay_ip","overlay_prefix","server_overlay_ip","server_pubkey","server_endpoint","keepalive_s","agent_token"}`. `agent_token` is this node's own `hearth_nt_…` credential, shown **once**; a re-join mints a fresh one and retires the old. Bad/used/expired token → uniform 401; **already-enrolled pubkey without a matching `node_token` → 409** (see below); overlay off → 503 (after the credential check); bad body → 400 **without** consuming the token. |
+| POST | `/api/v1/join-tokens` | admin | `{"node_hint"?}` (≤64 chars) | 201 `{"id":"jt-…","token":"felucca_jt_…"}` — token shown **once**, sha256-only at rest, TTL 24h, single-use. Tenant keys → 404. (Minting works even with the overlay off; the token just can't be redeemed until it's on.) |
+| POST | `/api/v1/nodes/join` | the join token itself as bearer (routed before the normal bearer gate) | `{"pubkey","hostname","node_token"?}` (44-char base64 pubkey) | 200 `{"overlay_ip","overlay_prefix","server_overlay_ip","server_pubkey","server_endpoint","keepalive_s","agent_token"}`. `agent_token` is this node's own `felucca_nt_…` credential, shown **once**; a re-join mints a fresh one and retires the old. Bad/used/expired token → uniform 401; **already-enrolled pubkey without a matching `node_token` → 409** (see below); overlay off → 503 (after the credential check); bad body → 400 **without** consuming the token. |
 
 Semantics: the token is consumed **last** (after the peer row is persisted and
 the kernel peer is installed), so no failure mode burns it. Re-join with the
@@ -115,7 +115,7 @@ subnet) — but must **prove possession** of that node's current credential in
 `node_token`, because a join token authorizes *an* enrollment without naming
 *which* node and the pubkey is caller-written; otherwise a token holder could
 rotate a live worker's credential out from under it. Unproven re-joins get
-`409`. `hearth-agent` does not send `node_token` (its body is `pubkey` +
+`409`. `felucca-agent` does not send `node_token` (its body is `pubkey` +
 `hostname` only), so the supported re-enrollment is a **fresh WireGuard key**:
 remove `{data_dir}/wg.json` *and* `{data_dir}/wg.key` before restarting with a
 new join token. The agent enrolls with `--join <url> --join-token <tok>`, persists the
@@ -125,10 +125,10 @@ overlay (`advertise_addr` = its overlay IP). An unreadable or corrupt `wg.json`
 is fatal — an enrolled node never silently degrades to direct mode. The https
 join goes through `curl --config -` with the token on stdin, never argv.
 
-## 3d. Sandbox ingress (v4 P3, hearthd + hearth-gw)
+## 3d. Sandbox ingress (v4 P3, feluccad + felucca-gw)
 
 Services inside sandboxes get public URLs `https://<name>--<id>.<ingress
-domain>` via the `hearth-gw` reverse proxy (wildcard DNS → gateway → worker
+domain>` via the `felucca-gw` reverse proxy (wildcard DNS → gateway → worker
 node port → DNAT → guest). Design: [ADR-0007](adr/ADR-0007-sandbox-ingress.md).
 
 | Method | Path | Auth | Body | Result |
@@ -143,20 +143,20 @@ E2B-style `8069--<id>` hostnames. Sandbox JSON carries `exposes` (omitted
 when empty — pre-P3 wire shape unchanged). Forks re-expose the parent's
 services on the child with fresh node ports. Sleeping sandboxes get a 503
 wake page at the gateway; the expose survives sleep/wake (the guest IP
-persists). `hearth-gw` flags (env): `--listen`
-(`HEARTH_GW_LISTEN`, default :8088), `--hearthd` (`HEARTH_GW_HEARTHD`),
-`--token` (`HEARTH_TOKEN`, admin — the route table is admin-only),
-`--domain` (`HEARTH_GW_DOMAIN`), `--refresh` (flag-only, seconds), and
-`--tenant-limits` (`HEARTH_GW_TENANT_LIMITS`, path to a JSON file:
-per-tenant `enabled` toggle + token-bucket `rps`). hearthd's
+persists). `felucca-gw` flags (env): `--listen`
+(`FELUCCA_GW_LISTEN`, default :8088), `--feluccad` (`FELUCCA_GW_FELUCCAD`),
+`--token` (`FELUCCA_TOKEN`, admin — the route table is admin-only),
+`--domain` (`FELUCCA_GW_DOMAIN`), `--refresh` (flag-only, seconds), and
+`--tenant-limits` (`FELUCCA_GW_TENANT_LIMITS`, path to a JSON file:
+per-tenant `enabled` toggle + token-bucket `rps`). feluccad's
 `ingress_domain` config key only renders the `url` field in expose
 responses.
 
-## 3e. Templates & bigger guests (v4 P4, hearthd + agent)
+## 3e. Templates & bigger guests (v4 P4, feluccad + agent)
 
 Sandboxes can boot from custom rootfs images with bigger shapes (caps:
 16 vCPU, 32768 MiB, 128 GB disk). A template = a catalog row + one image file
-on hearthd (`images_dir`, default `/var/lib/hearth/images`); workers
+on feluccad (`images_dir`, default `/var/lib/felucca/images`); workers
 pull-and-cache images sha256-addressed. Design:
 [ADR-0008](adr/ADR-0008-templates-and-image-distribution.md).
 
@@ -177,7 +177,7 @@ sandbox's effective disk (declared `disk_gb`, or 2 GiB for unresized base
 sandboxes). Agent: `POST /v1/vms` gains `image`/`image_sha256`/`disk_gb`;
 `GET /v1/vms/{id}/rootfs` streams a stopped VM's rootfs (capture);
 `POST /v1/images/prefetch` warms the cache; `PUT /v1/pools` replaces the
-node's template warm-pool specs (hearthd pushes on template changes and to
+node's template warm-pool specs (feluccad pushes on template changes and to
 every node right after it registers — the register response stays `{"id"}`).
 
 ## 3f. Streaming exec, lifecycle policies, usage (v4 P5)
@@ -201,18 +201,18 @@ gains `"stream":true` and the response becomes those frames as JSON lines.
 `default_asleep_delete_s` (create-time, seconds, 0 = off); sandbox create
 (and fork, inherited) accepts `idle_sleep_s` / `asleep_delete_s`
 (0 = inherit tenant default, -1 = disabled, else bounded `[5|30, 31536000]`,
-400 outside). A 15s hearthd sweep auto-sleeps running sandboxes idle past
+400 outside). A 15s feluccad sweep auto-sleeps running sandboxes idle past
 the effective policy (no exec, no ingress, no wake since) and auto-deletes
 sleeping ones past their TTL (events recorded as ordinary `slept`/`deleted`).
 Auto-sleep also drops the sandbox's **dynamic** (all-digit-named) exposes;
 named exposes and manual sleeps are untouched. The activity clock counts:
 create, fork, wake, both exec arms, and gateway traffic
 (`POST /api/v1/routes/activity {"sandbox_ids":[…]}`, admin/gateway-only,
-batched by hearth-gw every refresh tick).
+batched by felucca-gw every refresh tick).
 
-**Auto-wake (hearth-gw)** — a request for a sleeping sandbox wakes it and
+**Auto-wake (felucca-gw)** — a request for a sleeping sandbox wakes it and
 waits ≤15s for the route to go running before falling back to the 503 page.
-Default on; `--auto-wake=false` / `HEARTH_GW_AUTO_WAKE=0` gateway-wide,
+Default on; `--auto-wake=false` / `FELUCCA_GW_AUTO_WAKE=0` gateway-wide,
 `"auto_wake": false` per tenant in the tenant-limits file.
 
 **Usage** — `GET /api/v1/tenants/{id}/usage?from=<unix>&to=<unix>` (defaults
@@ -222,9 +222,9 @@ only) folds `usage_events` into
 "disk_gb_hours","execs","events"}` — intervals open on
 created/started/resumed/woken/forked, close on paused/slept/stopped/deleted,
 clipped to the window and to now; `disk_gb` 0 counts as the 2 GiB base
-image. Every exec attempt appends an `"exec"` event. Retention: hearthd
+image. Every exec attempt appends an `"exec"` event. Retention: feluccad
 hourly prunes **`exec`** events older than `usage_retention_days`
-(config/`HEARTH_USAGE_RETENTION_DAYS`/`--usage-retention-days`, default 90,
+(config/`FELUCCA_USAGE_RETENTION_DAYS`/`--usage-retention-days`, default 90,
 0 = keep forever) — lifecycle transition events are kept (they are the
 interval skeleton the aggregation replays, and are low-volume).
 
@@ -234,29 +234,29 @@ catalog GET filters to public + own entries for tenant keys, and a foreign
 tenant's create-by-template gets the same `400 unknown template` as a
 missing one. Admin sees and uses everything.
 
-**SDK & verify** — `sdk/ts/` ships `@hearth/sdk` (zero-dep typed client:
+**SDK & verify** — `sdk/ts/` ships `@felucca/sdk` (zero-dep typed client:
 create/exec/execStream/sleep/wake/fork/expose/templates/tenantUsage);
-`scripts/hearth-verify.sh <endpoint> [token]` runs this conformance suite
+`scripts/felucca-verify.sh <endpoint> [token]` runs this conformance suite
 against any deployment.
 
-## 3g. Observability (v4 P6, hearthd + agent)
+## 3g. Observability (v4 P6, feluccad + agent)
 
 Design: [ADR-0010](adr/ADR-0010-observability-and-bench.md).
 
 **Request IDs** — every `/api/` request is assigned `req-<hex>`, echoed back
-as the `X-Hearth-Request-Id` response header and forwarded on every
-hearthd→agent proxy call via the same header; both binaries log it
+as the `X-Felucca-Request-Id` response header and forwarded on every
+feluccad→agent proxy call via the same header; both binaries log it
 (`request_id` field). Headers only — no wire-shape change; pre-P6 agents
 ignore it. Background actors mint `sweep-`/`bg-` prefixed ids.
 
-**Structured logs** — hearthd/hearth-gw log via Go `slog` (text, stderr),
+**Structured logs** — feluccad/felucca-gw log via Go `slog` (text, stderr),
 the agent via Rust `tracing` (`RUST_LOG` filter, default `info`). Message
 phrases are stable (grep-able); values are structured fields. The guest
 stays on plain stderr by design.
 
 **Admin metrics surface** — `GET /api/v1/metrics/tenants` (admin token only;
 404 to tenant keys) serves the per-tenant Prometheus gauges
-(`hearth_tenant_{sandboxes,running,vcpus,mem_mib,disk_gb}`). They are kept
+(`felucca_tenant_{sandboxes,running,vcpus,mem_mib,disk_gb}`). They are kept
 off `/metrics` even though `/metrics` is itself admin-gated now (§7): the
 tenant inventory is a narrower audience than the fleet scrape credential —
 ADR-0009, and the ADR-0010 amendment that closed `/metrics`. **Both** jobs
@@ -282,13 +282,13 @@ fork; lab numbers live in [BENCHMARKS.md](BENCHMARKS.md).
 
 - Agent flag/config `net_cidr` (default `10.231.0.0/24`), `net = on|off` (default **on**; `off`
   restores v1 behavior, `ip:null`).
-- Per node at agent startup (idempotent): bridge `hearth0` with the CIDR's `.1` as gateway,
+- Per node at agent startup (idempotent): bridge `felucca0` with the CIDR's `.1` as gateway,
   `nftables` masquerade for egress, ip_forward on.
-- Per VM: tap `hth-<n>` enslaved to `hearth0`; guest IP assigned sequentially from the CIDR;
+- Per VM: tap `hth-<n>` enslaved to `felucca0`; guest IP assigned sequentially from the CIDR;
   guest configured via kernel boot arg `ip=<ip>::<gw>:<mask>::eth0:off`; FC `network-interfaces`
   configured before boot. Snapshots are taken **after** networking is up; restore/fork uses
   `/snapshot/load` `network_overrides` to attach a (new) tap.
-- **Cross-tenant isolation is live (v4 P1)**: guest-to-guest traffic on `hearth0` is
+- **Cross-tenant isolation is live (v4 P1)**: guest-to-guest traffic on `felucca0` is
   dropped unless source and destination belong to the same tenant — the optional
   `tenant_id` on `POST /v1/vms` (§3) governs membership; a VM with no/invalid tenant
   joins no pair and is isolated from all peers. Egress NAT and host↔guest traffic are
@@ -296,13 +296,13 @@ fork; lab numbers live in [BENCHMARKS.md](BENCHMARKS.md).
   node-local). Design: [ADR-0005](adr/ADR-0005-cross-tenant-network-isolation.md).
 - **Three more fences around the bridge (v4 hardening)**, because the tenant `forward`
   ruleset only ever sees IPv4 guest-to-guest traffic:
-  - `ip hearth input` — guest→host. Guests route through the bridge gateway, and that
+  - `ip felucca input` — guest→host. Guests route through the bridge gateway, and that
     traffic lands on the INPUT hook the forward chain never sees. Drops everything
-    arriving on `hearth0` except ICMP and `ct state established,related`, with the
+    arriving on `felucca0` except ICMP and `ct state established,related`, with the
     agent's own port in an explicit drop rule.
-  - `bridge hearth forward` — accepts only ARP and IPv4 between bridge ports, dropping
-    the rest (link-local IPv6 above all). IPv6 is also disabled on `hearth0`.
-  - `netdev hearth <tap>` — one `policy drop` chain per tap pinning that guest's source
+  - `bridge felucca forward` — accepts only ARP and IPv4 between bridge ports, dropping
+    the rest (link-local IPv6 above all). IPv6 is also disabled on `felucca0`.
+  - `netdev felucca <tap>` — one `policy drop` chain per tap pinning that guest's source
     MAC, ARP sender MAC, ARP sender IP, and IPv4 source address. Without the ARP pin a
     guest can move a victim's address in the bridge FDB onto its own port.
 
@@ -314,40 +314,40 @@ fork; lab numbers live in [BENCHMARKS.md](BENCHMARKS.md).
 Precedence: **flags > env vars > config file > defaults**. Nothing may hardcode
 localhost/Lima paths — local lab and remote servers differ only by config.
 
-- `--config <path>` loads a JSON config file. Env: `HEARTH_CONFIG`.
-- **hearthd** keys (JSON / env / flag): `bind` (`HEARTH_BIND`, default `0.0.0.0:8080`),
-  `state_path` (`HEARTH_STATE`, default `/var/lib/hearth/state.json`),
-  `ui_dir` (`HEARTH_UI_DIR`, default `/usr/share/hearth/ui`), `token` (`HEARTH_TOKEN`).
-- **hearthd** overlay/TLS keys (v4 P2): `wg_ip` (CIDR, e.g. `10.100.0.1/24` — setting it
+- `--config <path>` loads a JSON config file. Env: `FELUCCA_CONFIG`.
+- **feluccad** keys (JSON / env / flag): `bind` (`FELUCCA_BIND`, default `0.0.0.0:8080`),
+  `state_path` (`FELUCCA_STATE`, default `/var/lib/felucca/state.json`),
+  `ui_dir` (`FELUCCA_UI_DIR`, default `/usr/share/felucca/ui`), `token` (`FELUCCA_TOKEN`).
+- **feluccad** overlay/TLS keys (v4 P2): `wg_ip` (CIDR, e.g. `10.100.0.1/24` — setting it
   enables the overlay; requires auth-on and `wg_endpoint`), `wg_port` (default 51820),
   `wg_key_path`, `wg_endpoint` (public `host:port` advertised to joiners), `wg_keepalive`
   (default 25), `tls_domain` (enables in-binary autocert on :443 + HTTP-01 on :80; the
   plain `port` listener stays for in-tunnel agents), `tls_cache_dir`.
-- **hearthd** template keys (v4 P4): `images_dir` (`HEARTH_IMAGES_DIR`,
-  `--images-dir`, default `/var/lib/hearth/images`) — where template images
+- **feluccad** template keys (v4 P4): `images_dir` (`FELUCCA_IMAGES_DIR`,
+  `--images-dir`, default `/var/lib/felucca/images`) — where template images
   live (captures land here; workers pull from `/api/v1/images/{name}`).
-- **hearthd** proxy keys: `trusted_proxies` (`HEARTH_TRUSTED_PROXIES`,
-  `--trusted-proxies`) — CIDRs whose `X-Forwarded-For` is honoured when hearthd
+- **feluccad** proxy keys: `trusted_proxies` (`FELUCCA_TRUSTED_PROXIES`,
+  `--trusted-proxies`) — CIDRs whose `X-Forwarded-For` is honoured when feluccad
   resolves the client address (the throttle key below). JSON array in the config
   file, comma-separated for env/flag; a bare IP is normalised to `/32`/`/128`.
   **Default empty = trust nothing** (use the connection peer); a malformed entry
   is a startup failure, not a skipped line. Chain walk is right-to-left, stopping
   at the first untrusted hop — the left-most (client-written) entry is never
-  used. `trust_x_real_ip` (`HEARTH_TRUST_X_REAL_IP`, `--trust-x-real-ip`,
+  used. `trust_x_real_ip` (`FELUCCA_TRUST_X_REAL_IP`, `--trust-x-real-ip`,
   **default false**) is a separate opt-in for `X-Real-IP`: while it is false that
   header is ignored from every peer, declared or not, because it carries no chain
   of custody. Setting it with `trusted_proxies` empty is a **startup failure**.
   DEPLOYMENT.md §7.1 has the Caddy and nginx directives that must accompany
   `trusted_proxies` — an edge proxy that forwards the client's own header while
   being listed as trusted hands every client its own throttle key, and no code
-  in hearthd can detect that.
-- **hearth-agent** keys: `bind` (`HEARTH_AGENT_BIND`, default `0.0.0.0:9090` —
+  in feluccad can detect that.
+- **felucca-agent** keys: `bind` (`FELUCCA_AGENT_BIND`, default `0.0.0.0:9090` —
   but the wildcard is **not honoured verbatim**; see below), `bind_any`
-  (`HEARTH_BIND_ANY`, `--bind-any`, default **off**),
-  `control_plane` (`HEARTH_CONTROL_PLANE`, e.g. `https://hearth.example.com` or `http://192.168.104.3:8080`),
-  `advertise_addr` (`HEARTH_ADVERTISE_ADDR`; **if unset, auto-detect** the source IP used to reach
-  the control plane), `data_dir` (`HEARTH_DATA_DIR`, default `/srv/ignis`), `token` (`HEARTH_TOKEN`),
-  `pool_size`, `net`, `net_cidr`, `join_url`/`join_token` (`HEARTH_JOIN_URL`/`HEARTH_JOIN_TOKEN`,
+  (`FELUCCA_BIND_ANY`, `--bind-any`, default **off**),
+  `control_plane` (`FELUCCA_CONTROL_PLANE`, e.g. `https://felucca.example.com` or `http://192.168.104.3:8080`),
+  `advertise_addr` (`FELUCCA_ADVERTISE_ADDR`; **if unset, auto-detect** the source IP used to reach
+  the control plane), `data_dir` (`FELUCCA_DATA_DIR`, default `/srv/ignis`), `token` (`FELUCCA_TOKEN`),
+  `pool_size`, `net`, `net_cidr`, `join_url`/`join_token` (`FELUCCA_JOIN_URL`/`FELUCCA_JOIN_TOKEN`,
   `--join`/`--join-token` — first-boot enrollment only; the persisted `wg.json` wins afterwards).
 - **The agent does not bind the wildcard by default.** `0.0.0.0` (or `::`, `*`,
   or an empty host) in `bind` is treated as "unset" and the listener uses the
@@ -363,7 +363,7 @@ localhost/Lima paths — local lab and remote servers differ only by config.
   `tls_domain` is set (v4 P2.3, see above); a reverse proxy (caddy/nginx) remains a valid
   alternative — both documented in DEPLOYMENT.md.
 - **Three principals, and a node is not a tenant.** The admin token is unrestricted; a tenant API
-  key (`hearth_sk_`) reaches its own sandboxes; a **node credential** (`hearth_nt_`) reaches an
+  key (`felucca_sk_`) reaches its own sandboxes; a **node credential** (`felucca_nt_`) reaches an
   explicit allowlist of two routes — `POST /api/v1/agents/register` and
   `POST /api/v1/agents/heartbeat` — and 404s on everything else. Within those two it is bound to
   its own node: register only **its own address** (403 otherwise), never a hostname another node
@@ -372,13 +372,13 @@ localhost/Lima paths — local lab and remote servers differ only by config.
   authentication costs **no store read**: tokens are resolved through an in-memory sha256 index
   built at startup and updated on every rotation.
 - **The per-node credential is used in BOTH directions, not just outbound.** A node's address is
-  caller-supplied, so dialing it with the admin key made "point hearthd at a host I control" equal
+  caller-supplied, so dialing it with the admin key made "point feluccad at a host I control" equal
   to "hand me the admin key"; requiring the admin token back on register/heartbeat meant every
   worker held the fleet key. Enrollment with a one-time join token (`POST /api/v1/nodes/join`, or
-  `POST /api/v1/agents/register` carrying `join_token`) mints `hearth_nt_<48 hex>` and returns it
-  **once** as an additive `agent_token` field. hearthd stores it keyed on the node's
+  `POST /api/v1/agents/register` carrying `join_token`) mints `felucca_nt_<48 hex>` and returns it
+  **once** as an additive `agent_token` field. feluccad stores it keyed on the node's
   **`host:port`** (two agents on one host are two nodes; rows written under the older bare-host key
-  are migrated on first use) and presents only that when dialing. `hearth-agent` persists it to
+  are migrated on first use) and presents only that when dialing. `felucca-agent` persists it to
   `<data_dir>/node-token` mode 0600, presents it outbound on the two agent routes, and accepts it
   inbound alongside its configured `token`; it never falls back to the shared token after the node
   token is rejected. A node with no credential row is dialed with **no** bearer. Nodes present
@@ -387,9 +387,9 @@ localhost/Lima paths — local lab and remote servers differ only by config.
   (`GET /api/v1/images/{name}`) are admin-only and a node credential cannot reach them. See
   DEPLOYMENT.md §6.7.
 - **No token is no longer "auth off"**: an empty `token` authorizes nobody, and both binaries
-  **refuse to start** on an empty, placeholder (`REPLACE_WITH…`, `hearth-lab-token`) or short
-  token — under 32 chars for hearthd, under 16 for the agent. Open mode is a deliberate,
-  named choice: `hearthd --insecure-no-auth` (loopback labs; logged as a WARN at every start).
+  **refuse to start** on an empty, placeholder (`REPLACE_WITH…`, `felucca-lab-token`) or short
+  token — under 32 chars for feluccad, under 16 for the agent. Open mode is a deliberate,
+  named choice: `feluccad --insecure-no-auth` (loopback labs; logged as a WARN at every start).
   The agent has no equivalent flag. `bind`'s host part is honoured, so a configured
   `127.0.0.1:8080` really is loopback-only — see DEPLOYMENT.md §6.3 for which topology wants which.
 - **Brute-force guard**: failed credentials are counted per source address, on both credential
@@ -403,7 +403,7 @@ localhost/Lima paths — local lab and remote servers differ only by config.
   text claiming a correct token is refused while throttled is stale.) Distinguish this 429 from
   the quota 429 by the header: the quota response carries none. A success does **not** clear the
   record — only quiet time decays it (one forgiven failure per 15s), because a wipe-on-success is
-  reachable by anyone sharing the key. The wait is capped at 60s for a source hearthd can
+  reachable by anyone sharing the key. The wait is capped at 60s for a source feluccad can
   attribute to one client, and at **2s** when the key provably stands for many (peer is a declared
   proxy that forwarded nothing attributable, or nothing is declared and the peer is
   loopback/private — the shipped topology). "Shared" is decided from config and peer address only,
@@ -415,15 +415,15 @@ localhost/Lima paths — local lab and remote servers differ only by config.
 ## 7. Metrics additions (`/metrics`)
 
 ```
-hearth_wake_ms_last        gauge   (last wake latency, per hearthd)
-hearth_wake_total          counter
-hearth_wake_ms_sum         counter (for avg = sum/total)
-hearth_forks_total         counter
-hearth_pool_size{node=...} gauge   (agent-side, aggregated by hearthd)
-hearth_sandboxes_total{state="sleeping"} added to the existing state gauge set
-hearth_wake_duration_ms_{bucket,sum,count}    histogram (v4 P6; ms buckets 5..30000,+Inf)
-hearth_exec_duration_ms_{bucket,sum,count}    histogram (v4 P6; buffered exec, hearthd wall-clock)
-hearth_create_duration_ms_{bucket,sum,count}  histogram (v4 P6; to 201, cold+claim mixed)
+felucca_wake_ms_last        gauge   (last wake latency, per feluccad)
+felucca_wake_total          counter
+felucca_wake_ms_sum         counter (for avg = sum/total)
+felucca_forks_total         counter
+felucca_pool_size{node=...} gauge   (agent-side, aggregated by feluccad)
+felucca_sandboxes_total{state="sleeping"} added to the existing state gauge set
+felucca_wake_duration_ms_{bucket,sum,count}    histogram (v4 P6; ms buckets 5..30000,+Inf)
+felucca_exec_duration_ms_{bucket,sum,count}    histogram (v4 P6; buffered exec, feluccad wall-clock)
+felucca_create_duration_ms_{bucket,sum,count}  histogram (v4 P6; to 201, cold+claim mixed)
 ```
 
 Histogram state is in-memory (resets on restart — standard Prometheus
@@ -448,9 +448,9 @@ on `GET /api/v1/tenants/{id}/usage` (§3f).
   origin) and **not** accepted from `?token=` (that value is already in browser history and in
   every fronting proxy's access log — the console strips it from the URL and ignores it).
   The paste-in banner is the only entry point; an upgraded console also purges any
-  `hearth_token` an older build left in storage.
+  `felucca_token` an older build left in storage.
 - Attach `Authorization: Bearer` to all API fetches. **Do not poll without a token**: each
-  attempt is counted by hearthd's per-source brute-force guard (§6), so a 3s timer with no
+  attempt is counted by feluccad's per-source brute-force guard (§6), so a 3s timer with no
   credential walks a shared source key past the threshold in ~20s. That does not cost the
   operator their own access (a correct token is served regardless), but it turns every
   unauthenticated answer on that key — including anyone else behind the same proxy address —

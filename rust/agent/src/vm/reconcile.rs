@@ -238,9 +238,9 @@ mod tests {
         let instances_dir = tmp.path().join("instances");
         fs::create_dir_all(&instances_dir).unwrap();
 
-        let meta = r#"{"id":"vm-evil","name":"vm-evil","dir_id":"../../etc/hearth","vcpus":1,"mem_mib":256,"pid":null,"slot":null,"ip":null,"state":"stopped"}"#;
+        let meta = r#"{"id":"vm-evil","name":"vm-evil","dir_id":"../../etc/felucca","vcpus":1,"mem_mib":256,"pid":null,"slot":null,"ip":null,"state":"stopped"}"#;
         write_meta(&instances_dir, "vm-evil", meta);
-        let bad_id = r#"{"id":"../../etc/hearth","name":"x","dir_id":"vm-evil2","vcpus":1,"mem_mib":256,"pid":null,"slot":null,"ip":null,"state":"stopped"}"#;
+        let bad_id = r#"{"id":"../../etc/felucca","name":"x","dir_id":"vm-evil2","vcpus":1,"mem_mib":256,"pid":null,"slot":null,"ip":null,"state":"stopped"}"#;
         write_meta(&instances_dir, "vm-evil2", bad_id);
 
         let vms = reconcile(data_dir, None);

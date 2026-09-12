@@ -1,4 +1,4 @@
-//! Library surface for hearth-guest, so integration tests can exercise the
+//! Library surface for felucca-guest, so integration tests can exercise the
 //! per-connection handler over a socket pair without a real vsock device.
 
 pub mod exec;

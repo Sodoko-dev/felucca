@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# install.sh — idempotent installer for hearthd (control-plane) or hearth-agent (worker)
+# install.sh — idempotent installer for feluccad (control-plane) or felucca-agent (worker)
 #
 # Usage:
-#   ./install.sh control-plane   # installs hearthd + systemd unit
-#   ./install.sh worker          # installs hearth-agent + systemd unit + checks prerequisites
+#   ./install.sh control-plane   # installs feluccad + systemd unit
+#   ./install.sh worker          # installs felucca-agent + systemd unit + checks prerequisites
 #
 # The script is safe to re-run.  It will not overwrite existing config files.
 # Run as root (or with sudo).
 #
 # Binary resolution:
-#   ./release/<arch>/hearthd | hearth-agent          (pre-built static binaries)
+#   ./release/<arch>/feluccad | felucca-agent          (pre-built static binaries)
 # Build them inside the toolchain VM (see docs/DEPLOYMENT.md):
-#   hearthd:      cd go && CGO_ENABLED=0 GOOS=linux GOARCH=<arch> go build ./cmd/hearthd
-#   hearth-agent: cd rust/agent && cargo build --release --target <arch>-unknown-linux-musl
+#   feluccad:      cd go && CGO_ENABLED=0 GOOS=linux GOARCH=<arch> go build ./cmd/feluccad
+#   felucca-agent: cd rust/agent && cargo build --release --target <arch>-unknown-linux-musl
 
 set -euo pipefail
 
@@ -59,18 +59,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Directories created by this installer
 INSTALL_BIN=/usr/local/bin
-CONF_DIR=/etc/hearth
-STATE_DIR=/var/lib/hearth
-DATA_DIR=/srv/hearth
-UI_DIR=/usr/share/hearth/ui
-# (no /run/hearth: nothing uses it — FC sockets live under DATA_DIR/instances)
+CONF_DIR=/etc/felucca
+STATE_DIR=/var/lib/felucca
+DATA_DIR=/srv/felucca
+UI_DIR=/usr/share/felucca/ui
+# (no /run/felucca: nothing uses it — FC sockets live under DATA_DIR/instances)
 
 # ---------------------------------------------------------------------------
 # Binary installation
 # ---------------------------------------------------------------------------
 
 install_binary() {
-    local name="$1"  # hearthd | hearth-agent
+    local name="$1"  # feluccad | felucca-agent
     local dest="${INSTALL_BIN}/${name}"
 
     # 1) Pre-built static binary in release/<arch>/
@@ -84,8 +84,8 @@ install_binary() {
 
     die "Cannot find ${name}: no pre-built binary at ${release_bin}.
 Build static binaries inside the toolchain VM and place them in ${SCRIPT_DIR}/release/${ARCH}/ :
-  hearthd:      cd go && CGO_ENABLED=0 GOOS=linux GOARCH=$([ "${ARCH}" = aarch64 ] && echo arm64 || echo amd64) go build -ldflags='-s -w' -o hearthd ./cmd/hearthd
-  hearth-agent: cd rust/agent && cargo build --release --target ${ARCH}-unknown-linux-musl
+  feluccad:      cd go && CGO_ENABLED=0 GOOS=linux GOARCH=$([ "${ARCH}" = aarch64 ] && echo arm64 || echo amd64) go build -ldflags='-s -w' -o feluccad ./cmd/feluccad
+  felucca-agent: cd rust/agent && cargo build --release --target ${ARCH}-unknown-linux-musl
 See docs/DEPLOYMENT.md."
 }
 
@@ -96,7 +96,7 @@ See docs/DEPLOYMENT.md."
 setup_directories() {
     info "Creating runtime directories"
 
-    # Config dir — readable by hearth user and root
+    # Config dir — readable by felucca user and root
     install -d -m 0750 "${CONF_DIR}"
     install -d -m 0750 "${STATE_DIR}"
     # Everything under DATA_DIR is tenant data the agent (root) alone touches:
@@ -104,34 +104,34 @@ setup_directories() {
     # the FC API socket and the guest vsock; images/ holds rootfs images and
     # templates captured from tenant sandboxes. World-readable here means any
     # local account on the worker reads another tenant's memory with no
-    # privilege escalation, so the tree is root-only (hearth-agent.service also
+    # privilege escalation, so the tree is root-only (felucca-agent.service also
     # sets UMask=0077 so FC's own files land 0600 inside it).
     install -d -m 0750 "${DATA_DIR}"
     install -d -m 0750 "${DATA_DIR}/kernels"
     install -d -m 0750 "${DATA_DIR}/images"
     install -d -m 0700 "${DATA_DIR}/instances"
-    # UI assets are public static files served by the non-root hearthd user.
+    # UI assets are public static files served by the non-root feluccad user.
     install -d -m 0755 "${UI_DIR}"
 
     ok "Directories ready"
 }
 
 # ---------------------------------------------------------------------------
-# hearth system user (control-plane only)
+# felucca system user (control-plane only)
 # ---------------------------------------------------------------------------
 
-setup_hearth_user() {
-    if id hearth >/dev/null 2>&1; then
-        ok "User 'hearth' already exists"
+setup_felucca_user() {
+    if id felucca >/dev/null 2>&1; then
+        ok "User 'felucca' already exists"
     else
-        info "Creating system user 'hearth'"
-        useradd --system --no-create-home --shell /sbin/nologin hearth
-        ok "User 'hearth' created"
+        info "Creating system user 'felucca'"
+        useradd --system --no-create-home --shell /sbin/nologin felucca
+        ok "User 'felucca' created"
     fi
 
-    # The hearth user needs to read config and write state
-    chown -R hearth:hearth "${CONF_DIR}" "${STATE_DIR}"
-    chown root:hearth "${CONF_DIR}"
+    # The felucca user needs to read config and write state
+    chown -R felucca:felucca "${CONF_DIR}" "${STATE_DIR}"
+    chown root:felucca "${CONF_DIR}"
     chmod 0750 "${CONF_DIR}"
     ok "Ownership set"
 }
@@ -160,8 +160,8 @@ install_unit() {
 # wireguard must be preloaded by the host (v4 P1/P2).
 
 install_modules_conf() {
-    local src="${SCRIPT_DIR}/systemd/hearth-modules.conf"
-    local dest=/etc/modules-load.d/hearth.conf
+    local src="${SCRIPT_DIR}/systemd/felucca-modules.conf"
+    local dest=/etc/modules-load.d/felucca.conf
 
     [ -f "${src}" ] || die "Modules file not found: ${src}"
 
@@ -193,7 +193,7 @@ install_modules_conf() {
 is_placeholder_token() {
     local t="$1"
     case "${t}" in
-        *REPLACE_WITH*|hearth-lab-token) return 0 ;;
+        *REPLACE_WITH*|felucca-lab-token) return 0 ;;
     esac
     [ "${#t}" -lt 32 ]
 }
@@ -205,7 +205,7 @@ generate_token() {
         od -An -vtx1 -N32 /dev/urandom | tr -d ' \n'
     else
         die "No source of randomness found (need openssl or /dev/urandom).
-Re-run with a token you generated elsewhere:  HEARTH_TOKEN=\$(openssl rand -hex 32) sudo -E $0 ${ROLE}"
+Re-run with a token you generated elsewhere:  FELUCCA_TOKEN=\$(openssl rand -hex 32) sudo -E $0 ${ROLE}"
     fi
 }
 
@@ -218,14 +218,14 @@ TOKEN_IS_NEW=no
 CONFIG_WAS_WRITTEN=no
 
 resolve_token() {
-    if [ -n "${HEARTH_TOKEN:-}" ]; then
-        if is_placeholder_token "${HEARTH_TOKEN}"; then
-            die "HEARTH_TOKEN is a placeholder or shorter than 32 characters.
+    if [ -n "${FELUCCA_TOKEN:-}" ]; then
+        if is_placeholder_token "${FELUCCA_TOKEN}"; then
+            die "FELUCCA_TOKEN is a placeholder or shorter than 32 characters.
 The control plane and its workers share one bearer token; generate it once with
 'openssl rand -hex 32' and pass the same value to every node."
         fi
-        TOKEN="${HEARTH_TOKEN}"
-        ok "Using HEARTH_TOKEN from the environment"
+        TOKEN="${FELUCCA_TOKEN}"
+        ok "Using FELUCCA_TOKEN from the environment"
     else
         TOKEN="$(generate_token)"
         TOKEN_IS_NEW=yes
@@ -268,19 +268,19 @@ install_config_stub() {
 # Host firewall
 # ---------------------------------------------------------------------------
 # DEPLOYMENT.md §8 used to present these rules as an example the operator was
-# trusted to apply by hand.  They are not optional: hearth-agent listens on the
+# trusted to apply by hand.  They are not optional: felucca-agent listens on the
 # bridge gateway that every guest has as its default route, and guest→host
 # packets hit the INPUT hook, which the agent's own forward-chain isolation
-# never sees.  Without the hearth0 drop, a tenant with root in their own
+# never sees.  Without the felucca0 drop, a tenant with root in their own
 # sandbox (the expected design) reaches the node's root control API.
 #
-# The rules live in their own `inet hearth_host` table so they never collide
-# with the agent's `ip hearth` table or with the host's existing filter table,
+# The rules live in their own `inet felucca_host` table so they never collide
+# with the agent's `ip felucca` table or with the host's existing filter table,
 # and the file is regenerated on every run — it is derived from the role and
-# HEARTH_CONTROL_PLANE_IP, not operator state.
+# FELUCCA_CONTROL_PLANE_IP, not operator state.
 
 FIREWALL_NFT="${CONF_DIR}/firewall.nft"
-FIREWALL_UNIT=/etc/systemd/system/hearth-firewall.service
+FIREWALL_UNIT=/etc/systemd/system/felucca-firewall.service
 
 write_worker_firewall() {
     # Loopback stays allowed either way so `curl 127.0.0.1:9090/healthz` still
@@ -288,11 +288,11 @@ write_worker_firewall() {
     # An inet-table `ip saddr` match never sees IPv6 packets, so each family
     # needs its own rule.
     local v4_allow="127.0.0.1" v6_allow="::1"
-    case "${HEARTH_CONTROL_PLANE_IP:-}" in
+    case "${FELUCCA_CONTROL_PLANE_IP:-}" in
         "")   ;;  # deny by default rather than open the root API to the whole
                   # private network on the strength of an unset variable
-        *:*)  v6_allow="::1, ${HEARTH_CONTROL_PLANE_IP}" ;;
-        *)    v4_allow="127.0.0.1, ${HEARTH_CONTROL_PLANE_IP}" ;;
+        *:*)  v6_allow="::1, ${FELUCCA_CONTROL_PLANE_IP}" ;;
+        *)    v4_allow="127.0.0.1, ${FELUCCA_CONTROL_PLANE_IP}" ;;
     esac
     local cp_rule="        tcp dport 9090 ip saddr != { ${v4_allow} } drop
         tcp dport 9090 ip6 saddr != { ${v6_allow} } drop"
@@ -300,19 +300,19 @@ write_worker_firewall() {
     cat > "${FIREWALL_NFT}" <<NFTEOF
 # Generated by deploy/install.sh — regenerated on every run, do not hand-edit.
 # Additional local policy belongs in its own table.
-table inet hearth_host {
+table inet felucca_host {
     chain input {
         type filter hook input priority filter; policy accept;
 
         # Replies to connections the host opened toward a guest (the agent
         # pings guests and drives them over vsock).
-        iifname "hearth0" ct state established,related accept
+        iifname "felucca0" ct state established,related accept
         # ICMP stays up: the agent and the verify scripts prove liveness by
         # pinging the guest from its worker.
-        iifname "hearth0" meta l4proto { icmp, ipv6-icmp } accept
+        iifname "felucca0" meta l4proto { icmp, ipv6-icmp } accept
         # Everything else a guest addresses to the host is dropped — the root
         # agent API on 9090 above all.
-        iifname "hearth0" drop
+        iifname "felucca0" drop
 
         # The agent API answers the control plane only.
 ${cp_rule}
@@ -326,11 +326,11 @@ write_control_plane_firewall() {
     cat > "${FIREWALL_NFT}" <<'NFTEOF'
 # Generated by deploy/install.sh — regenerated on every run, do not hand-edit.
 # Additional local policy belongs in its own table.
-table inet hearth_host {
+table inet felucca_host {
     chain input {
         type filter hook input priority filter; policy accept;
 
-        # hearthd answers the local reverse proxy only (DEPLOYMENT.md §7).
+        # feluccad answers the local reverse proxy only (DEPLOYMENT.md §7).
         # An inet-table `ip saddr` match never sees IPv6 packets, so the two
         # families need one rule each.
         tcp dport 8080 ip saddr != 127.0.0.1 drop
@@ -348,7 +348,7 @@ install_firewall() {
     nft_bin="$(command -v nft || true)"
     if [ -z "${nft_bin}" ]; then
         echo "    ERROR: nft not found — the host firewall rules cannot be installed."
-        echo "    hearth-agent.service Requires=hearth-firewall.service and will refuse"
+        echo "    felucca-agent.service Requires=felucca-firewall.service and will refuse"
         echo "    to start until they are. Install nftables and re-run this installer."
         return
     fi
@@ -364,34 +364,34 @@ install_firewall() {
     # order themselves after it so a node never serves its API unfiltered.
     #
     # The unit ships in deploy/systemd/ like every other one rather than being
-    # generated here: hearth-agent.service's Requires= points at it, so it is
+    # generated here: felucca-agent.service's Requires= points at it, so it is
     # part of the enforcement path and belongs somewhere it gets reviewed and
     # run through `systemd-analyze verify` (scripts/verify-units.sh) instead of
     # living only inside an installer heredoc. Only the two paths are
     # substituted, and only when they differ from the shipped defaults.
-    local unit_src="${SCRIPT_DIR}/systemd/hearth-firewall.service"
+    local unit_src="${SCRIPT_DIR}/systemd/felucca-firewall.service"
     [ -f "${unit_src}" ] || die "Unit file not found: ${unit_src}"
     install -m 0644 "${unit_src}" "${FIREWALL_UNIT}"
     if [ "${nft_bin}" != /usr/sbin/nft ]; then
         sed -i "s#/usr/sbin/nft#${nft_bin}#g" "${FIREWALL_UNIT}"
     fi
-    if [ "${FIREWALL_NFT}" != /etc/hearth/firewall.nft ]; then
-        sed -i "s#/etc/hearth/firewall.nft#${FIREWALL_NFT}#g" "${FIREWALL_UNIT}"
+    if [ "${FIREWALL_NFT}" != /etc/felucca/firewall.nft ]; then
+        sed -i "s#/etc/felucca/firewall.nft#${FIREWALL_NFT}#g" "${FIREWALL_UNIT}"
     fi
     ok "${FIREWALL_UNIT}"
     systemctl daemon-reload
-    systemctl enable hearth-firewall >/dev/null 2>&1 || true
+    systemctl enable felucca-firewall >/dev/null 2>&1 || true
 
-    if systemctl restart hearth-firewall >/dev/null 2>&1; then
-        ok "Firewall rules active (table inet hearth_host)"
+    if systemctl restart felucca-firewall >/dev/null 2>&1; then
+        ok "Firewall rules active (table inet felucca_host)"
     else
-        echo "    WARNING: could not apply the rules now — check 'systemctl status hearth-firewall'."
+        echo "    WARNING: could not apply the rules now — check 'systemctl status felucca-firewall'."
         echo "    ${role} services will not start until it succeeds."
     fi
 
-    if [ "${role}" = worker ] && [ -z "${HEARTH_CONTROL_PLANE_IP:-}" ]; then
-        echo "    NOTE: HEARTH_CONTROL_PLANE_IP was not set, so port 9090 is currently"
-        echo "    loopback-only. Re-run with HEARTH_CONTROL_PLANE_IP=<control plane IP>"
+    if [ "${role}" = worker ] && [ -z "${FELUCCA_CONTROL_PLANE_IP:-}" ]; then
+        echo "    NOTE: FELUCCA_CONTROL_PLANE_IP was not set, so port 9090 is currently"
+        echo "    loopback-only. Re-run with FELUCCA_CONTROL_PLANE_IP=<control plane IP>"
         echo "    (or edit ${FIREWALL_NFT}) before the control plane can drive this node."
     fi
 }
@@ -422,7 +422,7 @@ check_kvm() {
 #   for a in aarch64 x86_64; do
 #     curl -fsSL "https://github.com/firecracker-microvm/firecracker/releases/download/${V}/firecracker-${V}-${a}.tgz.sha256.txt"
 #   done
-# HEARTH_FC_VERSION + HEARTH_FC_SHA256 override both together for a node that
+# FELUCCA_FC_VERSION + FELUCCA_FC_SHA256 override both together for a node that
 # must run a different build.
 FC_VERSION=v1.16.1
 
@@ -440,12 +440,12 @@ install_firecracker() {
     fi
 
     local version sha
-    version="${HEARTH_FC_VERSION:-${FC_VERSION}}"
-    if [ -n "${HEARTH_FC_VERSION:-}" ] || [ -n "${HEARTH_FC_SHA256:-}" ]; then
-        if [ -z "${HEARTH_FC_VERSION:-}" ] || [ -z "${HEARTH_FC_SHA256:-}" ]; then
-            die "HEARTH_FC_VERSION and HEARTH_FC_SHA256 must be set together — a version without a digest is an unverified download."
+    version="${FELUCCA_FC_VERSION:-${FC_VERSION}}"
+    if [ -n "${FELUCCA_FC_VERSION:-}" ] || [ -n "${FELUCCA_FC_SHA256:-}" ]; then
+        if [ -z "${FELUCCA_FC_VERSION:-}" ] || [ -z "${FELUCCA_FC_SHA256:-}" ]; then
+            die "FELUCCA_FC_VERSION and FELUCCA_FC_SHA256 must be set together — a version without a digest is an unverified download."
         fi
-        sha="${HEARTH_FC_SHA256}"
+        sha="${FELUCCA_FC_SHA256}"
     else
         sha="$(fc_pinned_sha256 "${ARCH}")"
         [ -n "${sha}" ] || die "No pinned Firecracker digest for ${ARCH}."
@@ -509,7 +509,7 @@ check_wireguard_tools() {
         echo "      apt-get install -y wireguard-tools   # Debian/Ubuntu"
         echo "      dnf install -y wireguard-tools        # RHEL/Fedora"
         if [ "${role}" = "control-plane" ]; then
-            echo "    (only needed when the WireGuard overlay is enabled — wg_ip set in hearthd.json)"
+            echo "    (only needed when the WireGuard overlay is enabled — wg_ip set in feluccad.json)"
         fi
     fi
 }
@@ -528,7 +528,7 @@ check_curl() {
 # Main
 # ---------------------------------------------------------------------------
 
-info "Hearth installer — role: ${ROLE} — arch: ${ARCH}"
+info "Felucca installer — role: ${ROLE} — arch: ${ARCH}"
 
 setup_directories
 install_modules_conf
@@ -537,33 +537,33 @@ resolve_token
 case "${ROLE}" in
     control-plane)
         check_wireguard_tools "control-plane"
-        install_binary "hearthd"
-        setup_hearth_user
-        install_unit "hearthd"
+        install_binary "feluccad"
+        setup_felucca_user
+        install_unit "feluccad"
         install_config_stub \
-            "${SCRIPT_DIR}/config/hearthd.example.json" \
-            "${CONF_DIR}/hearthd.json" \
-            "hearth:hearth"
+            "${SCRIPT_DIR}/config/feluccad.example.json" \
+            "${CONF_DIR}/feluccad.json" \
+            "felucca:felucca"
         # Env file stub (carries secrets; not tracked in git)
-        if [ ! -f "${CONF_DIR}/hearthd.env" ]; then
-            cat > "${CONF_DIR}/hearthd.env" <<'ENVEOF'
-# Environment overrides for hearthd (optional — the installer already wrote the
-# token into hearthd.json). Setting HEARTH_TOKEN here overrides that value and
+        if [ ! -f "${CONF_DIR}/feluccad.env" ]; then
+            cat > "${CONF_DIR}/feluccad.env" <<'ENVEOF'
+# Environment overrides for feluccad (optional — the installer already wrote the
+# token into feluccad.json). Setting FELUCCA_TOKEN here overrides that value and
 # keeps the secret out of the JSON; systemd reads this file as root, so it never
-# has to be readable by the hearth user.
-#HEARTH_TOKEN=
+# has to be readable by the felucca user.
+#FELUCCA_TOKEN=
 ENVEOF
-            chmod 0640 "${CONF_DIR}/hearthd.env"
-            chown root:hearth "${CONF_DIR}/hearthd.env"
-            ok "Env stub installed: ${CONF_DIR}/hearthd.env"
+            chmod 0640 "${CONF_DIR}/feluccad.env"
+            chown root:felucca "${CONF_DIR}/feluccad.env"
+            ok "Env stub installed: ${CONF_DIR}/feluccad.env"
         fi
         install_firewall "control-plane"
         # Enable but do NOT start: the config still needs this host's real
         # values, and starting now would serve the API before the operator has
         # reviewed the firewall rules above.
-        info "Enabling hearthd (not starting it yet)"
-        systemctl enable hearthd
-        ok "hearthd enabled — it will start on the next boot, or when you start it"
+        info "Enabling feluccad (not starting it yet)"
+        systemctl enable feluccad
+        ok "feluccad enabled — it will start on the next boot, or when you start it"
         ;;
 
     worker)
@@ -572,37 +572,37 @@ ENVEOF
         check_nftables
         check_wireguard_tools "worker"
         check_curl
-        install_binary "hearth-agent"
-        install_unit "hearth-agent"
+        install_binary "felucca-agent"
+        install_unit "felucca-agent"
         install_config_stub \
-            "${SCRIPT_DIR}/config/hearth-agent.example.json" \
-            "${CONF_DIR}/hearth-agent.json" \
+            "${SCRIPT_DIR}/config/felucca-agent.example.json" \
+            "${CONF_DIR}/felucca-agent.json" \
             "root:root"
         if [ ! -f "${CONF_DIR}/agent.env" ]; then
             cat > "${CONF_DIR}/agent.env" <<'ENVEOF'
-# Environment overrides for hearth-agent (optional — the installer already wrote
-# the token into hearth-agent.json). Setting HEARTH_TOKEN here overrides that
+# Environment overrides for felucca-agent (optional — the installer already wrote
+# the token into felucca-agent.json). Setting FELUCCA_TOKEN here overrides that
 # value and keeps the secret out of the JSON.
-#HEARTH_TOKEN=
+#FELUCCA_TOKEN=
 ENVEOF
             chmod 0640 "${CONF_DIR}/agent.env"
             ok "Env stub installed: ${CONF_DIR}/agent.env"
         fi
         install_firewall "worker"
-        info "Enabling hearth-agent (not starting it yet)"
-        systemctl enable hearth-agent
-        ok "hearth-agent enabled — start it once the steps below are done"
+        info "Enabling felucca-agent (not starting it yet)"
+        systemctl enable felucca-agent
+        ok "felucca-agent enabled — start it once the steps below are done"
         echo ""
         echo "Before starting the agent:"
-        echo "  1. Set control_plane, advertise_addr and bind in ${CONF_DIR}/hearth-agent.json"
+        echo "  1. Set control_plane, advertise_addr and bind in ${CONF_DIR}/felucca-agent.json"
         echo "     (bind must be this node's management address — never 0.0.0.0, which"
         echo "      includes the bridge gateway every guest routes through)."
         echo "  2. Confirm the token matches the control plane's."
         echo "  3. Fetch guest kernel + rootfs:  sudo ${SCRIPT_DIR}/firecracker-assets.sh"
-        echo "  4. Review ${FIREWALL_NFT} and 'nft list table inet hearth_host'."
-        echo "  5. sudo systemctl start hearth-agent"
+        echo "  4. Review ${FIREWALL_NFT} and 'nft list table inet felucca_host'."
+        echo "  5. sudo systemctl start felucca-agent"
         echo ""
-        echo "Enroll with the hub: hearth-agent --join https://<hub> --join-token <token>  (token from POST /api/v1/join-tokens; ${CONF_DIR}/hearth-agent.json takes over on later boots)"
+        echo "Enroll with the hub: felucca-agent --join https://<hub> --join-token <token>  (token from POST /api/v1/join-tokens; ${CONF_DIR}/felucca-agent.json takes over on later boots)"
         ;;
 esac
 
@@ -611,13 +611,13 @@ if [ "${TOKEN_IS_NEW}" = yes ] && [ "${CONFIG_WAS_WRITTEN}" = yes ]; then
     echo "Bearer token for this node (shown once — it is not printed again):"
     echo "    ${TOKEN}"
     if [ "${ROLE}" = worker ]; then
-        echo "This worker minted its own token because HEARTH_TOKEN was not supplied."
-        echo "Hearth shares ONE token across the fleet, so replace it with the control"
+        echo "This worker minted its own token because FELUCCA_TOKEN was not supplied."
+        echo "Felucca shares ONE token across the fleet, so replace it with the control"
         echo "plane's value or the agent will never register:"
-        echo "    HEARTH_TOKEN=<control plane token> sudo -E $0 worker   # on a fresh node"
-        echo "    or edit \"token\" in ${CONF_DIR}/hearth-agent.json"
+        echo "    FELUCCA_TOKEN=<control plane token> sudo -E $0 worker   # on a fresh node"
+        echo "    or edit \"token\" in ${CONF_DIR}/felucca-agent.json"
     else
-        echo "Give this same value to every worker:  HEARTH_TOKEN=... sudo -E $0 worker"
+        echo "Give this same value to every worker:  FELUCCA_TOKEN=... sudo -E $0 worker"
     fi
 elif [ "${CONFIG_WAS_WRITTEN}" = no ]; then
     echo ""

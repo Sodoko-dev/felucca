@@ -1,11 +1,11 @@
-# Hearth — Architecture
+# Felucca — Architecture
 
-Hearth is a self-hosted infrastructure SaaS that manages **Firecracker microVMs ("sandboxes") for AI workloads**.
-The backend is two static binaries — `hearthd` (control plane, **Go**) and `hearth-agent` (node agent,
+Felucca is a self-hosted infrastructure SaaS that manages **Firecracker microVMs ("sandboxes") for AI workloads**.
+The backend is two static binaries — `feluccad` (control plane, **Go**) and `felucca-agent` (node agent,
 **Rust**) — with no Kubernetes on the control path (languages per
 [ADR-0003](adr/ADR-0003-go-rust-port.md); the wire and on-disk formats are unchanged from the Zig v2
 implementation and enforced by `test/conformance/`). A third component arrived with v3.1:
-**`hearth-guest`** (Rust), a vsock agent baked into the guest image that gives the platform
+**`felucca-guest`** (Rust), a vsock agent baked into the guest image that gives the platform
 in-guest command execution (`exec`) and fork re-IP/re-MAC — **rolled out to the lab and
 verified green on 2026-06-11** (conformance 132/0, verify-v2 21/0;
 [API-V3-EXEC.md](API-V3-EXEC.md) is its contract).
@@ -27,11 +27,11 @@ Related docs: [PLAN.md](PLAN.md) (adopted plan), [API-V2.md](API-V2.md) (v2 API/
 ```mermaid
 flowchart TB
     subgraph client["Client"]
-        UI["Hearth Console<br/>(static SPA — vanilla JS,<br/>3s polling, mock-mode fallback)"]
+        UI["Felucca Console<br/>(static SPA — vanilla JS,<br/>3s polling, mock-mode fallback)"]
         CLI["curl / scripts"]
     end
 
-    subgraph hearthd["hearthd — control plane (Go, :8080)"]
+    subgraph feluccad["feluccad — control plane (Go, :8080)"]
         AUTH["Bearer-token guard<br/>(required, constant-time,<br/>per-source failure throttle;<br/>only /healthz + UI files open)"]
         STATIC["Static file server<br/>(serves ui/, index.html fallback)"]
         API["REST API v1+v2+v3.1<br/>(JSON over HTTP/1.1;<br/>sleep · wake · fork · exec verbs)"]
@@ -41,12 +41,12 @@ flowchart TB
         METRICS["/metrics<br/>(Prometheus text:<br/>wake_ms, forks, pool, states)<br/>admin token required"]
     end
 
-    subgraph agent["hearth-agent — per worker (Rust, :9090)"]
+    subgraph agent["felucca-agent — per worker (Rust, :9090)"]
         AAPI["Agent REST API<br/>(/v1/vms · sleep · wake · fork · exec)<br/>bound to the management address,<br/>never 0.0.0.0 by default"]
         VMM["VM manager<br/>(spawn firecracker, configure over UDS,<br/>snapshot/restore, track pids)"]
         GC["Guest client (v3.1)<br/>(hybrid vsock: CONNECT 52,<br/>exec + set_ip on fork)"]
         POOL["Warm pool<br/>(pool_size paused VMs,<br/>claim on create, async refill)"]
-        NET["Networking<br/>(bridge hearth0 + tap per VM,<br/>sequential IP, nft masquerade,<br/>cross-tenant nft isolation — v4 P1;<br/>guest→host input fence, per-tap<br/>anti-spoof, bridge L2 + IPv6 fence)"]
+        NET["Networking<br/>(bridge felucca0 + tap per VM,<br/>sequential IP, nft masquerade,<br/>cross-tenant nft isolation — v4 P1;<br/>guest→host input fence, per-tap<br/>anti-spoof, bridge L2 + IPv6 fence)"]
         HB["Heartbeat loop<br/>(every 5s: mem_free,<br/>vm_count, pool_size)"]
     end
 
@@ -54,10 +54,10 @@ flowchart TB
         FCAPI["REST over unix socket<br/>fc.sock"]
         VSOCK["vsock device<br/>(host UDS v.sock,<br/>attached when image marker present)"]
         UVM["microVM guest<br/>(vmlinux + rootfs.ext4 copy,<br/>ip= boot-arg networking)"]
-        HG["hearth-guest (v3.1)<br/>(vsock port 52, systemd unit:<br/>exec + set_ip ops)"]
+        HG["felucca-guest (v3.1)<br/>(vsock port 52, systemd unit:<br/>exec + set_ip ops)"]
     end
 
-    ASSETS[("/srv/ignis<br/>kernels/vmlinux<br/>images/ubuntu-base.ext4<br/>(+ .hearth-guest-v1 marker)<br/>instances/&lt;id&gt;/<br/>(+ vmstate.bin/mem.bin<br/>when sleeping)")]
+    ASSETS[("/srv/ignis<br/>kernels/vmlinux<br/>images/ubuntu-base.ext4<br/>(+ .felucca-guest-v1 marker)<br/>instances/&lt;id&gt;/<br/>(+ vmstate.bin/mem.bin<br/>when sleeping)")]
 
     UI -->|"GET /  +  /api/v1/*<br/>Authorization: Bearer"| AUTH
     CLI --> AUTH
@@ -83,10 +83,10 @@ flowchart TB
 
 **Auth posture (v4 hardening):** there is no "auth off" mode that a deployment can fall into by
 accident. Both binaries **refuse to start** on an empty, placeholder (`REPLACE_WITH…`,
-`hearth-lab-token`) or short token — under 32 chars for `hearthd`, under 16 for `hearth-agent`
+`felucca-lab-token`) or short token — under 32 chars for `feluccad`, under 16 for `felucca-agent`
 (`config.ValidateAuth` / `config::validate_token`). Open mode exists only as the explicitly named
-`hearthd --insecure-no-auth`, which logs a WARN at every start and a second, louder one when the
-bind is not loopback; **`hearth-agent` has no equivalent flag** — its API execs into every guest on
+`feluccad --insecure-no-auth`, which logs a WARN at every start and a second, louder one when the
+bind is not loopback; **`felucca-agent` has no equivalent flag** — its API execs into every guest on
 the node. `/metrics` is admin-token-gated (§9); only `/healthz` and the static UI files are open.
 Failed credentials are counted per source address: past 10 failures the wait doubles and a further
 failure inside that window is answered 429 with `Retry-After` (capped at 60 s, or 2 s when the key
@@ -97,19 +97,19 @@ credential holder out. Quiet time is the only thing that forgives a record (one 
 success deliberately does not, because a wipe-on-success is reachable by anyone sharing the key. The
 source key is the connection peer unless the peer is inside the configured `trusted_proxies` CIDR
 list (default **empty** — no forwarded header is believed; `X-Real-IP` additionally needs
-`trust_x_real_ip`, default false, which hearthd refuses to start with unless a proxy is declared);
+`trust_x_real_ip`, default false, which feluccad refuses to start with unless a proxy is declared);
 see [DEPLOYMENT.md §7.1](DEPLOYMENT.md#71-forwarded-client-addresses-required-reading).
 
 **Host-side network fences (v4 hardening, per worker):** the tenant `forward` ruleset only ever sees
-IPv4 between guests, so three more fences sit around the bridge. A `hearth input` chain
-default-drops everything arriving on `hearth0` except ICMP and replies to host-initiated flows —
+IPv4 between guests, so three more fences sit around the bridge. A `felucca input` chain
+default-drops everything arriving on `felucca0` except ICMP and replies to host-initiated flows —
 guests route through the bridge gateway, so without it every host service on a wildcard bind is one
 hop from inside a sandbox, and the agent port is named in its own explicit drop rule. A `bridge
-hearth forward` chain accepts only ARP and IPv4 between bridge ports and drops the rest, closing the
+felucca forward` chain accepts only ARP and IPv4 between bridge ports and drops the rest, closing the
 pure-L2 path (most importantly link-local IPv6, which guest kernels autoconfigure); IPv6 is also
 disabled on the bridge itself. Per tap, a `netdev` ingress chain with `policy drop` pins the guest's
 source MAC, its ARP sender MAC **and** ARP sender IP, and its IPv4 source address — without the ARP
-pin a guest could move a victim's address in the bridge FDB. `hearth-agent` **refuses to serve**
+pin a guest could move a victim's address in the bridge FDB. `felucca-agent` **refuses to serve**
 when networking is on and any of these are not in force (`netfilter_ready`): a worker with no
 isolation would otherwise keep accepting tenant placements silently.
 
@@ -118,9 +118,9 @@ Firecracker directly; the control plane only does placement and proxying. v2 del
 pool is claimed and refilled entirely on the agent, and wake is one `/snapshot/load` away — no
 control-plane round trip on the latency-critical path.
 
-**Cross-tenant isolation (v4 P1):** guest-to-guest traffic on `hearth0` is dropped unless source
+**Cross-tenant isolation (v4 P1):** guest-to-guest traffic on `felucca0` is dropped unless source
 and destination IPs share a tenant. One concatenated nft set (`tenant_pairs`, `ipv4_addr . ipv4_addr`,
-table `ip hearth`) holds the allowed same-tenant pairs; `br_netfilter` routes bridged L2 frames
+table `ip felucca`) holds the allowed same-tenant pairs; `br_netfilter` routes bridged L2 frames
 through the forward chain so same-subnet traffic can't bypass it. The agent rebuilds the set
 flush-and-repopulate (idempotent, serialized) after every create/fork/delete and at startup —
 `tenant_id` is only a Rust-side grouping key and never appears in an nft command. Egress NAT and
@@ -132,15 +132,15 @@ alternatives: [ADR-0005](adr/ADR-0005-cross-tenant-network-isolation.md).
 ## 2. Deployment topology
 
 The same binaries serve two topologies, differing **only by configuration**
-(precedence: flags > `HEARTH_*` env > `--config` JSON > defaults — see [API-V2.md](API-V2.md) §6):
+(precedence: flags > `FELUCCA_*` env > `--config` JSON > defaults — see [API-V2.md](API-V2.md) §6):
 
 ```mermaid
 flowchart LR
     subgraph prod["Production (remote servers — deploy/ + DEPLOYMENT.md)"]
         direction LR
-        PROXY["Reverse proxy (caddy/nginx)<br/>TLS termination<br/>only 443 exposed<br/>must set X-Forwarded-For;<br/>hearthd must list it in trusted_proxies"]
-        HDP["hearthd (systemd, hearth user)<br/>/etc/hearth/hearthd.json<br/>HEARTH_TOKEN"]
-        W1["worker 1..N (systemd, root)<br/>hearth-agent + firecracker<br/>/dev/kvm, CAP_NET_ADMIN"]
+        PROXY["Reverse proxy (caddy/nginx)<br/>TLS termination<br/>only 443 exposed<br/>must set X-Forwarded-For;<br/>feluccad must list it in trusted_proxies"]
+        HDP["feluccad (systemd, felucca user)<br/>/etc/felucca/feluccad.json<br/>FELUCCA_TOKEN"]
+        W1["worker 1..N (systemd, root)<br/>felucca-agent + firecracker<br/>/dev/kvm, CAP_NET_ADMIN"]
         PROXY --> HDP
         HDP <-->|"private network only<br/>:9090 + per-node bearer"| W1
     end
@@ -156,18 +156,18 @@ flowchart LR
     end
 
     subgraph lab["Lima VM: infra-saas-lab — 192.168.104.3"]
-        HD["hearthd :8080"]
+        HD["feluccad :8080"]
         ZIG["Go 1.26 + Rust 1.96 toolchains<br/>(only build environment)"]
         UIDIR[("repo mount<br/>ui/ + go/ + rust/")]
     end
 
     subgraph k0["Lima VM: kata-lab-0 — 192.168.104.1"]
-        A0["hearth-agent :9090"]
+        A0["felucca-agent :9090"]
         F0["firecracker × N<br/>(/dev/kvm, nested virt)"]
     end
 
     subgraph k1["Lima VM: kata-lab-1 — 192.168.104.4"]
-        A1["hearth-agent :9090"]
+        A1["felucca-agent :9090"]
         F1["firecracker × N<br/>(/dev/kvm, nested virt)"]
     end
 
@@ -181,7 +181,7 @@ flowchart LR
 
 > **Networking gotcha:** Apple's vzNAT (`lima0`, 192.168.64.x) gives **no guest-to-guest connectivity**
 > (verified: 100% loss). All inter-VM traffic uses Lima's `user-v2` network. Guests inside microVMs
-> get IPs from the per-node `net_cidr` (default `10.231.0.0/24`) via the `hearth0` bridge — verified
+> get IPs from the per-node `net_cidr` (default `10.231.0.0/24`) via the `felucca0` bridge — verified
 > by host→guest ping; `--net off` restores IP-less operation.
 
 ---
@@ -227,9 +227,9 @@ Firecracker exit flips the VM to `error` within seconds (exit reaper + 5s livene
 sequenceDiagram
     autonumber
     actor U as User (UI / curl)
-    participant H as hearthd :8080
+    participant H as feluccad :8080
     participant S as Scheduler
-    participant A as hearth-agent :9090<br/>(chosen worker)
+    participant A as felucca-agent :9090<br/>(chosen worker)
     participant F as firecracker<br/>(new child process)
 
     U->>H: POST /api/v1/sandboxes {name, namespace, vcpus, mem_mib}
@@ -244,7 +244,7 @@ sequenceDiagram
         A->>A: refill pool asynchronously
     else cold boot
         A->>A: mkdir /srv/ignis/instances/id/<br/>cp ubuntu-base.ext4 → rootfs.ext4
-        A->>A: create tap hth-N on bridge hearth0,<br/>allocate next IP from net_cidr
+        A->>A: create tap hth-N on bridge felucca0,<br/>allocate next IP from net_cidr
         A->>F: spawn firecracker --api-sock fc.sock
         A->>A: poll fc.sock (≤3s)
         A->>F: PUT /boot-source (vmlinux,<br/>boot args incl. ip=10.231.0.x)
@@ -285,8 +285,8 @@ gateway does not otherwise authenticate.
 sequenceDiagram
     autonumber
     actor U as User (UI / curl)
-    participant H as hearthd
-    participant A as owning hearth-agent
+    participant H as feluccad
+    participant A as owning felucca-agent
     participant F as firecracker
 
     U->>H: POST /api/v1/sandboxes/{id}/pause
@@ -309,8 +309,8 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     actor U as User (UI / curl)
-    participant H as hearthd
-    participant A as owning hearth-agent
+    participant H as feluccad
+    participant A as owning felucca-agent
     participant F as firecracker
 
     rect rgb(35,35,45)
@@ -362,18 +362,18 @@ fails with EADDRINUSE unless wake removes the stale `v.sock` first (it does).
 ## 5c. User flow — exec and fork re-IP (v3.1, via the guest agent)
 
 Both v3.1 features ride the same channel: a Firecracker **vsock** device (host side: `v.sock`
-in the instance dir) connected to **hearth-guest**, a small Rust server baked into the base
+in the instance dir) connected to **felucca-guest**, a small Rust server baked into the base
 image and started by systemd inside every guest. The device is attached at cold boot only when
-the image carries the `.hearth-guest-v1` marker, so un-injected images keep exact v2 behavior.
+the image carries the `.felucca-guest-v1` marker, so un-injected images keep exact v2 behavior.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor U as User (UI / curl)
-    participant H as hearthd
-    participant A as owning hearth-agent
+    participant H as feluccad
+    participant A as owning felucca-agent
     participant F as firecracker vsock (v.sock)
-    participant G as hearth-guest (in guest, port 52)
+    participant G as felucca-guest (in guest, port 52)
 
     rect rgb(30,38,46)
     Note over U,G: EXEC — run a command inside the sandbox
@@ -410,8 +410,8 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     autonumber
-    participant A as hearth-agent (worker)
-    participant H as hearthd
+    participant A as felucca-agent (worker)
+    participant H as feluccad
     actor U as UI
 
     A->>H: POST /api/v1/agents/register<br/>{hostname, addr, cpus, mem_total_mib}
@@ -433,19 +433,19 @@ Sleeping VMs survive agent restarts: the agent reconciles instance dirs and `met
 
 **The per-node credential (v4 hardening).** A node's `addr` is caller-supplied, so every outbound
 dial is a decision about where to deliver a secret; sending the cluster admin token made "point
-hearthd at a host I control" equivalent to "hand me the admin key". And requiring that same token
+feluccad at a host I control" equivalent to "hand me the admin key". And requiring that same token
 back on register/heartbeat meant every worker in the fleet held it. Enrollment with a one-time join
 token — over the wg overlay (`POST /api/v1/nodes/join`) or by passing `join_token` to
-`POST /api/v1/agents/register` — mints a per-node bearer (`hearth_nt_…`) that replaces the admin
+`POST /api/v1/agents/register` — mints a per-node bearer (`felucca_nt_…`) that replaces the admin
 token on **both** legs:
 
-- hearthd stores it keyed on the node's **`host:port`** (two agents on one host are two nodes; rows
+- feluccad stores it keyed on the node's **`host:port`** (two agents on one host are two nodes; rows
   written under the earlier bare-host key are migrated on first use) and presents **that**, and
   nothing else, on every proxy call to that node — structurally, via `nodeDial`, whose only
   constructor resolves the credential from the node's identity so no call site can substitute
   `cfg.Token`. An address with no credential row gets **no** bearer, which is the case a forged
   registration lands in.
-- `hearth-agent` persists the issued credential to `<data_dir>/node-token` (0600, refusing to start
+- `felucca-agent` persists the issued credential to `<data_dir>/node-token` (0600, refusing to start
   if it is readable more widely), presents it outbound on the two agent routes, and accepts it
   inbound alongside its configured `token`. There is deliberately no fallback the other way: a
   rejected node token is never retried with the shared one, or making a single request fail would
@@ -465,7 +465,7 @@ at startup, so authenticating the fleet's highest-rate traffic costs no store re
 > (verified: `Manager::new` receives `cfg.token` and `curl_download` presents it). A worker
 > compromise is still an admin-token compromise until that path has its own credential.
 >
-> `hearth-agent` also does not send the `node_token` proof-of-possession field, so re-enrolling an
+> `felucca-agent` also does not send the `node_token` proof-of-possession field, so re-enrolling an
 > overlay worker means giving it a fresh WireGuard key — see
 > [DEPLOYMENT.md §6.7](DEPLOYMENT.md#67-per-node-agent-credentials).
 
@@ -475,7 +475,7 @@ at startup, so authenticating the fleet's highest-rate traffic costs no store re
 
 ```mermaid
 flowchart TD
-    START(["page load"]) --> PURGE["purge any hearth_token left<br/>in local/sessionStorage by an<br/>older build; strip and IGNORE ?token="]
+    START(["page load"]) --> PURGE["purge any felucca_token left<br/>in local/sessionStorage by an<br/>older build; strip and IGNORE ?token="]
     PURGE --> TOK["token lives in a module-scoped<br/>variable that dies with the tab;<br/>Authorization header on every fetch"]
     TOK --> R0["initial render"]
     R0 -->|"no token: do NOT poll"| BANNER
@@ -500,9 +500,9 @@ structural changes rebuild the DOM; volatile values are patched into existing el
 tab — **never** `localStorage` or `sessionStorage`, because web storage hands the cluster admin
 token to any script on the origin and turns one XSS into a stolen admin credential. A `?token=` in
 the URL is **stripped and ignored, never accepted**: by the time the page runs, that value is
-already in the browser's history entry and in the access log of every proxy in front of hearthd, so
+already in the browser's history entry and in the access log of every proxy in front of feluccad, so
 it is a token to rotate rather than a token to use. An upgraded console also purges any
-`hearth_token` an older build left in web storage. The paste-in banner is the only way in — and with
+`felucca_token` an older build left in web storage. The paste-in banner is the only way in — and with
 no token the console does **not** poll at all, because every attempt would be a counted auth failure
 against the per-source throttle, and an unattended 3 s timer walks a shared source key past the
 threshold in ~20 seconds. That no longer locks the operator out — a correct token is served
@@ -518,8 +518,8 @@ those messages carry server-supplied numbers.
 flowchart LR
     subgraph srv["/srv/ignis"]
         K["kernels/vmlinux<br/>(shared guest kernel, firecracker-ci)"]
-        B["images/ubuntu-base.ext4<br/>(2 GB shared base rootfs,<br/>hearth-guest baked in by installer)"]
-        MK["images/.hearth-guest-v1<br/>(marker: agent attaches vsock<br/>to new cold boots)"]
+        B["images/ubuntu-base.ext4<br/>(2 GB shared base rootfs,<br/>felucca-guest baked in by installer)"]
+        MK["images/.felucca-guest-v1<br/>(marker: agent attaches vsock<br/>to new cold boots)"]
         subgraph inst["instances/&lt;sandbox-id&gt;/"]
             RF["rootfs.ext4 (private copy of base)"]
             SK["fc.sock (Firecracker API)"]
@@ -543,7 +543,7 @@ v3 replaces the full rootfs copy with **overlayfs**: shared read-only base + tin
 
 ## 9. Status — shipped (v2), live (v3.1), and what remains
 
-Shipped in v2, then ported to Go (`hearthd`) and Rust (`hearth-agent`) under the frozen
+Shipped in v2, then ported to Go (`feluccad`) and Rust (`felucca-agent`) under the frozen
 API-V2 contract — all verified end-to-end on the lab (17/17 system checks +
 `test/conformance/` contract suite, goldens recorded from the Zig reference;
 migration record in [ADR-0003](adr/ADR-0003-go-rust-port.md)):
@@ -553,32 +553,32 @@ migration record in [ADR-0003](adr/ADR-0003-go-rust-port.md)):
 | `sleep` / `wake` | snapshot/create → kill; snapshot/load resume — **wake_ms≈70 measured** (67–85 across both implementations) |
 | `fork` | parent snapshot + rootfs/mem copy + own tap via `network_overrides`, `parent_id` set |
 | Warm pool | `pool_size` paused VMs per agent; matching create claims one, async refill |
-| Guest networking | bridge `hearth0` + per-VM tap + sequential IP (`net_cidr`) + nftables masquerade; `ip` populated; host→guest ping verified |
-| Auth | bearer token (`HEARTH_TOKEN`/config/flag); 401 without; constant-time compare. **Hardened in v4** (see "Auth posture", §1): both binaries refuse to start without a real token, `/metrics` is admin-gated, failures are throttled per source address, and the console takes its token from a paste-in banner only — `?token=` is stripped and ignored, web storage is never used |
-| Production config | flags > env (`HEARTH_*`) > `--config` JSON > defaults; no hardcoded paths; static binaries for **aarch64 + x86_64**; systemd units + installer in `deploy/`, guide in `DEPLOYMENT.md` |
+| Guest networking | bridge `felucca0` + per-VM tap + sequential IP (`net_cidr`) + nftables masquerade; `ip` populated; host→guest ping verified |
+| Auth | bearer token (`FELUCCA_TOKEN`/config/flag); 401 without; constant-time compare. **Hardened in v4** (see "Auth posture", §1): both binaries refuse to start without a real token, `/metrics` is admin-gated, failures are throttled per source address, and the console takes its token from a paste-in banner only — `?token=` is stripped and ignored, web storage is never used |
+| Production config | flags > env (`FELUCCA_*`) > `--config` JSON > defaults; no hardcoded paths; static binaries for **aarch64 + x86_64**; systemd units + installer in `deploy/`, guide in `DEPLOYMENT.md` |
 
 v3.1 — **live in the lab** (rolled out and verified 2026-06-11: conformance **132/0** + verify-v2
 **21/0**; contract: [API-V3-EXEC.md](API-V3-EXEC.md)):
 
 | Capability | v3.1 implementation | Validation |
 |---|---|---|
-| `exec` (run commands in guests) | `POST .../exec` → agent → FC hybrid vsock (`CONNECT 52`) → `hearth-guest` in the image (systemd unit); 501 for pre-v3.1 VMs | exit code + output round-trip on cold-booted and woken guests; wake still ~69 ms with vsock attached |
+| `exec` (run commands in guests) | `POST .../exec` → agent → FC hybrid vsock (`CONNECT 52`) → `felucca-guest` in the image (systemd unit); 501 for pre-v3.1 VMs | exit code + output round-trip on cold-booted and woken guests; wake still ~69 ms with vsock attached |
 | Fork guest re-IP + re-MAC | agent first sets a fresh locally-administered MAC on the child (plain `exec` — the memory-clone shares the parent's MAC), then `set_ip` over vsock (best-effort, 3 attempts) | fork child answers on its own IP **and the parent keeps its connectivity** (shared-MAC bridge-FDB flap found and fixed in lab verification) |
-| Asset pipeline | `infra/guest-agent-install.sh` injects binary+unit into the base image and drops the `.hearth-guest-v1` marker that gates the vsock device | idempotent run against an image copy; un-injected images keep exact v2 behavior |
-| Lifecycle hardening | `start` = guarded cold boot (`stopped`/`error` only; 409 `InvalidState` otherwise — start-on-paused used to orphan the live FC); `pause`/`resume` guarded; FC exits detected (spawn reaper + 5 s sweep) → `state:error`; failed spawns reaped; dead pool VM falls through to cold boot | start-on-paused 409 regression cases in conformance (agent/07, hearthd/10); poisoned wake flips to `error` within ~5 s instead of a stale `running` |
+| Asset pipeline | `infra/guest-agent-install.sh` injects binary+unit into the base image and drops the `.felucca-guest-v1` marker that gates the vsock device | idempotent run against an image copy; un-injected images keep exact v2 behavior |
+| Lifecycle hardening | `start` = guarded cold boot (`stopped`/`error` only; 409 `InvalidState` otherwise — start-on-paused used to orphan the live FC); `pause`/`resume` guarded; FC exits detected (spawn reaper + 5 s sweep) → `state:error`; failed spawns reaped; dead pool VM falls through to cold boot | start-on-paused 409 regression cases in conformance (agent/07, feluccad/10); poisoned wake flips to `error` within ~5 s instead of a stale `running` |
 
 v4 — multi-tenant, deploy-anywhere, product-ready (in progress; plan P0–P6,
 [ADR-0004](adr/ADR-0004-tenancy-and-sqlite.md)):
 
 | Phase | Capability | Status |
 |---|---|---|
-| P0 | Tenancy (API keys, enforced namespaces, quotas, usage metering) + SQLite store (`go/internal/store`, pure-Go driver, one-time state.json import) | **live in the lab 2026-06-12** — conformance **166/0** (new `hearthd/17-tenancy`), verify-v2 **21/0**; contract in API-V2 §3b |
+| P0 | Tenancy (API keys, enforced namespaces, quotas, usage metering) + SQLite store (`go/internal/store`, pure-Go driver, one-time state.json import) | **live in the lab 2026-06-12** — conformance **166/0** (new `feluccad/17-tenancy`), verify-v2 **21/0**; contract in API-V2 §3b |
 | P1 | Cross-tenant network isolation (br_netfilter + single concatenated nft pair set `tenant_pairs`, flush-and-rebuild from full membership; `tenant_id` never hits an nft command) | **live in the lab 2026-06-12** — conformance **178/0** (new `agent/11-isolation`), verify-v2 **21/0**; design in [ADR-0005](adr/ADR-0005-cross-tenant-network-isolation.md); tenant networks node-scoped until P2 |
-| P2 | WireGuard hub-and-spoke overlay (hearthd = hub; one-time join tokens, sha256-at-rest, consume-last; agent `--join` + persisted `wg.json`), in-binary TLS (autocert), fleet under hardened systemd units | **overlay live in the lab 2026-06-12** — mixed fleet (one direct + one overlay worker), conformance **193/0** (new `hearthd/18-join`), verify-v2 **21/0**; design in [ADR-0006](adr/ADR-0006-wireguard-overlay-and-node-join.md); contract in API-V2 §3c; 48h systemd soak running; mixed-fleet acceptance (P2.6: external worker + live TLS) pending external infra |
-| P3 | Multi-service ingress: named exposes (route row + worker nft DNAT, node ports 20000-29999), `hearth-gw` reverse proxy (Host `name--id` routing, WebSocket passthrough, 503 wake page, dynamic port-in-hostname opt-in, per-tenant edge limits) | **live in the lab 2026-06-12** — conformance **227/0** (new `hearthd/19-expose`, +34 checks), verify-v2 **21/0**; live e2e: HTTP + WebSocket 101 through gw→DNAT→guest on the direct worker, dynamic route over the wg overlay worker, sleep→wake page→recovery, fork child URLs serving; design in [ADR-0007](adr/ADR-0007-sandbox-ingress.md); contract in API-V2 §3d; wildcard TLS + auto-wake deferred (external infra / P5) |
-| P4 | Templates & bigger guests: template entity + rootfs capture pipeline (`build-template.sh`, docker-base/odoo-v18 provision scripts), sha256-addressed pull-and-cache image distribution, grow-only `disk_gb` resize (caps 16 vCPU/32 GiB/128 GB), per-template warm pools (top-up + drain, sha-matched claims), per-tenant disk quota | **live in the lab 2026-06-12** — conformance **266/0** (new `hearthd/20-templates`, +39 checks incl. capture → cross-node pull → boot-from-captured-image proof), verify-v2 **21/0**, cargo 117/0; docker-base built via the public API on the systemd fleet; design in [ADR-0008](adr/ADR-0008-templates-and-image-distribution.md); contract in API-V2 §3e |
-| P5 | Streaming exec (`?stream=1` SSE over guest NDJSON), lifecycle policies (per-tenant + per-sandbox idle auto-sleep / asleep-TTL auto-delete; gateway auto-wake + dynamic-expose GC), usage aggregation (`GET /tenants/{id}/usage` + exec-only retention), per-template tenant visibility, worker image-cache GC, gratuitous-ARP fork fix, zero-dep TS SDK + `hearth-verify.sh` | **live in the lab 2026-06-13** — conformance **326/0** (new `hearthd/21-stream-exec`, `22-lifecycle`, `23-template-visibility`, +60 checks), verify-v2 **21/0**, cargo **41/0 guest + 121/0 agent**; design in [ADR-0009](adr/ADR-0009-streaming-lifecycle-usage.md); contract in API-V2 §3f; kata-lab-0 vz crashes #8–#9 under the heavier capture/VM churn (healed by stop -f + start; clean re-run) |
-| P6 | Observability & bench: structured logs (Go `slog`, Rust `tracing`) with `X-Hearth-Request-Id` propagated hearthd→agent, latency histograms (`hearth_{wake,exec,create}_duration_ms`) on `/metrics` (open when P6 shipped; **admin-gated since the v4 hardening pass** — ADR-0010 amendment), per-tenant gauges behind the authed `GET /api/v1/metrics/tenants`, Grafana dashboard (`deploy/grafana/`), `scripts/bench.sh` p50/p95 published in BENCHMARKS.md; HA + uffd CoW fork delivered as groundwork docs (docs/HA-GROUNDWORK.md, research/uffd-cow-fork.md), implementation deferred | **live in the lab 2026-08-09** — conformance **342/0** (new `hearthd/24-observability`), verify-v2 **21/0**, cargo **121/0 agent + 41/0 guest**; design in [ADR-0010](adr/ADR-0010-observability-and-bench.md); contract in API-V2 §3g/§7 |
+| P2 | WireGuard hub-and-spoke overlay (feluccad = hub; one-time join tokens, sha256-at-rest, consume-last; agent `--join` + persisted `wg.json`), in-binary TLS (autocert), fleet under hardened systemd units | **overlay live in the lab 2026-06-12** — mixed fleet (one direct + one overlay worker), conformance **193/0** (new `feluccad/18-join`), verify-v2 **21/0**; design in [ADR-0006](adr/ADR-0006-wireguard-overlay-and-node-join.md); contract in API-V2 §3c; 48h systemd soak running; mixed-fleet acceptance (P2.6: external worker + live TLS) pending external infra |
+| P3 | Multi-service ingress: named exposes (route row + worker nft DNAT, node ports 20000-29999), `felucca-gw` reverse proxy (Host `name--id` routing, WebSocket passthrough, 503 wake page, dynamic port-in-hostname opt-in, per-tenant edge limits) | **live in the lab 2026-06-12** — conformance **227/0** (new `feluccad/19-expose`, +34 checks), verify-v2 **21/0**; live e2e: HTTP + WebSocket 101 through gw→DNAT→guest on the direct worker, dynamic route over the wg overlay worker, sleep→wake page→recovery, fork child URLs serving; design in [ADR-0007](adr/ADR-0007-sandbox-ingress.md); contract in API-V2 §3d; wildcard TLS + auto-wake deferred (external infra / P5) |
+| P4 | Templates & bigger guests: template entity + rootfs capture pipeline (`build-template.sh`, docker-base/odoo-v18 provision scripts), sha256-addressed pull-and-cache image distribution, grow-only `disk_gb` resize (caps 16 vCPU/32 GiB/128 GB), per-template warm pools (top-up + drain, sha-matched claims), per-tenant disk quota | **live in the lab 2026-06-12** — conformance **266/0** (new `feluccad/20-templates`, +39 checks incl. capture → cross-node pull → boot-from-captured-image proof), verify-v2 **21/0**, cargo 117/0; docker-base built via the public API on the systemd fleet; design in [ADR-0008](adr/ADR-0008-templates-and-image-distribution.md); contract in API-V2 §3e |
+| P5 | Streaming exec (`?stream=1` SSE over guest NDJSON), lifecycle policies (per-tenant + per-sandbox idle auto-sleep / asleep-TTL auto-delete; gateway auto-wake + dynamic-expose GC), usage aggregation (`GET /tenants/{id}/usage` + exec-only retention), per-template tenant visibility, worker image-cache GC, gratuitous-ARP fork fix, zero-dep TS SDK + `felucca-verify.sh` | **live in the lab 2026-06-13** — conformance **326/0** (new `feluccad/21-stream-exec`, `22-lifecycle`, `23-template-visibility`, +60 checks), verify-v2 **21/0**, cargo **41/0 guest + 121/0 agent**; design in [ADR-0009](adr/ADR-0009-streaming-lifecycle-usage.md); contract in API-V2 §3f; kata-lab-0 vz crashes #8–#9 under the heavier capture/VM churn (healed by stop -f + start; clean re-run) |
+| P6 | Observability & bench: structured logs (Go `slog`, Rust `tracing`) with `X-Felucca-Request-Id` propagated feluccad→agent, latency histograms (`felucca_{wake,exec,create}_duration_ms`) on `/metrics` (open when P6 shipped; **admin-gated since the v4 hardening pass** — ADR-0010 amendment), per-tenant gauges behind the authed `GET /api/v1/metrics/tenants`, Grafana dashboard (`deploy/grafana/`), `scripts/bench.sh` p50/p95 published in BENCHMARKS.md; HA + uffd CoW fork delivered as groundwork docs (docs/HA-GROUNDWORK.md, research/uffd-cow-fork.md), implementation deferred | **live in the lab 2026-08-09** — conformance **342/0** (new `feluccad/24-observability`), verify-v2 **21/0**, cargo **121/0 agent + 41/0 guest**; design in [ADR-0010](adr/ADR-0010-observability-and-bench.md); contract in API-V2 §3g/§7 |
 
 ### v4 security hardening (post-P6)
 
@@ -590,23 +590,23 @@ they are:
 
 | Area | What changed | Where |
 |---|---|---|
-| Auth is not optional | Empty / placeholder / short tokens are a **startup failure** in both binaries (32 chars hearthd, 16 agent); `--insecure-no-auth` is the named loopback-lab opt-out, hearthd only, WARN'd at every start | `config.ValidateAuth`, `config::validate_token`, `cmd/hearthd/main.go` |
+| Auth is not optional | Empty / placeholder / short tokens are a **startup failure** in both binaries (32 chars feluccad, 16 agent); `--insecure-no-auth` is the named loopback-lab opt-out, feluccad only, WARN'd at every start | `config.ValidateAuth`, `config::validate_token`, `cmd/feluccad/main.go` |
 | `/metrics` closed | Admin bearer required; tenant keys get 404. The scrape names every worker, reports live fleet counts, and takes the global state lock | `server.handle` |
 | Brute-force throttle | Per-source failure counting on both credential gates (bearer + node join), 429 + `Retry-After`, quiet-time decay instead of success-clears; wait capped at 2 s when the key stands for many clients | `authThrottle` |
 | Throttle cannot deny service | The credential is authenticated **before** the backoff is consulted, so a correct token is always served and anonymous guessing on a shared key cannot lock the control plane out. Ordering it the other way was itself the regression a later review found | `gateAuth`, `refuse` |
 | Forwarded client IP | `X-Forwarded-For` honoured **only** from peers inside `trusted_proxies`, default empty; right-to-left chain walk (left-most, client-written entry never used); malformed CIDR is fatal at startup. `X-Real-IP` needs the separate `trust_x_real_ip` (default false), which is a startup failure without a declared proxy | `Server.clientIP`, `ValidateTrustedProxies` |
-| Residual closed by config, not code | hearthd cannot distinguish a forwarded header its proxy wrote from one it copied through. An edge proxy listed in `trusted_proxies` **must** overwrite `X-Forwarded-For` (`header_up …{remote_host}` / `proxy_set_header … $remote_addr`) or clients pick their own throttle key | [DEPLOYMENT.md §7.1](DEPLOYMENT.md#71-forwarded-client-addresses-required-reading) |
+| Residual closed by config, not code | feluccad cannot distinguish a forwarded header its proxy wrote from one it copied through. An edge proxy listed in `trusted_proxies` **must** overwrite `X-Forwarded-For` (`header_up …{remote_host}` / `proxy_set_header … $remote_addr`) or clients pick their own throttle key | [DEPLOYMENT.md §7.1](DEPLOYMENT.md#71-forwarded-client-addresses-required-reading) |
 | Console token handling | Module-scoped variable only; `?token=` stripped and ignored; old web-storage copies purged; no polling without a token | `ui/app.js` |
 | Agent listener | No wildcard by default — the management address plus loopback; `bind_any` is the opt-out; refuses a bind inside the guest CIDR | `rust/agent/src/main.rs` |
 | Host-side fences | Guest→host input chain, per-tap anti-spoof (MAC + ARP sender MAC/IP + IPv4 source), bridge L2 fence, IPv6 off on the bridge; agent refuses to serve if they are not in force | `rust/agent/src/net.rs` |
 | Unguessable ids | 26 hex chars from `crypto/rand` (104 bits); the `seq` counter left the id | `state.nextID` |
 | Input bounds | 1 MiB body cap ahead of every route; `name`/`namespace` 1..64 printable ASCII without `< > " ' &`; `timeout_ms` outside `[1,300000]` → 400 | `server.handle`, `validDisplayName` |
 | Key lifecycle | API keys can carry an expiry (`expires_in_s`, max 1 year) and are listable by an admin (`GET /api/v1/tenants/{id}/keys`) so a leaked secret can be matched by prefix and revoked | `tenants.go`, API-V2 §3b |
-| Per-node agent credential | `hearth_nt_…` minted at enrollment, keyed on `host:port`, used in **both** directions: hearthd presents it dialing the node, the node presents it on register/heartbeat, and the agent persists it 0600 and accepts it inbound. The shared token is still needed for image pulls — see §6 | `agentTokenFor`, `nodeDial`, `join.go`, `rust/agent/src/registration.rs` |
+| Per-node agent credential | `felucca_nt_…` minted at enrollment, keyed on `host:port`, used in **both** directions: feluccad presents it dialing the node, the node presents it on register/heartbeat, and the agent persists it 0600 and accepts it inbound. The shared token is still needed for image pulls — see §6 | `agentTokenFor`, `nodeDial`, `join.go`, `rust/agent/src/registration.rs` |
 | A node is not a tenant | A node credential is its own principal with an **allowlist** of two routes, bound to its own address / hostname / node id, and barred from spending a join token. Squeezing it into the tenant string (where admin is `""`) would have put it one typo from being a second admin | `principal`, `serveAPI`, `nodeMayRegister` |
 | Re-join proof of possession | A join token authorizes *an* enrollment, not a *specific node*, and the pubkey is caller-written — so re-joining an enrolled pubkey must present that node's current credential (`node_token`) or get 409, else a token holder could rotate a live worker off the control plane | `nodeTokenMatches`, `join.go` |
 | Pre-auth store pressure | Credential lookups reachable before authentication are bounded (`maxCredLookups` = 4) in front of the single sqlite connection, and node tokens resolve from an in-memory sha256 index with no store read at all | `credGate`, `nodeTokenIndex` |
-| Attacker-sized request heads | `MaxHeaderBytes` 16 KiB (Go's default is 1 MiB) and the `X-Forwarded-For` walk is bounded to 16 hops without ever splitting the whole header — the parse runs on the pre-auth path | `cmd/hearthd/main.go`, `Server.clientIP` |
+| Attacker-sized request heads | `MaxHeaderBytes` 16 KiB (Go's default is 1 MiB) and the `X-Forwarded-For` walk is bounded to 16 hops without ever splitting the whole header — the parse runs on the pre-auth path | `cmd/feluccad/main.go`, `Server.clientIP` |
 
 Remaining beyond v4:
 
@@ -619,4 +619,4 @@ Remaining beyond v4:
 | OIDC / multi-user auth | token-exchange resolving to the same tenant entities as API keys |
 | Pool-orphan reclaim | a paused pool FC orphaned by an agent restart is reconciled to `stopped` but its process is not reaped (1:1 with v2 behavior) |
 | uffd lazy restore / CoW fork | in-process userfaultfd in the Rust agent (the reason the agent is Rust — rust-vmm territory) |
-| Terraform provider | Go provider against the hearthd API (the reason the control plane is Go) |
+| Terraform provider | Go provider against the feluccad API (the reason the control plane is Go) |

@@ -28,7 +28,7 @@ One wire shape end to end, translated at each hop:
   unavailable). The data phase has an absolute deadline of
   `timeout_ms + 60s` (`DeadlineStream`); on expiry the body just ends and
   the missing done frame is the consumer's error signal.
-- **hearthd**: `POST /api/v1/sandboxes/{id}/exec?stream=1` returns SSE; each
+- **feluccad**: `POST /api/v1/sandboxes/{id}/exec?stream=1` returns SSE; each
   agent NDJSON line becomes one `data:` event, flushed immediately. The
   route keeps its slow-loris bound (`deadlineFor(timeout_ms + 90s)` — wider
   than the agent's deadline plus margin, still finite and request-sized). A
@@ -48,7 +48,7 @@ gateway already handles streaming responses (FlushInterval).
   clocks excluded from the wire JSON (the pre-P5 goldens stay frozen):
   `last_activity` (stamped by create, fork, wake, both exec arms, and
   gateway ingress reports) and `slept_at`.
-- A 15s sweep in hearthd (`LifecycleLoop`) auto-sleeps running sandboxes
+- A 15s sweep in feluccad (`LifecycleLoop`) auto-sleeps running sandboxes
   idle past their effective policy and auto-deletes sleeping ones past
   their TTL, via the same agent calls as the handlers (best-effort, retried
   next sweep). Decisions snapshot under the state lock; agent I/O happens
@@ -57,13 +57,13 @@ gateway already handles streaming responses (FlushInterval).
 - Activity stamps are memory-only and ride the next snapshot persist: the
   clock steers auto-sleep, it is not billing data; losing a few seconds of
   it on crash means a sandbox sleeps marginally early, nothing worse.
-- **Ingress activity**: hearth-gw batches the sandbox ids it proxied and
+- **Ingress activity**: felucca-gw batches the sandbox ids it proxied and
   POSTs `/api/v1/routes/activity` (admin-gated) every refresh tick; failed
-  reports re-queue so a hearthd blip can't make an active sandbox look idle.
+  reports re-queue so a feluccad blip can't make an active sandbox look idle.
 - **Auto-wake (ADR-0007 deferral)**: a request for a sleeping sandbox now
   wakes it (`POST …/wake` with the gateway's admin token) and polls the
   route table up to 15s before falling back to the 503 page. Gateway-wide
-  default on (`--auto-wake` / `HEARTH_GW_AUTO_WAKE=0`), per-tenant
+  default on (`--auto-wake` / `FELUCCA_GW_AUTO_WAKE=0`), per-tenant
   `auto_wake` override in the tenant-limits file. Wake-on-request is the
   product behavior (Sodoko end users reload a page, the system heals);
   combined with idle auto-sleep it makes sandboxes effectively serverless.
@@ -124,29 +124,29 @@ cold-cache 502.
 
 ### Gratuitous-ARP fix (P4 deferral)
 
-`IpRunner` (hearth-guest) gains `announce(gw)`: after a successful fork
+`IpRunner` (felucca-guest) gains `announce(gw)`: after a successful fork
 re-IP the guest fires one throwaway UDP datagram at the gateway. Snapshot-
 restored guests answer host-side ARP only after their first transmit; the
 datagram (and the ARP request it triggers) is that transmit, so verify-v2's
 ping checks see fork children immediately instead of after their first
 organic packet.
 
-### TS SDK + hearth verify
+### TS SDK + felucca verify
 
 - `sdk/ts/` — zero-dependency typed client (global fetch, ESM, Node ≥ 18):
   create/get/list/delete, sleep/wake/fork, exec (buffered + `execStream`
   with onStdout/onStderr callbacks and proper SSE buffering), expose/
   unexpose, templates, tenantUsage. Tests use node:test with an in-process
-  fake hearthd.
-- `scripts/hearth-verify.sh <endpoint> [token]` — the conformance suite
+  fake feluccad.
+- `scripts/felucca-verify.sh <endpoint> [token]` — the conformance suite
   pointed at ANY deployment (the suite was already endpoint-parameterized;
   this is the published front door). Agent suite included when `AGENT_API`
-  is set. A real `hearth` CLI subcommand is deferred until a CLI exists.
+  is set. A real `felucca` CLI subcommand is deferred until a CLI exists.
 
 ## Rejected alternatives
 
 - **WebSocket for exec streaming** — heavier on every hop (upgrade through
-  gateway + hearthd + agent), no benefit over SSE for a server→client
+  gateway + feluccad + agent), no benefit over SSE for a server→client
   byte stream; stdin interactivity is a different feature (P6+, needs a
   protocol redesign anyway).
 - **Storing last_activity on every exec (DB write)** — the snapshot persist
@@ -170,7 +170,7 @@ organic packet.
   tenants/sandboxes, `/routes/activity`, `/tenants/{id}/usage`, template
   `tenant` scoping. All additive; every pre-P5 shape is byte-frozen
   (activity clocks are `json:"-"`).
-- hearthd now has a second background goroutine (lifecycle) and the agent's
+- feluccad now has a second background goroutine (lifecycle) and the agent's
   refill loop does double duty (GC). Both are sweep-idempotent and
   best-effort; a missed tick delays, never corrupts.
 - Auto-wake makes the gateway hold requests up to ~15s on first hit of a
@@ -182,6 +182,6 @@ organic packet.
 ## Deferred
 
 - Exec stdin / PTY interactivity (protocol redesign; post-v4).
-- `hearth` CLI binary (would subsume hearth-verify.sh and join-token UX).
+- `felucca` CLI binary (would subsume felucca-verify.sh and join-token UX).
 - Per-sandbox policy PATCH (create-only today; tenants can fork-replace).
 - SDK publish to npm (needs org + CI; code ships in-repo).

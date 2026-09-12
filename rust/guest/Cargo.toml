@@ -1,14 +1,14 @@
 [package]
-name = "hearth-guest"
+name = "felucca-guest"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "hearth_guest"
+name = "felucca_guest"
 path = "src/lib.rs"
 
 [[bin]]
-name = "hearth-guest"
+name = "felucca-guest"
 path = "src/main.rs"
 
 [dependencies]

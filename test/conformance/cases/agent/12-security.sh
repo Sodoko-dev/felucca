@@ -23,8 +23,8 @@ CF_SEC_DOTDOT="%2e%2e"
 # ── Block 1: auth is evaluated BEFORE the id ────────────────────────────────
 # Otherwise the agent is an unauthenticated oracle for which ids are well
 # formed, and every id-shaped probe is answerable without a credential.
-if [ "${HEARTH_INSECURE_NO_AUTH:-0}" = "1" ]; then
-  skip "HEARTH_INSECURE_NO_AUTH=1; auth-ordering block needs a credential"
+if [ "${FELUCCA_INSECURE_NO_AUTH:-0}" = "1" ]; then
+  skip "FELUCCA_INSECURE_NO_AUTH=1; auth-ordering block needs a credential"
 else
   ag DELETE "/v1/vms/$CF_SEC_TRAV" "" none
   assert_unauthorized "DELETE traversal id without token -> 401 (auth precedes id validation)"
@@ -50,7 +50,7 @@ assert_status 400 "stop on '..' -> 400"
 
 # A create whose BODY carries the traversal: the id is a JSON field here, not a
 # path segment, so it reaches the handler without any URL decoding at all.
-ag POST /v1/vms '{"id":"../../../etc/hearth","name":"cf-trav","vcpus":1,"mem_mib":256}'
+ag POST /v1/vms '{"id":"../../../etc/felucca","name":"cf-trav","vcpus":1,"mem_mib":256}'
 assert_status 400 "create with traversal id in the body -> 400"
 assert_body_exact '{"error":"invalid id"}' "create traversal body exact"
 

@@ -1,5 +1,5 @@
 /* ============================================================
-   HEARTH CONSOLE — app.test.mjs
+   FELUCCA CONSOLE — app.test.mjs
    Regression tests for the console's polling and status reporting.
 
    Run:  node --test ui/app.test.mjs      (node >= 18)
@@ -7,7 +7,7 @@
    These cover the two properties an operator's safety depends on and that a
    passing 401-banner test does not prove:
 
-     1. The console never talks to the API without a credential. hearthd's
+     1. The console never talks to the API without a credential. feluccad's
         brute-force guard counts failed attempts per source address and backs
         the source off for up to a minute; an unattended console on a 3s timer
         generated two failures per poll and locked out its own operator.
@@ -148,10 +148,10 @@ function loadApp() {
   vm.createContext(ctx);
 
   const src = fs.readFileSync(APP_JS, 'utf8') +
-    '\n;globalThis.__hearth = { state, poll, setToken, getToken, MOCK_NODES, render };\n';
+    '\n;globalThis.__felucca = { state, poll, setToken, getToken, MOCK_NODES, render };\n';
   vm.runInContext(src, ctx, { filename: 'app.js' });
 
-  const api = ctx.__hearth;
+  const api = ctx.__felucca;
   return {
     ...api,
     ctx,
@@ -193,7 +193,7 @@ test('poll() sends no request at all when no token is set', async () => {
   await app.poll();
 
   assert.equal(app.fetchCalls.length, 0,
-    'an unattended console must not spend hearthd auth attempts on a 3s timer');
+    'an unattended console must not spend feluccad auth attempts on a 3s timer');
   assert.equal(app.state.dataMode, 'no-token');
 });
 
@@ -284,7 +284,7 @@ test('429 waits out Retry-After instead of feeding the backoff', async () => {
 
   assert.equal(next.length, 1, 'the loop continues, but later');
   assert.ok(next[0].ms >= 17000,
-    `next poll must be after hearthd's Retry-After, got ${next[0].ms}ms`);
+    `next poll must be after feluccad's Retry-After, got ${next[0].ms}ms`);
 });
 
 test('a token applied during a lockout is retried at once', async () => {

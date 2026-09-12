@@ -7,7 +7,7 @@
 
 ## Decision
 
-Both backend components — the control plane (`hearthd`) and the node agent (`hearth-agent`) — are
+Both backend components — the control plane (`feluccad`) and the node agent (`felucca-agent`) — are
 implemented in **Zig 0.16.0**, communicating over **REST/JSON on HTTP and Unix domain sockets**.
 No gRPC. The baseline's Go + `firecracker-go-sdk` + gRPC stack is replaced.
 
@@ -16,7 +16,7 @@ No gRPC. The baseline's Go + `firecracker-go-sdk` + gRPC stack is replaced.
 1. **User mandate.** Zig 0.16.0 is a hard, non-negotiable constraint. It is already installed and
    verified at `/usr/local/bin/zig` (`0.16.0`) on the `infra-saas-lab` build VM.
 2. **The transport Firecracker actually uses is REST over a Unix domain socket.** Driving Firecracker
-   is `PUT`/`GET` JSON against `/run/hearth/<id>.sock` (`/machine-config`, `/boot-source`, `/drives`,
+   is `PUT`/`GET` JSON against `/run/felucca/<id>.sock` (`/machine-config`, `/boot-source`, `/drives`,
    `/network-interfaces`, `/actions`, `/snapshot/create`, `/snapshot/load`). Zig std (`std.net`,
    `std.http`, `std.json`) maps onto this directly — UDS client + JSON is a few hundred lines, no SDK.
 3. **No Zig gRPC ecosystem.** There is no mature gRPC stack for Zig. Forcing gRPC would mean writing a
@@ -29,7 +29,7 @@ No gRPC. The baseline's Go + `firecracker-go-sdk` + gRPC stack is replaced.
 5. **No GC pauses on the hot path.** The wake/fork/snapshot path (PLAN §3) is the product's only
    defensible advantage; tail latency is the metric. Zig has manual, explicit memory management and no
    garbage collector, so there are no stop-the-world pauses to perturb wake p99. This matters most in
-   `hearth-agent`'s warm-pool hand-out and CoW fork loops.
+   `felucca-agent`'s warm-pool hand-out and CoW fork loops.
 6. **Small, auditable surface for untrusted-workload infrastructure.** A platform whose whole purpose
    is isolating untrusted code benefits from a backend with no hidden runtime and a minimal dependency
    tree. Zig's explicitness aids review of the privileged agent code.

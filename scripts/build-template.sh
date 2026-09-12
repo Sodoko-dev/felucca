@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build-template.sh — build a Hearth template image via the public API.
+# build-template.sh — build a Felucca template image via the public API.
 #
 # Boots a builder sandbox, streams a provision script into the guest, runs it
 # (nohup + poll, so builds aren't bound by the 5-minute exec cap), stops the
@@ -9,17 +9,17 @@
 #
 # Usage:
 #   build-template.sh --name docker-base --provision deploy/templates/docker-base.sh \
-#     [--api http://127.0.0.1:8080] [--token-env HEARTH_TOKEN] \
+#     [--api http://127.0.0.1:8080] [--token-env FELUCCA_TOKEN] \
 #     [--base TEMPLATE] [--vcpus N] [--mem-mib M] [--disk-gb G] [--pool-size P] \
 #     [--build-timeout SECONDS]
 #
-# The admin token is read from the environment (default HEARTH_TOKEN) — never
+# The admin token is read from the environment (default FELUCCA_TOKEN) — never
 # from argv, so it can't leak via process listings.
 # Requires: curl, jq, base64.
 set -euo pipefail
 
 API=http://127.0.0.1:8080
-TOKEN_ENV=HEARTH_TOKEN
+TOKEN_ENV=FELUCCA_TOKEN
 NAME="" PROVISION="" BASE=""
 VCPUS=1 MEM_MIB=1024 DISK_GB=4 POOL_SIZE=0
 BUILD_TIMEOUT=1800

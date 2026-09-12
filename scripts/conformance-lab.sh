@@ -6,16 +6,16 @@
 set -u
 
 # The lab token authenticates a root-privileged agent API, so it is never a
-# literal in the repo: argument, then HEARTH_TOKEN, then a file kept outside
+# literal in the repo: argument, then FELUCCA_TOKEN, then a file kept outside
 # the tree. Whatever the lab stack was started with has to match.
-TOKEN_FILE="${HEARTH_TOKEN_FILE:-$HOME/.config/hearth/lab-token}"
-TOKEN="${1:-${HEARTH_TOKEN:-}}"
+TOKEN_FILE="${FELUCCA_TOKEN_FILE:-$HOME/.config/felucca/lab-token}"
+TOKEN="${1:-${FELUCCA_TOKEN:-}}"
 if [ -z "$TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
   TOKEN="$(tr -d " \t\r\n" < "$TOKEN_FILE")"
 fi
 if [ -z "$TOKEN" ]; then
   echo "ERROR: no lab token." >&2
-  echo "  Pass it as \$1, export HEARTH_TOKEN, or write it to $TOKEN_FILE" >&2
+  echo "  Pass it as \$1, export FELUCCA_TOKEN, or write it to $TOKEN_FILE" >&2
   echo "  (generate one with: openssl rand -hex 32)" >&2
   exit 1
 fi
@@ -35,8 +35,8 @@ ENTRY=run.sh
 [ "$MODE" = "record" ] && ENTRY=record.sh
 
 limactl shell $CP_VM -- env \
-  HEARTH_API=http://127.0.0.1:8080 \
-  HEARTH_TOKEN="$TOKEN" \
+  FELUCCA_API=http://127.0.0.1:8080 \
+  FELUCCA_TOKEN="$TOKEN" \
   AGENT_API="http://$AGENT_ADDR" \
   SUITE=all \
   bash "$REPO_DIR_HOST/test/conformance/$ENTRY"

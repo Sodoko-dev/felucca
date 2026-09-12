@@ -11,7 +11,7 @@
 ## Decision
 
 1. **br_netfilter, because the bridge bypasses the `forward` hook.** Same-subnet
-   guests on `hearth0` talk via L2 switching, which never traverses the ip
+   guests on `felucca0` talk via L2 switching, which never traverses the ip
    `forward` hook — an nft forward chain alone would see nothing. The agent
    loads `br_netfilter` and sets `net.bridge.bridge-nf-call-iptables=1`
    (`ensure_bridge_netfilter`, `rust/agent/src/net.rs`) so bridged IPv4 frames
@@ -19,12 +19,12 @@
    traffic.
 2. **One concatenated pair set, not per-tenant sets.** A single nft set
    `tenant_pairs` (`type ipv4_addr . ipv4_addr`) in the existing table
-   `ip hearth` holds every allowed ordered (source IP, destination IP) pair —
+   `ip felucca` holds every allowed ordered (source IP, destination IP) pair —
    i.e. all same-tenant pairs. The forward chain (policy **accept**) is, in
    order: accept `ct state established,related`; accept anything whose
-   in-interface is not `hearth0`; accept anything whose out-interface is not
-   `hearth0`; accept `ip saddr . ip daddr @tenant_pairs`; **drop** the
-   remaining `hearth0`↔`hearth0` traffic. Only intra-bridge guest-to-guest is
+   in-interface is not `felucca0`; accept anything whose out-interface is not
+   `felucca0`; accept `ip saddr . ip daddr @tenant_pairs`; **drop** the
+   remaining `felucca0`↔`felucca0` traffic. Only intra-bridge guest-to-guest is
    policed — egress NAT and host↔guest are accepted before the pair check.
 3. **Flush-and-rebuild from full membership.** `rebuild_isolation(members)`
    takes `(tenant_id, guest_ip)` for every VM that currently holds an IP,
@@ -53,30 +53,30 @@ the whole fence. The `ip` `forward` chain polices exactly one path — IPv4,
 guest-to-guest, across the bridge — and three other paths reached around it.
 All three are now closed in `rust/agent/src/net.rs`, and `netfilter_ready()`
 returns true only when **every** one of them is confirmed; with networking on
-and any of them missing, `hearth-agent` **refuses to serve** rather than accept
+and any of them missing, `felucca-agent` **refuses to serve** rather than accept
 tenant placements onto a node with no isolation.
 
-1. **Guest → host (`ip hearth input`, `ensure_guest_input_filter`).** Guests
+1. **Guest → host (`ip felucca input`, `ensure_guest_input_filter`).** Guests
    route to the world through the bridge gateway, so traffic they aim *at the
    host itself* lands on the INPUT hook, which the forward chain never sees —
    every host service on a wildcard bind was one curl from inside any sandbox,
    the agent's own root API included. The chain accepts anything arriving on a
    different interface, then explicitly drops `tcp dport <agent port>` from
-   `hearth0`, then permits only ICMP (gateway pings, path-MTU discovery) and
-   `ct state established,related` before a trailing `iifname hearth0 drop`.
+   `felucca0`, then permits only ICMP (gateway pings, path-MTU discovery) and
+   `ct state established,related` before a trailing `iifname felucca0 drop`.
    Chain policy stays `accept` deliberately — this is a shared hook, and a drop
    policy would cut the host's own SSH; the trailing drop fails closed for guest
    traffic only. No DHCP or DNS holes: guests are addressed from the kernel
    command line and resolve through NAT'd egress.
-2. **Non-IPv4 between guests (`bridge hearth forward`, `ensure_bridge_l2_filter`).**
+2. **Non-IPv4 between guests (`bridge felucca forward`, `ensure_bridge_l2_filter`).**
    The pair set is `ipv4_addr . ipv4_addr` in the `ip` family, so it only ever
    sees IPv4. Two guests on one bridge exchange every *other* ethertype by pure
    L2 switching — most importantly IPv6, which any guest kernel autoconfigures
    as a link-local address on eth0 and which no tenant rule covered. The bridge-
-   family chain (priority -200) accepts ARP and IPv4 between `hearth0` ports and
+   family chain (priority -200) accepts ARP and IPv4 between `felucca0` ports and
    drops the rest; IPv6 is separately disabled on the bridge
    (`ensure_ipv6_disabled`).
-3. **Source-address spoofing (`netdev hearth <tap>`, `ensure_tap_antispoof`).**
+3. **Source-address spoofing (`netdev felucca <tap>`, `ensure_tap_antispoof`).**
    Membership is keyed on the guest's IP, so a guest that simply *claims* another
    tenant's address rides that tenant's allow pair. A per-tap ingress chain with
    `policy drop` pins the guest's `ether saddr`, its `arp saddr ether` **and**
@@ -96,7 +96,7 @@ family, loaded through the same `nft -f -` path as everything else.
 
 ## Alternatives considered
 
-- **Per-tenant named sets `hearth_t_<tenant>`** (the plan's original sketch):
+- **Per-tenant named sets `felucca_t_<tenant>`** (the plan's original sketch):
   rejected — set names would embed tenant strings in nft command lines, making
   string sanitization the actual security boundary (exactly the injection
   surface the P0 review flagged). It also needs one set + one rule per tenant
@@ -123,7 +123,7 @@ family, loaded through the same `nft -f -` path as everything else.
   counts; revisit (e.g. nft maps / marks) if a single node ever hosts very
   large same-tenant fleets.
 - `bridge-nf-call-iptables=1` is host-global: all bridged IPv4 on the host now
-  traverses netfilter. On a dedicated worker `hearth0` is the only bridge, so
+  traverses netfilter. On a dedicated worker `felucca0` is the only bridge, so
   the blast radius is the chain we installed (early accepts keep everything
   else untouched).
 - Every create/fork/delete pays one serialized rebuild (a handful of nft

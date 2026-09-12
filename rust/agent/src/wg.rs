@@ -1,5 +1,5 @@
-//! WireGuard overlay join flow for hearth-agent (v4 P2): keypair on disk,
-//! one-shot enrollment against hearthd, and the `wg-hearth` interface.
+//! WireGuard overlay join flow for felucca-agent (v4 P2): keypair on disk,
+//! one-shot enrollment against feluccad, and the `wg-felucca` interface.
 //!
 //! A worker enrolls once via POST {join_url}/api/v1/nodes/join with a
 //! single-use join token, persists the granted overlay assignment to
@@ -20,9 +20,9 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-pub const WG_IFACE: &str = "wg-hearth";
+pub const WG_IFACE: &str = "wg-felucca";
 
-/// Overlay assignment returned by hearthd's join endpoint; persisted verbatim
+/// Overlay assignment returned by feluccad's join endpoint; persisted verbatim
 /// to wg.json so later boots can rebuild the tunnel without a token.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct JoinInfo {
@@ -32,18 +32,18 @@ pub struct JoinInfo {
     pub server_pubkey: String,
     pub server_endpoint: String,
     pub keepalive_s: u32,
-    /// hearthd API port over the overlay. Not part of the server response —
+    /// feluccad API port over the overlay. Not part of the server response —
     /// recorded client-side from the join URL at enrollment so later boots
     /// don't fall back to a default the hub may not listen on.
     #[serde(default = "default_api_port")]
     pub api_port: u16,
-    /// This node's own hearthd→agent credential, minted by the same exchange.
+    /// This node's own feluccad→agent credential, minted by the same exchange.
     ///
     /// Transient, and `skip_serializing` is the point: it is persisted to its
     /// own 0600 file (config::save_node_token) so the credential lives in
     /// exactly ONE place on disk, and so the register route — which issues the
     /// same token and never writes wg.json — has somewhere to put a rotation.
-    /// Absent from an older hearthd's response, which serde defaults to "".
+    /// Absent from an older feluccad's response, which serde defaults to "".
     #[serde(default, skip_serializing)]
     pub agent_token: String,
 }
@@ -59,7 +59,7 @@ fn default_api_port() -> u16 {
 /// Generates ONLY when the file does not exist (ErrorKind::NotFound). Any
 /// other read error — and an existing-but-empty file — is returned as an
 /// error, never silently regenerated: rotating the key would orphan the
-/// enrollment on the hearthd side.
+/// enrollment on the feluccad side.
 pub fn ensure_key(path: &str) -> Result<String, String> {
     let private = match std::fs::read_to_string(path) {
         Ok(s) => {
@@ -180,7 +180,7 @@ fn valid_endpoint(ep: &str) -> bool {
 
 // ---- join (one-shot enrollment) ----
 
-/// Enroll against hearthd: POST {join_url}/api/v1/nodes/join with the join
+/// Enroll against feluccad: POST {join_url}/api/v1/nodes/join with the join
 /// token as bearer auth and our pubkey + hostname. 200 returns the overlay
 /// assignment (validated before returning); non-200 is failure (401 invalid
 /// or used token, 503 overlay off).
@@ -233,7 +233,7 @@ pub async fn join(
     Ok(info)
 }
 
-/// hearthd API port for an https join_url: the explicit port in the URL when
+/// feluccad API port for an https join_url: the explicit port in the URL when
 /// present, else 443 (the https default). split_host_port is NOT used here
 /// because its portless fallback is 8080.
 fn https_api_port(join_url: &str) -> u16 {
@@ -340,9 +340,9 @@ pub fn allowed_ips(info: &JoinInfo) -> String {
 /// Idempotently create, configure, and bring up the WireGuard interface from
 /// a (validated) JoinInfo. Mirrors net::ensure_bridge: creation/addr-add
 /// ignore "exists"; configuration steps that must take effect return errors.
-/// NOTE: the interface name matches hearthd's hub interface. Workers and the
+/// NOTE: the interface name matches feluccad's hub interface. Workers and the
 /// hub are separate hosts by design; running an agent with --join on the SAME
-/// host as hearthd would clobber the hub's key (documented constraint, see
+/// host as feluccad would clobber the hub's key (documented constraint, see
 /// ADR-0006).
 pub fn ensure_interface(info: &JoinInfo, key_path: &str) -> Result<(), String> {
     // Pre-flight the key file: `wg set` reads it as the same user, but its
@@ -471,7 +471,7 @@ mod tests {
             server_endpoint: "hub.example.com:51820".into(),
             keepalive_s: 25,
             api_port: 8080,
-            agent_token: "hearth_nt_9f2c1b8a7d4e6f0312a5b9c8d7e6f504".into(),
+            agent_token: "felucca_nt_9f2c1b8a7d4e6f0312a5b9c8d7e6f504".into(),
         }
     }
 
@@ -482,19 +482,19 @@ mod tests {
         // rotate and two places to leak.
         let json = serde_json::to_string(&good()).expect("serialize");
         assert!(!json.contains("agent_token"), "{}", json);
-        assert!(!json.contains("hearth_nt_"), "{}", json);
+        assert!(!json.contains("felucca_nt_"), "{}", json);
     }
 
     #[test]
     fn test_join_response_carries_the_node_credential() {
         // Was: the agent parsed the overlay grant and dropped the credential
-        // hearthd minted in the same exchange, so hearthd's calls to this node
-        // (hearth_nt_...) hit an agent that only knew the shared token.
-        let body = r#"{"overlay_ip":"10.100.0.2","overlay_prefix":24,"server_overlay_ip":"10.100.0.1","server_pubkey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","server_endpoint":"hub:51820","keepalive_s":25,"agent_token":"hearth_nt_abc"}"#;
+        // feluccad minted in the same exchange, so feluccad's calls to this node
+        // (felucca_nt_...) hit an agent that only knew the shared token.
+        let body = r#"{"overlay_ip":"10.100.0.2","overlay_prefix":24,"server_overlay_ip":"10.100.0.1","server_pubkey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","server_endpoint":"hub:51820","keepalive_s":25,"agent_token":"felucca_nt_abc"}"#;
         let info: JoinInfo = serde_json::from_str(body).expect("parse");
-        assert_eq!(info.agent_token, "hearth_nt_abc");
+        assert_eq!(info.agent_token, "felucca_nt_abc");
         assert!(validate_join_info(&info).is_ok());
-        // An older hearthd omits it: still a valid grant, no credential.
+        // An older feluccad omits it: still a valid grant, no credential.
         let old = r#"{"overlay_ip":"10.100.0.2","overlay_prefix":24,"server_overlay_ip":"10.100.0.1","server_pubkey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","server_endpoint":"hub:51820","keepalive_s":25}"#;
         let info: JoinInfo = serde_json::from_str(old).expect("parse");
         assert!(info.agent_token.is_empty());
@@ -665,7 +665,7 @@ mod tests {
     #[test]
     fn test_state_save_load_round_trip() {
         let dir = std::env::temp_dir().join(format!(
-            "hearth-wg-test-{}-{:?}",
+            "felucca-wg-test-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -745,7 +745,7 @@ mod tests {
 
     #[test]
     fn test_load_state_missing_is_ok_none() {
-        assert!(load_state("/nonexistent/hearth-wg-test")
+        assert!(load_state("/nonexistent/felucca-wg-test")
             .expect("missing file is not an error")
             .is_none());
     }
@@ -753,7 +753,7 @@ mod tests {
     #[test]
     fn test_load_state_unparseable_is_err() {
         let dir = std::env::temp_dir().join(format!(
-            "hearth-wg-garbage-{}-{:?}",
+            "felucca-wg-garbage-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -769,7 +769,7 @@ mod tests {
     fn test_load_state_unreadable_is_err() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!(
-            "hearth-wg-noperm-{}-{:?}",
+            "felucca-wg-noperm-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -790,7 +790,7 @@ mod tests {
     #[test]
     fn test_ensure_interface_unreadable_key_names_the_key() {
         // Must fail BEFORE shelling out, with the key path in the error.
-        let err = ensure_interface(&good(), "/nonexistent/hearth-wg-test.key").unwrap_err();
-        assert!(err.contains("/nonexistent/hearth-wg-test.key"), "got: {}", err);
+        let err = ensure_interface(&good(), "/nonexistent/felucca-wg-test.key").unwrap_err();
+        assert!(err.contains("/nonexistent/felucca-wg-test.key"), "got: {}", err);
     }
 }

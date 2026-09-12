@@ -1,4 +1,4 @@
-// Package model defines the shared data types for the Hearth control plane.
+// Package model defines the shared data types for the Felucca control plane.
 // JSON field order and null handling must match the Zig implementation exactly.
 package model
 

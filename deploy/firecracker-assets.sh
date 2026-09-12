@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # firecracker-assets.sh — fetch guest kernel + base rootfs for the current arch
-# into the Hearth data directory.
+# into the Felucca data directory.
 #
 # The firecracker-ci S3 objects are pinned by version and digest (see the pin
 # block below). They used to be discovered at run time from a cleartext HTTP
@@ -8,7 +8,7 @@
 # fleet booted its tenants on.
 #
 # Usage (run as root or a user that can write to DATA_DIR):
-#   ./firecracker-assets.sh [--data-dir /srv/hearth]
+#   ./firecracker-assets.sh [--data-dir /srv/felucca]
 #
 # The script is idempotent: it skips the download if the target file already
 # exists and is non-empty.
@@ -28,7 +28,7 @@ skip() { echo "    [skip] $*"; }
 # Argument parsing
 # ---------------------------------------------------------------------------
 
-DATA_DIR=/srv/hearth
+DATA_DIR=/srv/felucca
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -95,14 +95,14 @@ esac
 #   curl -fsSL "$B/?prefix=firecracker-ci/&delimiter=/&list-type=2"
 #   curl -fsSL "$B/?prefix=firecracker-ci/v1.15/aarch64/&list-type=2"
 #   curl -fsSL "$B/firecracker-ci/v1.15/aarch64/vmlinux-6.1.155" | sha256sum
-# HEARTH_CI_KERNEL_SHA256 / HEARTH_CI_ROOTFS_SHA256 override a single digest
-# alongside HEARTH_CI_VERSION + HEARTH_CI_KERNEL / HEARTH_CI_ROOTFS.
+# FELUCCA_CI_KERNEL_SHA256 / FELUCCA_CI_ROOTFS_SHA256 override a single digest
+# alongside FELUCCA_CI_VERSION + FELUCCA_CI_KERNEL / FELUCCA_CI_ROOTFS.
 
 S3_BASE="https://s3.amazonaws.com/spec.ccfc.min"
 
-CI_V="${HEARTH_CI_VERSION:-v1.15}"
-KERNEL_NAME="${HEARTH_CI_KERNEL:-vmlinux-6.1.155}"
-ROOTFS_NAME="${HEARTH_CI_ROOTFS:-ubuntu-24.04.squashfs}"
+CI_V="${FELUCCA_CI_VERSION:-v1.15}"
+KERNEL_NAME="${FELUCCA_CI_KERNEL:-vmlinux-6.1.155}"
+ROOTFS_NAME="${FELUCCA_CI_ROOTFS:-ubuntu-24.04.squashfs}"
 
 pinned_sha256() {  # <arch>/<object name>
     case "$1" in
@@ -124,7 +124,7 @@ fetch_verified() {
     want="${override:-$(pinned_sha256 "${ARCH}/${name}")}"
     [ -n "${want}" ] || die "No pinned SHA-256 for ${ARCH}/${name}.
 Record one (see the pin block in this script) or pass it in the matching
-HEARTH_CI_*_SHA256 variable — an unverified guest kernel or rootfs is not
+FELUCCA_CI_*_SHA256 variable — an unverified guest kernel or rootfs is not
 something this installer will place under a tenant."
 
     echo "    object: firecracker-ci/${CI_V}/${ARCH}/${name}"
@@ -157,7 +157,7 @@ if [ -s "${VMLINUX}" ]; then
     skip "Guest kernel already present: ${VMLINUX} ($(du -sh "${VMLINUX}" | cut -f1))"
 else
     info "Downloading guest kernel for ${ARCH} (CI ${CI_V})"
-    fetch_verified "${KERNEL_NAME}" "${HEARTH_CI_KERNEL_SHA256:-}" "${WORK_DIR}/vmlinux"
+    fetch_verified "${KERNEL_NAME}" "${FELUCCA_CI_KERNEL_SHA256:-}" "${WORK_DIR}/vmlinux"
     install -m 0644 "${WORK_DIR}/vmlinux" "${VMLINUX}"
     ok "Guest kernel: ${VMLINUX} ($(du -sh "${VMLINUX}" | cut -f1))"
 fi
@@ -170,7 +170,7 @@ if [ -s "${ROOTFS}" ]; then
     skip "Base rootfs already present: ${ROOTFS} ($(du -sh "${ROOTFS}" | cut -f1))"
 else
     info "Downloading Ubuntu squashfs for ${ARCH} (CI ${CI_V})"
-    fetch_verified "${ROOTFS_NAME}" "${HEARTH_CI_ROOTFS_SHA256:-}" "${WORK_DIR}/rootfs.squashfs"
+    fetch_verified "${ROOTFS_NAME}" "${FELUCCA_CI_ROOTFS_SHA256:-}" "${WORK_DIR}/rootfs.squashfs"
 
     info "Extracting squashfs"
     unsquashfs -q -d "${WORK_DIR}/rootfs" "${WORK_DIR}/rootfs.squashfs"

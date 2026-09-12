@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# scripts/bench.sh — Hearth v4 P6.3 performance benchmark
+# scripts/bench.sh — Felucca v4 P6.3 performance benchmark
 #
 # Usage:
-#   bash scripts/bench.sh <hearthd-endpoint> [admin-token]
-#   e.g. bash scripts/bench.sh http://127.0.0.1:8080 "$(cat ~/.config/hearth/lab-token)"
+#   bash scripts/bench.sh <feluccad-endpoint> [admin-token]
+#   e.g. bash scripts/bench.sh http://127.0.0.1:8080 "$(cat ~/.config/felucca/lab-token)"
 #
-# The admin token is REQUIRED and must be the one hearthd was started with:
-# every operation below is a /api/v1 call, and hearthd refuses to start without
+# The admin token is REQUIRED and must be the one feluccad was started with:
+# every operation below is a /api/v1 call, and feluccad refuses to start without
 # a real token, so there is no unauthenticated endpoint to benchmark. Pass it
-# as $2, export HEARTH_TOKEN, or keep it in $HEARTH_TOKEN_FILE (default
-# ~/.config/hearth/lab-token) — the same contract as the other lab scripts.
+# as $2, export FELUCCA_TOKEN, or keep it in $FELUCCA_TOKEN_FILE (default
+# ~/.config/felucca/lab-token) — the same contract as the other lab scripts.
 #
 # Env knobs:
 #   N                 — iterations per operation (default: 10)
@@ -21,12 +21,12 @@ set -u
 
 # ── Args ─────────────────────────────────────────────────────────────────────
 ENDPOINT="${1:-}"
-TOKEN="${2:-${HEARTH_TOKEN:-}}"
-TOKEN_FILE="${HEARTH_TOKEN_FILE:-${HOME:-}/.config/hearth/lab-token}"
+TOKEN="${2:-${FELUCCA_TOKEN:-}}"
+TOKEN_FILE="${FELUCCA_TOKEN_FILE:-${HOME:-}/.config/felucca/lab-token}"
 if [ -z "$ENDPOINT" ]; then
-  printf 'usage: %s <hearthd-endpoint> [admin-token]\n' "$0" >&2
-  printf '  e.g. %s http://127.0.0.1:8080 "$(cat ~/.config/hearth/lab-token)"\n' "$0" >&2
-  printf '  the token may also come from HEARTH_TOKEN or HEARTH_TOKEN_FILE\n' >&2
+  printf 'usage: %s <feluccad-endpoint> [admin-token]\n' "$0" >&2
+  printf '  e.g. %s http://127.0.0.1:8080 "$(cat ~/.config/felucca/lab-token)"\n' "$0" >&2
+  printf '  the token may also come from FELUCCA_TOKEN or FELUCCA_TOKEN_FILE\n' >&2
   exit 2
 fi
 if [ -z "$TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
@@ -34,21 +34,21 @@ if [ -z "$TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
 fi
 # Fail here rather than at the preflight: an empty token authorizes nobody now
 # (it is not "auth off"), so a tokenless run would just be a 401 wearing a
-# benchmark's clothes. HEARTH_INSECURE_NO_AUTH=1 is the explicit opt-out, for a
-# hearthd started with --insecure-no-auth.
-if [ -z "$TOKEN" ] && [ "${HEARTH_INSECURE_NO_AUTH:-0}" != "1" ]; then
+# benchmark's clothes. FELUCCA_INSECURE_NO_AUTH=1 is the explicit opt-out, for a
+# feluccad started with --insecure-no-auth.
+if [ -z "$TOKEN" ] && [ "${FELUCCA_INSECURE_NO_AUTH:-0}" != "1" ]; then
   printf 'error: no admin token.\n' >&2
-  printf '  Pass it as the second argument, export HEARTH_TOKEN, or write it to %s\n' "$TOKEN_FILE" >&2
+  printf '  Pass it as the second argument, export FELUCCA_TOKEN, or write it to %s\n' "$TOKEN_FILE" >&2
   printf '  (generate one with: openssl rand -hex 32).\n' >&2
-  printf '  It must be the token hearthd was STARTED with — hearthd refuses to start\n' >&2
+  printf '  It must be the token feluccad was STARTED with — feluccad refuses to start\n' >&2
   printf '  without a real one. For a loopback lab on --insecure-no-auth, re-run with\n' >&2
-  printf '  HEARTH_INSECURE_NO_AUTH=1.\n' >&2
+  printf '  FELUCCA_INSECURE_NO_AUTH=1.\n' >&2
   exit 2
 fi
 case "$(printf '%s' "$TOKEN" | tr '[:upper:]' '[:lower:]')" in
-  *replace_with*|hearth-lab-token)
+  *replace_with*|felucca-lab-token)
     printf 'error: that token is a shipped placeholder — it is published in this repo, and\n' >&2
-    printf '       hearthd refuses to start with it, so nothing is listening on it.\n' >&2
+    printf '       feluccad refuses to start with it, so nothing is listening on it.\n' >&2
     printf '  Generate a real one with: openssl rand -hex 32\n' >&2
     exit 2 ;;
 esac
@@ -130,7 +130,7 @@ hd_req() {   # hd_req <method> <path> [body]  — sets HD_STATUS, HD_BODY
 
 # ── Guest-ready polling ───────────────────────────────────────────────────────
 # Poll exec(["true"]) until {"ok":true} — never sleep a mid-boot guest.
-# Two contract constraints at once: hearth-guest must be listening before exec /
+# Two contract constraints at once: felucca-guest must be listening before exec /
 # sleep / fork are exercised (a snapshot of a mid-boot guest is poisoned).
 wait_guest_ready() {   # wait_guest_ready <id> [timeout_s=90]
   local id="$1" timeout="${2:-90}"
@@ -211,8 +211,8 @@ hd_req GET /api/v1/nodes
 if [ "$HD_STATUS" != "200" ]; then
   printf 'error: GET /api/v1/nodes -> %s  (bad token or wrong endpoint)\n' "$HD_STATUS" >&2
   case "$HD_STATUS" in
-    401) printf '  401: the token is not the one hearthd was started with.\n' >&2 ;;
-    429) printf '  429: hearthd is throttling this source after repeated failed credentials;\n' >&2
+    401) printf '  401: the token is not the one feluccad was started with.\n' >&2 ;;
+    429) printf '  429: feluccad is throttling this source after repeated failed credentials;\n' >&2
          printf '       wait for the Retry-After window and re-run with the right token.\n' >&2 ;;
   esac
   exit 1
@@ -229,7 +229,7 @@ fi
 printf '    %s\n\n' "$POOL_NOTE"
 
 # ── Run header ────────────────────────────────────────────────────────────────
-printf '### Hearth benchmark  %s  N=%s  git=%s\n\n' \
+printf '### Felucca benchmark  %s  N=%s  git=%s\n\n' \
   "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$N" "${GIT_REV:-unknown}"
 
 # =============================================================================
@@ -393,7 +393,7 @@ printf '\n'
 # =============================================================================
 # Op 5: wake  (N sleep → wake cycles on the long-lived sandbox)
 # Measures wall-clock (POST /wake → 200) AND the agent-reported wake_ms field
-# from the response body (snapshot-restore latency measured inside hearthd/agent).
+# from the response body (snapshot-restore latency measured inside feluccad/agent).
 # Sleep itself is untimed — it returns synchronously with state=sleeping.
 # =============================================================================
 printf '==> [5/6] wake  (%d sleep->wake cycles; wall-clock and api wake_ms both reported)\n' "$N"
@@ -439,7 +439,7 @@ fi
 # Op 6: fork
 # POST /sandboxes/{id}/fork {"name":"..."} on the running long-lived sandbox.
 # Measures: POST sent → 201 received.  Child is deleted inline each iteration.
-# Parent is briefly paused by hearthd during the fork; it returns to running.
+# Parent is briefly paused by feluccad during the fork; it returns to running.
 # =============================================================================
 printf '==> [6/6] fork\n'
 S6="" F6=0
@@ -475,7 +475,7 @@ _remove_tracked "$LL_ID"
 # Markdown report (paste into docs)
 # =============================================================================
 printf '\n---\n\n'
-printf '## Hearth Benchmark Results\n\n'
+printf '## Felucca Benchmark Results\n\n'
 printf '**Endpoint:** `%s`  \n'  "$ENDPOINT"
 printf '**Date:** `%s`  \n'      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 printf '**N:** %s iterations per operation  \n' "$N"
@@ -501,7 +501,7 @@ printf '  still running when the first frame arrives, so this truly measures fir
 printf '  latency, not total exec time.\n'
 printf -- '- **`wake (wall-clock)`**: POST /wake → 200 HTTP round-trip. **`wake (api wake_ms)`**:\n'
 printf '  the integer `wake_ms` field in the wake response body — agent-measured\n'
-printf '  snapshot-restore latency from inside hearthd/hearth-agent.\n'
+printf '  snapshot-restore latency from inside feluccad/felucca-agent.\n'
 printf -- '- **Cleanup guarantee:** every sandbox named `bench-%s-*` is deleted inline\n' "$RUN"
 printf '  after each iteration (create-cold, create-claim, fork children) and the\n'
 printf '  long-lived sandbox is deleted after the fork op. An EXIT trap (`_sweep`) deletes\n'

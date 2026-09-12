@@ -1,4 +1,4 @@
-# Semantic normalizer for Hearth API JSON (used with `jq -S`).
+# Semantic normalizer for Felucca API JSON (used with `jq -S`).
 # Erases volatile values but *asserts their type/format*: a wrong type or a
 # null-vs-omitted drift produces a <BAD-*> marker or a missing key, which the
 # golden diff catches. Key order is irrelevant (-S sorts); key SET is strict.

@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/alpham/infra-saas/hearth/internal/model"
-	"github.com/alpham/infra-saas/hearth/internal/store"
+	"github.com/alpham/infra-saas/felucca/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/store"
 )
 
 // newSecret returns n cryptographically random bytes hex-encoded.
@@ -45,12 +45,12 @@ const maxKeyTTLS = 365 * 24 * 60 * 60
 // secret). The secret is shown exactly once; only its sha256 is stored.
 // expiresAt is unix seconds, 0 for a key that never expires.
 func mintKey(tenantID string, now, expiresAt int64) (*store.APIKey, string) {
-	secret := "hearth_sk_" + newSecret(24)
+	secret := apiKeyPrefix + newSecret(24)
 	return &store.APIKey{
 		ID:        "key-" + newSecret(6),
 		TenantID:  tenantID,
 		KeyHash:   hashSecret(secret),
-		Prefix:    secret[:14], // "hearth_sk_" + 4 chars: enough to identify, useless to guess
+		Prefix:    secret[:len(apiKeyPrefix)+4], // prefix + 4 chars: enough to identify, useless to guess
 		CreatedAt: now,
 		ExpiresAt: expiresAt,
 	}, secret

@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alpham/infra-saas/hearth/internal/model"
-	"github.com/alpham/infra-saas/hearth/internal/state"
-	"github.com/alpham/infra-saas/hearth/internal/store"
+	"github.com/alpham/infra-saas/felucca/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/state"
+	"github.com/alpham/infra-saas/felucca/internal/store"
 )
 
 func open(t *testing.T) *store.SQLite {
@@ -214,7 +214,7 @@ func TestTenantsAndKeys(t *testing.T) {
 		t.Errorf("list tenants: %d", len(ts))
 	}
 
-	key := &store.APIKey{ID: "key-1", TenantID: "tn-1", KeyHash: "abc123", Prefix: "hearth_sk_xy", CreatedAt: 1}
+	key := &store.APIKey{ID: "key-1", TenantID: "tn-1", KeyHash: "abc123", Prefix: "felucca_sk_xy", CreatedAt: 1}
 	if err := db.CreateKey(key); err != nil {
 		t.Fatalf("create key: %v", err)
 	}
@@ -248,9 +248,9 @@ func TestAPIKeyExpiry(t *testing.T) {
 
 	now := time.Now().Unix()
 	for _, k := range []*store.APIKey{
-		{ID: "key-never", TenantID: "tn-1", KeyHash: "hash-never", Prefix: "hearth_sk_nv", CreatedAt: now},
-		{ID: "key-live", TenantID: "tn-1", KeyHash: "hash-live", Prefix: "hearth_sk_lv", CreatedAt: now, ExpiresAt: now + 3600},
-		{ID: "key-expired", TenantID: "tn-1", KeyHash: "hash-expired", Prefix: "hearth_sk_ex", CreatedAt: now - 7200, ExpiresAt: now - 1},
+		{ID: "key-never", TenantID: "tn-1", KeyHash: "hash-never", Prefix: "felucca_sk_nv", CreatedAt: now},
+		{ID: "key-live", TenantID: "tn-1", KeyHash: "hash-live", Prefix: "felucca_sk_lv", CreatedAt: now, ExpiresAt: now + 3600},
+		{ID: "key-expired", TenantID: "tn-1", KeyHash: "hash-expired", Prefix: "felucca_sk_ex", CreatedAt: now - 7200, ExpiresAt: now - 1},
 	} {
 		if err := db.CreateKey(k); err != nil {
 			t.Fatalf("create %s: %v", k.ID, err)
@@ -276,7 +276,7 @@ func TestAPIKeyExpiry(t *testing.T) {
 
 // ListKeys + RevokeKeyByHash are the recovery path for a leaked secret: the
 // key id is shown once at creation, so without them a key whose id was lost
-// can only be revoked with raw SQL against hearth.db.
+// can only be revoked with raw SQL against felucca.db.
 func TestListKeysAndRevokeByHash(t *testing.T) {
 	db := open(t)
 	for _, tn := range []*store.Tenant{
@@ -291,9 +291,9 @@ func TestListKeysAndRevokeByHash(t *testing.T) {
 	// listing and revocation, not about expiry.
 	const farFuture int64 = 4102444800
 	for _, k := range []*store.APIKey{
-		{ID: "key-old", TenantID: "tn-1", KeyHash: "hash-old", Prefix: "hearth_sk_od", CreatedAt: 10},
-		{ID: "key-new", TenantID: "tn-1", KeyHash: "hash-new", Prefix: "hearth_sk_nw", CreatedAt: 20, ExpiresAt: farFuture},
-		{ID: "key-other", TenantID: "tn-2", KeyHash: "hash-other", Prefix: "hearth_sk_ot", CreatedAt: 30},
+		{ID: "key-old", TenantID: "tn-1", KeyHash: "hash-old", Prefix: "felucca_sk_od", CreatedAt: 10},
+		{ID: "key-new", TenantID: "tn-1", KeyHash: "hash-new", Prefix: "felucca_sk_nw", CreatedAt: 20, ExpiresAt: farFuture},
+		{ID: "key-other", TenantID: "tn-2", KeyHash: "hash-other", Prefix: "felucca_sk_ot", CreatedAt: 30},
 	} {
 		if err := db.CreateKey(k); err != nil {
 			t.Fatalf("create %s: %v", k.ID, err)
@@ -366,7 +366,7 @@ func TestAPIKeyExpiryMigration(t *testing.T) {
 		   revoked_at INTEGER
 		 )`,
 		`INSERT INTO api_keys (id, tenant_id, key_hash, prefix, created_at, revoked_at)
-		 VALUES ('key-legacy', 'tn-1', 'hash-legacy', 'hearth_sk_lg', 1, NULL)`,
+		 VALUES ('key-legacy', 'tn-1', 'hash-legacy', 'felucca_sk_lg', 1, NULL)`,
 	} {
 		if _, err := raw.Exec(stmt); err != nil {
 			t.Fatalf("legacy schema: %v", err)
@@ -540,19 +540,19 @@ func TestNodeCredRoundTripAndRotation(t *testing.T) {
 	if c, err := db.GetNodeCred("10.100.0.2"); err != nil || c != nil {
 		t.Fatalf("absent cred: got %+v err %v, want nil nil", c, err)
 	}
-	if err := db.PutNodeCred(&store.NodeCred{Host: "10.100.0.2", Token: "hearth_nt_one", CreatedAt: 10}); err != nil {
+	if err := db.PutNodeCred(&store.NodeCred{Host: "10.100.0.2", Token: "felucca_nt_one", CreatedAt: 10}); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	c, err := db.GetNodeCred("10.100.0.2")
-	if err != nil || c == nil || c.Token != "hearth_nt_one" || c.Legacy {
+	if err != nil || c == nil || c.Token != "felucca_nt_one" || c.Legacy {
 		t.Fatalf("get: %+v err %v", c, err)
 	}
 	// A re-enrollment rotates in place rather than accumulating rows.
-	if err := db.PutNodeCred(&store.NodeCred{Host: "10.100.0.2", Token: "hearth_nt_two", CreatedAt: 20}); err != nil {
+	if err := db.PutNodeCred(&store.NodeCred{Host: "10.100.0.2", Token: "felucca_nt_two", CreatedAt: 20}); err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
 	c, err = db.GetNodeCred("10.100.0.2")
-	if err != nil || c == nil || c.Token != "hearth_nt_two" || c.CreatedAt != 20 {
+	if err != nil || c == nil || c.Token != "felucca_nt_two" || c.CreatedAt != 20 {
 		t.Fatalf("after rotation: %+v err %v", c, err)
 	}
 }
@@ -569,8 +569,8 @@ func TestListAndDeleteNodeCreds(t *testing.T) {
 		t.Fatalf("empty store: %d creds err=%v", len(creds), err)
 	}
 	for _, c := range []*store.NodeCred{
-		{Host: "10.100.0.2:9090", Token: "hearth_nt_a", CreatedAt: 10},
-		{Host: "10.100.0.3:9090", Token: "hearth_nt_b", CreatedAt: 20},
+		{Host: "10.100.0.2:9090", Token: "felucca_nt_a", CreatedAt: 10},
+		{Host: "10.100.0.3:9090", Token: "felucca_nt_b", CreatedAt: 20},
 		{Host: "10.100.0.4:9090", Legacy: true, CreatedAt: 30},
 	} {
 		if err := db.PutNodeCred(c); err != nil {
@@ -585,7 +585,7 @@ func TestListAndDeleteNodeCreds(t *testing.T) {
 	for _, c := range creds {
 		seen[c.Host] = c
 	}
-	if c := seen["10.100.0.2:9090"]; c == nil || c.Token != "hearth_nt_a" {
+	if c := seen["10.100.0.2:9090"]; c == nil || c.Token != "felucca_nt_a" {
 		t.Errorf("listed row lost its token: %+v", c)
 	}
 	if c := seen["10.100.0.4:9090"]; c == nil || !c.Legacy || c.Token != "" {

@@ -1,7 +1,7 @@
 // Tests for the P6 latency histograms and the authenticated per-tenant
 // metrics surface (metrics.go). The handler is tested directly; its routing
 // (admin-gate 404, 401 without auth) is covered by conformance
-// hearthd/24-observability once the route lands in serveAPI.
+// feluccad/24-observability once the route lands in serveAPI.
 package server
 
 import (
@@ -83,11 +83,11 @@ func TestServeTenantMetricsShapeAndScoping(t *testing.T) {
 	}
 	out := w.Body.String()
 	for _, want := range []string{
-		"# TYPE hearth_tenant_sandboxes gauge",
-		`hearth_tenant_sandboxes{tenant="tn-metrics"} 1`,
-		`hearth_tenant_running{tenant="tn-metrics"} 1`,
-		`hearth_tenant_vcpus{tenant="tn-metrics"} 1`,
-		`hearth_tenant_disk_gb{tenant="tn-metrics"} 8`,
+		"# TYPE felucca_tenant_sandboxes gauge",
+		`felucca_tenant_sandboxes{tenant="tn-metrics"} 1`,
+		`felucca_tenant_running{tenant="tn-metrics"} 1`,
+		`felucca_tenant_vcpus{tenant="tn-metrics"} 1`,
+		`felucca_tenant_disk_gb{tenant="tn-metrics"} 8`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in:\n%s", want, out)
@@ -105,7 +105,7 @@ func TestServeTenantMetricsEmptyStateKeepsHeaders(t *testing.T) {
 	srv.serveTenantMetrics(w)
 	// HELP/TYPE always emitted: scrape shape stable with zero tenants
 	// (conformance asserts this without creating sandboxes).
-	if !strings.Contains(w.Body.String(), "# HELP hearth_tenant_sandboxes") {
+	if !strings.Contains(w.Body.String(), "# HELP felucca_tenant_sandboxes") {
 		t.Errorf("zero-state output missing HELP header:\n%s", w.Body.String())
 	}
 }

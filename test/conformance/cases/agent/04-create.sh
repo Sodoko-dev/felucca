@@ -1,7 +1,7 @@
 # shellcheck shell=bash
-# Direct agent create (the id is caller-supplied — hearthd does this in
+# Direct agent create (the id is caller-supplied — feluccad does this in
 # production): 201 {"ok":true,"ip":<str|null>}, then the VM lists as running
-# with a live pid. Uses a hearthd-shaped id so normalize.jq applies: that is
+# with a live pid. Uses a feluccad-shaped id so normalize.jq applies: that is
 # now "sb-" + 26 hex with no sequence tail, and normalize.jq asserts the width.
 CF_VM1="sb-cf000000000000000000000001"
 # Self-cleaning entry: a crashed previous run can leave cf-vm-1 adopted on the

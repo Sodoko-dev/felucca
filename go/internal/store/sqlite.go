@@ -8,10 +8,10 @@ import (
 	"os"
 	"strings"
 
-	"github.com/alpham/infra-saas/hearth/internal/model"
-	"github.com/alpham/infra-saas/hearth/internal/state"
+	"github.com/alpham/infra-saas/felucca/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/state"
 
-	_ "modernc.org/sqlite" // pure-Go driver: hearthd stays CGO_ENABLED=0
+	_ "modernc.org/sqlite" // pure-Go driver: feluccad stays CGO_ENABLED=0
 )
 
 const schema = `
@@ -125,7 +125,7 @@ type SQLite struct {
 
 // OpenSQLite opens (creating if needed) the database at path and applies the
 // schema. The connection pool is capped at one writer — correct for SQLite
-// and for hearthd's single-process write pattern (ADR-0002).
+// and for feluccad's single-process write pattern (ADR-0002).
 func OpenSQLite(path string) (*SQLite, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {

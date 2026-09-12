@@ -1,5 +1,5 @@
 /* ============================================================
-   HEARTH CONSOLE — app.js  (v2)
+   FELUCCA CONSOLE — app.js  (v2)
    Pure vanilla JS SPA. No build step, no dependencies.
    Polls /api/v1/* every 3s once a token is set, and never shows
    anything but live data without saying so in the header.
@@ -31,13 +31,15 @@ let bearerToken = null;
    console does not leave the old credential sitting in storage. */
 (function purgeStoredToken() {
   try {
-    localStorage.removeItem('hearth_token');
-    sessionStorage.removeItem('hearth_token');
+    for (const key of ['felucca_token', 'hearth_token']) { // hearth_token: pre-rename builds
+      localStorage.removeItem(key);
+      sessionStorage.removeItem(key);
+    }
   } catch (_) { /* storage unavailable — nothing to purge */ }
 })();
 
 /* A ?token= has already been written to browser history and to the access log
-   of every proxy in front of hearthd, so it is never accepted as a
+   of every proxy in front of feluccad, so it is never accepted as a
    credential — it is only scrubbed out of the URL. Paste it into the banner. */
 (function scrubTokenFromUrl() {
   const params = new URLSearchParams(window.location.search);
@@ -120,7 +122,7 @@ function showBanner(kind, message, opts = {}) {
       const val = input.value.trim();
       if (!val) return;
       setToken(val);
-      // A token pasted while hearthd is throttling this source must not sit
+      // A token pasted while feluccad is throttling this source must not sit
       // behind the old backoff — the console caused those failures, and the
       // operator has now supplied the fix.
       rateLimitedUntil = 0;
@@ -371,7 +373,7 @@ function getNsBadgeClass(ns) {
 }
 
 /* --- API / fetch ------------------------------------------ */
-/* hearthd answers a throttled source with 429 + Retry-After in seconds
+/* feluccad answers a throttled source with 429 + Retry-After in seconds
    (gateAuth, go/internal/server/server.go). Its OTHER 429 — quota exceeded on
    create/fork — carries no Retry-After, so the header is what separates "wait"
    from "you are over your limit". Returns 0 when this is not a throttle. */
@@ -383,7 +385,7 @@ function retryAfterMs(res) {
 
 /* Every failure is classified rather than collapsed, because the caller has to
    tell the operator which one it is: 401 needs a token, 429 needs a wait, a
-   dead socket needs someone to look at hearthd. Folding all three into "mock"
+   dead socket needs someone to look at feluccad. Folding all three into "mock"
    is what let the console quietly show a fabricated fleet. */
 async function apiFetch(path) {
   const headers = {};
@@ -477,12 +479,12 @@ function statusFor(mode, detail) {
       return { badge: 'Unauthorized', live: 'NO AUTH', kind: 'auth', tokenInput: true,
                msg: '401 Unauthorized — token rejected. Polling is paused so repeated retries do not throttle you.' };
     case 'rate-limited':
-      // The paste box belongs here too: the usual reason hearthd is throttling
+      // The paste box belongs here too: the usual reason feluccad is throttling
       // this source is that a wrong token was being retried, and the operator
       // must be able to supply the right one without waiting out the backoff
       // their own console produced.
       return { badge: 'Rate limited', live: 'THROTTLED', kind: 'rate-limited', tokenInput: true,
-               msg: `429 Rate limited by hearthd — retrying in ${detail}s. Paste a token to retry now.` };
+               msg: `429 Rate limited by feluccad — retrying in ${detail}s. Paste a token to retry now.` };
     case 'unreachable':
       return { badge: 'Stale', live: 'STALE', kind: 'offline',
                msg: `Control plane unreachable — the fleet below was last read at ${detail}` };
@@ -499,7 +501,7 @@ function statusFor(mode, detail) {
 
 /* The single place that records what is on screen. Every exit from poll() goes
    through it, so "LIVE" is never displayed for data that did not come from
-   hearthd on this poll. */
+   feluccad on this poll. */
 function setDataMode(mode, detail) {
   state.dataMode = mode;
   state.statusDetail = detail ?? null;
@@ -530,7 +532,7 @@ function applyStatus() {
 
 /* --- Poll ------------------------------------------------- */
 /* Self-rescheduling rather than a bare setInterval. A fixed 3s interval polls
-   whether or not a token is set, and hearthd counts every failed attempt
+   whether or not a token is set, and feluccad counts every failed attempt
    against the source address: ten failures is five polls, so an unattended
    console locked out its own operator inside twenty seconds and then rejected
    the correct token for up to a minute. Nothing is sent until there is a
@@ -620,13 +622,13 @@ function handlePollFailure(failure) {
   switch (failure.reason) {
     case 'unauthorized':
       // The token we hold is not accepted. Stop the loop rather than replay it
-      // every 3s: the retries are what walk hearthd's backoff up to a minute,
+      // every 3s: the retries are what walk feluccad's backoff up to a minute,
       // and the fix is a human pasting a different token (which restarts it).
       setDataMode('unauthorized');
       break;
 
     case 'rate-limited': {
-      // Honour hearthd's Retry-After. Without a header, back off well past the
+      // Honour feluccad's Retry-After. Without a header, back off well past the
       // poll interval — anything shorter just extends the lockout.
       const ms = failure.retryAfterMs || POLL_INTERVAL_MS * 5;
       rateLimitedUntil = Date.now() + ms;
@@ -637,7 +639,7 @@ function handlePollFailure(failure) {
 
     default:
       // Unreachable or a server error. Keep the last real fleet on screen and
-      // mark it stale; only a console that has NEVER reached hearthd falls
+      // mark it stale; only a console that has NEVER reached feluccad falls
       // back to MOCK_* — that is the design/demo case, and it says so.
       if (state.everLive) {
         setDataMode(failure.reason === 'error' ? 'error' : 'unreachable',
@@ -801,33 +803,25 @@ function renderHeader() {
   return `
     <div class="header-brand">
       <svg class="brand-logo" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <!-- Hearth/flame motif -->
-        <rect x="4" y="20" width="20" height="4" rx="1.5" fill="#f97316" opacity="0.9"/>
-        <rect x="7" y="18" width="14" height="2.5" rx="1" fill="#f97316" opacity="0.7"/>
-        <!-- Flame shape -->
-        <path d="M14 4
-                 C14 4 18 7 18 11
-                 C18 13.5 16.5 14.5 16.5 14.5
-                 C16.5 14.5 17 12 15.5 10.5
-                 C15.5 10.5 16 13 14 14.5
-                 C12 13 12.5 10.5 12.5 10.5
-                 C11 12 11.5 14.5 11.5 14.5
-                 C11.5 14.5 10 13.5 10 11
-                 C10 7 14 4 14 4Z"
-              fill="#f97316"/>
-        <path d="M14 9
-                 C14 9 15.5 11 15.5 12.5
-                 C15.5 13.8 14.8 14.5 14 14.5
-                 C13.2 14.5 12.5 13.8 12.5 12.5
-                 C12.5 11 14 9 14 9Z"
-              fill="#fde68a" opacity="0.9"/>
-        <!-- Base grate lines -->
-        <line x1="8" y1="20" x2="8" y2="18" stroke="#f97316" stroke-width="1" opacity="0.5"/>
-        <line x1="12" y1="20" x2="12" y2="18" stroke="#f97316" stroke-width="1" opacity="0.5"/>
-        <line x1="16" y1="20" x2="16" y2="18" stroke="#f97316" stroke-width="1" opacity="0.5"/>
-        <line x1="20" y1="20" x2="20" y2="18" stroke="#f97316" stroke-width="1" opacity="0.5"/>
+        <!-- Felucca motif: lateen sail on a Nile hull -->
+        <!-- Mast -->
+        <line x1="12" y1="4" x2="12" y2="19" stroke="#fde68a" stroke-width="1.2" stroke-linecap="round" opacity="0.9"/>
+        <!-- Lateen sail: tall triangle swept aft, with a lighter inner panel -->
+        <path d="M12.5 4.5 L23 17.5 L12.5 17.5 Z" fill="#f97316"/>
+        <path d="M12.5 8 L19.5 17 L12.5 17 Z" fill="#fde68a" opacity="0.55"/>
+        <!-- Hull: shallow crescent with a raised prow -->
+        <path d="M3 19.5
+                 L25 19.5
+                 C24 22.5 21.5 24 18 24
+                 L9.5 24
+                 C6.5 24 4.2 22.3 3 19.5 Z"
+              fill="#f97316" opacity="0.9"/>
+        <path d="M3 19.5 C4 20.3 5.6 20.6 7.5 20.6 L25 19.5" stroke="#fde68a" stroke-width="0.8" opacity="0.5" stroke-linecap="round"/>
+        <!-- Water line -->
+        <path d="M2.5 26 C5 24.8 7.5 24.8 10 26 C12.5 27.2 15 27.2 17.5 26 C20 24.8 22.5 24.8 25.5 26"
+              stroke="#f97316" stroke-width="1" opacity="0.5" stroke-linecap="round"/>
       </svg>
-      <span class="brand-name">HEARTH</span>
+      <span class="brand-name">FELUCCA</span>
     </div>
 
     <nav class="header-nav">

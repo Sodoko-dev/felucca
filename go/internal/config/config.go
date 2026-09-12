@@ -1,4 +1,4 @@
-// Package config handles hearthd configuration loading.
+// Package config handles feluccad configuration loading.
 // Precedence: flags > env vars > JSON config file > defaults.
 package config
 
@@ -14,7 +14,7 @@ import (
 	"strings"
 )
 
-// Config holds all hearthd runtime configuration.
+// Config holds all feluccad runtime configuration.
 type Config struct {
 	Bind      string
 	UIDir     string
@@ -30,7 +30,7 @@ type Config struct {
 	InsecureNoAuth bool
 
 	// WireGuard overlay. Empty WgIP means the overlay is disabled.
-	WgIP        string // hearthd's overlay address in CIDR form, e.g. "10.100.0.1/16"
+	WgIP        string // feluccad's overlay address in CIDR form, e.g. "10.100.0.1/16"
 	WgPort      uint16 // wg listen port
 	WgKeyPath   string // private key file path
 	WgEndpoint  string // public "host:port" workers dial for wg
@@ -45,7 +45,7 @@ type Config struct {
 	// are omitted (labels still route via the gateway's own domain config).
 	IngressDomain string
 
-	// Templates (v4 P4): where hearthd keeps template rootfs images
+	// Templates (v4 P4): where feluccad keeps template rootfs images
 	// (<name>.ext4 + captured uploads). Workers pull from
 	// GET /api/v1/images/{name} and cache locally.
 	ImagesDir string
@@ -55,8 +55,8 @@ type Config struct {
 	UsageRetentionDays int64
 
 	// TrustedProxies lists CIDRs whose X-Forwarded-For header is honoured when
-	// hearthd resolves the client address. Empty (the default) means trust NO
-	// proxy and use the connection's RemoteAddr. hearthd is documented behind a
+	// feluccad resolves the client address. Empty (the default) means trust NO
+	// proxy and use the connection's RemoteAddr. feluccad is documented behind a
 	// Caddy reverse proxy, so every client arrives as 127.0.0.1; believing a
 	// client-settable header by default would let any caller forge the
 	// per-source key the auth throttle counts on, which is strictly worse than
@@ -66,7 +66,7 @@ type Config struct {
 	// TrustXRealIP additionally honours X-Real-IP from a trusted proxy when no
 	// X-Forwarded-For is present. OFF by default, and deliberately so.
 	//
-	// X-Forwarded-For carries a chain: hearthd walks it from the right and stops
+	// X-Forwarded-For carries a chain: feluccad walks it from the right and stops
 	// at the first hop that is not one of the declared proxies, so a client's own
 	// forged prefix is discarded. X-Real-IP is a bare single value with NO chain
 	// of custody at all — whatever the last hop wrote (or forwarded verbatim)
@@ -83,9 +83,9 @@ type Config struct {
 func Load(args []string) (*Config, error) {
 	cfg := &Config{
 		Bind:      "0.0.0.0:8080",
-		UIDir:     "/usr/share/hearth/ui",
-		StatePath: "/var/lib/hearth/state.json",
-		DBPath:    "/var/lib/hearth/hearth.db",
+		UIDir:     "/usr/share/felucca/ui",
+		StatePath: "/var/lib/felucca/state.json",
+		DBPath:    "/var/lib/felucca/felucca.db",
 		Token:     "",
 		Port:      8080,
 
@@ -93,16 +93,16 @@ func Load(args []string) (*Config, error) {
 
 		WgIP:        "",
 		WgPort:      51820,
-		WgKeyPath:   "/var/lib/hearth/wg.key",
+		WgKeyPath:   "/var/lib/felucca/wg.key",
 		WgEndpoint:  "",
 		WgKeepalive: 25,
 
 		TLSDomain:   "",
-		TLSCacheDir: "/var/lib/hearth/autocert",
+		TLSCacheDir: "/var/lib/felucca/autocert",
 
 		IngressDomain: "",
 
-		ImagesDir: "/var/lib/hearth/images",
+		ImagesDir: "/var/lib/felucca/images",
 
 		UsageRetentionDays: 90,
 
@@ -113,12 +113,12 @@ func Load(args []string) (*Config, error) {
 	}
 
 	// --- Layer 1: JSON config file (lowest above defaults) ---
-	// Find the config path from --config flag or HEARTH_CONFIG env. Both are
+	// Find the config path from --config flag or FELUCCA_CONFIG env. Both are
 	// paths the operator named, so a file that is missing or malformed is
 	// fatal: warn-and-continue would drop the token the operator put in it and
-	// boot with Token still "". Only a path hearthd guessed for itself would
+	// boot with Token still "". Only a path feluccad guessed for itself would
 	// be allowed to be a soft miss, and today it guesses none.
-	configPath := os.Getenv("HEARTH_CONFIG")
+	configPath := os.Getenv("FELUCCA_CONFIG")
 	for i, a := range args {
 		if a == "--config" && i+1 < len(args) {
 			configPath = args[i+1]
@@ -135,72 +135,72 @@ func Load(args []string) (*Config, error) {
 	}
 
 	// --- Layer 2: Environment variables ---
-	if v := os.Getenv("HEARTH_BIND"); v != "" {
+	if v := os.Getenv("FELUCCA_BIND"); v != "" {
 		cfg.Bind = v
 	}
-	if v := os.Getenv("HEARTH_UI_DIR"); v != "" {
+	if v := os.Getenv("FELUCCA_UI_DIR"); v != "" {
 		cfg.UIDir = v
 	}
-	if v := os.Getenv("HEARTH_STATE"); v != "" {
+	if v := os.Getenv("FELUCCA_STATE"); v != "" {
 		cfg.StatePath = v
 	}
-	if v := os.Getenv("HEARTH_DB"); v != "" {
+	if v := os.Getenv("FELUCCA_DB"); v != "" {
 		cfg.DBPath = v
 	}
-	if v := os.Getenv("HEARTH_TOKEN"); v != "" {
+	if v := os.Getenv("FELUCCA_TOKEN"); v != "" {
 		cfg.Token = v
 	}
-	if v := os.Getenv("HEARTH_INSECURE_NO_AUTH"); v != "" {
+	if v := os.Getenv("FELUCCA_INSECURE_NO_AUTH"); v != "" {
 		// Only an affirmative value opens the gate; garbage keeps auth on.
 		if b, err := strconv.ParseBool(v); err == nil {
 			cfg.InsecureNoAuth = b
 		}
 	}
-	if v := os.Getenv("HEARTH_PORT"); v != "" {
+	if v := os.Getenv("FELUCCA_PORT"); v != "" {
 		if p, err := strconv.ParseUint(v, 10, 16); err == nil {
 			cfg.Port = uint16(p)
 		}
 	}
-	if v := os.Getenv("HEARTH_WG_IP"); v != "" {
+	if v := os.Getenv("FELUCCA_WG_IP"); v != "" {
 		cfg.WgIP = v
 	}
-	if v := os.Getenv("HEARTH_WG_PORT"); v != "" {
+	if v := os.Getenv("FELUCCA_WG_PORT"); v != "" {
 		if p, err := strconv.ParseUint(v, 10, 16); err == nil {
 			cfg.WgPort = uint16(p)
 		}
 	}
-	if v := os.Getenv("HEARTH_WG_KEY_PATH"); v != "" {
+	if v := os.Getenv("FELUCCA_WG_KEY_PATH"); v != "" {
 		cfg.WgKeyPath = v
 	}
-	if v := os.Getenv("HEARTH_WG_ENDPOINT"); v != "" {
+	if v := os.Getenv("FELUCCA_WG_ENDPOINT"); v != "" {
 		cfg.WgEndpoint = v
 	}
-	if v := os.Getenv("HEARTH_WG_KEEPALIVE"); v != "" {
+	if v := os.Getenv("FELUCCA_WG_KEEPALIVE"); v != "" {
 		if p, err := strconv.ParseUint(v, 10, 16); err == nil {
 			cfg.WgKeepalive = uint16(p)
 		}
 	}
-	if v := os.Getenv("HEARTH_TLS_DOMAIN"); v != "" {
+	if v := os.Getenv("FELUCCA_TLS_DOMAIN"); v != "" {
 		cfg.TLSDomain = v
 	}
-	if v := os.Getenv("HEARTH_TLS_CACHE"); v != "" {
+	if v := os.Getenv("FELUCCA_TLS_CACHE"); v != "" {
 		cfg.TLSCacheDir = v
 	}
-	if v := os.Getenv("HEARTH_INGRESS_DOMAIN"); v != "" {
+	if v := os.Getenv("FELUCCA_INGRESS_DOMAIN"); v != "" {
 		cfg.IngressDomain = v
 	}
-	if v := os.Getenv("HEARTH_IMAGES_DIR"); v != "" {
+	if v := os.Getenv("FELUCCA_IMAGES_DIR"); v != "" {
 		cfg.ImagesDir = v
 	}
-	if v := os.Getenv("HEARTH_USAGE_RETENTION_DAYS"); v != "" {
+	if v := os.Getenv("FELUCCA_USAGE_RETENTION_DAYS"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
 			cfg.UsageRetentionDays = n
 		}
 	}
-	if v := os.Getenv("HEARTH_TRUSTED_PROXIES"); v != "" {
+	if v := os.Getenv("FELUCCA_TRUSTED_PROXIES"); v != "" {
 		cfg.TrustedProxies = splitList(v)
 	}
-	if v := os.Getenv("HEARTH_TRUST_X_REAL_IP"); v != "" {
+	if v := os.Getenv("FELUCCA_TRUST_X_REAL_IP"); v != "" {
 		// Only an affirmative value opts in; garbage keeps the header ignored.
 		if b, err := strconv.ParseBool(v); err == nil {
 			cfg.TrustXRealIP = b
@@ -208,7 +208,7 @@ func Load(args []string) (*Config, error) {
 	}
 
 	// --- Layer 3: Command-line flags (highest precedence) ---
-	fs := flag.NewFlagSet("hearthd", flag.ContinueOnError)
+	fs := flag.NewFlagSet("feluccad", flag.ContinueOnError)
 	bind := fs.String("bind", cfg.Bind, "")
 	uiDir := fs.String("ui-dir", cfg.UIDir, "")
 	statePath := fs.String("state", cfg.StatePath, "")
@@ -464,7 +464,7 @@ func (c *Config) ListenAddr() string {
 	return net.JoinHostPort(host, strconv.FormatUint(uint64(c.Port), 10))
 }
 
-// ValidateBind rejects a bind hearthd cannot honour as written. Refusing to
+// ValidateBind rejects a bind feluccad cannot honour as written. Refusing to
 // start is recoverable in seconds; guessing the wildcard for an address the
 // operator typed exposes the admin API — which is remote root on every worker
 // — to everything that can route to the host, and nothing in the logs says so.
@@ -473,7 +473,7 @@ func (c *Config) ValidateBind() error {
 	if hadPort {
 		if _, port, err := net.SplitHostPort(c.Bind); err == nil && port != "" {
 			if _, perr := strconv.ParseUint(port, 10, 16); perr != nil {
-				return fmt.Errorf("bind %q has a non-numeric port %q: hearthd would silently listen on %d instead", c.Bind, port, c.Port)
+				return fmt.Errorf("bind %q has a non-numeric port %q: feluccad would silently listen on %d instead", c.Bind, port, c.Port)
 			}
 		}
 	}
@@ -494,7 +494,7 @@ func (c *Config) ValidateBind() error {
 	return nil
 }
 
-// isHostname reports whether h looks like a DNS name hearthd can resolve at
+// isHostname reports whether h looks like a DNS name feluccad can resolve at
 // listen time. Deliberately permissive — the point is to catch a value that is
 // not an address at all, not to out-parse the resolver.
 func isHostname(h string) bool {
@@ -515,8 +515,8 @@ func isHostname(h string) bool {
 	return true
 }
 
-// OverlayBindProblem describes why enrolled agents cannot reach hearthd once
-// the wg overlay is on, or "" when they can. Agents dial hearthd at its
+// OverlayBindProblem describes why enrolled agents cannot reach feluccad once
+// the wg overlay is on, or "" when they can. Agents dial feluccad at its
 // overlay IP inside the tunnel, so a loopback-only listener blackholes the
 // whole fleet: every registration and heartbeat fails with a connection
 // refused that reads like an agent-side fault. The shipped example config now
@@ -540,10 +540,10 @@ func (c *Config) OverlayBindProblem() string {
 		dialed = overlay.String()
 	}
 	if isLoopbackHost(host) {
-		return fmt.Sprintf("bind %q is loopback-only but the wg overlay is enabled: enrolled agents dial hearthd at %s inside the tunnel and every one of them will fail to connect — bind the overlay address or the wildcard", c.Bind, dialed)
+		return fmt.Sprintf("bind %q is loopback-only but the wg overlay is enabled: enrolled agents dial feluccad at %s inside the tunnel and every one of them will fail to connect — bind the overlay address or the wildcard", c.Bind, dialed)
 	}
 	if ip := net.ParseIP(host); ip != nil && err == nil && !ip.Equal(overlay) {
-		return fmt.Sprintf("bind %q listens only on %s but the wg overlay is enabled: enrolled agents dial hearthd at %s inside the tunnel and will not be able to reach it — bind the overlay address or the wildcard", c.Bind, ip, dialed)
+		return fmt.Sprintf("bind %q listens only on %s but the wg overlay is enabled: enrolled agents dial feluccad at %s inside the tunnel and will not be able to reach it — bind the overlay address or the wildcard", c.Bind, ip, dialed)
 	}
 	return ""
 }
@@ -557,7 +557,7 @@ func isLoopbackHost(host string) bool {
 	return strings.EqualFold(host, "localhost")
 }
 
-// ValidateTrustedProxies reports a trusted-proxy entry hearthd cannot parse.
+// ValidateTrustedProxies reports a trusted-proxy entry feluccad cannot parse.
 // A malformed CIDR has to be a startup failure and not a skipped entry: the
 // operator who wrote it believes forwarded client addresses are being
 // honoured, and a silent skip leaves the deployment keying its throttles and
@@ -579,7 +579,7 @@ func (c *Config) ValidateTrustedProxies() error {
 	return nil
 }
 
-// MinTokenLen is the shortest admin token hearthd will serve with. The
+// MinTokenLen is the shortest admin token feluccad will serve with. The
 // documented recipe (`openssl rand -hex 32`) yields 64 chars; below 32 an
 // operator-chosen token is guessable at API line rate.
 const MinTokenLen = 32
@@ -589,8 +589,9 @@ const MinTokenLen = 32
 // authenticate everyone who can read GitHub.
 var placeholderTokens = []string{
 	"replace_with_output_of__openssl_rand_-hex_32",
-	"replace_with_same_token_as_hearthd",
-	"hearth-lab-token",
+	"replace_with_same_token_as_feluccad",
+	"felucca-lab-token",
+	"hearth-lab-token", // pre-rename spelling, still in git history
 }
 
 // IsPlaceholderToken reports whether tok is one of the public example values.
@@ -610,7 +611,7 @@ func IsPlaceholderToken(tok string) bool {
 }
 
 // ValidateAuth reports why the configured credentials must not be served with.
-// hearthd calls it before it listens: the admin API is remote root on every
+// feluccad calls it before it listens: the admin API is remote root on every
 // worker, so a missing, public or guessable token is a startup failure and not
 // a warning. InsecureNoAuth is the operator's explicit opt-out.
 func (c *Config) ValidateAuth() error {
@@ -618,7 +619,7 @@ func (c *Config) ValidateAuth() error {
 		return nil
 	}
 	if c.Token == "" {
-		return errors.New("no auth token configured: set token / HEARTH_TOKEN / --token, or pass --insecure-no-auth for a loopback-only lab")
+		return errors.New("no auth token configured: set token / FELUCCA_TOKEN / --token, or pass --insecure-no-auth for a loopback-only lab")
 	}
 	if IsPlaceholderToken(c.Token) {
 		return errors.New("auth token is a shipped placeholder and is public: generate one with `openssl rand -hex 32`")

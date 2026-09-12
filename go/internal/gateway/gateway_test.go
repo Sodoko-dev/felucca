@@ -12,12 +12,12 @@ import (
 	"time"
 )
 
-// testEnv wires a fake hearthd (route table + ensure) and a fake backend
+// testEnv wires a fake feluccad (route table + ensure) and a fake backend
 // (echoing which Host/path it saw) behind a Gateway.
 type testEnv struct {
 	gw       *Gateway
 	backend  *httptest.Server
-	hearthd  *httptest.Server
+	feluccad  *httptest.Server
 	routes   atomic.Value // []Route
 	ensure   func(sandboxID string, port uint16) int
 	backends atomic.Int64
@@ -33,7 +33,7 @@ func newTestEnv(t *testing.T, limits map[string]TenantLimit) *testEnv {
 	}))
 	t.Cleanup(env.backend.Close)
 
-	env.hearthd = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	env.feluccad = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer admin-tok" {
 			w.WriteHeader(404)
 			return
@@ -60,11 +60,11 @@ func newTestEnv(t *testing.T, limits map[string]TenantLimit) *testEnv {
 			w.WriteHeader(404)
 		}
 	}))
-	t.Cleanup(env.hearthd.Close)
+	t.Cleanup(env.feluccad.Close)
 
 	env.gw = New(Config{
 		Domain:       "sb.lab.test",
-		HearthdURL:   env.hearthd.URL,
+		FeluccadURL:   env.feluccad.URL,
 		Token:        "admin-tok",
 		Refresh:      time.Hour, // tests refresh explicitly
 		TenantLimits: limits,
@@ -161,7 +161,7 @@ func TestDynamicPortEnsure(t *testing.T) {
 	env := newTestEnv(t, nil)
 	env.setRoutes() // empty table
 
-	// hearthd allows the ensure and then serves the new route.
+	// feluccad allows the ensure and then serves the new route.
 	env.ensure = func(sandboxID string, port uint16) int {
 		if sandboxID == "sb-dyn" && port == 8069 {
 			env.routes.Store([]Route{env.backendRoute("8069--sb-dyn", "sb-dyn", "t-1", "running")})
@@ -174,7 +174,7 @@ func TestDynamicPortEnsure(t *testing.T) {
 		t.Fatalf("dynamic: got %d body %s", w.Code, w.Body.String())
 	}
 
-	// Opt-out sandbox: hearthd says 403, the gateway forwards the refusal.
+	// Opt-out sandbox: feluccad says 403, the gateway forwards the refusal.
 	env.ensure = func(string, uint16) int { return 403 }
 	w2 := doHost(t, env.gw, "9000--sb-locked.sb.lab.test", "/")
 	if w2.Code != 403 {
@@ -191,7 +191,7 @@ func TestDynamicPortEnsure(t *testing.T) {
 
 	// Non-canonical digits (leading zeros, oversize) never trigger ensure:
 	// they could ensure a port whose canonical label never matches, turning
-	// every request into hearthd round-trips.
+	// every request into feluccad round-trips.
 	for _, host := range []string{"08080--sb-dyn.sb.lab.test", "070--sb-dyn.sb.lab.test", "99999--sb-dyn.sb.lab.test", "0--sb-dyn.sb.lab.test"} {
 		called = false
 		w := doHost(t, env.gw, host, "/")
@@ -204,7 +204,7 @@ func TestDynamicPortEnsure(t *testing.T) {
 func TestNodeLessRoute503(t *testing.T) {
 	env := newTestEnv(t, nil)
 	r := env.backendRoute("odoo--sb-1", "sb-1", "t-1", "error")
-	r.NodeHost = "" // node gone; hearthd still serves the row for state-aware errors
+	r.NodeHost = "" // node gone; feluccad still serves the row for state-aware errors
 	env.setRoutes(r)
 	w := doHost(t, env.gw, "odoo--sb-1.sb.lab.test", "/")
 	if w.Code != 503 || !strings.Contains(w.Body.String(), "error") {
@@ -235,12 +235,12 @@ func TestTenantToggleAndRateLimit(t *testing.T) {
 	}
 }
 
-func TestRefreshSurvivesHearthdOutage(t *testing.T) {
+func TestRefreshSurvivesFeluccadOutage(t *testing.T) {
 	env := newTestEnv(t, nil)
 	env.setRoutes(env.backendRoute("odoo--sb-1", "sb-1", "t-1", "running"))
 
-	// hearthd goes away; the stale-but-working table keeps serving.
-	env.hearthd.Close()
+	// feluccad goes away; the stale-but-working table keeps serving.
+	env.feluccad.Close()
 	env.gw.refresh()
 	if w := doHost(t, env.gw, "odoo--sb-1.sb.lab.test", "/"); w.Code != 200 {
 		t.Errorf("after outage: got %d, want 200 from cached route", w.Code)

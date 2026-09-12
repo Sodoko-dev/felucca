@@ -1,4 +1,4 @@
-//! hearth-guest: a tiny vsock server that runs inside Firecracker guests.
+//! felucca-guest: a tiny vsock server that runs inside Firecracker guests.
 //!
 //! Listens on AF_VSOCK (any CID), port 52. One JSON request per connection:
 //! `exec` (run a command) or `set_ip` (reconfigure the primary interface).
@@ -7,8 +7,8 @@
 use std::thread;
 use std::time::Duration;
 
-use hearth_guest::handle_connection;
-use hearth_guest::vsock::VsockListener;
+use felucca_guest::handle_connection;
+use felucca_guest::vsock::VsockListener;
 
 /// vsock port the guest agent listens on (per the v3 contract).
 const VSOCK_PORT: u32 = 52;
@@ -18,7 +18,7 @@ const BACKLOG: i32 = 128;
 const RETRY: Duration = Duration::from_secs(5);
 
 fn main() {
-    eprintln!("hearth-guest: starting, listening on vsock port {VSOCK_PORT}");
+    eprintln!("felucca-guest: starting, listening on vsock port {VSOCK_PORT}");
 
     // Bind with retry-forever: on old VMs without a vsock device, socket/bind can
     // fail; we must not crash-loop hard (the unit restarts us, but spinning is
@@ -27,13 +27,13 @@ fn main() {
         match VsockListener::bind(VSOCK_PORT, BACKLOG) {
             Ok(l) => break l,
             Err(e) => {
-                eprintln!("hearth-guest: vsock bind failed ({e}); retrying in {RETRY:?}");
+                eprintln!("felucca-guest: vsock bind failed ({e}); retrying in {RETRY:?}");
                 thread::sleep(RETRY);
             }
         }
     };
 
-    eprintln!("hearth-guest: ready");
+    eprintln!("felucca-guest: ready");
     serve(listener);
 }
 
@@ -44,13 +44,13 @@ fn serve(listener: VsockListener) {
             Ok(stream) => {
                 thread::spawn(move || {
                     if let Err(e) = handle_connection(stream) {
-                        eprintln!("hearth-guest: connection error: {e}");
+                        eprintln!("felucca-guest: connection error: {e}");
                     }
                 });
             }
             Err(e) => {
                 // Transient accept errors shouldn't kill the server.
-                eprintln!("hearth-guest: accept failed: {e}");
+                eprintln!("felucca-guest: accept failed: {e}");
                 thread::sleep(Duration::from_millis(100));
             }
         }

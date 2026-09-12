@@ -1,12 +1,12 @@
-//! Configuration loading for hearth-agent.
+//! Configuration loading for felucca-agent.
 //!
 //! Precedence (highest first): command-line flags > env vars > JSON config file > defaults.
-//! Keys: bind/HEARTH_AGENT_BIND/--bind, control_plane/HEARTH_CONTROL_PLANE/--control-plane,
-//! advertise_addr/HEARTH_ADVERTISE_ADDR/--advertise-addr, data_dir/HEARTH_DATA_DIR/--data-dir,
-//! token/HEARTH_TOKEN/--token, pool_size/HEARTH_POOL_SIZE/--pool-size,
-//! net/HEARTH_NET/--net (on/off/true/false/1/0), net_cidr/HEARTH_NET_CIDR/--net-cidr,
-//! join_url/HEARTH_JOIN_URL/--join, join_token/HEARTH_JOIN_TOKEN/--join-token,
-//! bind_any/HEARTH_BIND_ANY/--bind-any (on/off).
+//! Keys: bind/FELUCCA_AGENT_BIND/--bind, control_plane/FELUCCA_CONTROL_PLANE/--control-plane,
+//! advertise_addr/FELUCCA_ADVERTISE_ADDR/--advertise-addr, data_dir/FELUCCA_DATA_DIR/--data-dir,
+//! token/FELUCCA_TOKEN/--token, pool_size/FELUCCA_POOL_SIZE/--pool-size,
+//! net/FELUCCA_NET/--net (on/off/true/false/1/0), net_cidr/FELUCCA_NET_CIDR/--net-cidr,
+//! join_url/FELUCCA_JOIN_URL/--join, join_token/FELUCCA_JOIN_TOKEN/--join-token,
+//! bind_any/FELUCCA_BIND_ANY/--bind-any (on/off).
 //! bind→port quirk: trailing :N in bind overrides port.
 
 use crate::ipalloc::Cidr;
@@ -20,7 +20,7 @@ pub struct Config {
     pub advertise_addr: String,
     pub data_dir: String,
     pub token: String,
-    /// WireGuard overlay join (v4 P2): hearthd join URL + single-use token.
+    /// WireGuard overlay join (v4 P2): feluccad join URL + single-use token.
     pub join_url: String,
     pub join_token: String,
     pub net: bool,
@@ -83,8 +83,8 @@ pub fn load(args: &[String], env: &HashMap<String, String>) -> Result<Config, St
     let mut cfg = Config::default();
 
     // --- 1) File layer (lowest precedence above defaults) ---
-    // Find --config flag or HEARTH_CONFIG env.
-    let mut config_path: Option<String> = env.get("HEARTH_CONFIG").cloned();
+    // Find --config flag or FELUCCA_CONFIG env.
+    let mut config_path: Option<String> = env.get("FELUCCA_CONFIG").cloned();
     let mut i = 1usize;
     while i < args.len() {
         if args[i] == "--config" {
@@ -137,24 +137,24 @@ pub fn load(args: &[String], env: &HashMap<String, String>) -> Result<Config, St
     }
 
     // --- 2) Env layer ---
-    if let Some(v) = env.get("HEARTH_AGENT_BIND") { cfg.bind = v.clone(); }
-    if let Some(v) = env.get("HEARTH_CONTROL_PLANE") { cfg.control_plane = v.clone(); }
-    if let Some(v) = env.get("HEARTH_ADVERTISE_ADDR") { cfg.advertise_addr = v.clone(); }
-    if let Some(v) = env.get("HEARTH_DATA_DIR") { cfg.data_dir = v.clone(); }
-    if let Some(v) = env.get("HEARTH_TOKEN") { cfg.token = v.clone(); }
-    if let Some(v) = env.get("HEARTH_JOIN_URL") { cfg.join_url = v.clone(); }
-    if let Some(v) = env.get("HEARTH_JOIN_TOKEN") { cfg.join_token = v.clone(); }
-    if let Some(v) = env.get("HEARTH_NET") {
+    if let Some(v) = env.get("FELUCCA_AGENT_BIND") { cfg.bind = v.clone(); }
+    if let Some(v) = env.get("FELUCCA_CONTROL_PLANE") { cfg.control_plane = v.clone(); }
+    if let Some(v) = env.get("FELUCCA_ADVERTISE_ADDR") { cfg.advertise_addr = v.clone(); }
+    if let Some(v) = env.get("FELUCCA_DATA_DIR") { cfg.data_dir = v.clone(); }
+    if let Some(v) = env.get("FELUCCA_TOKEN") { cfg.token = v.clone(); }
+    if let Some(v) = env.get("FELUCCA_JOIN_URL") { cfg.join_url = v.clone(); }
+    if let Some(v) = env.get("FELUCCA_JOIN_TOKEN") { cfg.join_token = v.clone(); }
+    if let Some(v) = env.get("FELUCCA_NET") {
         if let Some(b) = parse_bool(v) { cfg.net = b; }
     }
-    if let Some(v) = env.get("HEARTH_NET_CIDR") { cfg.net_cidr = v.clone(); }
-    if let Some(v) = env.get("HEARTH_POOL_SIZE") {
+    if let Some(v) = env.get("FELUCCA_NET_CIDR") { cfg.net_cidr = v.clone(); }
+    if let Some(v) = env.get("FELUCCA_POOL_SIZE") {
         if let Ok(n) = v.parse::<u32>() { cfg.pool_size = n; }
     }
-    if let Some(v) = env.get("HEARTH_AGENT_PORT") {
+    if let Some(v) = env.get("FELUCCA_AGENT_PORT") {
         if let Ok(n) = v.parse::<u16>() { cfg.port = n; }
     }
-    if let Some(v) = env.get("HEARTH_BIND_ANY") {
+    if let Some(v) = env.get("FELUCCA_BIND_ANY") {
         if let Some(b) = parse_bool(v) { cfg.bind_any = b; }
     }
 
@@ -213,8 +213,11 @@ pub fn load(args: &[String], env: &HashMap<String, String>) -> Result<Config, St
 /// public constants, so a deploy still carrying one has no credential at all —
 /// anyone can read it from GitHub and drive the root agent API with it.
 const PLACEHOLDER_TOKENS: &[&str] = &[
-    "REPLACE_WITH_SAME_TOKEN_AS_HEARTHD",
+    "REPLACE_WITH_SAME_TOKEN_AS_FELUCCAD",
     "REPLACE_WITH_OUTPUT_OF__openssl_rand_-hex_32",
+    "felucca-lab-token",
+    // The pre-rename spelling is still in git history and on old worker disks;
+    // it is exactly MIN_TOKEN_LEN bytes, so only this list keeps it out.
     "hearth-lab-token",
 ];
 
@@ -228,7 +231,7 @@ const MIN_TOKEN_LEN: usize = 16;
 /// agent that is down.
 pub fn validate_token(token: &str) -> Result<(), String> {
     if token.is_empty() {
-        return Err("no token configured — set `token` in the config file, HEARTH_TOKEN, or --token".into());
+        return Err("no token configured — set `token` in the config file, FELUCCA_TOKEN, or --token".into());
     }
     let lower = token.to_ascii_lowercase();
     // Prefix match, not just the exact literals: every shipped placeholder
@@ -247,10 +250,10 @@ pub fn validate_token(token: &str) -> Result<(), String> {
     Ok(())
 }
 
-// ---- per-node credential (hearthd -> agent), persisted ----
+// ---- per-node credential (feluccad -> agent), persisted ----
 
-/// File holding the per-node bearer hearthd mints for this worker at
-/// enrollment (`hearth_nt_...`). hearthd presents it on every control-plane
+/// File holding the per-node bearer feluccad mints for this worker at
+/// enrollment (`felucca_nt_...`). feluccad presents it on every control-plane
 /// call to this node and resolves it to a NODE principal, never to admin, so a
 /// token harvested off one worker is worth that worker and nothing else.
 ///
@@ -310,7 +313,7 @@ pub fn save_node_token(data_dir: &str, token: &str) -> Result<(), String> {
 /// NOT be a startup failure, or upgrading the agent would take the fleet down.
 ///
 /// Everything else is `Err` and the caller treats it as fatal. A file that
-/// exists but cannot be used is not the same as no file: hearthd is presenting
+/// exists but cannot be used is not the same as no file: feluccad is presenting
 /// this credential on every call to this node, so guessing "no credential"
 /// would come up as a node that 401s the control plane with no explanation.
 pub fn load_node_token(data_dir: &str) -> Result<Option<String>, String> {
@@ -455,16 +458,16 @@ pub fn authorized(token: &str, authorization: Option<&str>) -> bool {
 }
 
 /// Authorized when the bearer matches EITHER credential this node answers to:
-/// the per-node token hearthd minted for it, or the configured shared token.
+/// the per-node token feluccad minted for it, or the configured shared token.
 ///
-/// Both are accepted on purpose. hearthd presents the per-node token to a node
+/// Both are accepted on purpose. feluccad presents the per-node token to a node
 /// it enrolled with a join token and the shared token to one it has not
 /// re-enrolled yet, and a fleet is upgraded one node at a time — accepting
 /// only the node token would 401 every call to a not-yet-re-enrolled worker
 /// (exec, expose, sleep, wake, delete, the lifecycle sweep), and accepting
 /// only the shared token is the break this replaces.
 ///
-/// `node` is "" until hearthd issues one, and an empty token authorizes nobody
+/// `node` is "" until feluccad issues one, and an empty token authorizes nobody
 /// (see `authorized`), so the unenrolled case is the shared token alone.
 pub fn authorized_either(shared: &str, node: &str, authorization: Option<&str>) -> bool {
     // Bitwise `|`, not `||`: both comparisons run on every request, so how
@@ -490,7 +493,7 @@ mod tests {
 
     #[test]
     fn test_defaults() {
-        let cfg = load(&["hearth-agent".into()], &HashMap::new()).expect("no config file");
+        let cfg = load(&["felucca-agent".into()], &HashMap::new()).expect("no config file");
         assert_eq!(cfg.bind, "0.0.0.0:9090");
         assert_eq!(cfg.port, 9090);
         assert!(cfg.net);
@@ -501,7 +504,7 @@ mod tests {
 
     #[test]
     fn test_bind_port_quirk() {
-        let args: Vec<String> = vec!["hearth-agent".into(), "--bind".into(), "0.0.0.0:8888".into()];
+        let args: Vec<String> = vec!["felucca-agent".into(), "--bind".into(), "0.0.0.0:8888".into()];
         let cfg = load(&args, &HashMap::new()).expect("no config file");
         assert_eq!(cfg.port, 8888);
     }
@@ -509,10 +512,10 @@ mod tests {
     #[test]
     fn test_env_overrides_default() {
         let mut env = HashMap::new();
-        env.insert("HEARTH_DATA_DIR".into(), "/tmp/ignis".into());
-        env.insert("HEARTH_NET".into(), "off".into());
-        env.insert("HEARTH_POOL_SIZE".into(), "3".into());
-        let cfg = load(&["hearth-agent".into()], &env).expect("no config file");
+        env.insert("FELUCCA_DATA_DIR".into(), "/tmp/ignis".into());
+        env.insert("FELUCCA_NET".into(), "off".into());
+        env.insert("FELUCCA_POOL_SIZE".into(), "3".into());
+        let cfg = load(&["felucca-agent".into()], &env).expect("no config file");
         assert_eq!(cfg.data_dir, "/tmp/ignis");
         assert!(!cfg.net);
         assert_eq!(cfg.pool_size, 3);
@@ -521,15 +524,15 @@ mod tests {
     #[test]
     fn test_flag_overrides_env() {
         let mut env = HashMap::new();
-        env.insert("HEARTH_NET".into(), "off".into());
-        let args: Vec<String> = vec!["hearth-agent".into(), "--net".into(), "on".into()];
+        env.insert("FELUCCA_NET".into(), "off".into());
+        let args: Vec<String> = vec!["felucca-agent".into(), "--net".into(), "on".into()];
         let cfg = load(&args, &env).expect("no config file");
         assert!(cfg.net);
     }
 
     #[test]
     fn test_join_defaults_empty() {
-        let cfg = load(&["hearth-agent".into()], &HashMap::new()).expect("no config file");
+        let cfg = load(&["felucca-agent".into()], &HashMap::new()).expect("no config file");
         assert!(cfg.join_url.is_empty());
         assert!(cfg.join_token.is_empty());
     }
@@ -537,20 +540,20 @@ mod tests {
     #[test]
     fn test_join_env_overrides_default() {
         let mut env = HashMap::new();
-        env.insert("HEARTH_JOIN_URL".into(), "http://hub.example.com:8080".into());
-        env.insert("HEARTH_JOIN_TOKEN".into(), "hearth_jt_abc".into());
-        let cfg = load(&["hearth-agent".into()], &env).expect("no config file");
+        env.insert("FELUCCA_JOIN_URL".into(), "http://hub.example.com:8080".into());
+        env.insert("FELUCCA_JOIN_TOKEN".into(), "felucca_jt_abc".into());
+        let cfg = load(&["felucca-agent".into()], &env).expect("no config file");
         assert_eq!(cfg.join_url, "http://hub.example.com:8080");
-        assert_eq!(cfg.join_token, "hearth_jt_abc");
+        assert_eq!(cfg.join_token, "felucca_jt_abc");
     }
 
     #[test]
     fn test_join_flag_overrides_env() {
         let mut env = HashMap::new();
-        env.insert("HEARTH_JOIN_URL".into(), "http://env-host:1111".into());
-        env.insert("HEARTH_JOIN_TOKEN".into(), "env-token".into());
+        env.insert("FELUCCA_JOIN_URL".into(), "http://env-host:1111".into());
+        env.insert("FELUCCA_JOIN_TOKEN".into(), "env-token".into());
         let args: Vec<String> = vec![
-            "hearth-agent".into(),
+            "felucca-agent".into(),
             "--join".into(), "http://flag-host:2222".into(),
             "--join-token".into(), "flag-token".into(),
         ];
@@ -561,10 +564,10 @@ mod tests {
 
     #[test]
     fn test_net_on_off_parsing() {
-        let args: Vec<String> = vec!["hearth-agent".into(), "--net".into(), "off".into()];
+        let args: Vec<String> = vec!["felucca-agent".into(), "--net".into(), "off".into()];
         let cfg = load(&args, &HashMap::new()).expect("no config file");
         assert!(!cfg.net);
-        let args2: Vec<String> = vec!["hearth-agent".into(), "--net".into(), "1".into()];
+        let args2: Vec<String> = vec!["felucca-agent".into(), "--net".into(), "1".into()];
         let cfg2 = load(&args2, &HashMap::new()).expect("no config file");
         assert!(cfg2.net);
     }
@@ -604,11 +607,12 @@ mod tests {
     #[test]
     fn test_validate_token_rejects_shipped_placeholders() {
         // Every one of these is a literal committed to the public repo.
-        assert!(validate_token("REPLACE_WITH_SAME_TOKEN_AS_HEARTHD").is_err());
+        assert!(validate_token("REPLACE_WITH_SAME_TOKEN_AS_FELUCCAD").is_err());
         assert!(validate_token("REPLACE_WITH_OUTPUT_OF__openssl_rand_-hex_32").is_err());
+        assert!(validate_token("felucca-lab-token").is_err());
         assert!(validate_token("hearth-lab-token").is_err());
         // Case-insensitive, and any variation carrying REPLACE_WITH.
-        assert!(validate_token("replace_with_same_token_as_hearthd").is_err());
+        assert!(validate_token("replace_with_same_token_as_feluccad").is_err());
         assert!(validate_token("REPLACE_WITH_ANYTHING_ELSE_ENTIRELY").is_err());
         assert!(validate_token("prefix-replace_with-suffix-padding").is_err());
     }
@@ -634,19 +638,19 @@ mod tests {
         // Was: an unreadable config silently fell back to defaults, whose
         // token is empty — a deleted config turned authentication off.
         let mut env = HashMap::new();
-        env.insert("HEARTH_CONFIG".into(), "/nonexistent/hearth-agent.json".into());
-        assert!(load(&["hearth-agent".into()], &env).is_err());
+        env.insert("FELUCCA_CONFIG".into(), "/nonexistent/felucca-agent.json".into());
+        assert!(load(&["felucca-agent".into()], &env).is_err());
     }
 
     #[test]
     fn test_load_malformed_config_file_is_error() {
-        let dir = std::env::temp_dir().join("hearth-cfg-malformed");
+        let dir = std::env::temp_dir().join("felucca-cfg-malformed");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("hearth-agent.json");
+        let path = dir.join("felucca-agent.json");
         std::fs::write(&path, "{ not json").unwrap();
         let mut env = HashMap::new();
-        env.insert("HEARTH_CONFIG".into(), path.to_string_lossy().into_owned());
-        assert!(load(&["hearth-agent".into()], &env).is_err());
+        env.insert("FELUCCA_CONFIG".into(), path.to_string_lossy().into_owned());
+        assert!(load(&["felucca-agent".into()], &env).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -673,13 +677,13 @@ mod tests {
 
     #[test]
     fn test_bind_any_defaults_off_and_parses() {
-        let cfg = load(&["hearth-agent".into()], &HashMap::new()).expect("no config file");
+        let cfg = load(&["felucca-agent".into()], &HashMap::new()).expect("no config file");
         assert!(!cfg.bind_any);
-        let args: Vec<String> = vec!["hearth-agent".into(), "--bind-any".into(), "on".into()];
+        let args: Vec<String> = vec!["felucca-agent".into(), "--bind-any".into(), "on".into()];
         assert!(load(&args, &HashMap::new()).expect("no config file").bind_any);
         let mut env = HashMap::new();
-        env.insert("HEARTH_BIND_ANY".into(), "true".into());
-        assert!(load(&["hearth-agent".into()], &env).expect("no config file").bind_any);
+        env.insert("FELUCCA_BIND_ANY".into(), "true".into());
+        assert!(load(&["felucca-agent".into()], &env).expect("no config file").bind_any);
     }
 
     #[test]
@@ -707,7 +711,7 @@ mod tests {
     /// Unique scratch dir per test (these run in parallel in one process).
     fn scratch(name: &str) -> String {
         let d = std::env::temp_dir().join(format!(
-            "hearth-nodetok-{}-{}-{:?}",
+            "felucca-nodetok-{}-{}-{:?}",
             name,
             std::process::id(),
             std::thread::current().id()
@@ -722,11 +726,11 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
-    const NT: &str = "hearth_nt_9f2c1b8a7d4e6f0312a5b9c8d7e6f504";
+    const NT: &str = "felucca_nt_9f2c1b8a7d4e6f0312a5b9c8d7e6f504";
 
     #[test]
     fn test_node_token_round_trips_and_is_not_world_readable() {
-        // Was: the agent had nowhere to keep the credential hearthd issues, so
+        // Was: the agent had nowhere to keep the credential feluccad issues, so
         // it kept presenting the fleet admin token instead. M2 is the reason
         // for the mode assertion — a persisted credential must be 0600.
         let dir = scratch("roundtrip");
@@ -743,16 +747,16 @@ mod tests {
         // that predates per-node credentials. Ok(None), never Err — otherwise
         // upgrading the agent takes the fleet down.
         assert_eq!(
-            load_node_token("/nonexistent/hearth-node-token-test").expect("no file is not an error"),
+            load_node_token("/nonexistent/felucca-node-token-test").expect("no file is not an error"),
             None
         );
     }
 
     #[test]
     fn test_node_token_rotation_replaces_cleanly() {
-        // hearthd mints a fresh credential on every re-enrollment.
+        // feluccad mints a fresh credential on every re-enrollment.
         let dir = scratch("rotate");
-        let first = "hearth_nt_1111111111111111111111111111";
+        let first = "felucca_nt_1111111111111111111111111111";
         save_node_token(&dir, first).expect("save first");
         save_node_token(&dir, NT).expect("save second");
         assert_eq!(load_node_token(&dir).expect("load").as_deref(), Some(NT));
@@ -769,7 +773,7 @@ mod tests {
         // guessable secret is never written, and never loaded if some other
         // writer put one there.
         let dir = scratch("guards");
-        for bad in ["", "short", "hearth-lab-token", "REPLACE_WITH_SAME_TOKEN_AS_HEARTHD"] {
+        for bad in ["", "short", "felucca-lab-token", "REPLACE_WITH_SAME_TOKEN_AS_FELUCCAD"] {
             assert!(save_node_token(&dir, bad).is_err(), "persisted {:?}", bad);
             std::fs::write(node_token_path(&dir), bad).unwrap();
             assert!(load_node_token(&dir).is_err(), "loaded {:?}", bad);
@@ -811,7 +815,7 @@ mod tests {
 
     #[test]
     fn test_authorized_either_accepts_both_credentials_and_nothing_else() {
-        // Was: only the shared token was accepted, so every hearthd call to a
+        // Was: only the shared token was accepted, so every feluccad call to a
         // join-enrolled node 401'd — exec, expose, sleep, wake, delete and the
         // lifecycle sweep all failed against it.
         let shared = "9f2c1b8a7d4e6f0312a5b9c8d7e6f504";
@@ -835,7 +839,7 @@ mod tests {
     fn test_split_host_port() {
         assert_eq!(split_host_port("http://127.0.0.1:8080"), ("127.0.0.1", 8080));
         assert_eq!(split_host_port("http://127.0.0.1:8080/api"), ("127.0.0.1", 8080));
-        assert_eq!(split_host_port("https://hearth.example.com"), ("hearth.example.com", 8080));
+        assert_eq!(split_host_port("https://felucca.example.com"), ("felucca.example.com", 8080));
         assert_eq!(split_host_port("192.168.1.1:9000"), ("192.168.1.1", 9000));
     }
 }

@@ -23,9 +23,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/alpham/infra-saas/hearth/internal/agentclient"
-	"github.com/alpham/infra-saas/hearth/internal/model"
-	"github.com/alpham/infra-saas/hearth/internal/store"
+	"github.com/alpham/infra-saas/felucca/internal/agentclient"
+	"github.com/alpham/infra-saas/felucca/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/store"
 )
 
 // Shape caps for sandbox/template creation (v4 P4 "bigger guests"). These are
@@ -159,7 +159,7 @@ func (srv *Server) pushPoolsTo(addr string) {
 
 // pushPools fans the current pool specs out to every ready node. Best-effort
 // and called off the request path (goroutine): a missed node heals on its
-// next register (hearthd pushes to a node right after it registers).
+// next register (feluccad pushes to a node right after it registers).
 func (srv *Server) pushPools() {
 	for _, addr := range srv.readyNodeAddrs() {
 		srv.pushPoolsTo(addr)

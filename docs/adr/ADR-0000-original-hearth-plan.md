@@ -1,5 +1,8 @@
 # ADR-0000 — Original "Hearth" plan (from claude.ai, provided by user 2026-06-10)
 
+> **2026-09-12:** the product was renamed **Hearth → Felucca** (see `CHANGELOG.md`). This ADR is a
+> quoted historical artifact and keeps the original name on purpose; every other document uses Felucca.
+
 > Preserved verbatim as the baseline this project's plan was derived from.
 > The adopted, amended plan lives in `docs/PLAN.md`. Notable amendment: the
 > backend (control plane + node agent) is implemented in **Zig**, per explicit

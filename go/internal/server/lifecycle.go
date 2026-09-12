@@ -1,7 +1,7 @@
 // Lifecycle policies (v4 P5.2): auto-sleep after idle, auto-delete after a
 // long sleep. Per-tenant defaults (store.Tenant) with per-sandbox overrides
 // (model.Sandbox.IdleSleepS/AsleepDeleteS; 0 = inherit, -1 = disabled); a
-// background sweep enforces them from the activity clocks hearthd already
+// background sweep enforces them from the activity clocks feluccad already
 // owns (exec, wake, gateway ingress reports). Design: ADR-0009.
 package server
 
@@ -11,8 +11,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/alpham/infra-saas/hearth/internal/model"
-	"github.com/alpham/infra-saas/hearth/internal/store"
+	"github.com/alpham/infra-saas/felucca/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/store"
 )
 
 const (
@@ -213,7 +213,7 @@ type nodeTenant struct {
 	tenant string
 }
 
-// nodeUnreachable records a hearthd→agent transport failure against addr, for
+// nodeUnreachable records a feluccad→agent transport failure against addr, for
 // this tenant, for the remainder of one sweep. err is the dial error: only a
 // transport failure counts (resp is nil), never a status the agent answered with.
 func nodeUnreachable(unreachable map[nodeTenant]bool, addr, tenant string, err error) {
@@ -242,7 +242,7 @@ func (srv *Server) autoSleep(id, tenant string, now int64, unreachable map[nodeT
 	// Each sweep action is its own traceable actor: the ID lets operators
 	// correlate agent sleep calls with this sandbox's sweep decision.
 	sweepID := newTraceID("sweep")
-	// Through the dial choke point like every other hearthd→agent call: the
+	// Through the dial choke point like every other feluccad→agent call: the
 	// sweep gets THIS node's credential, never the control-plane admin token.
 	// It used to pass srv.cfg.Token, which made "set idle_sleep_s: 5 on a
 	// sandbox scheduled to a node I control" a 20-second recovery of the fleet

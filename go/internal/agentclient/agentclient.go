@@ -1,4 +1,4 @@
-// Package agentclient provides an HTTP client for talking to hearth-agent
+// Package agentclient provides an HTTP client for talking to felucca-agent
 // instances, replicating client.zig behavior exactly.
 package agentclient
 
@@ -12,10 +12,10 @@ import (
 	"time"
 )
 
-// RequestIDHeader carries the hearthd-minted per-request trace ID on every
-// hop (client response, hearthd→agent calls). One constant on the Go side —
+// RequestIDHeader carries the feluccad-minted per-request trace ID on every
+// hop (client response, feluccad→agent calls). One constant on the Go side —
 // the Rust agent and TS SDK read the same name (lowercased by their stacks).
-const RequestIDHeader = "X-Hearth-Request-Id"
+const RequestIDHeader = "X-Felucca-Request-Id"
 
 // Response mirrors the Zig client.Response.
 type Response struct {
@@ -27,7 +27,7 @@ var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 // Request performs an HTTP request to the agent at host:port.
 // token is attached as "Authorization: Bearer <token>" when non-empty.
-// reqID is attached as "X-Hearth-Request-Id" when non-empty.
+// reqID is attached as "X-Felucca-Request-Id" when non-empty.
 func Request(host string, port uint16, method, path string, body []byte, token, reqID string) (*Response, error) {
 	url := fmt.Sprintf("http://%s:%d%s", host, port, path)
 
@@ -70,7 +70,7 @@ func Request(host string, port uint16, method, path string, body []byte, token, 
 // ExecVM proxies an exec request to the node agent at host:port for the given
 // vm id.  timeout is the per-request HTTP timeout (timeout_ms + 10s); a fresh
 // http.Client is created so the shared client's 30 s timeout is not used.
-// reqID is attached as "X-Hearth-Request-Id" when non-empty.
+// reqID is attached as "X-Felucca-Request-Id" when non-empty.
 func ExecVM(host string, port uint16, id string, body []byte, token string, timeout time.Duration, reqID string) (*Response, error) {
 	url := fmt.Sprintf("http://%s:%d/v1/vms/%s/exec", host, port, id)
 
@@ -113,7 +113,7 @@ func ExecVM(host string, port uint16, id string, body []byte, token string, time
 // the caller can relay the agent's NDJSON stream as it arrives. The returned
 // cancel func releases the request context — the caller must defer it (and
 // close resp.Body); the context timeout bounds the whole stream.
-// reqID is attached as "X-Hearth-Request-Id" when non-empty.
+// reqID is attached as "X-Felucca-Request-Id" when non-empty.
 func ExecVMStream(host string, port uint16, id string, body []byte, token string, timeout time.Duration, reqID string) (*http.Response, context.CancelFunc, error) {
 	url := fmt.Sprintf("http://%s:%d/v1/vms/%s/exec", host, port, id)
 

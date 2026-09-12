@@ -1,22 +1,121 @@
-# Hearth — Project history
+# Felucca — Project history
 
 Everything built, verified, and learned, in order. Companion docs:
 [PLAN.md](PLAN.md) (adopted architecture), [API-V2.md](API-V2.md) +
 [API-V3-EXEC.md](API-V3-EXEC.md) (contracts), [ARCHITECTURE.md](ARCHITECTURE.md)
 (current system), the ADRs in [adr/](adr/), and [DEPLOYMENT.md](DEPLOYMENT.md).
 
+## Rename: Hearth → Felucca (2026-09-12)
+
+The product, both binaries, on-disk paths, and every public identifier were
+renamed from **Hearth** to **Felucca** via a case-preserving find/replace over
+the whole tree. History below has been rewritten to the new name throughout —
+the binaries, config paths, and everything else described in older entries
+always refer to what is now called Felucca. Commit hashes and tags (`v3.0.0`,
+`v3.1.0`) are **unchanged**; only the working tree content was rewritten.
+
+| Old (Hearth) | New (Felucca) |
+|---|---|
+| `hearthd` | `feluccad` |
+| `hearth-agent` | `felucca-agent` |
+| `hearth-gw` | `felucca-gw` |
+| `hearth-guest` | `felucca-guest` |
+| `hearth0` (bridge) | `felucca0` |
+| `wg-hearth` | `wg-felucca` |
+| `HEARTH_*` env vars | `FELUCCA_*` |
+| `X-Hearth-Request-Id` | `X-Felucca-Request-Id` |
+| `hearth_*` metrics | `felucca_*` |
+| `hearth_sk_` / `hearth_nt_` / `hearth_jt_` key prefixes | `felucca_sk_` / `felucca_nt_` / `felucca_jt_` |
+| `/etc/hearth` | `/etc/felucca` |
+| `/var/lib/hearth` | `/var/lib/felucca` |
+| `/usr/share/hearth` | `/usr/share/felucca` |
+| `/srv/hearth` | `/srv/felucca` |
+| `~/.config/hearth` | `~/.config/felucca` |
+| `hearth.db` | `felucca.db` |
+| `.hearth-guest-v1` marker | `.felucca-guest-v1` |
+| `hearthd.service`, `hearth-agent.service`, `hearth-gw.service`, `hearth-firewall.service` | `feluccad.service`, `felucca-agent.service`, `felucca-gw.service`, `felucca-firewall.service` |
+| `modules-load.d/hearth.conf` | `modules-load.d/felucca.conf` |
+| `@hearth/sdk` (npm) | `@felucca/sdk` |
+| Go module `…/hearth` | `…/felucca` |
+
+### Migration for existing deployments (lab included)
+
+- [ ] Stop the old units before touching anything: `systemctl stop hearthd hearth-agent hearth-gw hearth-firewall` (as applicable per host).
+- [ ] Move config: `/etc/hearth` → `/etc/felucca`, renaming `hearthd.json` → `feluccad.json` and `hearth-agent.json` → `felucca-agent.json` inside it.
+- [ ] Move state: `/var/lib/hearth` → `/var/lib/felucca`, **and rename `hearth.db` → `felucca.db` inside it** — `feluccad` looks for `felucca.db` by name, so skipping this rename starts the new binary with **empty state**.
+- [ ] Move shared assets: `/usr/share/hearth` → `/usr/share/felucca`.
+- [ ] Move the lab token: `~/.config/hearth/lab-token` → `~/.config/felucca/lab-token`.
+- [ ] Install the new unit files (`feluccad.service`, `felucca-agent.service`, `felucca-gw.service`, `felucca-firewall.service`) and `systemctl disable` (and remove) the old `hearth*` units so they can't race the new ones on next boot.
+- [ ] Move `modules-load.d/hearth.conf` → `modules-load.d/felucca.conf`.
+- [ ] On workers, rename the per-image marker `{data_dir}/images/.hearth-guest-v1` → `.felucca-guest-v1`. Existing rootfs images/templates still carry the **old** `hearth-guest` binary and unit baked in — they keep working as-is over vsock (the wire protocol is unchanged), but should be re-injected with `infra/guest-agent-install.sh` at the next template rebuild so newly captured images carry `felucca-guest`.
+- [ ] Bridges `hearth0` and `wg-hearth` are recreated under their new names (`felucca0`, `wg-felucca`) automatically the next time the agent starts; the old interfaces are orphaned and can be removed with `ip link del hearth0` / `ip link del wg-hearth`.
+- [ ] Re-import the Grafana dashboard — the metric names changed (`hearth_*` → `felucca_*`), so a dashboard built against the old names will show empty panels.
+- [ ] Update any client code to send `FELUCCA_*` env vars, expect `X-Felucca-Request-Id`, and use `felucca_sk_…` tenant keys going forward.
+- [ ] Per-node credentials: the worker's `{data_dir}/node-token` and the `node_creds` rows in `felucca.db` still carry the `hearth_nt_` prefix, which the bearer gate now rejects. Either re-join every worker with a fresh join token, or rewrite the prefix on both sides before starting (`UPDATE node_creds SET token = replace(token, 'hearth_nt_', 'felucca_nt_')` and `sed -i 's/^hearth_nt_/felucca_nt_/' {data_dir}/node-token`).
+- [ ] Tear down the old nftables tables on every worker — the agent creates `ip/bridge/netdev felucca` idempotently but never deletes the old-named ones, so `ip hearth` / `bridge hearth` / `netdev hearth` (and `inet hearth_host` from the old firewall unit) keep matching alongside the new rules until removed: `for f in ip bridge netdev; do nft delete table $f hearth 2>/dev/null; done; nft delete table inet hearth_host 2>/dev/null`.
+- [ ] The Grafana dashboard `uid` changed (`hearth-fleet` → `felucca-fleet`), so the import creates a new board; delete the old one and fix any permalinks/alert rules pointing at it.
+
+**Lab migration, 2026-09-12 — what the checklist above missed, found live:**
+
+- `felucca-agent.service` `Requires=felucca-firewall.service` (v4 hardening), so a
+  worker upgraded from a pre-hardening install also needs `/etc/felucca/firewall.nft`
+  and the firewall unit, or the agent never starts. Over the overlay the control
+  plane reaches `:9090` from `10.100.0.1`, so the worker ruleset must allow the
+  hub's overlay address as well as its LAN address.
+- A direct-mode (non-overlay) worker is admitted only through `knownNodeAddr` —
+  its existing node record — once `wg_ip` is configured. Deleting `nodes` rows
+  (e.g. to shed pre-hardening ids the conformance normalizer no longer accepts)
+  strands such a worker with `invalid addr`; re-seed its record or enroll it with
+  a join token.
+- Lima `user-v2` DHCP reshuffled the lab again (control plane `.3` → `.1`):
+  `node_creds.host` and `nodes.addr` are pinned to the old address and must be
+  re-pointed by an operator, exactly as the address-pin design intends.
+- `scripts/verify-v2.sh` §8 fetched `/metrics` unauthenticated; it needs the admin
+  token since the ADR-0010 amendment. Fixed.
+- API-key `prefix` is now **15** chars (`felucca_sk_` + 4) — API-V2 §3b and
+  `feluccad/17-tenancy` updated to match; the old `[:14]` literal would have
+  silently shortened it to prefix + 3.
+- Gates on the migrated fleet: conformance **423/0** (2 documented skips),
+  verify-v2 **21/0**, wake p50 ≈ 80 ms.
+
+Two safety nets exist for the upgrade path, both deliberate exceptions to the
+"no old name anywhere" rule: `feluccad` **refuses to start** when its database
+is absent but a pre-rename `hearth.db` exists at the corresponding old path
+(so a skipped state move cannot masquerade as a clean boot), and the
+placeholder-token denylist in both binaries keeps the pre-rename lab literal
+alongside the new one (it is exactly the agent's minimum token length, so
+nothing else would catch it). The console also purges the `hearth_token`
+browser-storage key that pre-rename builds wrote.
+
+**On old credentials — verified against `go/internal/server/tenants.go` and
+`join.go`:** existing tenant API keys, per-node tokens, and join tokens minted
+before the rename **do not** keep validating. The bearer gate in
+`go/internal/server/server.go` checks the literal string prefix of every
+credential (`strings.HasPrefix(key, nodeTokenPrefix)` for node tokens,
+`strings.HasPrefix(key, apiKeyPrefix) && validAPIKeyShape(key)` for tenant
+keys, and a literal `"felucca_jt_"` prefix check for join tokens in
+`nodeJoin`), and `apiKeyPrefix`/`nodeTokenPrefix` are now `"felucca_sk_"` /
+`"felucca_nt_"` — one character longer than the old `hearth_` prefixes.
+An old `hearth_sk_…` key or `hearth_nt_…` node token fails the prefix (and,
+for tenant keys, the exact-length shape) check before the credential ever
+reaches the database lookup, so it is rejected outright — it does **not**
+fall back to being treated as an opaque, still-valid secret. Every tenant API
+key and per-node token must be rotated (mint new, revoke old) after
+upgrading; join tokens are single-use and short-lived (24h TTL) so old ones
+were already expected to be replaced.
+
 ## v1 — foundation (2026-06-09, Zig)
 
 Two static Zig 0.16 binaries on a three-VM Lima lab (`infra-saas-lab` control
 plane + toolchain; `kata-lab-0/1` workers with KVM + Firecracker v1.16):
 
-- `hearthd`: REST API `:8080`, scheduler (ready node, lowest vm_count), node
+- `feluccad`: REST API `:8080`, scheduler (ready node, lowest vm_count), node
   registry with 5s heartbeats / 15s down-detection, JSON state persistence
   (atomic tmp+rename), static UI serving, Prometheus metrics.
-- `hearth-agent`: `:9090`, drives Firecracker over per-VM unix sockets
+- `felucca-agent`: `:9090`, drives Firecracker over per-VM unix sockets
   (boot-source/drives/machine-config/InstanceStart), instance dirs under
   `/srv/ignis` with `meta.json` enabling restart adoption.
-- Hearth Console UI (vanilla JS SPA): fleet + sandbox views, 3s polling with
+- Felucca Console UI (vanilla JS SPA): fleet + sandbox views, 3s polling with
   flicker-free in-place updates, mock-mode fallback.
 - Research reports on Modal / Northflank / Sprites (`research/`); architecture
   decisions: Zig backend (ADR-0001), **no Kubernetes on the control path**
@@ -35,11 +134,11 @@ The features that make sandboxes a product, per the adopted plan:
 - **Warm pool**: `pool_size` pre-booted paused VMs per agent; matching create
   claims one (keeping the pool `dir_id` so baked snapshot paths stay valid),
   async refill.
-- **Guest networking**: bridge `hearth0`, per-VM `hth-<slot>` taps, sequential
+- **Guest networking**: bridge `felucca0`, per-VM `hth-<slot>` taps, sequential
   IPs from `net_cidr`, nftables masquerade, `ip=` kernel-arg guest config.
 - **Auth**: optional bearer token, constant-time compare; `/healthz`,
   `/metrics`, UI stay open.
-- **Production config**: flags > `HEARTH_*` env > `--config` JSON > defaults;
+- **Production config**: flags > `FELUCCA_*` env > `--config` JSON > defaults;
   nothing hardcoded — the same binaries run on the lab and remote servers.
   `deploy/`: systemd units, installer, config stubs, firecracker-assets script.
 - Verification: `scripts/verify-v2.sh` (16 end-to-end checks incl. host→guest
@@ -54,7 +153,7 @@ boundary), wire and on-disk formats frozen.
 - **Phase 0**: `test/conformance/` — ~24-case executable contract with semantic
   goldens (key sets, types, null-vs-omitted; never byte order) recorded from
   the running Zig stack. Green vs Zig before any port code ran.
-- **Phase 1**: `go/` hearthd, stdlib-only, CGO-free. Solo-verified 78/78 on a
+- **Phase 1**: `go/` feluccad, stdlib-only, CGO-free. Solo-verified 78/78 on a
   side port including adopting a copy of the live `state.json` (same node and
   sandbox ids — critical because agents never re-register after success).
 - **Phase 2**: `rust/agent/` (tokio/axum/hyper-UDS). Hard adoption gate passed
@@ -62,7 +161,7 @@ boundary), wire and on-disk formats frozen.
   dir (live pids kept, sleeping VMs intact, `pooled` orphans → stopped), node
   id preserved, a **Zig-written snapshot woken by the Rust agent**. Adoption
   proven in both directions (rollback-safe).
-- **Cutover**: Gate A (Go hearthd + Zig agents) and Gate B (full Rust fleet,
+- **Cutover**: Gate A (Go feluccad + Zig agents) and Gate B (full Rust fleet,
   one worker at a time, running guests surviving the swaps) each passed full
   conformance + verify-v2; `backend/` deleted in a revertable commit; repo
   brought under git.
@@ -80,18 +179,18 @@ boundary), wire and on-disk formats frozen.
 Contract: [API-V3-EXEC.md](API-V3-EXEC.md). Three components, built in
 parallel against the frozen contract:
 
-- **`rust/guest/` → `hearth-guest`** (528 KB static): vsock server on guest
+- **`rust/guest/` → `felucca-guest`** (528 KB static): vsock server on guest
   port 52 — `exec` (timeout, output capture, truncation caps) and `set_ip`
   (iproute2). Installed into the base image as a systemd unit by
   `infra/guest-agent-install.sh`, which also drops the
-  `images/.hearth-guest-v1` marker.
+  `images/.felucca-guest-v1` marker.
 - **`rust/agent/`**: attaches a Firecracker vsock device at cold boot when the
   marker is present (`vsock:true` in meta.json, optional field — old metas
   parse unchanged); hybrid-vsock guest client (`CONNECT 52` handshake);
   `POST /v1/vms/{id}/exec` (501 `guest agent unavailable` for pre-v3.1 VMs);
   fork performs best-effort `set_ip` on the child after restore.
 - **`go/`**: `POST /api/v1/sandboxes/{id}/exec` proxy with per-request
-  timeouts; `hearth_execs_total` metric.
+  timeouts; `felucca_execs_total` metric.
 
 Scratch end-to-end validation (real Firecracker VMs from an injected image
 copy; zero live impact): exec on cold-booted guests, exec after sleep/wake
@@ -109,7 +208,7 @@ Defects found by validating against real Firecracker (not mocks):
 
 ## v3.1 rollout + lifecycle hardening (2026-06-11; lab live — conformance 132/0, verify-v2 21/0)
 
-The live rollout (`scripts/roll-v3.1.sh`: inject → roll agents → roll hearthd
+The live rollout (`scripts/roll-v3.1.sh`: inject → roll agents → roll feluccad
 → goldens → verify) surfaced four defects. All were fixed, re-rolled, and
 verified green the same day:
 
@@ -119,10 +218,10 @@ verified green the same day:
   forever (resume → connect error from then on) and each retry leaked another
   FC. `start` is now a guarded cold boot: valid only from `stopped`/`error`,
   409 `InvalidState` otherwise, with a pid-liveness check so it can never
-  spawn over a live process. `pause`/`resume` got matching guards, hearthd
+  spawn over a live process. `pause`/`resume` got matching guards, feluccad
   forwards agent 409s (with the real reason) instead of a blanket 502, and
   the UI dropped the Start button on paused rows. Regression cases pin the
-  path shut (`agent/07-actions`, `hearthd/10-actions`).
+  path shut (`agent/07-actions`, `feluccad/10-actions`).
 - **Firecracker death was invisible**: a guest panic (e.g. resume from a
   mid-boot snapshot) exits FC cleanly, but the VM stayed `running` with a
   stale pid and every subsequent op returned an opaque `FcError: Connect`.
@@ -133,7 +232,7 @@ verified green the same day:
   FC instead of leaking it; a dead pool VM is retagged to `error` and the
   create falls through to a cold boot.
 - **The suites slept mid-boot guests**: post-inject boots are slower (the
-  hearth-guest unit), so the cases' create-then-sleep pattern and fixed 3 s
+  felucca-guest unit), so the cases' create-then-sleep pattern and fixed 3 s
   exec waits became systematic failures — poisoned snapshots (guest panics on
   wake, FC exits) or a guest agent not yet listening. `wait_guest_ready`
   (conformance `lib.sh`) and `wait_exec_ready` (verify-v2) poll
@@ -151,7 +250,7 @@ captured) — recovered with `limactl stop -f` + start + agent redeploy; not
 reproduced after the fixes, with the duplicate-FC pile-up as prime suspect.
 Worker agent binaries live in `/tmp` and vanish on reboot — redeploy after
 any worker restart. Goldens re-recorded against the fixed stack:
-`metrics-names` gains `hearth_execs_total`; new `hearthd/exec` and
+`metrics-names` gains `felucca_execs_total`; new `feluccad/exec` and
 `agent/vm-exec` goldens carry real 200 bodies.
 
 ## v4 P0 — tenancy, SQLite store, usage metering (2026-06-12; lab live — conformance 166/0, verify-v2 21/0)
@@ -159,7 +258,7 @@ any worker restart. Goldens re-recorded against the fixed stack:
 First phase of the v4 "multi-tenant, deploy-anywhere, product-ready" plan
 ([ADR-0004](adr/ADR-0004-tenancy-and-sqlite.md); contract in API-V2 §3b):
 
-- **Tenants + API keys**: `hearth_sk_…` bearer keys (sha256-at-rest, shown
+- **Tenants + API keys**: `felucca_sk_…` bearer keys (sha256-at-rest, shown
   once, instant revocation); the legacy configured token is now the admin
   credential — pre-v4 deployments work unchanged. Admin-only CRUD under
   `/api/v1/tenants*`; tenant keys get 404 on infra routes.
@@ -175,7 +274,7 @@ First phase of the v4 "multi-tenant, deploy-anywhere, product-ready" plan
   whole-snapshot transactions at the same granularity as the old JSON persist,
   plus row-level tenants/keys/usage. One-time `state.json` import (renamed
   `*.imported`) — verified live on the lab. DB file is 0600.
-- Conformance grew to **166 checks**: new `hearthd/17-tenancy` (scoping,
+- Conformance grew to **166 checks**: new `feluccad/17-tenancy` (scoping,
   cross-tenant 404s, revocation, quota 429) with per-run-unique tenant names,
   a `req_as` helper in lib.sh, and self-cleaning agent cases (a crashed prior
   run can no longer cascade `AlreadyExists` failures into the next).
@@ -183,7 +282,7 @@ First phase of the v4 "multi-tenant, deploy-anywhere, product-ready" plan
 Operational notes: kata-lab-0's Lima VM died at the hypervisor level again
 (`VZErrorDomain Code=3`, second occurrence, both during the agent suite's
 rapid sleep/wake/fork) — with the duplicate-FC bug fixed since v3.1, this now
-reads as a macOS Virtualization.framework nested-virt limitation, not a Hearth
+reads as a macOS Virtualization.framework nested-virt limitation, not a Felucca
 bug (kata-lab-1 runs the identical binary clean). Documented as a lab
 constraint; production bare-metal workers (v4 P2) are unaffected by vz.
 Security review notes: tenant-name length capped; quota check has a benign
@@ -200,14 +299,14 @@ and flows within one, consuming the `tenant_id` P0 started recording in
 `meta.json`. All in the Rust agent (`rust/agent/src/net.rs`,
 `rust/agent/src/vm/mod.rs`).
 
-- **br_netfilter**: same-subnet guests on `hearth0` talk via L2 switching,
+- **br_netfilter**: same-subnet guests on `felucca0` talk via L2 switching,
   which bypasses the ip `forward` hook entirely — the agent loads
   `br_netfilter` and sets `bridge-nf-call-iptables=1` so bridged frames
   traverse netfilter and the forward chain can police them.
 - **Single concatenated pair set**: one nft set `tenant_pairs`
-  (`ipv4_addr . ipv4_addr`, table `ip hearth`) holds every allowed
+  (`ipv4_addr . ipv4_addr`, table `ip felucca`) holds every allowed
   same-tenant (saddr, daddr) pair. Forward chain (policy accept): accept
-  established/related, accept anything not `hearth0`→`hearth0`, accept pairs
+  established/related, accept anything not `felucca0`→`felucca0`, accept pairs
   in `@tenant_pairs`, drop the remaining bridge-to-bridge. Egress NAT and
   host↔guest are untouched.
 - **Flush-and-rebuild from full membership** (the `ensure_nat` idiom):
@@ -222,7 +321,7 @@ and flows within one, consuming the `tenant_id` P0 started recording in
   `valid_tenant()` (`[A-Za-z0-9_-]`, 1..=64) is defense-in-depth; a
   missing/invalid tenant joins no pair → isolated from all peers
   (fail-closed). Rejected alternative: per-tenant named sets
-  `hearth_t_<tenant>` would have put tenant strings in command lines
+  `felucca_t_<tenant>` would have put tenant strings in command lines
   (ADR-0005).
 - **Caveat**: tenant networks are node-scoped until the P2 overlay —
   per-node CIDRs are node-local, cross-node same-tenant traffic is not
@@ -237,15 +336,15 @@ created with tenant keys all scheduled onto one node: cross-tenant ping exit 1
 
 ## v4 P2 — WireGuard overlay, node join, TLS, systemd fleet (2026-06-12, Go+Rust)
 
-Workers now join hearthd from anywhere: hub-and-spoke WireGuard overlay with
-hearthd as hub. Step commits `bb182f3` (hub: wg config, one-time join tokens
+Workers now join feluccad from anywhere: hub-and-spoke WireGuard overlay with
+feluccad as hub. Step commits `bb182f3` (hub: wg config, one-time join tokens
 sha256-at-rest TTL 24h, `/api/v1/nodes/join` with consume-LAST semantics so no
 failure burns a token), `7ac7ead` (agent `--join`: enroll once, persist
 `wg.json`, every boot brings the tunnel up and registers over the overlay),
 `fdeb995` (in-binary TLS via autocert on :443/:80 when `tls_domain` is set —
 plain listener stays for in-tunnel agents; agent https join via
 `curl --config -` so the token never hits argv), `ee54a9f` (conformance
-`hearthd/18-join` + live lab overlay), `f2eb5a1`+`80dcc08` (systemd units
+`feluccad/18-join` + live lab overlay), `f2eb5a1`+`80dcc08` (systemd units
 validated by running the real fleet under them). Contract: API-V2 §3c; design
 + deferred items: ADR-0006.
 
@@ -261,12 +360,12 @@ systemd migration findings, all unit-encoded now: Firecracker needs `@sandbox`
 (it installs its own seccomp(2) filters; died SIGSYS without it) and
 `/dev/net/tun`; `ReadWritePaths` entries must pre-exist (226/NAMESPACE);
 `StateDirectoryMode=0750` pinned (default re-loosens to 0755 every start);
-`modules-load.d/hearth.conf` preloads `br_netfilter`+`wireguard` because
+`modules-load.d/felucca.conf` preloads `br_netfilter`+`wireguard` because
 `ProtectKernelModules` forbids the services doing it (load-bearing for P1
 isolation). kata-lab-0 vz crash #4 self-healed via unit auto-start on VM
 restart — the old re-stage runbook is obsolete.
 
-Evidence: conformance **193/0** (15 new checks in `hearthd/18-join`: mint /
+Evidence: conformance **193/0** (15 new checks in `feluccad/18-join`: mint /
 validation ladder / admin-only / uniform 401s / 400-doesn't-burn-token),
 verify-v2 **21/0**, both against a mixed fleet running entirely under the
 hardened units — kata-lab-1 enrolled as `10.100.0.2` over the tunnel
@@ -279,35 +378,35 @@ binaries for both arches.
 ## v4 P3 — sandbox ingress (2026-06-12, Go+Rust)
 
 Services inside sandboxes are now reachable by URL: `https://<name>--<id>.
-<domain>` through the new `hearth-gw` reverse proxy. Step commits `ff3cdc3`
-(hearthd expose API + worker DNAT) and `653e2e2` (hearth-gw). Contract:
+<domain>` through the new `felucca-gw` reverse proxy. Step commits `ff3cdc3`
+(feluccad expose API + worker DNAT) and `653e2e2` (felucca-gw). Contract:
 API-V2 §3d; design + deferred items: ADR-0007.
 
 - **Expose API**: POST/DELETE `/api/v1/sandboxes/{id}/expose[/{name}]`,
   multi-service per sandbox; one route row + one worker nft DNAT rule
-  (the `ingress` chain — nat hook prerouting — in the existing `ip hearth`
+  (the `ingress` chain — nat hook prerouting — in the existing `ip felucca`
   table, node ports 20000-29999, flush-and-rebuild from meta.json like
   isolation — same nothing-user-controlled-near-nft invariant). Forks re-expose the child
   with fresh node ports.
-- **hearth-gw**: route table from hearthd (admin-only `GET /api/v1/routes`,
+- **felucca-gw**: route table from feluccad (admin-only `GET /api/v1/routes`,
   cached, outage-tolerant), WebSocket passthrough, 503 wake page for
   sleeping sandboxes, dynamic `8069--<id>` port-in-hostname as a lazy
   expose gated by the per-sandbox `allow_dynamic_ports` opt-in (canonical
   decimal labels only), per-tenant edge toggles + token-bucket rate limits.
-  Ships with a hardened systemd unit (hearth-gw.service).
+  Ships with a hardened systemd unit (felucca-gw.service).
 - **Review loop** (pre-commit) caught and fixed: both snapshot stores
-  silently dropping all ingress state on hearthd restart (SQLite columns +
+  silently dropping all ingress state on feluccad restart (SQLite columns +
   idempotent ALTER migration; state.json loadSandbox fields); a
   concurrent-expose 409 path leaking unaccounted agent DNAT entries and a
   shared-port unexpose TOCTOU (both fixed by serializing ingress mutations
   end-to-end); 30s browser hangs on stale routes (3s connect timeout);
-  leading-zero dynamic labels as an unauthenticated hearthd-amplification
+  leading-zero dynamic labels as an unauthenticated feluccad-amplification
   loop (canonical-spelling gate); node-less sandboxes vanishing from the
   route table instead of serving state-aware 503s. Deferred to ADR-0007:
-  hearthd↔agent expose reconciliation after failed deletes, dynamic-expose
+  feluccad↔agent expose reconciliation after failed deletes, dynamic-expose
   GC (P5 idle policies), wildcard TLS (external infra), auto-wake (P5).
 
-Evidence: conformance **227/0** (new `hearthd/19-expose`, +34 checks:
+Evidence: conformance **227/0** (new `feluccad/19-expose`, +34 checks:
 validation ladder, scoping, idempotency/conflict, admin-only route table,
 dynamic gate, unexpose), verify-v2 **21/0**, cargo 87/0, go suite green.
 Live e2e through the gateway on the systemd fleet: HTTP + a real WebSocket
@@ -321,11 +420,11 @@ ports; deletes flushed every DNAT rule on both workers.
 
 Sandboxes now boot from custom rootfs images with bigger shapes (caps
 16 vCPU / 32 GiB / 128 GB disk). A template is a catalog row + one image on
-hearthd; capture IS the build pipeline; workers pull-and-cache
+feluccad; capture IS the build pipeline; workers pull-and-cache
 sha256-addressed. Contract: API-V2 §3e; design + deferred: ADR-0008.
 
 - **Template entity + capture**: `POST /api/v1/templates` captures a
-  stopped sandbox's rootfs (streamed agent→hearthd, hashed in flight,
+  stopped sandbox's rootfs (streamed agent→feluccad, hashed in flight,
   O_EXCL'd partial as the per-image capture mutex) or registers a
   pre-provisioned image; `disk_gb` is floored at the recorded
   `image_size_gb` so the agent's grow-only resize can never be asked to
@@ -358,8 +457,8 @@ sha256-addressed. Contract: API-V2 §3e; design + deferred: ADR-0008.
   pinning a stale image forever after a crash; `stop` returning before FC
   exit (capture could stream a dirty rootfs) + a capture-vs-start race
   (drop-guarded capture registration); create requests cancelled by
-  hearthd's 30s timeout leaving records stuck in `creating`
-  (spawn-shielded); hearthd's global 60s WriteTimeout killing >60s
+  feluccad's 30s timeout leaving records stuck in `creating`
+  (spawn-shielded); feluccad's global 60s WriteTimeout killing >60s
   capture/image transfers mid-stream (found live — per-route
   `ResponseController` deadlines); a store error tearing down every pool
   (error-aware spec push); the admin token on build-template.sh's curl
@@ -371,16 +470,16 @@ sha256-addressed. Contract: API-V2 §3e; design + deferred: ADR-0008.
   (rm + rewrite, never `[ -s ] ||`); the FC guest kernel has legacy
   xtables but no nf_tables (pin `iptables-legacy`) and no `raw` table
   (docker bridge networks need `gateway_mode_ipv4=nat-unprotected`; the
-  template pre-bakes a `hearth` network and compose project networks
+  template pre-bakes a `felucca` network and compose project networks
   inherit the mode via `default-network-opts`).
 - **Lab churn**: kata-lab-0 vz crashes #5–#7 mid-suite (heavier P4 I/O);
   all healed by `limactl stop -f` + `start` with zero manual staging.
   Post-crash orphan churn surfaced a latent quirk: snapshot-restored
   guests (fork children) don't answer host ARP until their first
   transmit — ping-only, self-healing, exec/vsock unaffected; gratuitous
-  ARP from hearth-guest after re-IP is the P5/P6 candidate fix.
+  ARP from felucca-guest after re-IP is the P5/P6 candidate fix.
 
-Evidence: conformance **266/0** (new `hearthd/20-templates`, +39 checks:
+Evidence: conformance **266/0** (new `feluccad/20-templates`, +39 checks:
 validation, capture incl. running/duplicate/in-progress 409s, catalog,
 create-by-template with a marker file proving the child booted from the
 captured image after a cross-node pull, disk floors, tenant scoping, disk
@@ -392,7 +491,7 @@ systemd fleet: `docker-base` built through the public API
 streaming past the old 60s limit), then a sandbox created from it ran
 `docker run hello-world` (image pulled from Docker Hub through guest NAT)
 and a `docker compose` busybox httpd — which was then exposed via the P3
-ingress and served through hearth-gw: the miniature Sodoko smoke
+ingress and served through felucca-gw: the miniature Sodoko smoke
 (template → compose stack → public URL) passes end-to-end.
 
 ## v4 P5 — streaming exec, lifecycle policies, usage, TS SDK (2026-06-13, Go+Rust)
@@ -405,18 +504,18 @@ Design: [ADR-0009](adr/ADR-0009-streaming-lifecycle-usage.md).
   hop — the guest's vsock exec gains `"stream":true` and replies with NDJSON
   frames (`{"stream":"stdout|stderr","data"}` chunks then a terminal
   `{"done":true,...}`); the agent passes them through as chunked
-  `application/x-ndjson`; hearthd relays each as one SSE `data:` event,
+  `application/x-ndjson`; feluccad relays each as one SSE `data:` event,
   flushed immediately. Buffered exec is byte-frozen. Stream cap 16 MiB/stream
   (vs buffered 1 MiB); guest timeouts surface as exit 124; a relay cut yields
   a synthetic `"stream interrupted"` done frame.
 - **Lifecycle policies**: per-tenant `default_idle_sleep_s` /
   `default_asleep_delete_s`, per-sandbox `idle_sleep_s` / `asleep_delete_s`
-  (0 = inherit, −1 = disabled). A 15s hearthd sweep auto-sleeps idle running
+  (0 = inherit, −1 = disabled). A 15s feluccad sweep auto-sleeps idle running
   sandboxes (no exec/ingress/wake) and auto-deletes sleeping ones past their
   TTL. The activity clock is fed by create, fork (parent AND child), wake,
   both exec arms, and gateway ingress reports (`POST /routes/activity`,
   batched per refresh tick).
-- **Auto-wake (hearth-gw)**: a request for a sleeping sandbox wakes it and
+- **Auto-wake (felucca-gw)**: a request for a sleeping sandbox wakes it and
   waits ≤15s (singleflighted per sandbox id — a burst is one wake, not N) for
   the route to go running; default on, per-tenant `auto_wake` override. Plus
   the ADR-0007 deferral: auto-sleep GCs the sandbox's dynamic (all-digit)
@@ -435,9 +534,9 @@ Design: [ADR-0009](adr/ADR-0009-streaming-lifecycle-usage.md).
 - **Gratuitous ARP** (P4 deferral): after a fork re-IP the guest fires one
   throwaway UDP datagram at the gateway so snapshot-restored children answer
   host ARP immediately (no more first-transmit ping gap in verify-v2).
-- **TS SDK** (`sdk/ts/`, `@hearth/sdk`, zero-dep): create/exec/execStream/
+- **TS SDK** (`sdk/ts/`, `@felucca/sdk`, zero-dep): create/exec/execStream/
   sleep/wake/fork/expose/templates/tenantUsage; node:test against an
-  in-process fake hearthd (8/8). `scripts/hearth-verify.sh <endpoint>` runs
+  in-process fake feluccad (8/8). `scripts/felucca-verify.sh <endpoint>` runs
   the conformance suite against any deployment.
 
 Review-loop findings, fixed before commit: (1) the streamed path lossy-decoded
@@ -456,18 +555,18 @@ whole exec history per query — bounded to in-window exec rows.
 
 Gates: cargo (guest UTF-8 + stream tests added), go vet/test green incl. new
 `lifecycle_test`/`usage_test`/`exec_stream_test` (17 new server tests), static
-hearthd+hearth-gw link; fleet rolled under systemd; conformance **326/0**
-(new `hearthd/21-stream-exec`, `22-lifecycle`, `23-template-visibility`; +60
+feluccad+felucca-gw link; fleet rolled under systemd; conformance **326/0**
+(new `feluccad/21-stream-exec`, `22-lifecycle`, `23-template-visibility`; +60
 checks over P4's 266), verify-v2 **21/0** (fork-child ping checks pass — the
 gratuitous-ARP fix working); live repro: streamed exec of a multi-write command
 returned ordered stdout/stderr frames + a `done` frame with the exit code
-through hearthd's SSE relay. kata-lab-0 vz crashes #8 and #9 mid-suite (P5
+through feluccad's SSE relay. kata-lab-0 vz crashes #8 and #9 mid-suite (P5
 conformance now boots+captures+sleep/wakes VMs across three cases — `20`,
 `22`, `23` — much heavier I/O than P4) — each healed by `limactl stop -f` +
 `start`, zero staging; every crash-run failure was `000`/empty-body from the
 dead hypervisor, never an assertion mismatch, and the recovered re-run was a
 clean 326/0. Deferred
-(ADR-0009): exec stdin/PTY, `hearth` CLI binary, authenticated metrics,
+(ADR-0009): exec stdin/PTY, `felucca` CLI binary, authenticated metrics,
 per-sandbox policy PATCH, SDK npm publish.
 
 ## v4 P6 — observability, bench, HA groundwork (2026-08-09, Go+Rust)
@@ -475,7 +574,7 @@ per-sandbox policy PATCH, SDK npm publish.
 Phase 6 of PLAN-v4 — the post-launch operability phase.
 Design: [ADR-0010](adr/ADR-0010-observability-and-bench.md).
 
-- **Structured logging**: hearthd + hearth-gw on Go `slog` (text handler,
+- **Structured logging**: feluccad + felucca-gw on Go `slog` (text handler,
   stderr, journald-friendly), the agent on Rust `tracing`
   (`tracing-subscriber` fmt, `RUST_LOG` filter, default info). Core
   message phrases preserved (grep for the key word still matches), but exact
@@ -483,13 +582,13 @@ Design: [ADR-0010](adr/ADR-0010-observability-and-bench.md).
   (migration note in DEPLOYMENT §11); values moved to structured fields with a fixed vocabulary (`err`,
   `sandbox`/`vm`, `tenant`, `node`, `image`, `request_id`, ...). The guest
   deliberately stays on `eprintln!` (serial console, binary size).
-- **Request IDs**: hearthd mints `req-<hex>` per `/api/` request, echoes it
-  as `X-Hearth-Request-Id`, forwards it on every agent proxy call; the agent
+- **Request IDs**: feluccad mints `req-<hex>` per `/api/` request, echoes it
+  as `X-Felucca-Request-Id`, forwards it on every agent proxy call; the agent
   logs it. Background actors mint `sweep-`/`bg-` ids. Headers only —
   mixed-fleet safe (pre-P6 agents ignore it).
 - **Metrics**: three hand-rolled histograms on the open `/metrics` —
-  `hearth_{wake,exec,create}_duration_ms` (ms buckets 5..30000,+Inf,
-  hearthd wall-clock, always-emitted so scrapes are shape-stable). Legacy
+  `felucca_{wake,exec,create}_duration_ms` (ms buckets 5..30000,+Inf,
+  feluccad wall-clock, always-emitted so scrapes are shape-stable). Legacy
   wake counters kept. Per-tenant gauges return — behind the
   **authenticated** `GET /api/v1/metrics/tenants` (admin token; 404 to
   tenant keys), resolving ADR-0009's leak concern with auth instead of
@@ -503,7 +602,7 @@ Design: [ADR-0010](adr/ADR-0010-observability-and-bench.md).
 - **HA groundwork** (docs/HA-GROUNDWORK.md): honest readiness assessment —
   what the Store boundary already buys, the real blockers (in-memory
   working set, snapshot-granularity persistence, singleton wg hub), the
-  staged litestream → Postgres → N×hearthd path with effort estimates.
+  staged litestream → Postgres → N×feluccad path with effort estimates.
   No code; litestream documented as deployable-today insurance.
 - **uffd CoW fork research** (research/uffd-cow-fork.md): the "branch a
   live Odoo system" track — FC uffd-backed snapshot load, per-lineage
@@ -511,7 +610,7 @@ Design: [ADR-0010](adr/ADR-0010-observability-and-bench.md).
   Implementation deferred until bench data shows fork latency blocking a
   product use.
 
-Conformance grows `hearthd/24-observability` (histogram presence, the
+Conformance grows `feluccad/24-observability` (histogram presence, the
 no-tenant-series-on-open-metrics leak guard, the admin-surface auth ladder,
 request-id minting — deliberately boots no VMs).
 
@@ -532,8 +631,8 @@ for ~2 months (2026-06-14 → 2026-08-09). On `limactl start` of all three
 VMs, every systemd unit self-started, both agents re-registered, and the
 fleet reported ready with zero manual staging — the strongest proof yet of
 the P2.5 reboot-survivability work. The cold boot also surfaced a known-class
-gap worth naming: hearthd's sandbox states (13 `running` rows) had diverged
-from the agents' ground truth (`sleeping`/`stopped` after adoption) — hearthd
+gap worth naming: feluccad's sandbox states (13 `running` rows) had diverged
+from the agents' ground truth (`sleeping`/`stopped` after adoption) — feluccad
 never re-reconciles against agents after a restart. Left as-is (user
 sandboxes among them; wake still works from the agent's real state); the fix
 belongs to the backlog's reschedule/reconcile sweep, not P6.
@@ -541,7 +640,7 @@ belongs to the backlog's reschedule/reconcile sweep, not P6.
 Gates: cargo **121/0 agent** (zero warnings — nothing unwired) + guest
 unchanged (41/0 from P5), go vet clean + full suite green (new histogram/
 admin-metrics unit tests), static binaries link; fleet
-rolled; conformance **342/0** (new `hearthd/24-observability`, +16 checks;
+rolled; conformance **342/0** (new `feluccad/24-observability`, +16 checks;
 metrics-names golden re-recorded for the histogram series), verify-v2
 **21/0** — after a genuinely instructive failure: the first two runs failed
 4/21 on host→guest pings because Lima's user-v2 DHCP had SWAPPED the two
@@ -558,7 +657,7 @@ re-proven directly against kata-lab-1's agent: all four pass (wake 59 ms) —
 the node's data path was never broken. kata-lab-1 also
 wedged once during diagnosis (its first-ever vz crash — all prior nine were
 kata-lab-0) — stop -f + start healed it, zero staging. Live repro: one
-request id followed from an API call through hearthd's journal into the
+request id followed from an API call through feluccad's journal into the
 owning agent's journal; bench table in BENCHMARKS.md. Zero vz crashes under the bench's ~90 VM
 operations; one kata-lab-1 wedge during the verify diagnosis (above).
 
@@ -572,15 +671,15 @@ just the features.
 **Auth, and what a credential reaches**
 
 - Both binaries refuse to start on an empty, placeholder (`REPLACE_WITH…`,
-  `hearth-lab-token`) or short token — 32 chars hearthd, 16 agent. An empty
-  token authorizes nobody. Open mode is only the named `hearthd
+  `felucca-lab-token`) or short token — 32 chars feluccad, 16 agent. An empty
+  token authorizes nobody. Open mode is only the named `feluccad
   --insecure-no-auth`, WARN'd at every start and again on a non-loopback bind.
 - `bind`'s host part is honoured (it used to be discarded, so a configured
-  `127.0.0.1:8080` still served the world). A bind hearthd cannot honour
+  `127.0.0.1:8080` still served the world). A bind feluccad cannot honour
   literally is fatal; an overlay-unreachable bind is a loud startup WARN.
 - `/metrics` is admin-gated. Tenant keys get 404, not 403.
 - **Per-node agent credentials, both directions.** Enrollment with a one-time
-  join token mints `hearth_nt_…`, keyed on the node's `host:port`. hearthd
+  join token mints `felucca_nt_…`, keyed on the node's `host:port`. feluccad
   presents it dialing that node — structurally, through a `nodeDial` whose only
   constructor derives the credential from the node's identity, so no call site
   can put `cfg.Token` on the wire (the earlier procedural rule was obeyed at
@@ -636,12 +735,12 @@ just the features.
   never split whole (a ~1 MiB run of commas used to build a ~500k-element slice
   per unauthenticated request); a malformed CIDR is fatal at startup.
 - `X-Real-IP` got its own opt-in, `trust_x_real_ip` (default **false**), because
-  it carries no chain of custody: hearthd cannot tell a value the proxy wrote
+  it carries no chain of custody: feluccad cannot tell a value the proxy wrote
   from one it forwarded verbatim. Setting it without `trusted_proxies` is a
   startup failure.
 - `MaxHeaderBytes` dropped from Go's 1 MiB default to 16 KiB — the XFF parse is
   on the pre-auth path.
-- **The residual is not closable in code.** hearthd cannot distinguish a header
+- **The residual is not closable in code.** feluccad cannot distinguish a header
   its proxy *wrote* from one the proxy *forwarded*. An edge proxy listed in
   `trusted_proxies` must overwrite `X-Forwarded-For`
   (`header_up X-Forwarded-For {remote_host}` / `proxy_set_header

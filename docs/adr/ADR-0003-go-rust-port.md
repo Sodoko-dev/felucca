@@ -1,4 +1,4 @@
-# ADR-0003: Port hearthd to Go and hearth-agent to Rust; retire the Zig backend
+# ADR-0003: Port feluccad to Go and felucca-agent to Rust; retire the Zig backend
 
 - **Status**: Accepted (2026-06-10)
 - **Supersedes**: [ADR-0001](ADR-0001-zig-backend.md) (Zig backend)
@@ -15,7 +15,7 @@ deployment. Three pressures motivated a language change for v3:
    none of what v3 needs (OIDC, SQLite, gRPC/Terraform plumbing).
 2. **The control plane wants Go.** A Terraform provider must be written in Go
    (terraform-plugin-framework); the broader infra ecosystem (OIDC libraries,
-   SQLite drivers, operational tooling) is Go-first. hearthd is a scheduler +
+   SQLite drivers, operational tooling) is Go-first. feluccad is a scheduler +
    REST API — exactly Go's wheelhouse.
 3. **The agent wants Rust.** The v3 data-plane roadmap — userfaultfd lazy
    restore in-process, CoW fork, possibly carrying patches against Firecracker
@@ -25,11 +25,11 @@ deployment. Three pressures motivated a language change for v3:
 
 ## Decision
 
-- **hearthd → Go** (`go/`): stdlib-only, `CGO_ENABLED=0`, static binaries for
+- **feluccad → Go** (`go/`): stdlib-only, `CGO_ENABLED=0`, static binaries for
   arm64 + amd64. Hand-rendered metrics text, explicit Content-Length on every
   response (never chunked — the wire stayed byte-compatible with what minimal
   HTTP clients expect), `crypto/subtle` for token comparison.
-- **hearth-agent → Rust** (`rust/agent/`): tokio + axum + serde, hyper over the
+- **felucca-agent → Rust** (`rust/agent/`): tokio + axum + serde, hyper over the
   Firecracker unix socket, static musl binary. Networking still shells out to
   `ip`/`nft` (rust-netlink is future work). Firecracker children are spawned
   with `kill_on_drop(false)` and reaped by detached tasks.
@@ -38,7 +38,7 @@ deployment. Three pressures motivated a language change for v3:
   (key sets, types, null-vs-omitted — never byte order) recorded from the
   running Zig v2 stack. Both ports had to go green against those goldens
   before touching the lab.
-- **On-disk formats are unchanged**: hearthd `state.json` (incl. `seq`
+- **On-disk formats are unchanged**: feluccad `state.json` (incl. `seq`
   continuity and hostname-idempotent node registration) and the agent's
   per-instance `meta.json`/`vmstate.bin`/`mem.bin`. Adoption was hard-gated
   and tested in both directions (Rust agent adopting a Zig-written data_dir
@@ -51,9 +51,9 @@ deployment. Three pressures motivated a language change for v3:
 | Gate | Configuration | Result |
 |---|---|---|
 | 0 | Conformance suite vs live Zig stack | 118+43 pass, 0 fail; verify-v2 16/16 |
-| solo | Go hearthd on :8081, copy of live state, real Zig agents | 78/78 incl. state adoption |
-| scratch | Go hearthd + Rust agent, Zig-written fixtures | adoption identical view, node id preserved, Zig snapshot woken by Rust (69–85ms), 120/0 |
-| A | Live cutover: Go hearthd + 2 Zig agents | node ids preserved, 118/0 + verify-v2 16/16 |
+| solo | Go feluccad on :8081, copy of live state, real Zig agents | 78/78 incl. state adoption |
+| scratch | Go feluccad + Rust agent, Zig-written fixtures | adoption identical view, node id preserved, Zig snapshot woken by Rust (69–85ms), 120/0 |
+| A | Live cutover: Go feluccad + 2 Zig agents | node ids preserved, 118/0 + verify-v2 16/16 |
 | B | Live cutover: + Rust agents (lab-1 then lab-0) | views identical, live FCs survived, e2e guests unaffected, 16/16, wake_ms 67 |
 
 Findings made during migration, now part of the record:

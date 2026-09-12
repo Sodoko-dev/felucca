@@ -11,7 +11,7 @@
 
 1. **Tenant is a first-class entity; API keys are the v1 credential.** A tenant
    carries quotas (max sandboxes/vcpus/mem/disk; 0 = unlimited). Credentials are
-   bearer keys `hearth_sk_<48 hex>`; the server stores only the SHA-256. The
+   bearer keys `felucca_sk_<48 hex>`; the server stores only the SHA-256. The
    pre-existing single configured token becomes the **admin** credential
    (unrestricted, unmetered) — every pre-v4 deployment keeps working unchanged.
    OIDC is deliberately deferred: machine consumers (the first product is a
@@ -23,9 +23,9 @@
    tenant admin) are admin-only and 404 for tenant keys. `tenant_id` is
    **excluded from all JSON responses** (`json:"-"`): the v2 wire contract is
    frozen by the conformance goldens, and tenancy is visible only through
-   scoping behavior — itself pinned by new conformance cases (hearthd/17).
+   scoping behavior — itself pinned by new conformance cases (feluccad/17).
 3. **Durable state is SQLite (WAL) via the pure-Go driver** (`modernc.org/sqlite`)
-   behind a `Store` interface (`go/internal/store`). hearthd keeps its in-memory
+   behind a `Store` interface (`go/internal/store`). feluccad keeps its in-memory
    working set (internal/state) and writes through with **whole-snapshot
    transactions** — the exact granularity the JSON file had, so the swap is
    behaviorally invisible; row-level writes are a later optimization, and the
@@ -35,13 +35,13 @@
    row-level and live only in the store. CGO stays disabled: the static-binary
    deployment story is load-bearing for the deploy-anywhere positioning.
 4. **One-time migration, no flag day.** On first boot with an empty store,
-   hearthd imports a legacy `state.json` if present and renames it to
+   feluccad imports a legacy `state.json` if present and renames it to
    `.imported`; otherwise it initializes empty. `--state` remains only as the
-   migration source; `--db` (HEARTH_DB, `db_path`) is the new operative config.
+   migration source; `--db` (FELUCCA_DB, `db_path`) is the new operative config.
 5. **The agent stays tenancy-dumb but tenancy-aware.** `POST /v1/vms` accepts an
    optional `tenant_id`, persisted in `meta.json` (optional field, old metas
    parse unchanged; the 7-key `/v1/vms` list shape is untouched). The agent does
-   not authorize by tenant — hearthd is the policy point — but the recorded
+   not authorize by tenant — feluccad is the policy point — but the recorded
    tenant feeds the next phase: per-tenant nftables isolation on the node.
 
 ## Alternatives considered
@@ -82,13 +82,13 @@ Two things Decision 1 left open turned out to matter.
 pre-existing single configured token" to the admin credential without saying
 what a usable token is, and the answer was "anything, including nothing": an
 empty token meant *auth off*, and the placeholders committed to this public
-repo (`REPLACE_WITH…`, `hearth-lab-token`) authenticated anyone who could read
+repo (`REPLACE_WITH…`, `felucca-lab-token`) authenticated anyone who could read
 GitHub. Since the admin credential is remote root on every worker in the fleet,
 both binaries now **refuse to start** on an empty, placeholder, or short token
-(under 32 chars for hearthd, under 16 for the agent), and an empty token
+(under 32 chars for feluccad, under 16 for the agent), and an empty token
 authorizes nobody rather than everybody. Open mode survives only as an
-explicitly named `hearthd --insecure-no-auth` for loopback labs, WARN'd at every
-start; `hearth-agent` has no equivalent. Failed credentials are additionally
+explicitly named `feluccad --insecure-no-auth` for loopback labs, WARN'd at every
+start; `felucca-agent` has no equivalent. Failed credentials are additionally
 throttled per source address (429 + `Retry-After`) — but the credential is
 authenticated **before** the throttle is consulted, so a correct token is always
 served and the guard can only ever shape the answer to an attempt that had
@@ -99,7 +99,7 @@ was itself a finding of the review that followed.
 **Keys can expire, and can be found.** Decision 1 minted keys that lived
 forever, and stored only their SHA-256 — correct for the hash, but it left no
 way to *find* a leaked key: `DELETE /api/v1/keys/{id}` needs a `key_id` nobody
-kept, so the only remediation was raw SQL against `hearth.db`. Two additions:
+kept, so the only remediation was raw SQL against `felucca.db`. Two additions:
 
 - `POST /api/v1/tenants/{id}/keys` accepts `expires_in_s` (max one year); the
   row carries `expires_at` (0 = never, still the default and still what
@@ -107,7 +107,7 @@ kept, so the only remediation was raw SQL against `hearth.db`. Two additions:
   revoked one — the check is in the lookup SQL, not the handler.
 - `GET /api/v1/tenants/{id}/keys` (admin) lists id, `prefix`, and timestamps —
   **never** the secret or its hash. `prefix` is the secret's first 14 chars
-  (`hearth_sk_` + 4), which is enough to match a leaked value against a row and
+  (`felucca_sk_` + 4), which is enough to match a leaked value against a row and
   revoke it, and useless for guessing the rest.
 
 Neither changes the wire shape of any pre-existing response, so the conformance

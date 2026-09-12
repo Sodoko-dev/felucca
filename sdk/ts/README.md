@@ -1,6 +1,6 @@
-# @hearth/sdk
+# @felucca/sdk
 
-Thin typed TypeScript client for the Hearth control plane (`hearthd`) REST
+Thin typed TypeScript client for the Felucca control plane (`feluccad`) REST
 API ([docs/API-V2.md](../../docs/API-V2.md)). Zero runtime dependencies —
 uses global `fetch` (Node >= 18, browsers). ESM with bundled types.
 
@@ -12,15 +12,15 @@ npm test        # node --test (Node >= 23.6, or 22.6+ with --experimental-strip-
 ## Usage
 
 ```ts
-import { HearthClient, HearthError } from "@hearth/sdk";
+import { FeluccaClient, FeluccaError } from "@felucca/sdk";
 
-const hearth = new HearthClient({
-  baseUrl: "https://hearth.example.com",
-  apiKey: process.env.HEARTH_API_KEY!, // admin token or hearth_sk_… tenant key
+const felucca = new FeluccaClient({
+  baseUrl: "https://felucca.example.com",
+  apiKey: process.env.FELUCCA_API_KEY!, // admin token or felucca_sk_… tenant key
 });
 
 // Create a sandbox (optionally from a template)
-const sb = await hearth.createSandbox({
+const sb = await felucca.createSandbox({
   name: "demo",
   template: "odoo-18",
   vcpus: 2,
@@ -29,7 +29,7 @@ const sb = await hearth.createSandbox({
 console.log(sb.id, sb.state, sb.ip);
 
 // Stream a long-running command (SSE under the hood)
-const { exitCode } = await hearth.execStream(
+const { exitCode } = await felucca.execStream(
   sb.id,
   { cmd: ["/bin/sh", "-c", "apt-get update && apt-get install -y build-essential"], timeout_ms: 300_000 },
   {
@@ -40,39 +40,39 @@ const { exitCode } = await hearth.execStream(
 console.log("exit:", exitCode);
 
 // Or buffered
-const out = await hearth.exec(sb.id, { cmd: ["/bin/sh", "-c", "echo hi"] });
+const out = await felucca.exec(sb.id, { cmd: ["/bin/sh", "-c", "echo hi"] });
 console.log(out.stdout); // "hi\n"
 
 // Publish a service port and get its public URL
-const exposed = await hearth.expose(sb.id, { name: "web", port: 8069 });
+const exposed = await felucca.expose(sb.id, { name: "web", port: 8069 });
 console.log(exposed.url ?? exposed.hostname); // https://web--sb-….<ingress domain>
 
 // Lifecycle
-await hearth.sleepSandbox(sb.id);
-const woken = await hearth.wakeSandbox(sb.id); // woken.wake_ms
-const child = await hearth.forkSandbox(sb.id, { name: "demo-fork" });
+await felucca.sleepSandbox(sb.id);
+const woken = await felucca.wakeSandbox(sb.id); // woken.wake_ms
+const child = await felucca.forkSandbox(sb.id, { name: "demo-fork" });
 
 // Cleanup
-await hearth.unexpose(sb.id, "web");
-await hearth.deleteSandbox(child.id);
-await hearth.deleteSandbox(sb.id);
+await felucca.unexpose(sb.id, "web");
+await felucca.deleteSandbox(child.id);
+await felucca.deleteSandbox(sb.id);
 ```
 
 ## Errors
 
-Every non-2xx response rejects with `HearthError`:
+Every non-2xx response rejects with `FeluccaError`:
 
 ```ts
 try {
-  await hearth.getSandbox("sb-nonexistent");
+  await felucca.getSandbox("sb-nonexistent");
 } catch (err) {
-  if (err instanceof HearthError) {
+  if (err instanceof FeluccaError) {
     console.error(err.status, err.body); // 404 {"error":"not found"}
   }
 }
 ```
 
-Streamed execs also reject with `HearthError` when the server reports an
+Streamed execs also reject with `FeluccaError` when the server reports an
 in-stream failure (`done.ok === false`, `status` is 200) or when the
 connection drops before the terminal done frame
 (`body === "stream ended without done frame"`).
