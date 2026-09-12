@@ -1,4 +1,4 @@
-// Package server implements the hearthd HTTP server, replicating main.zig
+// Package server implements the feluccad HTTP server, replicating main.zig
 // handler behavior exactly: routing, auth, proxying, metrics, static UI.
 package server
 
@@ -21,12 +21,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/alpham/infra-saas/hearth/internal/agentclient"
-	"github.com/alpham/infra-saas/hearth/internal/config"
-	"github.com/alpham/infra-saas/hearth/internal/model"
-	"github.com/alpham/infra-saas/hearth/internal/state"
-	"github.com/alpham/infra-saas/hearth/internal/store"
-	"github.com/alpham/infra-saas/hearth/internal/wg"
+	"github.com/alpham/infra-saas/felucca/internal/agentclient"
+	"github.com/alpham/infra-saas/felucca/internal/config"
+	"github.com/alpham/infra-saas/felucca/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/state"
+	"github.com/alpham/infra-saas/felucca/internal/store"
+	"github.com/alpham/infra-saas/felucca/internal/wg"
 )
 
 // adminTenant is the tenant context value for the configured admin token
@@ -35,7 +35,7 @@ const adminTenant = ""
 
 // maxRequestBody caps every request body. Applied at the very top of handle()
 // so it also covers /api/v1/nodes/join, which is routed BEFORE the bearer
-// gate: without it an unauthenticated peer holding only a "hearth_jt_" prefix
+// gate: without it an unauthenticated peer holding only a "felucca_jt_" prefix
 // can stream an unbounded body into a decoder. Every documented body is a
 // few hundred bytes; 1 MiB is the widest of them by orders of magnitude.
 const maxRequestBody = 1 << 20
@@ -71,7 +71,7 @@ type Server struct {
 	cfg *config.Config
 	st  *state.State
 	db  store.Store
-	// WireGuard overlay (v4 P2): hearthd's public key, set at startup when
+	// WireGuard overlay (v4 P2): feluccad's public key, set at startup when
 	// the overlay is configured; joinMu serializes overlay IP allocation.
 	// addPeer is the live-kernel install hook — wg.AddPeer in production,
 	// swappable in tests (the binary isn't present there).
@@ -94,7 +94,7 @@ type Server struct {
 	// whose forwarded client address clientIP will honour. Empty means trust
 	// nobody's header and key on the connection itself.
 	trustedProxies []*net.IPNet
-	// credCache memoizes the resolved hearthd→agent bearer per node key
+	// credCache memoizes the resolved feluccad→agent bearer per node key
 	// ("host:port", see nodeCredKey). Exec is the hot path and a credential
 	// changes only at enrollment, so the alternative is a synchronous sqlite
 	// read per proxied request behind a single-writer pool. Misses are NOT
@@ -139,7 +139,7 @@ func New(cfg *config.Config, st *state.State, db store.Store) *Server {
 		}
 		srv.trustedProxies = append(srv.trustedProxies, n)
 	}
-	// Every hearthd→agent call carries the credential minted for THAT node,
+	// Every feluccad→agent call carries the credential minted for THAT node,
 	// never cfg.Token — see nodeDial.
 	srv.agentCall = func(host string, port uint16, method, path string, body []byte, reqID string) (*agentclient.Response, error) {
 		return srv.dialNodeHostPort(host, port).do(method, path, body, reqID)
@@ -170,12 +170,12 @@ func (srv *Server) loadNodeTokenIndex() {
 // Credential prefixes. Each kind of secret carries its own so an operator (or a
 // log line, or the bearer gate) can tell them apart at a glance.
 const (
-	nodeTokenPrefix = "hearth_nt_" // hearthd↔agent, per node
-	apiKeyPrefix    = "hearth_sk_" // tenant API key
+	nodeTokenPrefix = "felucca_nt_" // feluccad↔agent, per node
+	apiKeyPrefix    = "felucca_sk_" // tenant API key
 )
 
-// newNodeToken mints a node's own hearthd↔agent bearer. It is presented in both
-// directions: hearthd offers it dialing that node, and the node offers it on the
+// newNodeToken mints a node's own feluccad↔agent bearer. It is presented in both
+// directions: feluccad offers it dialing that node, and the node offers it on the
 // agent routes (see principal).
 func newNodeToken() string { return nodeTokenPrefix + newSecret(24) }
 
@@ -260,7 +260,7 @@ const maxCredLookups = 4
 // read in authenticate, the join-token read in nodeJoin). Those are the only
 // store reads an unauthenticated caller can reach, and store/sqlite.go caps the
 // pool at ONE connection, so without a bound a client opening N concurrent
-// connections with a bogus "hearth_sk_..." bearer puts N queries in front of
+// connections with a bogus "felucca_sk_..." bearer puts N queries in front of
 // every other user of that connection: SaveSnapshot on each create/sleep/delete,
 // AppendUsage, the sweep's GetTenant, and GetNodeCred on the exec hot path.
 //
@@ -286,10 +286,10 @@ func (g *credGate) acquire(ctx context.Context) (release func(), ok bool) {
 	}
 }
 
-// validAPIKeyShape reports whether a bearer could be a key hearthd ever issued:
+// validAPIKeyShape reports whether a bearer could be a key feluccad ever issued:
 // mintKey produces apiKeyPrefix + 48 lowercase hex characters, and nothing else
 // writes an api_keys row. Checked before the store lookup, so garbage never
-// reaches (or queues for) the database. A key that hearthd minted always passes,
+// reaches (or queues for) the database. A key that feluccad minted always passes,
 // so this can never refuse a valid credential.
 func validAPIKeyShape(key string) bool {
 	const secretLen = 48 // hex of newSecret(24)
@@ -334,12 +334,12 @@ func (srv *Server) seedLegacyNodeCreds() {
 	}
 }
 
-// agentTokenFor resolves the bearer hearthd presents to one node.
+// agentTokenFor resolves the bearer feluccad presents to one node.
 //
 // The admin API token is NOT it. A node address is caller-supplied (POST
 // /api/v1/agents/register), so every outbound dial is a decision about where
 // to deliver a bearer secret; reusing the control-plane admin key there made
-// "point hearthd at a host I control" equivalent to "hand me the admin key".
+// "point feluccad at a host I control" equivalent to "hand me the admin key".
 // Each node gets its own token at enrollment instead, so a harvested one is
 // worth one worker.
 //
@@ -511,7 +511,7 @@ func (d nodeDial) execStream(id string, body []byte, timeout time.Duration, reqI
 
 // putNodeCred records (or rotates) a node's own credential, drops the memoized
 // value so the very next dial uses it, and re-points the inbound index so the
-// node can authenticate to hearthd with it immediately.
+// node can authenticate to feluccad with it immediately.
 func (srv *Server) putNodeCred(host string, port uint16, token string, now int64) error {
 	key := nodeCredKey(host, port)
 	if err := srv.db.PutNodeCred(&store.NodeCred{Host: key, Token: token, CreatedAt: now}); err != nil {
@@ -521,12 +521,12 @@ func (srv *Server) putNodeCred(host string, port uint16, token string, now int64
 	delete(srv.credCache, key)
 	srv.credMu.Unlock()
 	// Rotation retires the previous token in the same call, so a credential
-	// hearthd no longer holds cannot still authenticate its node.
+	// feluccad no longer holds cannot still authenticate its node.
 	srv.nodeIdx.put(key, token)
 	return nil
 }
 
-// SetWgPubKey records hearthd's WireGuard public key (returned to joining
+// SetWgPubKey records feluccad's WireGuard public key (returned to joining
 // workers). Called once at startup, before the listener starts.
 func (srv *Server) SetWgPubKey(pub string) { srv.wgPubKey = pub }
 
@@ -540,7 +540,7 @@ func (srv *Server) persist() error {
 //
 //   - admin      — the configured token (or open mode): unrestricted.
 //   - tenant     — an API key: its own sandboxes, nothing fleet-wide.
-//   - node       — a worker's own hearth_nt_ credential: the two agent routes
+//   - node       — a worker's own felucca_nt_ credential: the two agent routes
 //     and NOTHING else (serveAPI allowlists them by hand).
 //
 // A node is deliberately not expressible as a tenant string. Before this, "who
@@ -586,7 +586,7 @@ func (srv *Server) authenticate(ctx context.Context, authHeader string) (princip
 	}
 	key := authHeader[len(prefix):]
 
-	// A worker presenting the credential hearthd issued it (M3, agent side).
+	// A worker presenting the credential feluccad issued it (M3, agent side).
 	// Resolved from memory: see nodeTokenIndex.
 	if strings.HasPrefix(key, nodeTokenPrefix) {
 		if nodeKey, ok := srv.nodeIdx.lookup(key); ok {
@@ -639,7 +639,7 @@ const (
 	authBackoffBase   = time.Second
 	authBackoffMax    = time.Minute
 	// authBackoffSharedMax caps the wait when the key provably stands for more
-	// than one client — hearthd behind an undeclared reverse proxy, where every
+	// than one client — feluccad behind an undeclared reverse proxy, where every
 	// caller arrives as the same address (see Server.throttleSource). A valid
 	// credential is served regardless, so this only bounds how long an
 	// unauthenticated neighbour is answered 429 instead of 401 for someone
@@ -663,9 +663,9 @@ const (
 	authFailCeiling = authFailThreshold + 8
 )
 
-// authThrottle is the only brute-force guard on hearthd's credential gates —
+// authThrottle is the only brute-force guard on feluccad's credential gates —
 // the gateway's token bucket is a different process and covers tenant ingress
-// only. Keyed on the client address hearthd can actually attribute a request
+// only. Keyed on the client address feluccad can actually attribute a request
 // to (see Server.throttleSource): the peer, or the forwarded hop when the peer
 // is a declared reverse proxy. Nothing clears a record — only quiet time decays
 // it (authFailDecay) — because a clear-on-success is reachable by anyone
@@ -826,7 +826,7 @@ func (srv *Server) trustedProxyIP(ip net.IP) bool {
 	return false
 }
 
-// clientIP is the address hearthd attributes a request to — the throttle key,
+// clientIP is the address feluccad attributes a request to — the throttle key,
 // and so what keeps one client's failures off another's record. It is not what
 // keeps a valid credential served: gateAuth authenticates first, so even a
 // perfectly forged key cannot deny service to anyone who holds a real token.
@@ -835,7 +835,7 @@ func (srv *Server) trustedProxyIP(ip net.IP) bool {
 // declared reverse proxy (cfg.TrustedProxies): a forwarded header is
 // caller-settable, so honouring it from anyone would let a client pick its own
 // key, and anyone else's. The shipped topology makes this load-bearing —
-// hearthd binds loopback behind Caddy, so without the proxy declared every
+// feluccad binds loopback behind Caddy, so without the proxy declared every
 // client, attacker and operator alike, arrives as 127.0.0.1 and shares one
 // record.
 //
@@ -852,10 +852,10 @@ func (srv *Server) clientIP(r *http.Request) string {
 		// Walked from the right, one hop at a time, and never split whole:
 		// strings.Split on a header the caller controls allocates one element
 		// per comma BEFORE anything is inspected, so a ~1 MiB run of commas
-		// (inside Go's old 1 MiB header default — cmd/hearthd now sets a much
+		// (inside Go's old 1 MiB header default — cmd/feluccad now sets a much
 		// smaller MaxHeaderBytes) built a ~500k-element slice per request. Only
 		// maxXFFHops are examined; no real proxy chain is anywhere near that,
-		// and a longer one is not a chain hearthd can attribute anything to.
+		// and a longer one is not a chain feluccad can attribute anything to.
 		rest := xff
 		for i := 0; i < maxXFFHops; i++ {
 			hop := rest
@@ -884,7 +884,7 @@ func (srv *Server) clientIP(r *http.Request) string {
 	}
 	// X-Real-IP, only when the operator opted in (cfg.TrustXRealIP, off by
 	// default and refused at startup unless a proxy is declared). Unlike XFF it
-	// is a bare value with NO chain of custody: hearthd cannot tell a header the
+	// is a bare value with NO chain of custody: feluccad cannot tell a header the
 	// proxy wrote from one it forwarded verbatim, so a proxy that does not
 	// rewrite it (nginx with a bare proxy_pass) hands the client its own key.
 	// The default is therefore to ignore it and key on the proxy — shared, but
@@ -923,9 +923,9 @@ func (s throttleSource) maxWait() time.Duration {
 // a header — so a client cannot opt itself into the softer treatment any more
 // than it can choose its key. Two cases produce a shared key:
 //
-//   - the peer is a declared proxy that forwarded nothing hearthd could attribute
+//   - the peer is a declared proxy that forwarded nothing feluccad could attribute
 //     (no XFF, or every hop was one of our own), so the key is the proxy itself;
-//   - no proxy is declared at all and the peer is loopback or private — hearthd
+//   - no proxy is declared at all and the peer is loopback or private — feluccad
 //     binds loopback behind Caddy in the shipped topology, so every client in the
 //     world arrives as 127.0.0.1 and shares one record, and a reverse proxy one
 //     hop away on the LAN produces the same thing from a private address.
@@ -934,7 +934,7 @@ func (s throttleSource) maxWait() time.Duration {
 // nobody's proxy is treated as shared and gets the short cap. That direction is
 // chosen deliberately. Being wrong this way costs throttle strength against a
 // brute-force attempt config.ValidateAuth has already made infeasible; being
-// wrong the other way spends a full minute of 429s on clients hearthd cannot
+// wrong the other way spends a full minute of 429s on clients feluccad cannot
 // tell apart, which is the failure this whole item is about.
 func (srv *Server) throttleSource(r *http.Request) throttleSource {
 	peer := peerIP(r)
@@ -1354,21 +1354,21 @@ func (srv *Server) listNodes(w http.ResponseWriter) {
 	writeJSON(w, 200, buf.Bytes())
 }
 
-// agentPort is hearth-agent's listen port: the agent's own default, the port
+// agentPort is felucca-agent's listen port: the agent's own default, the port
 // ARCHITECTURE and DEPLOYMENT document throughout, and the one the deployment
 // guide's firewall rules open from the control plane to a worker. It is also
-// the only port hearthd will accept a NEW node address on — the port was never
+// the only port feluccad will accept a NEW node address on — the port was never
 // inspected, so "10.0.0.5:6379" and "203.0.113.9:80" were valid node addresses
-// and aimed hearthd's HTTP client (bearer header and all) at whatever was
+// and aimed feluccad's HTTP client (bearer header and all) at whatever was
 // listening there. Addresses enrolled before this check keep working through
 // knownNodeAddr.
 const agentPort = 9090
 
-// validNodeAddr reports whether an agent-supplied address is one hearthd may
+// validNodeAddr reports whether an agent-supplied address is one feluccad may
 // dial. Accepting an address is accepting to speak to whatever answers there
 // with a bearer credential attached, so it has to be a literal, routable
 // unicast address on the agent's port. Names are refused because what they
-// resolve to is not hearthd's decision, and when the wg overlay is configured
+// resolve to is not feluccad's decision, and when the wg overlay is configured
 // a worker that is not on it cannot be a worker at all.
 func (srv *Server) validNodeAddr(addr string) bool {
 	host, port := agentclient.SplitHostPort(addr)
@@ -1393,7 +1393,7 @@ func (srv *Server) validNodeAddr(addr string) bool {
 }
 
 // knownNodeAddr reports whether the address is already an enrolled node's.
-// Such a re-registration grants no new reach — hearthd dials that address
+// Such a re-registration grants no new reach — feluccad dials that address
 // already — and exempting it keeps a fleet enrolled before validNodeAddr
 // existed able to re-register instead of being stranded by an upgrade.
 func (srv *Server) knownNodeAddr(addr string) bool {
@@ -1418,7 +1418,7 @@ const (
 	maxHostnameLenStr = "128" // for the 400 body; keep in step with the above
 )
 
-// validNodeHostname reports whether a hostname is one hearthd will record for a
+// validNodeHostname reports whether a hostname is one feluccad will record for a
 // node: 1..maxHostnameLen bytes of [A-Za-z0-9._-], the character set a real host
 // name is drawn from. The charset is not decoration — the value is a map key, a
 // log field and a console label, and none of those want control bytes in them.
@@ -1445,7 +1445,7 @@ func validNodeHostname(s string) bool {
 // Two things it must not be able to do, both of which would break "worth one
 // worker" outright:
 //
-//   - advertise an address that is not its own — hearthd would then dial another
+//   - advertise an address that is not its own — feluccad would then dial another
 //     node's workloads at an address this worker controls;
 //   - take over another node's RECORD — state.RegisterNode matches on hostname,
 //     so registering as "worker-B" would repoint every sandbox on B here.
@@ -1504,7 +1504,7 @@ func (srv *Server) agentRegister(w http.ResponseWriter, r *http.Request, p princ
 		// JoinToken is optional and turns a bare registration into an
 		// operator-authorized enrollment: it is the one-time, admin-issued
 		// credential from POST /api/v1/join-tokens, and presenting it is what
-		// buys this address its own hearthd→agent token. Deployments running
+		// buys this address its own feluccad→agent token. Deployments running
 		// the wg overlay spend the token at /api/v1/nodes/join instead and
 		// leave this empty.
 		JoinToken string `json:"join_token"`
@@ -1549,7 +1549,7 @@ func (srv *Server) agentRegister(w http.ResponseWriter, r *http.Request, p princ
 	// row behind. The token is consumed here — one token, one node.
 	agentToken := ""
 	if req.JoinToken != "" {
-		if !strings.HasPrefix(req.JoinToken, "hearth_jt_") {
+		if !strings.HasPrefix(req.JoinToken, "felucca_jt_") {
 			writeJSON(w, 401, []byte(`{"error":"invalid, used, or expired join token"}`))
 			return
 		}
@@ -1607,7 +1607,7 @@ func (srv *Server) agentRegister(w http.ResponseWriter, r *http.Request, p princ
 	if agentToken != "" {
 		// Shown exactly once, and only to the enrollment that minted it: a
 		// later plain registration of the same address never re-reveals it, so
-		// one worker cannot read another's credential out of hearthd. A worker
+		// one worker cannot read another's credential out of feluccad. A worker
 		// that lost its copy re-enrolls with a fresh join token, which rotates.
 		tokJSON, _ := json.Marshal(agentToken)
 		body = `{"id":` + string(idJSON) + `,"agent_token":` + string(tokJSON) + `}`
@@ -2083,7 +2083,7 @@ func (srv *Server) wakeSandbox(w http.ResponseWriter, r *http.Request, id, tenan
 		writeJSON(w, 502, []byte(`{"error":"agent wake failed"}`))
 		return
 	}
-	// Successful wake: histogram gets hearthd's wall-clock (v4 P6) — the
+	// Successful wake: histogram gets feluccad's wall-clock (v4 P6) — the
 	// agent-reported wake_ms below stays the wire/legacy-counter value.
 	observeWakeMs(uint64(time.Since(wakeStart).Milliseconds()))
 
@@ -2602,20 +2602,20 @@ func (srv *Server) serveMetrics(w http.ResponseWriter) {
 	}()
 
 	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "# HELP hearth_nodes_ready Number of ready nodes\n# TYPE hearth_nodes_ready gauge\nhearth_nodes_ready %d\n", readyCount)
-	buf.WriteString("# HELP hearth_sandboxes_total Sandboxes by state\n# TYPE hearth_sandboxes_total gauge\n")
+	fmt.Fprintf(&buf, "# HELP felucca_nodes_ready Number of ready nodes\n# TYPE felucca_nodes_ready gauge\nfelucca_nodes_ready %d\n", readyCount)
+	buf.WriteString("# HELP felucca_sandboxes_total Sandboxes by state\n# TYPE felucca_sandboxes_total gauge\n")
 	for _, st := range model.AllStates {
-		fmt.Fprintf(&buf, "hearth_sandboxes_total{state=%q} %d\n", string(st), counts[st])
+		fmt.Fprintf(&buf, "felucca_sandboxes_total{state=%q} %d\n", string(st), counts[st])
 	}
-	fmt.Fprintf(&buf, "# HELP hearth_api_requests_total Total API requests\n# TYPE hearth_api_requests_total counter\nhearth_api_requests_total %d\n", requestCount)
-	fmt.Fprintf(&buf, "# HELP hearth_wake_ms_last Last wake latency in ms\n# TYPE hearth_wake_ms_last gauge\nhearth_wake_ms_last %d\n", wakeMsLast)
-	fmt.Fprintf(&buf, "# HELP hearth_wake_total Total wakes\n# TYPE hearth_wake_total counter\nhearth_wake_total %d\n", wakeTotal)
-	fmt.Fprintf(&buf, "# HELP hearth_wake_ms_sum Sum of wake latencies (ms)\n# TYPE hearth_wake_ms_sum counter\nhearth_wake_ms_sum %d\n", wakeMsSum)
-	fmt.Fprintf(&buf, "# HELP hearth_forks_total Total forks\n# TYPE hearth_forks_total counter\nhearth_forks_total %d\n", forksTotal)
-	fmt.Fprintf(&buf, "# HELP hearth_execs_total Total exec attempts\n# TYPE hearth_execs_total counter\nhearth_execs_total %d\n", execsTotal)
-	buf.WriteString("# HELP hearth_pool_size Warm-pool depth per node\n# TYPE hearth_pool_size gauge\n")
+	fmt.Fprintf(&buf, "# HELP felucca_api_requests_total Total API requests\n# TYPE felucca_api_requests_total counter\nfelucca_api_requests_total %d\n", requestCount)
+	fmt.Fprintf(&buf, "# HELP felucca_wake_ms_last Last wake latency in ms\n# TYPE felucca_wake_ms_last gauge\nfelucca_wake_ms_last %d\n", wakeMsLast)
+	fmt.Fprintf(&buf, "# HELP felucca_wake_total Total wakes\n# TYPE felucca_wake_total counter\nfelucca_wake_total %d\n", wakeTotal)
+	fmt.Fprintf(&buf, "# HELP felucca_wake_ms_sum Sum of wake latencies (ms)\n# TYPE felucca_wake_ms_sum counter\nfelucca_wake_ms_sum %d\n", wakeMsSum)
+	fmt.Fprintf(&buf, "# HELP felucca_forks_total Total forks\n# TYPE felucca_forks_total counter\nfelucca_forks_total %d\n", forksTotal)
+	fmt.Fprintf(&buf, "# HELP felucca_execs_total Total exec attempts\n# TYPE felucca_execs_total counter\nfelucca_execs_total %d\n", execsTotal)
+	buf.WriteString("# HELP felucca_pool_size Warm-pool depth per node\n# TYPE felucca_pool_size gauge\n")
 	for _, p := range pools {
-		fmt.Fprintf(&buf, "hearth_pool_size{node=%q} %d\n", p.hostname, p.size)
+		fmt.Fprintf(&buf, "felucca_pool_size{node=%q} %d\n", p.hostname, p.size)
 	}
 
 	// Latency histograms (v4 P6, ADR-0010): always emitted, in-memory only.

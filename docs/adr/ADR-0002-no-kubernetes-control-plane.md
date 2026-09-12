@@ -7,10 +7,10 @@
 
 ## Decision
 
-The Hearth lab control plane is a **single Zig binary (`hearthd`) backed by SQLite (WAL mode)**. It is
+The Felucca lab control plane is a **single Zig binary (`feluccad`) backed by SQLite (WAL mode)**. It is
 **not** Kubernetes. There are no CRDs, no operator/controller-runtime, no k3s on the control path, and
-no etcd/Postgres in the lab. `hearthd` owns the REST API, node registry, scheduler, a periodic
-reconcile loop, and static-UI serving. k3s already running on the worker VMs is **ignored** by Hearth.
+no etcd/Postgres in the lab. `feluccad` owns the REST API, node registry, scheduler, a periodic
+reconcile loop, and static-UI serving. k3s already running on the worker VMs is **ignored** by Felucca.
 
 ## Decision drivers
 
@@ -25,9 +25,9 @@ reconcile loop, and static-UI serving. k3s already running on the worker VMs is 
    distributed systems to operate before one microVM boots. The lab is two worker VMs and one control
    VM; SQLite on a single control node is correct-by-scale. The relational queries the baseline wanted
    Postgres for (quotas, billing, audit) are fully served by SQLite at this size.
-4. **Single static binary deployment** (see ADR-0001). `hearthd` is one file + one SQLite file. Backup
-   is `cp hearth.db`. No cluster to bootstrap, upgrade, or babysit.
-5. **Firecracker control does not need k8s.** Everything Hearth does — boot, snapshot, restore, fork,
+4. **Single static binary deployment** (see ADR-0001). `feluccad` is one file + one SQLite file. Backup
+   is `cp felucca.db`. No cluster to bootstrap, upgrade, or babysit.
+5. **Firecracker control does not need k8s.** Everything Felucca does — boot, snapshot, restore, fork,
    tap networking, warm pool — is the node agent talking to Firecracker over UDS. Kubernetes/Kata
    RuntimeClass would *abstract away* exactly the snapshot/fork control the product depends on.
 
@@ -61,9 +61,9 @@ up six subsystems.
 State lives in a DB behind an interface, and the control plane is otherwise stateless:
 
 1. **SQLite → Postgres:** swap the DB driver; schema is already relational.
-2. **Single `hearthd` → HA:** run N `hearthd` behind a load balancer once on Postgres; no other change.
+2. **Single `feluccad` → HA:** run N `feluccad` behind a load balancer once on Postgres; no other change.
 3. **Dynamic fleet:** the node registry already supports one-command join (PLAN Phase 7) — bare-metal
-   hosts become capacity by running `hearth-agent`. No CRDs needed for this.
+   hosts become capacity by running `felucca-agent`. No CRDs needed for this.
 4. **If a declarative/`kubectl` surface is ever required**, it can be layered as a thin adapter over the
    stable REST API rather than rebuilt as the control plane's foundation.
 

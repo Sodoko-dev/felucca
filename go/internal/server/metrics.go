@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/alpham/infra-saas/hearth/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/model"
 )
 
 // latencyBucketsMs are the shared upper bounds (ms) for all three histograms —
@@ -42,7 +42,7 @@ func (h *latencyHist) observe(ms uint64) {
 
 // emit writes the full HELP/TYPE/_bucket/_sum/_count block. Every bucket is
 // ALWAYS emitted — even at zero observations — so scrape shape is stable and
-// the conformance presence checks are deterministic (hearthd/24-observability).
+// the conformance presence checks are deterministic (feluccad/24-observability).
 func (h *latencyHist) emit(buf *bytes.Buffer, name, help string) {
 	h.mu.Lock()
 	counts := h.counts
@@ -62,7 +62,7 @@ func (h *latencyHist) emit(buf *bytes.Buffer, name, help string) {
 	fmt.Fprintf(buf, "%s_count %d\n", name, n)
 }
 
-// The three process-lifetime histograms (ADR-0010): hearthd wall-clock — the
+// The three process-lifetime histograms (ADR-0010): feluccad wall-clock — the
 // latency a caller experiences, agent round-trip included.
 var (
 	wakeHist   latencyHist
@@ -77,9 +77,9 @@ func observeCreateMs(ms uint64) { createHist.observe(ms) }
 // appendHistograms renders all three into the open /metrics payload
 // (called from serveMetrics).
 func appendHistograms(buf *bytes.Buffer) {
-	wakeHist.emit(buf, "hearth_wake_duration_ms", "Wake latency (hearthd wall-clock, ms)")
-	execHist.emit(buf, "hearth_exec_duration_ms", "Buffered exec latency (hearthd wall-clock, ms)")
-	createHist.emit(buf, "hearth_create_duration_ms", "Create-to-201 latency (cold boots and pool claims mixed, ms)")
+	wakeHist.emit(buf, "felucca_wake_duration_ms", "Wake latency (feluccad wall-clock, ms)")
+	execHist.emit(buf, "felucca_exec_duration_ms", "Buffered exec latency (feluccad wall-clock, ms)")
+	createHist.emit(buf, "felucca_create_duration_ms", "Create-to-201 latency (cold boots and pool claims mixed, ms)")
 }
 
 // serveTenantMetrics handles GET /api/v1/metrics/tenants — the AUTHENTICATED
@@ -132,11 +132,11 @@ func (srv *Server) serveTenantMetrics(w http.ResponseWriter) {
 			fmt.Fprintf(&buf, "%s{tenant=%q} %d\n", name, id, val(perTenant[id]))
 		}
 	}
-	emit("hearth_tenant_sandboxes", "Sandboxes per tenant", func(t *tshape) uint64 { return uint64(t.sandboxes) })
-	emit("hearth_tenant_running", "Running sandboxes per tenant", func(t *tshape) uint64 { return uint64(t.running) })
-	emit("hearth_tenant_vcpus", "Allocated vCPUs per tenant", func(t *tshape) uint64 { return t.vcpus })
-	emit("hearth_tenant_mem_mib", "Allocated memory per tenant (MiB)", func(t *tshape) uint64 { return t.memMiB })
-	emit("hearth_tenant_disk_gb", "Allocated disk per tenant (GB, quota-effective)", func(t *tshape) uint64 { return t.diskGB })
+	emit("felucca_tenant_sandboxes", "Sandboxes per tenant", func(t *tshape) uint64 { return uint64(t.sandboxes) })
+	emit("felucca_tenant_running", "Running sandboxes per tenant", func(t *tshape) uint64 { return uint64(t.running) })
+	emit("felucca_tenant_vcpus", "Allocated vCPUs per tenant", func(t *tshape) uint64 { return t.vcpus })
+	emit("felucca_tenant_mem_mib", "Allocated memory per tenant (MiB)", func(t *tshape) uint64 { return t.memMiB })
+	emit("felucca_tenant_disk_gb", "Allocated disk per tenant (GB, quota-effective)", func(t *tshape) uint64 { return t.diskGB })
 
 	body := buf.Bytes()
 	h := w.Header()

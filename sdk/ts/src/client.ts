@@ -1,4 +1,4 @@
-// HearthClient — thin typed client over hearthd's REST API (docs/API-V2.md).
+// FeluccaClient — thin typed client over feluccad's REST API (docs/API-V2.md).
 // Zero runtime dependencies: global fetch (Node >= 18 / browsers), ESM.
 
 import type {
@@ -31,34 +31,34 @@ export type {
 } from "./types.ts";
 
 /** Every non-2xx response (and broken exec streams) rejects with this. */
-export class HearthError extends Error {
+export class FeluccaError extends Error {
   /** HTTP status code (200 for in-stream exec failures). */
   readonly status: number;
   /** Raw response body (or stream error text). */
   readonly body: string;
   /**
-   * hearthd's X-Hearth-Request-Id for this call (v4 P6) — quote it in bug
-   * reports; the operator can grep both hearthd's and the agent's journals
+   * feluccad's X-Felucca-Request-Id for this call (v4 P6) — quote it in bug
+   * reports; the operator can grep both feluccad's and the agent's journals
    * for it. Empty when the server predates P6 or the failure was client-side.
    */
   readonly requestId: string;
 
   constructor(status: number, body: string, requestId = "") {
     super(
-      `hearthd request failed: ${status}: ${body}` +
+      `feluccad request failed: ${status}: ${body}` +
         (requestId ? ` (request_id ${requestId})` : ""),
     );
-    this.name = "HearthError";
+    this.name = "FeluccaError";
     this.status = status;
     this.body = body;
     this.requestId = requestId;
   }
 }
 
-export interface HearthClientOptions {
-  /** e.g. "http://192.168.104.3:8080" or "https://hearth.example.com". */
+export interface FeluccaClientOptions {
+  /** e.g. "http://192.168.104.3:8080" or "https://felucca.example.com". */
   baseUrl: string;
-  /** Admin token or tenant key ("hearth_sk_…"); sent as a bearer token. */
+  /** Admin token or tenant key ("felucca_sk_…"); sent as a bearer token. */
   apiKey: string;
 }
 
@@ -68,11 +68,11 @@ type ExecStreamFrame =
   | { done: true; ok: true; exit_code: number; truncated: boolean }
   | { done: true; ok: false; error: string };
 
-export class HearthClient {
+export class FeluccaClient {
   readonly #baseUrl: string;
   readonly #apiKey: string;
 
-  constructor(opts: HearthClientOptions) {
+  constructor(opts: FeluccaClientOptions) {
     this.#baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.#apiKey = opts.apiKey;
   }
@@ -150,7 +150,7 @@ export class HearthClient {
    * `{"done":true,"ok":true,"exit_code":N,"truncated":bool}` or
    * `{"done":true,"ok":false,"error":string}`.
    *
-   * Rejects with HearthError on non-2xx, on `done.ok === false`, and when
+   * Rejects with FeluccaError on non-2xx, on `done.ok === false`, and when
    * the stream ends without a done frame.
    */
   async execStream(
@@ -164,7 +164,7 @@ export class HearthClient {
       req,
     );
     if (!res.body) {
-      throw new HearthError(res.status, "response has no body", reqIDOf(res));
+      throw new FeluccaError(res.status, "response has no body", reqIDOf(res));
     }
 
     const reader = res.body.getReader();
@@ -192,7 +192,7 @@ export class HearthClient {
                 truncated: frame.truncated ?? false,
               };
             }
-            throw new HearthError(res.status, frame.error, reqIDOf(res));
+            throw new FeluccaError(res.status, frame.error, reqIDOf(res));
           }
           if (frame.stream === "stdout") handlers.onStdout?.(frame.data);
           else if (frame.stream === "stderr") handlers.onStderr?.(frame.data);
@@ -201,7 +201,7 @@ export class HearthClient {
     } finally {
       reader.cancel().catch(() => {});
     }
-    throw new HearthError(res.status, "stream ended without done frame", reqIDOf(res));
+    throw new FeluccaError(res.status, "stream ended without done frame", reqIDOf(res));
   }
 
   // ---- Ingress (API-V2 §3d) ----
@@ -224,7 +224,7 @@ export class HearthClient {
   }
 
   /**
-   * Current exposes of a sandbox. hearthd has no GET on /expose — the
+   * Current exposes of a sandbox. feluccad has no GET on /expose — the
    * sandbox JSON carries the `exposes` array (omitted when empty), so this
    * reads GET /api/v1/sandboxes/{id}.
    */
@@ -286,7 +286,7 @@ export class HearthClient {
       body: payload,
     });
     if (!res.ok) {
-      throw new HearthError(res.status, await res.text(), reqIDOf(res));
+      throw new FeluccaError(res.status, await res.text(), reqIDOf(res));
     }
     return res;
   }
@@ -297,14 +297,14 @@ export class HearthClient {
   }
 }
 
-/** hearthd's per-request id (v4 P6); "" when absent (pre-P6 servers). */
+/** feluccad's per-request id (v4 P6); "" when absent (pre-P6 servers). */
 function reqIDOf(res: Response): string {
-  return res.headers.get("x-hearth-request-id") ?? "";
+  return res.headers.get("x-felucca-request-id") ?? "";
 }
 
 /**
  * Find the end of the first complete SSE message in `buf`. Messages are
- * terminated by a blank line — "\n\n" (what hearthd emits) or "\r\n\r\n"
+ * terminated by a blank line — "\n\n" (what feluccad emits) or "\r\n\r\n"
  * (also legal SSE). Returns the delimiter position and length, or null when
  * no complete message is buffered yet.
  */
@@ -344,6 +344,6 @@ function parseFrame(
   try {
     return JSON.parse(payload) as ExecStreamFrame;
   } catch {
-    throw new HearthError(status, `invalid SSE frame: ${payload}`, requestId);
+    throw new FeluccaError(status, `invalid SSE frame: ${payload}`, requestId);
   }
 }

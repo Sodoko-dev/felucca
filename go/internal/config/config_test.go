@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alpham/infra-saas/hearth/internal/config"
-	"github.com/alpham/infra-saas/hearth/internal/model"
-	"github.com/alpham/infra-saas/hearth/internal/state"
-	"github.com/alpham/infra-saas/hearth/internal/store"
+	"github.com/alpham/infra-saas/felucca/internal/config"
+	"github.com/alpham/infra-saas/felucca/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/state"
+	"github.com/alpham/infra-saas/felucca/internal/store"
 
 	_ "modernc.org/sqlite" // poison a stored row the way a driver/IO fault would
 )
@@ -34,10 +34,10 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Port != 8080 {
 		t.Errorf("Port default: got %d", cfg.Port)
 	}
-	if cfg.UIDir != "/usr/share/hearth/ui" {
+	if cfg.UIDir != "/usr/share/felucca/ui" {
 		t.Errorf("UIDir default: got %q", cfg.UIDir)
 	}
-	if cfg.StatePath != "/var/lib/hearth/state.json" {
+	if cfg.StatePath != "/var/lib/felucca/state.json" {
 		t.Errorf("StatePath default: got %q", cfg.StatePath)
 	}
 	if cfg.Token != "" {
@@ -46,8 +46,8 @@ func TestLoadDefaults(t *testing.T) {
 }
 
 func TestFlagPrecedence(t *testing.T) {
-	t.Setenv("HEARTH_BIND", "0.0.0.0:9999")
-	t.Setenv("HEARTH_TOKEN", "fromenv")
+	t.Setenv("FELUCCA_BIND", "0.0.0.0:9999")
+	t.Setenv("FELUCCA_TOKEN", "fromenv")
 
 	cfg, err := config.Load([]string{"--bind", "0.0.0.0:7777", "--token", "fromflag"})
 	if err != nil {
@@ -75,8 +75,8 @@ func TestEnvBeatsFile(t *testing.T) {
 	})
 	os.WriteFile(cfgFile, data, 0o644)
 
-	t.Setenv("HEARTH_TOKEN", "fromenv")
-	t.Setenv("HEARTH_CONFIG", cfgFile)
+	t.Setenv("FELUCCA_TOKEN", "fromenv")
+	t.Setenv("FELUCCA_CONFIG", cfgFile)
 
 	cfg, err := config.Load([]string{})
 	if err != nil {
@@ -108,9 +108,9 @@ func TestExplicitConfigPathMissingIsFatal(t *testing.T) {
 		t.Error("--config=<path> with a missing file: want error, got nil")
 	}
 
-	t.Setenv("HEARTH_CONFIG", missing)
+	t.Setenv("FELUCCA_CONFIG", missing)
 	if _, err := config.Load([]string{}); err == nil {
-		t.Error("HEARTH_CONFIG with a missing file: want error, got nil")
+		t.Error("FELUCCA_CONFIG with a missing file: want error, got nil")
 	}
 }
 
@@ -234,10 +234,10 @@ func TestPortLessBindIsNeverWidenedToWildcard(t *testing.T) {
 }
 
 func TestValidateBind(t *testing.T) {
-	// The values hearthd cannot honour literally must stop startup rather than
+	// The values feluccad cannot honour literally must stop startup rather than
 	// resolve to something wider than what was written.
 	ok := []string{"", "0.0.0.0:8080", ":8080", "127.0.0.1:8080", "10.0.0.5",
-		"localhost:1234", "[::1]:8080", "::1", "hearth.example.com:8080"}
+		"localhost:1234", "[::1]:8080", "::1", "felucca.example.com:8080"}
 	for _, bind := range ok {
 		t.Run("ok/"+bind, func(t *testing.T) {
 			cfg := &config.Config{Bind: bind, Port: 8080}
@@ -273,7 +273,7 @@ func TestOverlayBindProblem(t *testing.T) {
 	}{
 		// The shipped example config binds loopback, which is right behind a
 		// local reverse proxy and cuts off the whole fleet on an overlay
-		// deployment: agents dial hearthd's overlay IP inside the tunnel.
+		// deployment: agents dial feluccad's overlay IP inside the tunnel.
 		{"loopback with overlay", "127.0.0.1:8080", wgIP, true},
 		{"localhost with overlay", "localhost:8080", wgIP, true},
 		{"loopback port-less with overlay", "127.0.0.1", wgIP, true},
@@ -328,7 +328,7 @@ func TestTrustedProxiesSources(t *testing.T) {
 		if err := os.WriteFile(cfgFile, data, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		t.Setenv("HEARTH_CONFIG", cfgFile)
+		t.Setenv("FELUCCA_CONFIG", cfgFile)
 		cfg, err := config.Load([]string{})
 		if err != nil {
 			t.Fatal(err)
@@ -344,19 +344,19 @@ func TestTrustedProxiesSources(t *testing.T) {
 		if err := os.WriteFile(cfgFile, data, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		t.Setenv("HEARTH_CONFIG", cfgFile)
-		t.Setenv("HEARTH_TRUSTED_PROXIES", "192.168.0.0/16, 172.16.0.0/12")
+		t.Setenv("FELUCCA_CONFIG", cfgFile)
+		t.Setenv("FELUCCA_TRUSTED_PROXIES", "192.168.0.0/16, 172.16.0.0/12")
 		cfg, err := config.Load([]string{})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if got := strings.Join(cfg.TrustedProxies, ","); got != "192.168.0.0/16,172.16.0.0/12" {
-			t.Errorf("HEARTH_TRUSTED_PROXIES: got %q", got)
+			t.Errorf("FELUCCA_TRUSTED_PROXIES: got %q", got)
 		}
 	})
 
 	t.Run("flag-beats-env", func(t *testing.T) {
-		t.Setenv("HEARTH_TRUSTED_PROXIES", "192.168.0.0/16")
+		t.Setenv("FELUCCA_TRUSTED_PROXIES", "192.168.0.0/16")
 		cfg, err := config.Load([]string{"--trusted-proxies", "10.1.2.0/24"})
 		if err != nil {
 			t.Fatal(err)
@@ -369,7 +369,7 @@ func TestTrustedProxiesSources(t *testing.T) {
 	t.Run("flag-can-clear", func(t *testing.T) {
 		// Naming the flag with an empty value is the operator asking to trust
 		// nobody, and must beat a proxy list inherited from env or file.
-		t.Setenv("HEARTH_TRUSTED_PROXIES", "192.168.0.0/16")
+		t.Setenv("FELUCCA_TRUSTED_PROXIES", "192.168.0.0/16")
 		cfg, err := config.Load([]string{"--trusted-proxies", ""})
 		if err != nil {
 			t.Fatal(err)
@@ -419,7 +419,7 @@ func TestValidateTrustedProxies(t *testing.T) {
 	}
 }
 
-// X-Real-IP has no chain of custody — hearthd cannot tell a value the proxy
+// X-Real-IP has no chain of custody — feluccad cannot tell a value the proxy
 // wrote from one it forwarded verbatim — so honouring it is an explicit
 // operator decision that is OFF by default and cannot be reached by accident.
 func TestTrustXRealIPDefaultsOffAndNeedsADeclaredProxy(t *testing.T) {
@@ -459,7 +459,7 @@ func TestTrustXRealIPSources(t *testing.T) {
 		if err := os.WriteFile(cfgFile, data, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		t.Setenv("HEARTH_CONFIG", cfgFile)
+		t.Setenv("FELUCCA_CONFIG", cfgFile)
 		cfg, err := config.Load([]string{})
 		if err != nil {
 			t.Fatal(err)
@@ -470,30 +470,30 @@ func TestTrustXRealIPSources(t *testing.T) {
 	})
 
 	t.Run("env", func(t *testing.T) {
-		t.Setenv("HEARTH_TRUST_X_REAL_IP", "true")
+		t.Setenv("FELUCCA_TRUST_X_REAL_IP", "true")
 		cfg, err := config.Load([]string{})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if !cfg.TrustXRealIP {
-			t.Error("HEARTH_TRUST_X_REAL_IP=true: got false, want true")
+			t.Error("FELUCCA_TRUST_X_REAL_IP=true: got false, want true")
 		}
 	})
 
 	t.Run("env-garbage-keeps-it-off", func(t *testing.T) {
 		// Only an affirmative value opts in; a typo must not open the header.
-		t.Setenv("HEARTH_TRUST_X_REAL_IP", "yes-please")
+		t.Setenv("FELUCCA_TRUST_X_REAL_IP", "yes-please")
 		cfg, err := config.Load([]string{})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if cfg.TrustXRealIP {
-			t.Error("unparseable HEARTH_TRUST_X_REAL_IP opted in")
+			t.Error("unparseable FELUCCA_TRUST_X_REAL_IP opted in")
 		}
 	})
 
 	t.Run("flag-beats-env", func(t *testing.T) {
-		t.Setenv("HEARTH_TRUST_X_REAL_IP", "true")
+		t.Setenv("FELUCCA_TRUST_X_REAL_IP", "true")
 		cfg, err := config.Load([]string{"--trust-x-real-ip=false"})
 		if err != nil {
 			t.Fatal(err)
@@ -530,7 +530,7 @@ func TestWgDefaults(t *testing.T) {
 	if cfg.WgPort != 51820 {
 		t.Errorf("WgPort default: got %d", cfg.WgPort)
 	}
-	if cfg.WgKeyPath != "/var/lib/hearth/wg.key" {
+	if cfg.WgKeyPath != "/var/lib/felucca/wg.key" {
 		t.Errorf("WgKeyPath default: got %q", cfg.WgKeyPath)
 	}
 	if cfg.WgEndpoint != "" {
@@ -539,10 +539,10 @@ func TestWgDefaults(t *testing.T) {
 }
 
 func TestWgEnv(t *testing.T) {
-	t.Setenv("HEARTH_WG_IP", "10.100.0.1/16")
-	t.Setenv("HEARTH_WG_PORT", "51999")
-	t.Setenv("HEARTH_WG_KEY_PATH", "/tmp/wg.key")
-	t.Setenv("HEARTH_WG_ENDPOINT", "hearth.example.com:51999")
+	t.Setenv("FELUCCA_WG_IP", "10.100.0.1/16")
+	t.Setenv("FELUCCA_WG_PORT", "51999")
+	t.Setenv("FELUCCA_WG_KEY_PATH", "/tmp/wg.key")
+	t.Setenv("FELUCCA_WG_ENDPOINT", "felucca.example.com:51999")
 
 	cfg, err := config.Load([]string{})
 	if err != nil {
@@ -557,16 +557,16 @@ func TestWgEnv(t *testing.T) {
 	if cfg.WgKeyPath != "/tmp/wg.key" {
 		t.Errorf("WgKeyPath from env: got %q", cfg.WgKeyPath)
 	}
-	if cfg.WgEndpoint != "hearth.example.com:51999" {
+	if cfg.WgEndpoint != "felucca.example.com:51999" {
 		t.Errorf("WgEndpoint from env: got %q", cfg.WgEndpoint)
 	}
 }
 
 func TestWgFlagPrecedence(t *testing.T) {
-	t.Setenv("HEARTH_WG_IP", "10.100.0.1/16")
-	t.Setenv("HEARTH_WG_PORT", "51999")
-	t.Setenv("HEARTH_WG_KEY_PATH", "/tmp/env-wg.key")
-	t.Setenv("HEARTH_WG_ENDPOINT", "env.example.com:51999")
+	t.Setenv("FELUCCA_WG_IP", "10.100.0.1/16")
+	t.Setenv("FELUCCA_WG_PORT", "51999")
+	t.Setenv("FELUCCA_WG_KEY_PATH", "/tmp/env-wg.key")
+	t.Setenv("FELUCCA_WG_ENDPOINT", "env.example.com:51999")
 
 	cfg, err := config.Load([]string{
 		"--wg-ip", "10.200.0.1/16",
@@ -603,7 +603,7 @@ func TestWgFile(t *testing.T) {
 	})
 	os.WriteFile(cfgFile, data, 0o644)
 
-	t.Setenv("HEARTH_CONFIG", cfgFile)
+	t.Setenv("FELUCCA_CONFIG", cfgFile)
 
 	cfg, err := config.Load([]string{})
 	if err != nil {
@@ -632,20 +632,20 @@ func TestTLSDefaults(t *testing.T) {
 	if cfg.TLSDomain != "" {
 		t.Errorf("TLSDomain default: got %q", cfg.TLSDomain)
 	}
-	if cfg.TLSCacheDir != "/var/lib/hearth/autocert" {
+	if cfg.TLSCacheDir != "/var/lib/felucca/autocert" {
 		t.Errorf("TLSCacheDir default: got %q", cfg.TLSCacheDir)
 	}
 }
 
 func TestTLSEnv(t *testing.T) {
-	t.Setenv("HEARTH_TLS_DOMAIN", "hearth.example.com")
-	t.Setenv("HEARTH_TLS_CACHE", "/tmp/env-autocert")
+	t.Setenv("FELUCCA_TLS_DOMAIN", "felucca.example.com")
+	t.Setenv("FELUCCA_TLS_CACHE", "/tmp/env-autocert")
 
 	cfg, err := config.Load([]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TLSDomain != "hearth.example.com" {
+	if cfg.TLSDomain != "felucca.example.com" {
 		t.Errorf("TLSDomain from env: got %q", cfg.TLSDomain)
 	}
 	if cfg.TLSCacheDir != "/tmp/env-autocert" {
@@ -654,8 +654,8 @@ func TestTLSEnv(t *testing.T) {
 }
 
 func TestTLSFlagPrecedence(t *testing.T) {
-	t.Setenv("HEARTH_TLS_DOMAIN", "env.example.com")
-	t.Setenv("HEARTH_TLS_CACHE", "/tmp/env-autocert")
+	t.Setenv("FELUCCA_TLS_DOMAIN", "env.example.com")
+	t.Setenv("FELUCCA_TLS_CACHE", "/tmp/env-autocert")
 
 	cfg, err := config.Load([]string{
 		"--tls-domain", "flag.example.com",
@@ -678,7 +678,7 @@ func TestValidateAuthRejectsOpenMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The default config has no token: hearthd must refuse to serve with it.
+	// The default config has no token: feluccad must refuse to serve with it.
 	if err := cfg.ValidateAuth(); err == nil {
 		t.Error("empty token: want startup error, got nil")
 	}
@@ -699,23 +699,23 @@ func TestInsecureNoAuthSources(t *testing.T) {
 	// Env and file must be able to express the opt-out too, and only an
 	// affirmative value may turn it on.
 	t.Run("env", func(t *testing.T) {
-		t.Setenv("HEARTH_INSECURE_NO_AUTH", "1")
+		t.Setenv("FELUCCA_INSECURE_NO_AUTH", "1")
 		cfg, err := config.Load([]string{})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if !cfg.InsecureNoAuth {
-			t.Error("HEARTH_INSECURE_NO_AUTH=1: not applied")
+			t.Error("FELUCCA_INSECURE_NO_AUTH=1: not applied")
 		}
 	})
 	t.Run("env-garbage", func(t *testing.T) {
-		t.Setenv("HEARTH_INSECURE_NO_AUTH", "maybe")
+		t.Setenv("FELUCCA_INSECURE_NO_AUTH", "maybe")
 		cfg, err := config.Load([]string{})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if cfg.InsecureNoAuth {
-			t.Error("HEARTH_INSECURE_NO_AUTH=maybe: should not open the gate")
+			t.Error("FELUCCA_INSECURE_NO_AUTH=maybe: should not open the gate")
 		}
 	})
 	t.Run("file", func(t *testing.T) {
@@ -724,7 +724,7 @@ func TestInsecureNoAuthSources(t *testing.T) {
 		if err := os.WriteFile(cfgFile, data, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		t.Setenv("HEARTH_CONFIG", cfgFile)
+		t.Setenv("FELUCCA_CONFIG", cfgFile)
 		cfg, err := config.Load([]string{})
 		if err != nil {
 			t.Fatal(err)
@@ -754,10 +754,11 @@ func TestValidateAuthTokenLength(t *testing.T) {
 func TestValidateAuthRejectsPlaceholders(t *testing.T) {
 	placeholders := []string{
 		"REPLACE_WITH_OUTPUT_OF__openssl_rand_-hex_32",
-		"REPLACE_WITH_SAME_TOKEN_AS_HEARTHD",
+		"REPLACE_WITH_SAME_TOKEN_AS_FELUCCAD",
 		"replace_with_output_of__openssl_rand_-hex_32",
+		"felucca-lab-token",
 		"hearth-lab-token",
-		"HEARTH-LAB-TOKEN",
+		"FELUCCA-LAB-TOKEN",
 		// Long enough to pass the length floor, still an unedited example.
 		"prefix-REPLACE_WITH_ANYTHING-suffix-padding-padding",
 	}
@@ -780,64 +781,64 @@ func TestValidateAuthRejectsPlaceholders(t *testing.T) {
 	}
 }
 
-// ---- hearthd startup behaviour ----
+// ---- feluccad startup behaviour ----
 //
 // These drive the real binary because the properties under test are decisions
 // main() makes about the config above — refusing to serve, and warning about a
 // listener the fleet cannot reach — and there is no seam short of the process
-// that can observe "hearthd did not start".
+// that can observe "feluccad did not start".
 
-// hearthdBinary builds cmd/hearthd once per test run and returns its path.
-func hearthdBinary(t *testing.T) string {
+// feluccadBinary builds cmd/feluccad once per test run and returns its path.
+func feluccadBinary(t *testing.T) string {
 	t.Helper()
-	hearthdBuild.Do(func() {
+	feluccadBuild.Do(func() {
 		if _, err := exec.LookPath("go"); err != nil {
-			hearthdNoToolchain = true
+			feluccadNoToolchain = true
 			return
 		}
-		dir, err := os.MkdirTemp("", "hearthd-bin")
+		dir, err := os.MkdirTemp("", "feluccad-bin")
 		if err != nil {
-			hearthdBuildErr = err
+			feluccadBuildErr = err
 			return
 		}
-		bin := filepath.Join(dir, "hearthd")
-		cmd := exec.Command("go", "build", "-o", bin, "./cmd/hearthd")
+		bin := filepath.Join(dir, "feluccad")
+		cmd := exec.Command("go", "build", "-o", bin, "./cmd/feluccad")
 		cmd.Dir = filepath.Join("..", "..") // module root
 		if out, err := cmd.CombinedOutput(); err != nil {
-			hearthdBuildErr = fmt.Errorf("go build cmd/hearthd: %v\n%s", err, out)
+			feluccadBuildErr = fmt.Errorf("go build cmd/feluccad: %v\n%s", err, out)
 			return
 		}
-		hearthdBin = bin
+		feluccadBin = bin
 	})
-	if hearthdNoToolchain {
-		t.Skip("no go toolchain: cannot exercise hearthd startup")
+	if feluccadNoToolchain {
+		t.Skip("no go toolchain: cannot exercise feluccad startup")
 	}
-	if hearthdBuildErr != nil {
+	if feluccadBuildErr != nil {
 		// A build failure is a real failure, never a skip: skipping here would
-		// quietly stop checking that hearthd refuses to start on a bad load.
-		t.Fatalf("cannot build hearthd: %v", hearthdBuildErr)
+		// quietly stop checking that feluccad refuses to start on a bad load.
+		t.Fatalf("cannot build feluccad: %v", feluccadBuildErr)
 	}
-	return hearthdBin
+	return feluccadBin
 }
 
 var (
-	hearthdBuild       sync.Once
-	hearthdBin         string
-	hearthdBuildErr    error
-	hearthdNoToolchain bool
+	feluccadBuild       sync.Once
+	feluccadBin         string
+	feluccadBuildErr    error
+	feluccadNoToolchain bool
 )
 
-// runHearthd starts the daemon with a clean environment and returns its stderr
+// runFeluccad starts the daemon with a clean environment and returns its stderr
 // plus whether the process exited on its own before the deadline.
-func runHearthd(t *testing.T, timeout time.Duration, args ...string) (stderr string, exited bool, exitErr error) {
+func runFeluccad(t *testing.T, timeout time.Duration, args ...string) (stderr string, exited bool, exitErr error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	var buf bytes.Buffer
-	cmd := exec.CommandContext(ctx, hearthdBinary(t), args...)
+	cmd := exec.CommandContext(ctx, feluccadBinary(t), args...)
 	cmd.Stderr = &buf
-	// Clean env: an inherited HEARTH_* would silently change the run.
+	// Clean env: an inherited FELUCCA_* would silently change the run.
 	cmd.Env = []string{"HOME=" + t.TempDir(), "PATH=" + os.Getenv("PATH")}
 	err := cmd.Run()
 	return buf.String(), ctx.Err() == nil, err
@@ -846,14 +847,14 @@ func runHearthd(t *testing.T, timeout time.Duration, args ...string) (stderr str
 // realToken passes ValidateAuth so these runs reach the code under test.
 const realToken = "9f2c7a1e4b6d8035af19c3e7d24b0f6a9f2c7a1e4b6d8035af19c3e7d24b0f6a"
 
-func TestHearthdRefusesToServeAPartiallyLoadedState(t *testing.T) {
+func TestFeluccadRefusesToServeAPartiallyLoadedState(t *testing.T) {
 	// LoadInto appends rows as it scans and never clears what it appended, so
 	// a load that fails part-way leaves a truncated working set in memory. The
 	// first mutation persists it, and SaveSnapshot's DELETE-then-reinsert makes
 	// the truncation permanent. A WARN here means the daemon serves happily
 	// while the next write destroys every row the scan did not reach.
 	tmp := t.TempDir()
-	dbPath := filepath.Join(tmp, "hearth.db")
+	dbPath := filepath.Join(tmp, "felucca.db")
 
 	db, err := store.OpenSQLite(dbPath)
 	if err != nil {
@@ -884,7 +885,7 @@ func TestHearthdRefusesToServeAPartiallyLoadedState(t *testing.T) {
 	}
 	raw.Close()
 
-	stderr, exited, exitErr := runHearthd(t, 60*time.Second,
+	stderr, exited, exitErr := runFeluccad(t, 60*time.Second,
 		"--db", dbPath,
 		"--state", filepath.Join(tmp, "state.json"),
 		"--ui-dir", tmp,
@@ -893,10 +894,10 @@ func TestHearthdRefusesToServeAPartiallyLoadedState(t *testing.T) {
 		"--token", realToken,
 	)
 	if !exited {
-		t.Fatalf("hearthd kept serving after a failed state load — the next write would delete every row it could not read.\nstderr:\n%s", stderr)
+		t.Fatalf("feluccad kept serving after a failed state load — the next write would delete every row it could not read.\nstderr:\n%s", stderr)
 	}
 	if exitErr == nil {
-		t.Fatalf("hearthd exited 0 after a failed state load, want a non-zero status.\nstderr:\n%s", stderr)
+		t.Fatalf("feluccad exited 0 after a failed state load, want a non-zero status.\nstderr:\n%s", stderr)
 	}
 	if !strings.Contains(stderr, "refusing to start") {
 		t.Errorf("startup failure should say why it refused; stderr:\n%s", stderr)
@@ -919,18 +920,18 @@ func TestHearthdRefusesToServeAPartiallyLoadedState(t *testing.T) {
 	}
 }
 
-func TestHearthdWarnsWhenTheOverlayCannotReachTheListener(t *testing.T) {
+func TestFeluccadWarnsWhenTheOverlayCannotReachTheListener(t *testing.T) {
 	// The shipped example config binds loopback, which is correct behind the
 	// documented reverse proxy and cuts off every enrolled agent on an overlay
-	// deployment — they dial hearthd's wg address inside the tunnel. Without
+	// deployment — they dial feluccad's wg address inside the tunnel. Without
 	// this line the symptom is a fleet that silently never registers.
 	tmp := t.TempDir()
 
 	// The wg key path is deliberately unopenable (its parent is a regular
 	// file), so EnsureKey fails and the daemon exits before it reaches
 	// EnsureInterface. That is load-bearing, not incidental: wg.run() retries
-	// every ip/wg command under sudo, so a hearthd that got that far would
-	// reconfigure the host's real wg-hearth interface — replacing its private
+	// every ip/wg command under sudo, so a feluccad that got that far would
+	// reconfigure the host's real wg-felucca interface — replacing its private
 	// key and stranding every enrolled agent on the machine running the tests.
 	// Keep this path broken. The warning under test is printed well before any
 	// of that, which is the whole point of putting it there.
@@ -939,19 +940,19 @@ func TestHearthdWarnsWhenTheOverlayCannotReachTheListener(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stderr, exited, _ := runHearthd(t, 30*time.Second,
-		"--db", filepath.Join(tmp, "hearth.db"),
+	stderr, exited, _ := runFeluccad(t, 30*time.Second,
+		"--db", filepath.Join(tmp, "felucca.db"),
 		"--state", filepath.Join(tmp, "state.json"),
 		"--ui-dir", tmp,
 		"--images-dir", filepath.Join(tmp, "images"),
 		"--bind", "127.0.0.1:0",
 		"--token", realToken,
 		"--wg-ip", "10.100.0.1/16",
-		"--wg-endpoint", "hearth.example.com:51820",
+		"--wg-endpoint", "felucca.example.com:51820",
 		"--wg-key", filepath.Join(blocked, "wg.key"),
 	)
 	if !exited {
-		t.Fatalf("hearthd did not stop at the unopenable wg key — it may have reconfigured the host's wg interface.\nstderr:\n%s", stderr)
+		t.Fatalf("feluccad did not stop at the unopenable wg key — it may have reconfigured the host's wg interface.\nstderr:\n%s", stderr)
 	}
 	if !strings.Contains(stderr, "OVERLAY UNREACHABLE") {
 		t.Errorf("loopback bind + wg overlay should warn loudly at startup; stderr:\n%s", stderr)
@@ -961,10 +962,10 @@ func TestHearthdWarnsWhenTheOverlayCannotReachTheListener(t *testing.T) {
 	}
 }
 
-func TestHearthdRefusesAMalformedTrustedProxy(t *testing.T) {
+func TestFeluccadRefusesAMalformedTrustedProxy(t *testing.T) {
 	tmp := t.TempDir()
-	stderr, exited, exitErr := runHearthd(t, 30*time.Second,
-		"--db", filepath.Join(tmp, "hearth.db"),
+	stderr, exited, exitErr := runFeluccad(t, 30*time.Second,
+		"--db", filepath.Join(tmp, "felucca.db"),
 		"--state", filepath.Join(tmp, "state.json"),
 		"--ui-dir", tmp,
 		"--images-dir", filepath.Join(tmp, "images"),
@@ -973,7 +974,7 @@ func TestHearthdRefusesAMalformedTrustedProxy(t *testing.T) {
 		"--trusted-proxies", "10.0.0.0/8,garbage",
 	)
 	if !exited || exitErr == nil {
-		t.Fatalf("hearthd started with an unparseable trusted proxy; stderr:\n%s", stderr)
+		t.Fatalf("feluccad started with an unparseable trusted proxy; stderr:\n%s", stderr)
 	}
 	if !strings.Contains(stderr, "trusted") {
 		t.Errorf("startup failure should name the bad setting; stderr:\n%s", stderr)

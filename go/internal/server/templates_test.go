@@ -17,10 +17,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alpham/infra-saas/hearth/internal/config"
-	"github.com/alpham/infra-saas/hearth/internal/model"
-	"github.com/alpham/infra-saas/hearth/internal/state"
-	"github.com/alpham/infra-saas/hearth/internal/store"
+	"github.com/alpham/infra-saas/felucca/internal/config"
+	"github.com/alpham/infra-saas/felucca/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/state"
+	"github.com/alpham/infra-saas/felucca/internal/store"
 )
 
 // tplAgent fakes the worker HTTP API for the template flows: VM create/fork
@@ -78,7 +78,7 @@ func newTemplateTestServer(t *testing.T) (*Server, *tplAgent, string) {
 		Token:     "admin-tok",
 		UIDir:     tmp,
 		StatePath: filepath.Join(tmp, "state.json"),
-		DBPath:    filepath.Join(tmp, "hearth.db"),
+		DBPath:    filepath.Join(tmp, "felucca.db"),
 		ImagesDir: filepath.Join(tmp, "images"),
 	}
 	if err := os.MkdirAll(cfg.ImagesDir, 0o755); err != nil {

@@ -1,6 +1,6 @@
-# Hearth — Production Deployment Guide
+# Felucca — Production Deployment Guide
 
-Hearth is two static Linux binaries (`hearthd` and `hearth-agent`) and a handful
+Felucca is two static Linux binaries (`feluccad` and `felucca-agent`) and a handful
 of shell scripts. This guide covers a production install on generic Linux servers.
 For the local Lima dev environment see `deploy/config/local-lab.md`.
 
@@ -31,15 +31,15 @@ For the local Lima dev environment see `deploy/config/local-lab.md`.
                                │
                                │ HTTP :8080 (loopback / private only)
                                ▼
-                         hearthd (control plane)
-                         /var/lib/hearth/state.json
+                           feluccad (control plane)
+                           /var/lib/felucca/state.json
                                │
                   ┌────────────┼────────────┐
                   │            │            │
             HTTP :9090   HTTP :9090   HTTP :9090
                   ▼            ▼            ▼
-           hearth-agent  hearth-agent  hearth-agent
-           (worker 0)    (worker 1)    (worker N)
+            felucca-agent  felucca-agent  felucca-agent
+             (worker 0)   (worker 1)   (worker N)
                   │
           Firecracker × M microVMs
           /dev/kvm, tap, nftables
@@ -48,16 +48,16 @@ For the local Lima dev environment see `deploy/config/local-lab.md`.
 **One control plane, N worker nodes.**
 
 This is the **Caddy-fronted single-node** topology, and it is what the shipped
-example configs are tuned for: `hearthd` binds `127.0.0.1:8080` and only Caddy
+example configs are tuned for: `feluccad` binds `127.0.0.1:8080` and only Caddy
 reaches it. A **WireGuard-overlay fleet** is the other supported shape and it
-needs the opposite bind — agents reach hearthd at its overlay address inside the
+needs the opposite bind — agents reach feluccad at its overlay address inside the
 tunnel, so a loopback bind refuses every registration. Decide which one you are
 building before you install: see [§6.3](#63-bind-address-which-topology-are-you-in)
 and [§6.4](#64-wireguard-overlay-fleets).
 
-- The control plane runs `hearthd` and holds all state. It does not run
+- The control plane runs `feluccad` and holds all state. It does not run
   Firecracker.
-- Each worker runs `hearth-agent`, which drives Firecracker processes directly.
+- Each worker runs `felucca-agent`, which drives Firecracker processes directly.
 - The control plane proxies VM lifecycle calls to the owning agent. If an agent
   is unreachable (heartbeat older than 15 s) it is marked `down` and excluded
   from placement.
@@ -110,20 +110,20 @@ control plane is Go and the agent is Rust.
 ```sh
 REPO=/Users/magdy/projects/github.com/alpham/infra-saas
 
-# hearthd (Go, static, cross-compiles to both arches from one box)
+# feluccad (Go, static, cross-compiles to both arches from one box)
 limactl shell infra-saas-lab -- bash -c \
   "export PATH=\$PATH:/usr/local/go/bin && cd $REPO/go && \
    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' \
-     -o $REPO/deploy/release/x86_64/hearthd ./cmd/hearthd && \
+     -o $REPO/deploy/release/x86_64/feluccad ./cmd/feluccad && \
    CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' \
-     -o $REPO/deploy/release/aarch64/hearthd ./cmd/hearthd"
+     -o $REPO/deploy/release/aarch64/feluccad ./cmd/feluccad"
 
-# hearth-agent (Rust, static musl)
+# felucca-agent (Rust, static musl)
 limactl shell infra-saas-lab -- bash -c \
-  "source ~/.cargo/env && export CARGO_TARGET_DIR=\$HOME/.cargo-target/hearth-agent && \
+  "source ~/.cargo/env && export CARGO_TARGET_DIR=\$HOME/.cargo-target/felucca-agent && \
    cd $REPO/rust/agent && cargo build --release --target aarch64-unknown-linux-musl && \
-   cp \$CARGO_TARGET_DIR/aarch64-unknown-linux-musl/release/hearth-agent \
-      $REPO/deploy/release/aarch64/hearth-agent"
+   cp \$CARGO_TARGET_DIR/aarch64-unknown-linux-musl/release/felucca-agent \
+      $REPO/deploy/release/aarch64/felucca-agent"
 ```
 
 For x86_64 agents, add the target (`rustup target add x86_64-unknown-linux-musl`
@@ -139,10 +139,10 @@ The installer finds binaries at `deploy/release/<arch>/`.
 > `/dev/net/tun` for taps, `StateDirectoryMode=0750`), so treat a hardening
 > failure as a missing *specific* allowance to add, not a directive to remove
 > wholesale. The one remaining experiment is `MemoryDenyWriteExecute=true` in
-> `hearthd.service` vs the Go runtime — it survives startup and the
+> `feluccad.service` vs the Go runtime — it survives startup and the
 > conformance suite; the 48h soak is the verdict. If you use a non-default
 > agent `data_dir`, override `ReadWritePaths` via a drop-in that resets the
-> list (see the comment in `hearth-agent.service`).
+> list (see the comment in `felucca-agent.service`).
 >
 > **Pinned downloads**: the Firecracker version and its SHA-256 live in
 > `deploy/install.sh`; the guest kernel and base rootfs objects and their
@@ -164,17 +164,17 @@ sudo bash deploy/install.sh control-plane
 
 The installer:
 
-1. Creates directories: `/etc/hearth`, `/var/lib/hearth`, `/srv/hearth`, `/usr/share/hearth/ui`.
-2. Creates the `hearth` system user (no login shell, no home).
-3. Copies `hearthd` to `/usr/local/bin/hearthd`.
-4. Installs `deploy/systemd/hearthd.service`.
+1. Creates directories: `/etc/felucca`, `/var/lib/felucca`, `/srv/felucca`, `/usr/share/felucca/ui`.
+2. Creates the `felucca` system user (no login shell, no home).
+3. Copies `feluccad` to `/usr/local/bin/feluccad`.
+4. Installs `deploy/systemd/feluccad.service`.
 5. **Generates a real bearer token** (`openssl rand -hex 32`) and writes
-   `/etc/hearth/hearthd.json` with that value, mode 0640, owned `hearth:hearth`
+   `/etc/felucca/feluccad.json` with that value, mode 0640, owned `felucca:felucca`
    — the example config's `REPLACE_WITH_…` placeholder never reaches `/etc`.
-6. Writes `/etc/hearth/firewall.nft` and installs
-   `deploy/systemd/hearth-firewall.service`, which applies it at boot (§8),
+6. Writes `/etc/felucca/firewall.nft` and installs
+   `deploy/systemd/felucca-firewall.service`, which applies it at boot (§8),
    then applies it immediately.
-7. **Enables but does not start** hearthd, and prints the generated token once.
+7. **Enables but does not start** feluccad, and prints the generated token once.
 
 The installer does not start the service because the config still needs this
 host's own values and because a control plane should not answer the network
@@ -184,9 +184,9 @@ Record the printed token — it is not shown again, and every worker needs the
 same value. Then review the config and start:
 
 ```sh
-sudo cat /etc/hearth/hearthd.json    # token is already filled in
-sudo systemctl start hearthd
-sudo systemctl status hearthd
+sudo cat /etc/felucca/feluccad.json    # token is already filled in
+sudo systemctl start feluccad
+sudo systemctl status feluccad
 
 # Smoke test (from the server — port 8080 is loopback-only, see §8)
 curl -s http://127.0.0.1:8080/healthz   # {"ok":true} — open, no token
@@ -199,7 +199,7 @@ existing fleet), pass it in — the installer validates it and does not generate
 one:
 
 ```sh
-HEARTH_TOKEN=<existing fleet token> sudo -E bash deploy/install.sh control-plane
+FELUCCA_TOKEN=<existing fleet token> sudo -E bash deploy/install.sh control-plane
 ```
 
 ---
@@ -209,8 +209,8 @@ HEARTH_TOKEN=<existing fleet token> sudo -E bash deploy/install.sh control-plane
 Run on each worker as root, passing the control plane's token and address:
 
 ```sh
-HEARTH_TOKEN=<token printed by the control-plane install> \
-HEARTH_CONTROL_PLANE_IP=10.0.1.10 \
+FELUCCA_TOKEN=<token printed by the control-plane install> \
+FELUCCA_CONTROL_PLANE_IP=10.0.1.10 \
   sudo -E bash deploy/install.sh worker
 ```
 
@@ -218,17 +218,17 @@ The installer:
 
 1. Checks `/dev/kvm`, installs the **pinned** Firecracker release and verifies
    its SHA-256 before it lands in `/usr/local/bin` (§3 note), checks `nft`.
-2. Copies `hearth-agent` to `/usr/local/bin/hearth-agent`.
-3. Installs `deploy/systemd/hearth-agent.service`.
-4. Writes `/etc/hearth/hearth-agent.json` with the real token (mode 0640) and an
-   `/etc/hearth/agent.env` stub.
-5. Writes `/etc/hearth/firewall.nft` and installs
-   `deploy/systemd/hearth-firewall.service`, then applies them (§8).
-6. **Enables but does not start** hearth-agent.
+2. Copies `felucca-agent` to `/usr/local/bin/felucca-agent`.
+3. Installs `deploy/systemd/felucca-agent.service`.
+4. Writes `/etc/felucca/felucca-agent.json` with the real token (mode 0640) and an
+   `/etc/felucca/agent.env` stub.
+5. Writes `/etc/felucca/firewall.nft` and installs
+   `deploy/systemd/felucca-firewall.service`, then applies them (§8).
+6. **Enables but does not start** felucca-agent.
 
-`HEARTH_TOKEN` is not optional in practice: without it the worker mints its own
+`FELUCCA_TOKEN` is not optional in practice: without it the worker mints its own
 token, which is safe but will not match the control plane, so the node never
-registers. `HEARTH_CONTROL_PLANE_IP` is what opens port 9090 to the control
+registers. `FELUCCA_CONTROL_PLANE_IP` is what opens port 9090 to the control
 plane — leave it unset and 9090 stays loopback-only.
 
 Then finish the config — `bind` must be this node's management address, never
@@ -241,27 +241,27 @@ that has produced empty tokens (which the agent then refuses to start on).
 
 ```sh
 # 1. Recover the token the installer wrote.
-TOKEN=$(sudo sed -n 's/.*"token": "\([^"]*\)".*/\1/p' /etc/hearth/hearth-agent.json)
-[ -n "$TOKEN" ] || { echo "no token found — check /etc/hearth/hearth-agent.json"; exit 1; }
+TOKEN=$(sudo sed -n 's/.*"token": "\([^"]*\)".*/\1/p' /etc/felucca/felucca-agent.json)
+[ -n "$TOKEN" ] || { echo "no token found — check /etc/felucca/felucca-agent.json"; exit 1; }
 
 # 2. This node's management address.
 ADDR=$(hostname -I | awk '{print $1}')
 
 # 3. Rewrite the config. Dropping "_bind_note" is intentional — it is guidance
 #    for the shipped example, ignored by the agent, and you have now chosen.
-sudo tee /etc/hearth/hearth-agent.json >/dev/null <<EOF
+sudo tee /etc/felucca/felucca-agent.json >/dev/null <<EOF
 {
   "bind": "${ADDR}:9090",
-  "control_plane": "https://hearth.internal.example.com",
+  "control_plane": "https://felucca.internal.example.com",
   "advertise_addr": "${ADDR}",
-  "data_dir": "/srv/hearth",
+  "data_dir": "/srv/felucca",
   "token": "${TOKEN}",
   "pool_size": 2,
   "net": "on",
   "net_cidr": "10.231.0.0/24"
 }
 EOF
-sudo chmod 0640 /etc/hearth/hearth-agent.json
+sudo chmod 0640 /etc/felucca/felucca-agent.json
 unset TOKEN
 ```
 
@@ -270,21 +270,21 @@ kernel and base rootfs are pinned by version and SHA-256 and verified before
 either is installed or extracted:
 
 ```sh
-sudo bash deploy/firecracker-assets.sh --data-dir /srv/hearth
+sudo bash deploy/firecracker-assets.sh --data-dir /srv/felucca
 ```
 
 Then start the agent:
 
 ```sh
-sudo systemctl start hearth-agent
-sudo systemctl status hearth-agent
+sudo systemctl start felucca-agent
+sudo systemctl status felucca-agent
 ```
 
 Verify the worker is registered on the control plane within ~5 s:
 
 ```sh
 curl -s -H "Authorization: Bearer ${TOKEN}" \
-  https://hearth.internal.example.com/api/v1/nodes
+  https://felucca.internal.example.com/api/v1/nodes
 # Should show the worker with status "ready"
 ```
 
@@ -292,7 +292,7 @@ curl -s -H "Authorization: Bearer ${TOKEN}" \
 
 ## 6. Tokens, auth, and bind addresses
 
-Hearth uses a single shared bearer token between the control plane and all
+Felucca uses a single shared bearer token between the control plane and all
 agents. Enrolled workers additionally get their own per-node credential, which
 replaces the shared token on the control-plane↔agent legs — see **§6.7**. The
 shared token is still required on every worker (image pulls need it), so set it
@@ -308,19 +308,19 @@ openssl rand -hex 32
 
 Set it in:
 
-- `/etc/hearth/hearthd.json` — `"token"` key (or `HEARTH_TOKEN` env var)
-- `/etc/hearth/hearth-agent.json` on every worker — same `"token"` value
+- `/etc/felucca/feluccad.json` — `"token"` key (or `FELUCCA_TOKEN` env var)
+- `/etc/felucca/felucca-agent.json` on every worker — same `"token"` value
 
-**Keep the token out of version control.** Store it in `/etc/hearth/hearthd.env`
-or `/etc/hearth/agent.env` (mode 0640, owned by the service user) if you prefer
+**Keep the token out of version control.** Store it in `/etc/felucca/feluccad.env`
+or `/etc/felucca/agent.env` (mode 0640, owned by the service user) if you prefer
 not to put it in the JSON config:
 
 ```sh
-# /etc/hearth/hearthd.env
-HEARTH_TOKEN=a3f8c21b...
+# /etc/felucca/feluccad.env
+FELUCCA_TOKEN=a3f8c21b...
 
-# /etc/hearth/agent.env
-HEARTH_TOKEN=a3f8c21b...
+# /etc/felucca/agent.env
+FELUCCA_TOKEN=a3f8c21b...
 ```
 
 Env vars take precedence over config file values (precedence: flags > env > config > defaults).
@@ -330,19 +330,19 @@ Env vars take precedence over config file values (precedence: flags > env > conf
 There is no "auth off by accident" state any more. A missing token used to mean
 *no authentication required*; it now means *do not serve*.
 
-| Condition | `hearthd` | `hearth-agent` |
+| Condition | `feluccad` | `felucca-agent` |
 |---|---|---|
 | `token` empty / config failed to load | **exits** | **exits** |
-| `token` matches a shipped placeholder (contains `REPLACE_WITH`, or `hearth-lab-token`) | **exits** | **exits** |
+| `token` matches a shipped placeholder (contains `REPLACE_WITH`, or `felucca-lab-token`) | **exits** | **exits** |
 | `token` too short | **exits** below 32 chars | **exits** below 16 chars |
 | Deliberate open mode | `--insecure-no-auth` | *no such flag — the agent always requires a token* |
 
 ```
-$ hearthd --db /var/lib/hearth/hearth.db
-level=ERROR msg=auth err="no auth token configured: set token / HEARTH_TOKEN /
+$ feluccad --db /var/lib/felucca/felucca.db
+level=ERROR msg=auth err="no auth token configured: set token / FELUCCA_TOKEN /
   --token, or pass --insecure-no-auth for a loopback-only lab"
 
-$ hearth-agent --config /etc/hearth/hearth-agent.json     # unedited example
+$ felucca-agent --config /etc/felucca/felucca-agent.json     # unedited example
 fatal: auth token: token is a known placeholder — generate a real one with
   `openssl rand -hex 32`
 ```
@@ -355,7 +355,7 @@ commands inside any tenant's guest) and `GET /v1/vms/:id/rootfs` (any tenant's
 whole disk image).
 
 `--insecure-no-auth` exists for a loopback lab and nothing else. It exists on
-`hearthd` only, it must be named explicitly, and hearthd logs a WARN at every
+`feluccad` only, it must be named explicitly, and feluccad logs a WARN at every
 start — plus a second, louder one when the bind is not a loopback address:
 
 ```
@@ -368,16 +368,16 @@ level=WARN msg="INSECURE MODE on a non-loopback address: every host that can
 There is no agent equivalent, deliberately: the agent API is root on the node.
 
 The lab scripts (`scripts/verify-v2.sh`, `scripts/conformance-lab.sh`,
-`scripts/roll-v3.1.sh`) take the token as `$1` or `HEARTH_TOKEN`, or read it
-from `~/.config/hearth/lab-token` (override with `HEARTH_TOKEN_FILE`). They fail
+`scripts/roll-v3.1.sh`) take the token as `$1` or `FELUCCA_TOKEN`, or read it
+from `~/.config/felucca/lab-token` (override with `FELUCCA_TOKEN_FILE`). They fail
 with a clear error when none is set rather than falling back to a literal.
 
 ### 6.2 What the token guards
 
 - Every `/api/*` request requires `Authorization: Bearer <token>`.
 - **Three kinds of credential, three reaches.** The admin token is
-  unrestricted. A tenant API key (`hearth_sk_…`) reaches its own sandboxes and
-  nothing fleet-wide. A node credential (`hearth_nt_…`, §6.7) reaches exactly
+  unrestricted. A tenant API key (`felucca_sk_…`) reaches its own sandboxes and
+  nothing fleet-wide. A node credential (`felucca_nt_…`, §6.7) reaches exactly
   `POST /api/v1/agents/register` and `POST /api/v1/agents/heartbeat`, bound to
   its own node — everything else answers `404`.
 - Agent registration and heartbeat accept either the admin token or the
@@ -396,7 +396,7 @@ credential gates: the bearer gate on every `/api/*` path and `/metrics`, and
 worker has no API key yet).
 
 > **The credential is checked first, and a correct token is always served.**
-> hearthd authenticates *before* it consults the backoff, so the guard only ever
+> feluccad authenticates *before* it consults the backoff, so the guard only ever
 > shapes the answer to an attempt that had already failed. A source sitting in
 > backoff still gets `200` the moment it presents a valid token, and nobody
 > else's failed guesses can refuse a request that would have succeeded. If you
@@ -434,10 +434,10 @@ How the backoff itself accumulates, per key:
   currently serving a backoff, lowest failure count, oldest) — so a wide spray
   evicts itself rather than flushing the record it was trying to displace.
 
-**The ceiling depends on how well hearthd can tell clients apart.** When the key
+**The ceiling depends on how well feluccad can tell clients apart.** When the key
 provably stands for more than one client, the wait is capped at **2s** instead
 of 60s — a shared key must not let one anonymous neighbour spend a full minute
-of `429`s on everyone who shares it. hearthd treats a key as shared when, and
+of `429`s on everyone who shares it. feluccad treats a key as shared when, and
 only when, the *configuration and peer address* say so — never a header, so a
 client cannot opt itself into the softer cap:
 
@@ -446,15 +446,15 @@ client cannot opt itself into the softer cap:
 | No `trusted_proxies`, peer is loopback or RFC1918/ULA private (the shipped Caddy-on-loopback topology, and overlay fleets) | the peer | **2s** |
 | Peer *is* a declared proxy but forwarded nothing attributable | the proxy | **2s** |
 | A client address attested by the declared proxy chain | that client | **60s** |
-| No `trusted_proxies`, peer is a public address (hearthd exposed directly) | the peer | **60s** |
+| No `trusted_proxies`, peer is a public address (feluccad exposed directly) | the peer | **60s** |
 
 - The key is a source address. Out of the box that is the **connection peer**,
   and behind a reverse proxy every client arrives as the proxy's own address —
   so one misbehaving client's failures raise everyone else's `401`s to `429`s
   (they do **not** lock anyone out; see the box above). Fixing that means
   configuring both halves: the proxy must **overwrite** `X-Forwarded-For`, and
-  hearthd must be told to believe it via `trusted_proxies`. **[§7.1](#71-forwarded-client-addresses-required-reading)
-  is required reading before you put anything in front of hearthd** — getting it
+  feluccad must be told to believe it via `trusted_proxies`. **[§7.1](#71-forwarded-client-addresses-required-reading)
+  is required reading before you put anything in front of feluccad** — getting it
   half-right in the wrong direction lets a client pick its own throttle key.
   Either way, put a real rate limiter at the proxy (the commented `rate_limit`
   block in §7) rather than treating this as your only guard.
@@ -469,27 +469,27 @@ still produced a world-reachable control plane; that is fixed, which means the
 value now has consequences. Pick deliberately — the two supported topologies
 want opposite answers, and adopting the wrong one costs a fleet-wide outage.
 
-| Topology | `hearthd` `bind` | Why |
+| Topology | `feluccad` `bind` | Why |
 |---|---|---|
 | **Caddy-fronted single node** (§7, the shipped example) | `127.0.0.1:8080` | Caddy terminates TLS and proxies over loopback; §8 drops 8080 from everywhere else. Nothing else needs to reach the port. |
-| **WireGuard-overlay fleet** (§6.4) | the hub's overlay address, e.g. `10.100.0.1:8080` | Enrolled agents speak plain HTTP to hearthd *inside* the tunnel. On a loopback bind **every agent registration is refused** and the fleet never forms. |
+| **WireGuard-overlay fleet** (§6.4) | the hub's overlay address, e.g. `10.100.0.1:8080` | Enrolled agents speak plain HTTP to feluccad *inside* the tunnel. On a loopback bind **every agent registration is refused** and the fleet never forms. |
 
-For `hearth-agent`, `bind` is always **this node's own management address** (or
+For `felucca-agent`, `bind` is always **this node's own management address** (or
 its overlay address on an overlay fleet) and never `0.0.0.0`. The wildcard
 includes the bridge gateway `10.231.0.1` that every guest has as its default
 route, and guest→host packets hit the INPUT hook — which the agent's own
 forward-chain tenant isolation never sees. The §8 firewall's
-`iifname "hearth0" drop` is the second layer under that; the bind address is the
+`iifname "felucca0" drop` is the second layer under that; the bind address is the
 first.
 
 Both shipped example configs carry a `_bind_note` key spelling this out. It is
-ignored by both loaders (verified: hearthd parses the example and listens on the
+ignored by both loaders (verified: feluccad parses the example and listens on the
 configured host) and is safe to delete once you have set a real value.
 
 ### 6.4 WireGuard overlay fleets
 
-Set `wg_ip` on hearthd to enable the overlay; it is off when empty, which is the
-default and what the single-node topology uses. hearthd refuses to start with
+Set `wg_ip` on feluccad to enable the overlay; it is off when empty, which is the
+default and what the single-node topology uses. feluccad refuses to start with
 the overlay half-configured:
 
 - `wg_ip` must be a CIDR (the hub's overlay address, e.g. `10.100.0.1/24`).
@@ -497,16 +497,16 @@ the overlay half-configured:
 - The overlay refuses to run in open mode: minting join tokens without a
   credential would be unauthenticated kernel network configuration.
 
-Then bind hearthd on the overlay address (§6.3), keep the §8 rule aligned with
+Then bind feluccad on the overlay address (§6.3), keep the §8 rule aligned with
 whatever you bound, and enroll each worker once:
 
 ```sh
 # On the control plane — mint a one-time join token:
 curl -s -XPOST -H "Authorization: Bearer ${TOKEN}" \
-  https://hearth.example.com/api/v1/join-tokens
+  https://felucca.example.com/api/v1/join-tokens
 
-# On the worker — first boot only; the persisted /srv/hearth/wg.json wins after:
-hearth-agent --join https://hearth.example.com --join-token <token>
+# On the worker — first boot only; the persisted /srv/felucca/wg.json wins after:
+felucca-agent --join https://felucca.example.com --join-token <token>
 ```
 
 The plain listener on `bind` stays up even when `tls_domain` is set: in-tunnel
@@ -523,9 +523,9 @@ the tab. It is **not** read from `localStorage`, `sessionStorage`, or a
   the only way in, by design.
 - A `?token=` in the URL is **stripped and ignored**, not accepted. By the time
   the page runs, that token is already in the browser's history entry and in the
-  access log of every proxy in front of hearthd — so it is a token to rotate,
+  access log of every proxy in front of feluccad — so it is a token to rotate,
   not a token to use. Never put one in a URL, a bookmark, or a shared link.
-- An upgraded console clears any `hearth_token` left in web storage by an older
+- An upgraded console clears any `felucca_token` left in web storage by an older
   build. Rotate that value too; it was readable by any script on the origin.
 - With no token the console does **not** poll. Every request would be a counted
   auth failure against the throttle in §6.2, and an unattended tab on a 3s timer
@@ -542,23 +542,23 @@ the tab. It is **not** read from `localStorage`, `sessionStorage`, or a
 ### 6.6 Finding and revoking a leaked tenant key
 
 Tenant API keys can now be listed and can carry an expiry, so a leaked key is
-recoverable without raw SQL against `hearth.db`.
+recoverable without raw SQL against `felucca.db`.
 
 ```sh
 # List a tenant's keys — id, prefix, timestamps. Never the secret or its hash.
 curl -s -H "Authorization: Bearer ${TOKEN}" \
-  https://hearth.example.com/api/v1/tenants/tn-450c79b1/keys
-# {"keys":[{"id":"key-f3a3349e533a","prefix":"hearth_sk_2f75",
+  https://felucca.example.com/api/v1/tenants/tn-450c79b1/keys
+# {"keys":[{"id":"key-f3a3349e533a","prefix":"felucca_sk_2f75",
 #           "created_at":1787982290,"expires_at":0,"revoked_at":null}, …]}
 
 # Match the leaked secret against `prefix` (the first 14 chars), then revoke:
 curl -s -XDELETE -H "Authorization: Bearer ${TOKEN}" \
-  https://hearth.example.com/api/v1/keys/key-f3a3349e533a
+  https://felucca.example.com/api/v1/keys/key-f3a3349e533a
 
 # Mint a replacement that expires on its own (seconds; max one year):
 curl -s -XPOST -H "Authorization: Bearer ${TOKEN}" \
   -d '{"expires_in_s":2592000}' \
-  https://hearth.example.com/api/v1/tenants/tn-450c79b1/keys
+  https://felucca.example.com/api/v1/tenants/tn-450c79b1/keys
 ```
 
 `expires_at` is `0` for a key that never expires — the historical default, and
@@ -567,20 +567,20 @@ explicit `expires_in_s` for anything handed to a person or a CI job.
 
 ### 6.7 Per-node agent credentials
 
-hearthd used to present the **cluster admin token** on every call it made to a
+feluccad used to present the **cluster admin token** on every call it made to a
 worker, and every worker had to present that same token back on register and
 heartbeat. A node's address comes from `POST /api/v1/agents/register`, so every
 outbound dial was a decision about where to deliver that secret — talking
-hearthd into dialing an attacker-controlled host handed over the key to the
+feluccad into dialing an attacker-controlled host handed over the key to the
 whole fleet, and compromising any one worker did the same.
 
 Both halves now land. Enrollment with a one-time join token mints a per-node
-bearer `hearth_nt_…`, and that credential is used **in both directions**:
+bearer `felucca_nt_…`, and that credential is used **in both directions**:
 
-- **hearthd → agent.** hearthd presents that node's credential, and nothing
+- **feluccad → agent.** feluccad presents that node's credential, and nothing
   else, on every proxy call to it. An address with no stored credential is
   dialed with **no** bearer at all — which is where a forged registration lands.
-- **agent → hearthd.** The agent presents it on `POST /api/v1/agents/register`
+- **agent → feluccad.** The agent presents it on `POST /api/v1/agents/register`
   and `POST /api/v1/agents/heartbeat` instead of the fleet token.
 - **agent inbound.** The agent accepts *either* its own credential or its
   configured `token`, so a rotation takes effect without a restart and a
@@ -616,7 +616,7 @@ Confirm it took, without printing the secret — the agent says which credential
 it is on at every start:
 
 ```
-level=INFO msg="hearth-agent startup" ... node_cred=own
+level=INFO msg="felucca-agent startup" ... node_cred=own
 ```
 
 `node_cred=shared` means this node is still on the fleet token. That is a
@@ -626,11 +626,11 @@ leave behind.
 #### Already-enrolled nodes
 
 **Nothing breaks and nothing needs doing urgently.** Workers already in
-`hearth.db` when this shipped are grandfathered onto the shared token exactly
+`felucca.db` when this shipped are grandfathered onto the shared token exactly
 once, so they keep authenticating in both directions. That one-time bound is the
 security property: if "this node has no credential yet" could mint one on
 demand, registering an arbitrary address would still get the control-plane key
-delivered to it. hearthd names each grandfathered node in a startup WARN:
+delivered to it. feluccad names each grandfathered node in a startup WARN:
 
 ```
 level=WARN msg="existing nodes are still using the shared control-plane token;
@@ -638,14 +638,14 @@ level=WARN msg="existing nodes are still using the shared control-plane token;
 ```
 
 To finish the rollout, re-enroll each node with a fresh join token, one at a
-time. Re-enrollment **rotates** the credential (hearthd retires the previous one
+time. Re-enrollment **rotates** the credential (feluccad retires the previous one
 in the same operation), and it is also the recovery path for a worker that lost
 its copy.
 
 > **On an overlay fleet, re-enroll with a fresh WireGuard key.** A join token
 > says *an operator authorized an enrollment*; it does not say *which node*, and
 > the pubkey naming the node is written by the caller. So `POST
-> /api/v1/nodes/join` under a pubkey hearthd already knows must also carry the
+> /api/v1/nodes/join` under a pubkey feluccad already knows must also carry the
 > node's **current** credential in a `node_token` field, or it is refused:
 >
 > ```
@@ -657,7 +657,7 @@ its copy.
 > worker's credential out from under it and take that worker off the control
 > plane.
 >
-> **`hearth-agent` does not send `node_token`** — its join request carries only
+> **`felucca-agent` does not send `node_token`** — its join request carries only
 > `pubkey` and `hostname` (verified against `rust/agent/src/wg.rs`). So the
 > supported way to re-enroll a worker is a fresh key: stop the agent, remove
 > **both** `<data_dir>/wg.json` and `<data_dir>/wg.key` (plus `node-token` if you
@@ -669,12 +669,12 @@ its copy.
 >
 > **What a fresh key costs you.** The new pubkey is a new peer, so it gets a
 > **new overlay address** and the node re-registers under it. The node's own
-> identity survives — hearthd keys node rows on hostname, so the id and its
+> identity survives — feluccad keys node rows on hostname, so the id and its
 > sandboxes stay put and only `addr` moves. But the **old WireGuard peer is not
 > removed**: its row and its kernel peer entry stay, and its overlay address
 > stays allocated. Nothing in the API retires a peer today, so on a fleet you
 > re-enroll often, watch the overlay pool (`wg_ip`'s prefix) and prune stale
-> peers by hand with `wg set wg-hearth peer <old-pubkey> remove`.
+> peers by hand with `wg set wg-felucca peer <old-pubkey> remove`.
 >
 > On a **non-overlay** fleet there is no pubkey and no such check: re-enrolling
 > is just another `POST /api/v1/agents/register` with a fresh `join_token`.
@@ -682,7 +682,7 @@ its copy.
 #### The fleet token is still required on workers
 
 Per-node credentials narrow the blast radius; they do not remove the shared
-token from workers. `hearth-agent` still needs `token` set, still refuses to
+token from workers. `felucca-agent` still needs `token` set, still refuses to
 start without a real one (§6.1), and still uses it for **template image pulls**
 (`GET /api/v1/images/{name}`), which are an admin-only route a node credential
 cannot reach. Keep treating a worker compromise as an admin-token compromise
@@ -694,7 +694,7 @@ until that path has its own credential.
 level=WARN msg="no agent credential for this node: dialing it without one —
   enroll it with a join token" node=10.100.0.2:9090
 ```
-hearthd is dialing a node it has no credential for — a node registered without a
+feluccad is dialing a node it has no credential for — a node registered without a
 join token, or one whose row was removed. Enroll it.
 
 ```
@@ -726,10 +726,10 @@ this node never enrolled, and the shared token carries both directions.
 
 ## 7. TLS and the reverse proxy (Caddy or nginx)
 
-Hearth does not terminate TLS itself. Run Caddy on the control plane host.
+Felucca does not terminate TLS itself. Run Caddy on the control plane host.
 (In-binary autocert is the other option — set `tls_domain`, §6.4. Either way,
-if anything at all sits in front of hearthd, read **§7.1**: the proxy decides
-what address hearthd throttles on.)
+if anything at all sits in front of feluccad, read **§7.1**: the proxy decides
+what address feluccad throttles on.)
 
 Install Caddy (Debian/Ubuntu):
 
@@ -745,15 +745,15 @@ apt-get update && apt-get install -y caddy
 `/etc/caddy/Caddyfile`:
 
 ```caddy
-hearth.example.com {
+felucca.example.com {
     # Caddy obtains and renews a Let's Encrypt certificate automatically.
     # Replace with your real domain.
 
-    # Reverse-proxy everything to hearthd on loopback.
+    # Reverse-proxy everything to feluccad on loopback.
     #
     # REQUIRED at the edge. header_up makes X-Forwarded-For say exactly one
     # thing — the peer Caddy actually accepted — instead of appending to
-    # whatever the client sent. hearthd only reads it if you ALSO set
+    # whatever the client sent. feluccad only reads it if you ALSO set
     # trusted_proxies; see §7.1, and do not set one half without the other:
     # trusted_proxies pointing at a proxy that forwards the client's header
     # lets the client choose its own throttle key.
@@ -776,12 +776,12 @@ hearth.example.com {
     #
     # This access log records the full request URI, so anything in a query
     # string lands on disk and in whatever ships these logs onward. Nothing in
-    # Hearth puts a credential there: the API takes the token in the
+    # Felucca puts a credential there: the API takes the token in the
     # Authorization header (which Caddy does not log), and the console strips
     # and ignores `?token=` rather than accepting it (§6.5). Keep it that way —
     # do not add a token to a URL to "make curl easier".
     log {
-        output file /var/log/caddy/hearth-access.log
+        output file /var/log/caddy/felucca-access.log
     }
 }
 ```
@@ -794,8 +794,8 @@ Caddyfile after adding it rather than trusting it on sight.
 
 > **If a token ever did reach a URL** — an old bookmark, a copied link, a
 > scripted `curl` with `?token=` — treat it as disclosed and rotate it.
-> Regenerate with `openssl rand -hex 32`, update `hearthd.json` and every
-> worker's `hearth-agent.json`, and restart. It is in browser history and in the
+> Regenerate with `openssl rand -hex 32`, update `feluccad.json` and every
+> worker's `felucca-agent.json`, and restart. It is in browser history and in the
 > proxy log whatever the console does with it afterwards.
 
 Reload Caddy:
@@ -812,17 +812,17 @@ internal` for a local CA if the control plane is not internet-facing.
 
 ### 7.1 Forwarded client addresses (required reading)
 
-hearthd keys its brute-force throttle (§6.2) on the address it attributes a
+feluccad keys its brute-force throttle (§6.2) on the address it attributes a
 request to. Behind a proxy, the connection peer is always the proxy, so without
 configuration **every client shares one throttle key** and one client's failed
 guesses raise everyone else's `401`s to `429`s. The fix has two halves — a
-hearthd setting and a proxy directive — and it is **both or neither**. Doing
-only the hearthd half is the one outcome that is *worse* than leaving it alone:
+feluccad setting and a proxy directive — and it is **both or neither**. Doing
+only the feluccad half is the one outcome that is *worse* than leaving it alone:
 it turns a shared key into a client-chosen one.
 
-> **Why this section is load-bearing and not advisory.** hearthd cannot tell a
+> **Why this section is load-bearing and not advisory.** feluccad cannot tell a
 > forwarded header its proxy *wrote* from one the proxy *copied through* — both
-> arrive as bytes on a connection from the proxy. Nothing hearthd can do in code
+> arrive as bytes on a connection from the proxy. Nothing feluccad can do in code
 > closes that; the only thing that closes it is the proxy overwriting the header
 > on every request. So: if you list a proxy in `trusted_proxies`, that proxy
 > **must** be configured to overwrite `X-Forwarded-For`. A proxy that forwards
@@ -834,7 +834,7 @@ it turns a shared key into a client-chosen one.
 > `trusted_proxies` empty. The shared-key cost is bounded and documented (§6.2
 > caps the wait at 2s for a shared key); a forgeable key is not.
 
-**Half 1 — hearthd: `trusted_proxies`.** hearthd honours `X-Forwarded-For`
+**Half 1 — feluccad: `trusted_proxies`.** feluccad honours `X-Forwarded-For`
 **only** when the immediate peer's address falls inside one of the CIDRs listed
 here (`X-Real-IP` needs one more opt-in — see below). The default is **empty,
 which means trust nothing**: no forwarded header is read at all, and the
@@ -844,13 +844,13 @@ throttle key, which is strictly worse than throttling the proxy as one source.
 
 | Source | Form | Example |
 |---|---|---|
-| Config file (`/etc/hearth/hearthd.json`) | JSON array of strings | `"trusted_proxies": ["127.0.0.1/32", "::1/128"]` |
-| Environment | comma-separated | `HEARTH_TRUSTED_PROXIES=127.0.0.1/32,::1/128` |
+| Config file (`/etc/felucca/feluccad.json`) | JSON array of strings | `"trusted_proxies": ["127.0.0.1/32", "::1/128"]` |
+| Environment | comma-separated | `FELUCCA_TRUSTED_PROXIES=127.0.0.1/32,::1/128` |
 | Flag | comma-separated | `--trusted-proxies=127.0.0.1/32,::1/128` |
 
 - A **bare IP is accepted** and normalised to a single-host CIDR (`127.0.0.1` →
   `127.0.0.1/32`, `::1` → `::1/128`).
-- An entry hearthd cannot parse as a CIDR is a **startup failure**, not a
+- An entry feluccad cannot parse as a CIDR is a **startup failure**, not a
   skipped line: silently dropping it would leave you keying throttles off the
   proxy's own address while believing otherwise, with nothing anywhere saying
   why.
@@ -862,21 +862,21 @@ level=ERROR msg=trusted-proxies err="trusted proxy \"10.0.0.0/99\" is not a
 ```
 
 - `--trusted-proxies=""` is an explicit "trust nobody" and is honoured as such.
-- List **every** proxy hop, and **only** proxies. hearthd walks the
+- List **every** proxy hop, and **only** proxies. feluccad walks the
   `X-Forwarded-For` chain right to left and stops at the first hop that is not
   itself a trusted proxy — that hop is the client. **The left-most entry, the one
   this kind of code usually reaches for, is whatever the original caller wrote
-  and is never used.** A hop hearthd cannot parse ends the chain of custody and
+  and is never used.** A hop feluccad cannot parse ends the chain of custody and
   it falls back to the peer; if every hop is one of yours, the peer is as far as
   it goes.
 - The walk stops after **16 hops**, and a chain longer than that falls back to
   the peer. The header is caller-sized, so this is a bound on work, not a
   deployment limit: real chains are one or two hops. If you genuinely run more
-  than sixteen proxies in front of hearthd, the ones past the sixteenth from the
+  than sixteen proxies in front of feluccad, the ones past the sixteenth from the
   right cannot be attributed and every client behind them shares the peer key.
 - The whole request head — request line plus all headers — is capped at **16
   KiB** (Go's default is 1 MiB, and this parse runs before authentication).
-  Over that, hearthd answers `431 Request Header Fields Too Large`. Generous for
+  Over that, feluccad answers `431 Request Header Fields Too Large`. Generous for
   a bearer, a trace id and a proxy chain; if your proxy injects a large header
   set, that is the limit to check.
 - **Never widen this to a range that contains real clients** (and never
@@ -887,22 +887,22 @@ level=ERROR msg=trusted-proxies err="trusted proxy \"10.0.0.0/99\" is not a
 For the shipped Caddy-fronted single-node topology (§7), the whole of half 1 is:
 
 ```jsonc
-// /etc/hearth/hearthd.json
+// /etc/felucca/feluccad.json
 "trusted_proxies": ["127.0.0.1/32", "::1/128"]
 ```
 
 **`X-Real-IP` is a second, separate opt-in: `trust_x_real_ip`.** It defaults to
-**false**, and while it is false hearthd ignores `X-Real-IP` completely — from
+**false**, and while it is false feluccad ignores `X-Real-IP` completely — from
 *any* peer, declared proxy or not. Listing a proxy in `trusted_proxies` does
 **not** by itself make `X-Real-IP` believed.
 
 | Source | Form | Example |
 |---|---|---|
 | Config file | JSON boolean | `"trust_x_real_ip": true` |
-| Environment | boolean string | `HEARTH_TRUST_X_REAL_IP=true` |
+| Environment | boolean string | `FELUCCA_TRUST_X_REAL_IP=true` |
 | Flag | boolean | `--trust-x-real-ip` |
 
-- The reason it is separate: `X-Forwarded-For` carries a chain hearthd can walk,
+- The reason it is separate: `X-Forwarded-For` carries a chain feluccad can walk,
   so a client's forged prefix is discarded at the first trusted-proxy boundary.
   `X-Real-IP` is a bare single value with **no chain of custody at all** —
   whatever the last hop wrote, *or forwarded verbatim*, becomes the throttle key.
@@ -927,13 +927,13 @@ strictly better and is what both the Caddy and nginx blocks below configure.
 **Half 2 — the edge proxy must OVERWRITE the header.** Not append to it, not
 pass it through. This is a requirement, not a hardening tip: it is the only
 thing standing between a listed proxy and a client-chosen throttle key, because
-hearthd cannot tell the two apart on the wire.
+feluccad cannot tell the two apart on the wire.
 
 *Caddy — the shipped topology (§7).* `reverse_proxy` does set `X-Forwarded-For`
 by itself, **appending** the connection peer to any value the client supplied.
-Since hearthd walks the chain right to left, the appended real peer is the entry
+Since feluccad walks the chain right to left, the appended real peer is the entry
 it lands on, so a bare `reverse_proxy` is not exploitable today. Do not rely on
-that: it makes your throttle key a property of hearthd's parser rather than a
+that: it makes your throttle key a property of feluccad's parser rather than a
 fact about your proxy, and it changes if either side's chain handling ever does.
 **Set the overwrite explicitly** — this line is in the shipped Caddyfile in §7
 and is required, not optional:
@@ -948,7 +948,7 @@ reverse_proxy 127.0.0.1:8080 {
 ```
 
 Nothing else is required on the Caddy side. Caddy does not need to be told about
-`X-Real-IP` at all, because hearthd ignores that header unless you opt in with
+`X-Real-IP` at all, because feluccad ignores that header unless you opt in with
 `trust_x_real_ip` (half 1) — and you should not.
 
 *nginx as the edge proxy.* nginx sets **nothing** by default: with a bare
@@ -966,7 +966,7 @@ location / {
     # REQUIRED at the edge. $remote_addr REPLACES any client-supplied value.
     proxy_set_header X-Forwarded-For $remote_addr;
 
-    # Harmless, and correct if you ever set trust_x_real_ip. hearthd ignores
+    # Harmless, and correct if you ever set trust_x_real_ip. feluccad ignores
     # X-Real-IP while that stays false (the default), so this line is not
     # what makes the setup safe — the X-Forwarded-For line above is.
     proxy_set_header X-Real-IP       $remote_addr;
@@ -984,7 +984,7 @@ location / {
 **Do not use `$proxy_add_x_forwarded_for` at the edge.** It is the variable
 every nginx snippet on the internet reaches for, and it is the wrong one here:
 it **appends** `$remote_addr` to the client's own header rather than replacing
-it, so the header still carries whatever the client wrote. hearthd's
+it, so the header still carries whatever the client wrote. feluccad's
 right-to-left walk means the appended real peer is what it keys on, so this is
 not exploitable today — but it leaves your throttle key depending on a parser
 detail instead of on your proxy, and it is one config copy away from the bare
@@ -1000,7 +1000,7 @@ back to back — one plain, one with a forged `X-Forwarded-For`. **Both must com
 back with the same status**, because they are the same client:
 
 ```sh
-URL=https://hearth.example.com/api/v1/nodes
+URL=https://felucca.example.com/api/v1/nodes
 AUTH="Authorization: Bearer wrong"
 
 # Burn the key: 20 rapid failures. The tail must contain 429s.
@@ -1017,7 +1017,7 @@ curl -so /dev/null -H "$AUTH" -H "X-Forwarded-For: 203.0.113.9" \
 `plain=429 forged=429` is the pass: the forged header bought nothing. Any result
 where **`forged` is `401` while `plain` is `429`** is the failure — the forged
 header got a fresh key, meaning a proxy in the path is passing the client's
-`X-Forwarded-For` through *and* hearthd is trusting the peer that sent it. Fix
+`X-Forwarded-For` through *and* feluccad is trusting the peer that sent it. Fix
 half 2, or clear `trusted_proxies` until you can.
 
 Send the last two requests immediately after the loop and immediately after each
@@ -1050,15 +1050,15 @@ adding them rather than trusting them on sight.
                          │
                    Port 8080    ← loopback ONLY (127.0.0.1)
                          │
-                   [ hearthd ]
+                   [ feluccad ]
                          │
           Private network (e.g. 10.0.1.0/24)
                          │
                    Port 9090    ← control plane → workers ONLY
                          │
-                [ hearth-agent ]
+                [ felucca-agent ]
                          │
-          Bridge hearth0 (10.231.0.1)  ← guests must NOT reach the host here
+          Bridge felucca0 (10.231.0.1)  ← guests must NOT reach the host here
                          │
                    /dev/kvm, tap
                          │
@@ -1066,11 +1066,11 @@ adding them rather than trusting them on sight.
 ```
 
 **These rules are installed, not suggested.** `deploy/install.sh` writes
-`/etc/hearth/firewall.nft` and installs `deploy/systemd/hearth-firewall.service`
-to apply it, and `hearth-agent.service` has `Requires=hearth-firewall.service` —
+`/etc/felucca/firewall.nft` and installs `deploy/systemd/felucca-firewall.service`
+to apply it, and `felucca-agent.service` has `Requires=felucca-firewall.service` —
 a worker whose rules are missing does not serve its API at all. The ruleset
-lives in its own `inet hearth_host` table, so it never collides with the agent's
-`ip hearth` table or with whatever else the host runs.
+lives in its own `inet felucca_host` table, so it never collides with the agent's
+`ip felucca` table or with whatever else the host runs.
 
 The unit is a reviewable file under `deploy/systemd/` rather than a heredoc
 inside the installer, because it is part of that enforcement path: it is what
@@ -1086,13 +1086,13 @@ bash scripts/verify-units.sh    # systemd-analyze verify over deploy/systemd/*
 Run it on a systemd host (the lab VM is fine). It stages a throwaway root with
 stub binaries at the paths the real `ExecStart` lines name, so the units are
 checked exactly as shipped — without it, `systemd-analyze verify` on a checkout
-always fails on "Command /usr/local/bin/hearthd is not executable" and on the
-unresolved `hearth-firewall.service`, and both of those are artifacts of the
+always fails on "Command /usr/local/bin/feluccad is not executable" and on the
+unresolved `felucca-firewall.service`, and both of those are artifacts of the
 checkout rather than defects. It treats any output as failure: systemd exits 0
 on a malformed `RestrictAddressFamilies=` or an unknown directive while only
 warning about it, which would otherwise let a hardening regression through.
 
-The rule that matters most is the worker's `iifname "hearth0" drop`. The agent
+The rule that matters most is the worker's `iifname "felucca0" drop`. The agent
 listens on the bridge gateway that every guest has as its default route, and
 guest→host packets hit the INPUT hook — which the agent's own forward-chain
 tenant isolation never sees. Without it, a tenant with root in their own
@@ -1100,15 +1100,15 @@ sandbox (the expected design) reaches the node's root control API and can exec
 into every other tenant's guest. Established flows and ICMP stay allowed so
 liveness checks still work.
 
-Worker ruleset (`HEARTH_CONTROL_PLANE_IP=10.0.1.10`):
+Worker ruleset (`FELUCCA_CONTROL_PLANE_IP=10.0.1.10`):
 
 ```
-table inet hearth_host {
+table inet felucca_host {
     chain input {
         type filter hook input priority filter; policy accept;
-        iifname "hearth0" ct state established,related accept
-        iifname "hearth0" meta l4proto { icmp, ipv6-icmp } accept
-        iifname "hearth0" drop
+        iifname "felucca0" ct state established,related accept
+        iifname "felucca0" meta l4proto { icmp, ipv6-icmp } accept
+        iifname "felucca0" drop
         tcp dport 9090 ip saddr != { 127.0.0.1, 10.0.1.10 } drop
         tcp dport 9090 ip6 saddr != { ::1 } drop
     }
@@ -1118,7 +1118,7 @@ table inet hearth_host {
 Control plane ruleset:
 
 ```
-table inet hearth_host {
+table inet felucca_host {
     chain input {
         type filter hook input priority filter; policy accept;
         tcp dport 8080 ip saddr != 127.0.0.1 drop
@@ -1130,13 +1130,13 @@ table inet hearth_host {
 Inspect and manage them with:
 
 ```sh
-sudo nft list table inet hearth_host
-sudo systemctl status hearth-firewall
-sudo systemctl restart hearth-firewall     # re-apply after editing the file
+sudo nft list table inet felucca_host
+sudo systemctl status felucca-firewall
+sudo systemctl restart felucca-firewall     # re-apply after editing the file
 ```
 
-The installer regenerates `/etc/hearth/firewall.nft` on every run, so local
-additions belong in a separate table of your own. If workers reach hearthd
+The installer regenerates `/etc/felucca/firewall.nft` on every run, so local
+additions belong in a separate table of your own. If workers reach feluccad
 directly on 8080 rather than through Caddy, widen the control-plane rule there —
 and note that the API is then exposed to whatever you widen it to.
 
@@ -1149,26 +1149,26 @@ ufw allow 80/tcp
 
 ### 8.1 The agent's own nft tables (not installer-managed)
 
-`hearth-agent` builds and maintains its own rules at runtime, in tables the
+`felucca-agent` builds and maintains its own rules at runtime, in tables the
 installer never touches. Expect to see them on a worker; do not hand-edit them
 (every one is flush-and-rebuilt, so edits are lost on the next lifecycle event).
 
 | Table / chain | Purpose |
 |---|---|
-| `ip hearth postrouting` | egress masquerade for the guest CIDR |
-| `ip hearth forward` | cross-tenant isolation — the `tenant_pairs` set (ADR-0005) |
-| `ip hearth input` | guest→host fence: drops everything arriving on `hearth0` except ICMP and replies to host-initiated flows, with the agent's own port named in an explicit drop |
-| `ip hearth ingress` | per-expose DNAT to guest ports (ADR-0007) |
-| `bridge hearth forward` | accepts only ARP and IPv4 between bridge ports, dropping everything else — closes the pure-L2 path around the IPv4-only tenant rules, link-local IPv6 above all |
-| `netdev hearth <tap>` | one chain per tap, `policy drop`: pins that guest's source MAC, ARP sender MAC, ARP sender IP, and IPv4 source address |
+| `ip felucca postrouting` | egress masquerade for the guest CIDR |
+| `ip felucca forward` | cross-tenant isolation — the `tenant_pairs` set (ADR-0005) |
+| `ip felucca input` | guest→host fence: drops everything arriving on `felucca0` except ICMP and replies to host-initiated flows, with the agent's own port named in an explicit drop |
+| `ip felucca ingress` | per-expose DNAT to guest ports (ADR-0007) |
+| `bridge felucca forward` | accepts only ARP and IPv4 between bridge ports, dropping everything else — closes the pure-L2 path around the IPv4-only tenant rules, link-local IPv6 above all |
+| `netdev felucca <tap>` | one chain per tap, `policy drop`: pins that guest's source MAC, ARP sender MAC, ARP sender IP, and IPv4 source address |
 
 Two operational consequences:
 
-- **IPv6 is disabled on `hearth0`** by the agent. Guests get IPv4 from the
+- **IPv6 is disabled on `felucca0`** by the agent. Guests get IPv4 from the
   kernel command line; there is no IPv6 guest networking to configure.
 - **The agent refuses to start** if networking is on and any of these fences is
   not in force. That is deliberate: a worker without them puts every tenant on
-  one flat network, and nothing on the tenant's side would show it while hearthd
+  one flat network, and nothing on the tenant's side would show it while feluccad
   kept scheduling onto it. The fatal names what failed — fix `nft`/permissions,
   or run the agent with `--net off` to serve unnetworked guests on purpose.
 
@@ -1177,12 +1177,12 @@ Two operational consequences:
     above) — refusing to serve tenants
   ```
 
-These sit **under** the installer's `inet hearth_host` rules from §8, not
+These sit **under** the installer's `inet felucca_host` rules from §8, not
 instead of them. Both layers exist because they fail independently: the agent's
 own fence is gone if the agent is not running, and the installer's is gone if
 the firewall unit was never installed.
 
-`hearth-agent` also refuses a `bind` inside the guest CIDR outright, for the
+`felucca-agent` also refuses a `bind` inside the guest CIDR outright, for the
 same reason the wildcard is not the default (§6.3):
 
 ```
@@ -1191,7 +1191,7 @@ fatal: refusing to listen on 10.231.0.1 — it is inside the guest CIDR
 ```
 
 If you genuinely front the agent with your own firewall and want the wildcard
-back, `bind_any` (`HEARTH_BIND_ANY`, `--bind-any`) is the named opt-out. It is
+back, `bind_any` (`FELUCCA_BIND_ANY`, `--bind-any`) is the named opt-out. It is
 off by default; leaving it off, the agent listens on its management address
 **and** on `127.0.0.1` — so local health checks and the rollout scripts keep
 working, which is why dropping the wildcard costs nothing.
@@ -1204,17 +1204,17 @@ The binaries are identical. Only the config values change.
 
 | Setting | Lima lab | Production |
 |---|---|---|
-| `control_plane` | `http://192.168.104.3:8080` | `https://hearth.internal.example.com` |
+| `control_plane` | `http://192.168.104.3:8080` | `https://felucca.internal.example.com` |
 | `advertise_addr` | `192.168.104.x` (user-v2 network) | `10.0.1.x` (private DC IP) |
 | `bind` (agent) | the VM's user-v2 address | the node's management address (§6.3) |
-| `bind` (hearthd) | the VM's user-v2 address, so the host can reach the UI | `127.0.0.1:8080` behind Caddy, or the overlay address on a wg fleet (§6.3) |
+| `bind` (feluccad) | the VM's user-v2 address, so the host can reach the UI | `127.0.0.1:8080` behind Caddy, or the overlay address on a wg fleet (§6.3) |
 | `token` | 64-hex-char secret (same as prod — the binaries reject empty, short and placeholder tokens everywhere, §6.1) | 64-hex-char secret |
 | `/metrics` | admin token required (same as prod) | admin token required (§6.2) |
 | TLS | none (L2-isolated Lima network) | Caddy terminates HTTPS |
 | `pool_size` | `0` (lab is too small) | `2`–`5` per node |
-| `state_path` | `/var/lib/hearth/state.json` | same |
-| `data_dir` | `/srv/hearth` | same |
-| systemd | not used in lab (so the host firewall unit is not installed either — do not expose a lab VM) | `hearthd.service` / `hearth-agent.service` + `hearth-firewall.service` |
+| `state_path` | `/var/lib/felucca/state.json` | same |
+| `data_dir` | `/srv/felucca` | same |
+| systemd | not used in lab (so the host firewall unit is not installed either — do not expose a lab VM) | `feluccad.service` / `felucca-agent.service` + `felucca-firewall.service` |
 
 The Lima lab uses the same JSON config structure. See `deploy/config/local-lab.md`
 for the exact values used in each Lima VM.
@@ -1223,9 +1223,19 @@ for the exact values used in each Lima VM.
 
 ## 10. Upgrade procedure
 
-Hearth upgrades are binary-replacement restarts. **Sleeping VMs survive agent
+Felucca upgrades are binary-replacement restarts. **Sleeping VMs survive agent
 restarts** (the Firecracker process is already stopped when a VM is sleeping;
 the snapshot on disk is untouched by a restart).
+
+### Upgrading from a Hearth install
+
+If this deployment predates the Hearth → Felucca rename, do the one-time
+migration first — stopped units, renamed paths (`hearth.db` → `felucca.db`
+included), new unit files, and the credential-rotation truth about old
+`hearth_sk_`/`hearth_nt_`/`hearth_jt_` prefixes — before following the
+regular upgrade steps below. See
+[docs/CHANGELOG.md § Rename: Hearth → Felucca](CHANGELOG.md#rename-hearth--felucca-2026-09-12)
+for the full checklist.
 
 ### Control plane upgrade
 
@@ -1233,32 +1243,32 @@ the snapshot on disk is untouched by a restart).
 # 1. Build new binaries (see §3 — Go build inside the toolchain VM)
 
 # 2. Copy the new binary to the server
-scp deploy/release/x86_64/hearthd root@cp-host:/usr/local/bin/hearthd.new
+scp deploy/release/x86_64/feluccad root@cp-host:/usr/local/bin/feluccad.new
 
 # 3. Atomic replace + restart (state.json is preserved)
 ssh root@cp-host "
-  install -m 0755 /usr/local/bin/hearthd.new /usr/local/bin/hearthd
-  systemctl restart hearthd
-  systemctl status hearthd --no-pager
+  install -m 0755 /usr/local/bin/feluccad.new /usr/local/bin/feluccad
+  systemctl restart feluccad
+  systemctl status feluccad --no-pager
 "
 ```
 
 ### Worker upgrade
 
 ```sh
-# 1. Build new hearth-agent binary (see §3 — Rust build inside the toolchain VM)
+# 1. Build new felucca-agent binary (see §3 — Rust build inside the toolchain VM)
 
 # 2. Copy to worker
-scp deploy/release/x86_64/hearth-agent root@worker-host:/usr/local/bin/hearth-agent.new
+scp deploy/release/x86_64/felucca-agent root@worker-host:/usr/local/bin/felucca-agent.new
 
 # 3. Atomic replace + restart
 #    Running VMs are unaffected — Firecracker children are independent processes.
 #    Sleeping VMs are safe — their snapshot is on disk; the agent re-discovers
 #    them from meta.json on restart (this is the contract from API-V2.md §6).
 ssh root@worker-host "
-  install -m 0755 /usr/local/bin/hearth-agent.new /usr/local/bin/hearth-agent
-  systemctl restart hearth-agent
-  systemctl status hearth-agent --no-pager
+  install -m 0755 /usr/local/bin/felucca-agent.new /usr/local/bin/felucca-agent
+  systemctl restart felucca-agent
+  systemctl status felucca-agent --no-pager
 "
 ```
 
@@ -1285,17 +1295,17 @@ Upgrade workers one at a time. Before restarting an agent, optionally drain it:
 ### Observability (v4 P6)
 
 All three binaries log structured `key=value` text to stderr → journald.
-Every `/api/` request gets an `X-Hearth-Request-Id` (also echoed to the
+Every `/api/` request gets an `X-Felucca-Request-Id` (also echoed to the
 client); to follow one failing call across binaries:
 
 ```bash
 # On the control plane, find the request:
-sudo journalctl -u hearthd | grep req-<id>
+sudo journalctl -u feluccad | grep req-<id>
 # On the owning worker, the same id appears on the agent's handler logs:
-sudo journalctl -u hearth-agent | grep req-<id>
+sudo journalctl -u felucca-agent | grep req-<id>
 ```
 
-Agent verbosity: set `RUST_LOG=debug` in `/etc/hearth/agent.env` and restart.
+Agent verbosity: set `RUST_LOG=debug` in `/etc/felucca/agent.env` and restart.
 Fatal-exit diagnostics (`fatal: ...`) and the cross-tenant-isolation warning
 bypass the filter and always reach the journal — a restrictive `RUST_LOG`
 can never hide them.
@@ -1313,60 +1323,60 @@ ritual: `scripts/bench.sh <endpoint> <token>` and refresh `docs/BENCHMARKS.md`.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `systemctl status hearthd` shows `failed` | Binary not found or config parse error | Check `journalctl -u hearthd -n 50`; verify `/usr/local/bin/hearthd` exists and is executable |
-| Either binary exits at startup complaining about the token | Token empty, a placeholder (`REPLACE_WITH…`, `hearth-lab-token`), or too short — under 32 characters for `hearthd`, under 16 for `hearth-agent` | Put the fleet token in the JSON config or `HEARTH_TOKEN`; generate with `openssl rand -hex 32` (64 chars, clears both bars); see §6.1 |
-| `hearthd` exits: `msg=trusted-proxies err="… is not a CIDR"` | A malformed entry in `trusted_proxies` — deliberately fatal, never skipped | Write CIDRs (`127.0.0.1/32`, `10.0.0.0/8`); a bare IP is accepted and normalised. See §7.1 |
-| `hearthd` exits: `msg=trusted-proxies err="trust_x_real_ip is set but no trusted_proxies are declared"` | `trust_x_real_ip` on with nothing declared would believe `X-Real-IP` from every peer — a header any client can set | Either list the proxy in `trusted_proxies`, or drop `trust_x_real_ip` and have the proxy send `X-Forwarded-For` (preferred). See §7.1 |
-| One client's bad token turns everyone else's `401`s into `429`s | Behind a proxy with no forwarded-header config, every client shares the proxy's address as its throttle key (holders of a valid token are unaffected — §6.2) | Configure both halves in §7.1: proxy **overwrites** `X-Forwarded-For`, hearthd lists the proxy in `trusted_proxies`. Never one without the other |
-| `hearth-agent` will not start: `Unit hearth-firewall.service not found` | Worker installed without the host firewall (or `nft` was missing when the installer ran) | Install nftables and re-run `deploy/install.sh worker`; this is deliberate — see §8 |
-| Control plane cannot reach a worker on 9090 | `HEARTH_CONTROL_PLANE_IP` was not set at install, so 9090 is loopback-only | Re-run the worker installer with it set, or edit `/etc/hearth/firewall.nft` and `systemctl restart hearth-firewall` |
+| `systemctl status feluccad` shows `failed` | Binary not found or config parse error | Check `journalctl -u feluccad -n 50`; verify `/usr/local/bin/feluccad` exists and is executable |
+| Either binary exits at startup complaining about the token | Token empty, a placeholder (`REPLACE_WITH…`, `felucca-lab-token`), or too short — under 32 characters for `feluccad`, under 16 for `felucca-agent` | Put the fleet token in the JSON config or `FELUCCA_TOKEN`; generate with `openssl rand -hex 32` (64 chars, clears both bars); see §6.1 |
+| `feluccad` exits: `msg=trusted-proxies err="… is not a CIDR"` | A malformed entry in `trusted_proxies` — deliberately fatal, never skipped | Write CIDRs (`127.0.0.1/32`, `10.0.0.0/8`); a bare IP is accepted and normalised. See §7.1 |
+| `feluccad` exits: `msg=trusted-proxies err="trust_x_real_ip is set but no trusted_proxies are declared"` | `trust_x_real_ip` on with nothing declared would believe `X-Real-IP` from every peer — a header any client can set | Either list the proxy in `trusted_proxies`, or drop `trust_x_real_ip` and have the proxy send `X-Forwarded-For` (preferred). See §7.1 |
+| One client's bad token turns everyone else's `401`s into `429`s | Behind a proxy with no forwarded-header config, every client shares the proxy's address as its throttle key (holders of a valid token are unaffected — §6.2) | Configure both halves in §7.1: proxy **overwrites** `X-Forwarded-For`, feluccad lists the proxy in `trusted_proxies`. Never one without the other |
+| `felucca-agent` will not start: `Unit felucca-firewall.service not found` | Worker installed without the host firewall (or `nft` was missing when the installer ran) | Install nftables and re-run `deploy/install.sh worker`; this is deliberate — see §8 |
+| Control plane cannot reach a worker on 9090 | `FELUCCA_CONTROL_PLANE_IP` was not set at install, so 9090 is loopback-only | Re-run the worker installer with it set, or edit `/etc/felucca/firewall.nft` and `systemctl restart felucca-firewall` |
 | Installer aborts: `failed SHA-256 verification` | The pinned Firecracker or guest asset did not match its recorded digest | Do not bypass it. Re-download; if the upstream artifact genuinely changed, refresh the pin per the comment block in the script |
-| `GET /healthz` returns `connection refused` from another host | hearthd binds `127.0.0.1:8080` (the shipped default — Caddy fronts it) | Intended. Reach it through Caddy, or widen `bind` *and* the §8 rule if you really need direct access |
-| `GET /healthz` returns `connection refused` on the server itself | hearthd not listening | Check `bind` in config; `journalctl -u hearthd -n 50` |
-| `GET /api/v1/nodes` returns `401` | Token mismatch or missing `Authorization` header | Verify `token` in hearthd config matches the `Bearer` value you're sending |
+| `GET /healthz` returns `connection refused` from another host | feluccad binds `127.0.0.1:8080` (the shipped default — Caddy fronts it) | Intended. Reach it through Caddy, or widen `bind` *and* the §8 rule if you really need direct access |
+| `GET /healthz` returns `connection refused` on the server itself | feluccad not listening | Check `bind` in config; `journalctl -u feluccad -n 50` |
+| `GET /api/v1/nodes` returns `401` | Token mismatch or missing `Authorization` header | Verify `token` in feluccad config matches the `Bearer` value you're sending |
 | A request with a **wrong or missing** token returns `429 too many failed attempts` with a `Retry-After` | The brute-force guard (§6.2) has armed a backoff for **your source address** after >10 failed credentials. Behind a proxy, the failures may be someone else's — you share the key | Fix the credential. A correct token is served immediately regardless of the backoff, so this only ever replaces the `401` you would otherwise get. Then stop whatever is retrying a stale token; the record decays with quiet time (one failure per 15s) |
-| A request you believe is **correctly authenticated** returns `429 too many failed attempts` | Not possible from the throttle — hearthd authenticates first (§6.2). The token on that request is not the one hearthd holds | Compare the token actually being sent against `token` in `/etc/hearth/hearthd.json`; check for a stale value in a script, a shell history entry, or a `Bearer ` prefix that got mangled |
+| A request you believe is **correctly authenticated** returns `429 too many failed attempts` | Not possible from the throttle — feluccad authenticates first (§6.2). The token on that request is not the one feluccad holds | Compare the token actually being sent against `token` in `/etc/felucca/feluccad.json`; check for a stale value in a script, a shell history entry, or a `Bearer ` prefix that got mangled |
 | `GET /metrics` returns `401`, Prometheus targets go down after an upgrade | `/metrics` is admin-gated now (§6.2) | Add `bearer_token` to the scrape job; see `deploy/grafana/` |
-| Agents never register, `GET /api/v1/nodes` stays empty on an overlay fleet | hearthd bound to `127.0.0.1` while agents dial its overlay IP | Bind the overlay address (§6.3) and align the §8 rule; the shipped example is loopback for the Caddy topology |
-| Console shows `MOCK` or `STALE` in the header | It never reached hearthd, or lost it — the rows on screen are not the live fleet | Read the banner; check hearthd and the token. Nothing on a `MOCK` console is real (§6.5) |
+| Agents never register, `GET /api/v1/nodes` stays empty on an overlay fleet | feluccad bound to `127.0.0.1` while agents dial its overlay IP | Bind the overlay address (§6.3) and align the §8 rule; the shipped example is loopback for the Caddy topology |
+| Console shows `MOCK` or `STALE` in the header | It never reached feluccad, or lost it — the rows on screen are not the live fleet | Read the banner; check feluccad and the token. Nothing on a `MOCK` console is real (§6.5) |
 | Console shows `NO TOKEN` and is not polling | Deliberate — it will not spend auth attempts without a credential (§6.5) | Paste the token into the banner; click the header badge if you dismissed it |
-| Worker shows `status: down` in node list | Agent heartbeat older than 15 s | Check `systemctl status hearth-agent` on the worker; check connectivity on port 9090 |
-| Worker never appears in node list | `control_plane` URL wrong or token mismatch | Check agent logs: `journalctl -u hearth-agent -n 50`; verify `control_plane` points to hearthd and token matches |
-| Sandbox stays in `creating` | Firecracker spawn failed on worker | Check `journalctl -u hearth-agent -n 100`; check `/dev/kvm` permissions; check `firecracker --version` |
+| Worker shows `status: down` in node list | Agent heartbeat older than 15 s | Check `systemctl status felucca-agent` on the worker; check connectivity on port 9090 |
+| Worker never appears in node list | `control_plane` URL wrong or token mismatch | Check agent logs: `journalctl -u felucca-agent -n 50`; verify `control_plane` points to feluccad and token matches |
+| Sandbox stays in `creating` | Firecracker spawn failed on worker | Check `journalctl -u felucca-agent -n 100`; check `/dev/kvm` permissions; check `firecracker --version` |
 | `POST /sandboxes` returns `503 no ready node` | No workers registered and ready | Fix the worker install and verify it reaches the control plane |
 | Guest networking not working (`ip: null`) | `net` is `off` or agent config missing | Set `"net": "on"` and `"net_cidr"` in agent config; verify `nft` and `ip` are installed |
-| Bridge `hearth0` missing after agent restart | Idempotent setup should recreate it | Agent recreates the bridge at startup; check `journalctl -u hearth-agent` for errors |
-| `POST /sandboxes/{id}/wake` is slow (> 500 ms) | No warm pool VMs available | Increase `pool_size` in agent config (requires restart); check `hearth_pool_size` metric |
+| Bridge `felucca0` missing after agent restart | Idempotent setup should recreate it | Agent recreates the bridge at startup; check `journalctl -u felucca-agent` for errors |
+| `POST /sandboxes/{id}/wake` is slow (> 500 ms) | No warm pool VMs available | Increase `pool_size` in agent config (requires restart); check `felucca_pool_size` metric |
 | `POST /sandboxes/{id}/fork` returns `501` | Running v1 binary | Upgrade to v2 binary |
 | TLS cert errors | Caddy cannot reach ACME or wrong domain | Check `journalctl -u caddy`; verify DNS and port 80/443 reachability |
-| `journalctl -u hearthd` shows `Permission denied` on state file | Wrong ownership of `/var/lib/hearth` | `chown -R hearth:hearth /var/lib/hearth` |
+| `journalctl -u feluccad` shows `Permission denied` on state file | Wrong ownership of `/var/lib/felucca` | `chown -R felucca:felucca /var/lib/felucca` |
 
 ### Useful commands
 
 ```sh
 # Control plane logs (live)
-journalctl -u hearthd -f
+journalctl -u feluccad -f
 
 # Worker agent logs (live)
-journalctl -u hearth-agent -f
+journalctl -u felucca-agent -f
 
 # Prometheus metrics (admin token required — §6.2)
 curl -s -H "Authorization: Bearer ${TOKEN}" \
-  http://127.0.0.1:8080/metrics | grep hearth_
+  http://127.0.0.1:8080/metrics | grep felucca_
 
 # List all nodes
 curl -s -H "Authorization: Bearer ${TOKEN}" \
-  https://hearth.example.com/api/v1/nodes | jq .
+  https://felucca.example.com/api/v1/nodes | jq .
 
 # List all sandboxes
 curl -s -H "Authorization: Bearer ${TOKEN}" \
-  https://hearth.example.com/api/v1/sandboxes | jq .
+  https://felucca.example.com/api/v1/sandboxes | jq .
 
 # Check warm pool gauge on a specific node
 curl -s -H "Authorization: Bearer ${TOKEN}" \
-  http://127.0.0.1:8080/metrics | grep hearth_pool_size
+  http://127.0.0.1:8080/metrics | grep felucca_pool_size
 
 # Check a sleeping sandbox's wake latency
 curl -s -X POST -H "Authorization: Bearer ${TOKEN}" \
-  https://hearth.example.com/api/v1/sandboxes/sb-abc123/wake | jq .wake_ms
+  https://felucca.example.com/api/v1/sandboxes/sb-abc123/wake | jq .wake_ms
 ```

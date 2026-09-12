@@ -1,4 +1,4 @@
-//! hearth-agent — node agent in Rust.
+//! felucca-agent — node agent in Rust.
 //!
 //! Registers with the control plane, heartbeats every 5s, and manages
 //! Firecracker microVMs over its local REST API (0.0.0.0:<port>).
@@ -67,8 +67,8 @@ async fn main() {
         fatal(&format!("auth token: {e}"));
     }
 
-    // This node's OWN credential, if hearthd has issued one. hearthd stopped
-    // reusing the fleet admin token as its hearthd→agent bearer: it mints a
+    // This node's OWN credential, if feluccad has issued one. feluccad stopped
+    // reusing the fleet admin token as its feluccad→agent bearer: it mints a
     // per-node token at enrollment and presents THAT. The agent accepts it
     // inbound alongside the configured shared token, and presents it outbound
     // on the agent routes instead of the fleet key.
@@ -78,7 +78,7 @@ async fn main() {
     // keeps working. That fallback is the whole rollout story, so it must not
     // be an error. A file that exists but cannot be used IS one — validate
     // first, then fatal, so the guards above apply to this credential too and
-    // an agent never starts on one that hearthd's calls will not match.
+    // an agent never starts on one that feluccad's calls will not match.
     let node_token: NodeToken = Arc::new(RwLock::new(String::new()));
     match config::load_node_token(&cfg.data_dir) {
         Ok(Some(t)) => {
@@ -141,9 +141,9 @@ async fn main() {
                     // crash-loop on a burned token weeks later instead.
                     fatal(&format!("wg joined but state not persisted: {e}"));
                 }
-                // The same exchange mints this node's hearthd→agent credential
+                // The same exchange mints this node's feluccad→agent credential
                 // (a re-join rotates it). Same reasoning as wg.json, and the
-                // stakes are higher: hearthd has already switched to this
+                // stakes are higher: feluccad has already switched to this
                 // token, so losing it silently means every control-plane call
                 // to this node 401s from the next boot onward.
                 if !info.agent_token.is_empty() {
@@ -174,7 +174,7 @@ async fn main() {
             fatal(&format!("wg interface: {e}"));
         }
         // Route control-plane traffic over the overlay; advertise our overlay
-        // IP so hearthd reaches this agent through the tunnel. The hub's API
+        // IP so feluccad reaches this agent through the tunnel. The hub's API
         // port was recorded in wg.json at enrollment (from the join URL), so
         // it survives reboots after the one-time join flags are removed.
         cfg.control_plane = format!("http://{}:{}", info.server_overlay_ip, info.api_port);
@@ -213,7 +213,7 @@ async fn main() {
         } else {
             "shared"
         },
-        "hearth-agent startup"
+        "felucca-agent startup"
     );
 
     // control_plane/token also drive image pulls (v4 P4); cfg.control_plane
@@ -238,7 +238,7 @@ async fn main() {
     mgr.refresh_isolation().await;
     // Refuse to serve tenants on a node whose fences are not up. Without them
     // every sandbox here shares one flat network, and nothing on the tenant's
-    // side would show it — hearthd would keep placing new tenants on a worker
+    // side would show it — feluccad would keep placing new tenants on a worker
     // with no isolation at all. Run `--net off` to serve unnetworked guests
     // deliberately instead.
     if cfg.net && !net::netfilter_ready() {
@@ -260,7 +260,7 @@ async fn main() {
         let tok = cfg.token.clone();
         let nid = Arc::clone(&node_id);
         // The node token, not cfg.token, is what goes on the wire to
-        // /api/v1/agents/register and /api/v1/agents/heartbeat once hearthd
+        // /api/v1/agents/register and /api/v1/agents/heartbeat once feluccad
         // has issued one — so a compromised worker no longer yields the fleet
         // key. data_dir is where a rotation issued mid-run is persisted.
         let ntok = Arc::clone(&node_token);
@@ -271,7 +271,7 @@ async fn main() {
     }
 
     // Async pool refill. Always spawned (v4 P4): even with pool_size == 0,
-    // hearthd can push template pools at runtime via PUT /v1/pools.
+    // feluccad can push template pools at runtime via PUT /v1/pools.
     {
         let mgr3 = Arc::clone(&mgr);
         tokio::spawn(async move {

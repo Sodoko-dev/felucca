@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alpham/infra-saas/hearth/internal/config"
-	"github.com/alpham/infra-saas/hearth/internal/state"
-	"github.com/alpham/infra-saas/hearth/internal/store"
+	"github.com/alpham/infra-saas/felucca/internal/config"
+	"github.com/alpham/infra-saas/felucca/internal/state"
+	"github.com/alpham/infra-saas/felucca/internal/store"
 )
 
 // barrierStore holds every quota-row read until `want` of them have arrived,
@@ -73,7 +73,7 @@ func newQuotaServer(t *testing.T) (*Server, *barrierStore) {
 		Token:     "admin-tok",
 		UIDir:     tmp,
 		StatePath: filepath.Join(tmp, "state.json"),
-		DBPath:    filepath.Join(tmp, "hearth.db"),
+		DBPath:    filepath.Join(tmp, "felucca.db"),
 	}
 	sqlite, err := store.OpenSQLite(cfg.DBPath)
 	if err != nil {

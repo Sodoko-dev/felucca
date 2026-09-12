@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# Hearth v2 end-to-end verification against the Lima lab.
+# Felucca v2 end-to-end verification against the Lima lab.
 # Run from the macOS host: bash scripts/verify-v2.sh [token]
 # Exercises: auth, create+ip, sleep/wake (+latency), fork, both nodes, metrics.
 set -u
 
 # The lab token authenticates a root-privileged agent API, so it is never a
-# literal in the repo: argument, then HEARTH_TOKEN, then a file kept outside
+# literal in the repo: argument, then FELUCCA_TOKEN, then a file kept outside
 # the tree. Whatever the lab stack was started with has to match.
-TOKEN_FILE="${HEARTH_TOKEN_FILE:-$HOME/.config/hearth/lab-token}"
-TOKEN="${1:-${HEARTH_TOKEN:-}}"
+TOKEN_FILE="${FELUCCA_TOKEN_FILE:-$HOME/.config/felucca/lab-token}"
+TOKEN="${1:-${FELUCCA_TOKEN:-}}"
 if [ -z "$TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
   TOKEN="$(tr -d " \t\r\n" < "$TOKEN_FILE")"
 fi
 if [ -z "$TOKEN" ]; then
   echo "ERROR: no lab token." >&2
-  echo "  Pass it as \$1, export HEARTH_TOKEN, or write it to $TOKEN_FILE" >&2
+  echo "  Pass it as \$1, export FELUCCA_TOKEN, or write it to $TOKEN_FILE" >&2
   echo "  (generate one with: openssl rand -hex 32)" >&2
   exit 1
 fi
@@ -32,7 +32,7 @@ cp_curl() { # cp_curl <curl args...> — curl from inside the control-plane VM w
 
 wait_exec_ready() { # <id> [timeout-s] — poll exec until the guest agent answers.
   # Sleeping a mid-boot guest poisons the snapshot (panic on resume), and exec
-  # needs hearth-guest listening — polling exec(["true"]) covers both.
+  # needs felucca-guest listening — polling exec(["true"]) covers both.
   local i=0 t="${2:-45}"
   while [ "$i" -lt "$t" ]; do
     cp_curl -X POST "$API/api/v1/sandboxes/$1/exec" -d '{"cmd":["true"],"timeout_ms":2000}' 2>/dev/null \
@@ -69,7 +69,7 @@ node_addr=$(printf '%s' "$nodes" | tr '{' '\n' | grep "$node_id" | grep -oE '"ad
 # stops (the workers' .1/.4 literally swapped after a 2-month gap and every
 # hardcoded addr→VM mapping silently pinged from the wrong machine).
 # Hostnames are stable and the agent re-registers its (auto-detected) addr
-# anyway, so the addr column stays correct for hearthd while the hostname
+# anyway, so the addr column stays correct for feluccad while the hostname
 # stays correct for us.
 node_host=$(printf '%s' "$nodes" | tr '{' '\n' | grep "$node_id" | grep -oE '"hostname":"[^"]+"' | cut -d'"' -f4)
 worker_vm=""
@@ -152,17 +152,18 @@ fi
 
 say "== 7b. exec (vsock guest agent) =="
 wait_exec_ready "$id" 15 || true  # absorb post-wake/fork re-listen latency
-eres=$(cp_curl -X POST $API/api/v1/sandboxes/$id/exec -d '{"cmd":["/bin/sh","-c","echo hearth-exec-ok; id -u"]}')
-if printf '%s' "$eres" | grep -q '"exit_code":0' && printf '%s' "$eres" | grep -q 'hearth-exec-ok'; then
+eres=$(cp_curl -X POST $API/api/v1/sandboxes/$id/exec -d '{"cmd":["/bin/sh","-c","echo felucca-exec-ok; id -u"]}')
+if printf '%s' "$eres" | grep -q '"exit_code":0' && printf '%s' "$eres" | grep -q 'felucca-exec-ok'; then
   ok "exec ran in guest (exit 0, output captured)"
 else
   bad "exec failed: $eres"
 fi
 
 say "== 8. metrics =="
-m=$(limactl shell $CP_VM -- curl -s -m5 $API/metrics)
-printf '%s' "$m" | grep -q 'hearth_wake_total' && ok "wake metrics present" || bad "hearth_wake_total missing"
-printf '%s' "$m" | grep -q 'hearth_forks_total' && ok "fork metrics present" || bad "hearth_forks_total missing"
+# /metrics needs the admin token since the v4 hardening (ADR-0010 amendment).
+m=$(cp_curl $API/metrics)
+printf '%s' "$m" | grep -q 'felucca_wake_total' && ok "wake metrics present" || bad "felucca_wake_total missing"
+printf '%s' "$m" | grep -q 'felucca_forks_total' && ok "fork metrics present" || bad "felucca_forks_total missing"
 printf '%s' "$m" | grep -q 'state="sleeping"' && ok "sleeping state in metrics" || bad "sleeping state missing from metrics"
 
 say "== 9. cleanup verify resources =="

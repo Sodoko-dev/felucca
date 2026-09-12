@@ -11,11 +11,11 @@
 
 ## Decision
 
-1. **A template is a store row + one image file on hearthd.** `templates`
+1. **A template is a store row + one image file on feluccad.** `templates`
    (id, unique name, image, image_sha256, vcpus, mem_mib, disk_gb,
    image_size_gb, pool_size, created_at). The image is
    `<images_dir>/<image>.ext4` (config `images_dir`, default
-   `/var/lib/hearth/images`). Template names use the expose-label grammar
+   `/var/lib/felucca/images`). Template names use the expose-label grammar
    (ADR-0007) — they double as image names and may surface in label-shaped
    contexts, so the reserved forms ("--", all-digits) apply. Image names are
    a strict path-component class (`[a-z0-9._-]`, no leading `.`/`-`, no
@@ -42,15 +42,15 @@
    sidecar but with an expected sha is re-hashed and self-heals its sidecar
    (crash-safe ordering: verified sidecar lands before the image rename).
    Downloads serialize per image (not globally) so a multi-GB pull never
-   blocks creates whose image is already cached. hearthd pushes
+   blocks creates whose image is already cached. feluccad pushes
    `POST /v1/images/prefetch` to ready nodes at template creation so the
    common first-create path finds a warm cache; a cold-node create may still
-   time out hearthd's 30s agent call — the agent's create is
+   time out feluccad's 30s agent call — the agent's create is
    cancellation-safe (spawned, converges to running/error) and the retry
    finds the cache.
 4. **disk_gb is a grow-only resize with an honest floor.** The agent copies
    the image then `truncate + e2fsck -fp + resize2fs` when disk_gb exceeds
-   the image size; shrinking is refused. hearthd enforces the same floor at
+   the image size; shrinking is refused. feluccad enforces the same floor at
    the API (`image_size_gb`, recorded at template creation): a template's
    disk_gb defaults to its image size, and per-sandbox overrides below the
    floor are 400s. Disk quota (`max_disk_gb`, P0 schema) charges
@@ -62,7 +62,7 @@
    spec — including a stale sha after a re-capture — is deleted; an empty
    push tears all template pools down). Claims match the full shape
    including sha, so a re-captured template can never serve a stale pooled
-   rootfs. The push has exactly one channel: hearthd pushes on template
+   rootfs. The push has exactly one channel: feluccad pushes on template
    create/delete and to each node right after it registers (the register
    response stays the frozen `{"id":...}`). The legacy `pool_size` config
    remains as an always-present default spec (ubuntu-base 1c/256), so
@@ -78,7 +78,7 @@
 
 ## Rejected alternatives
 
-- **Node-push distribution (hearthd uploads to every node).** The fleet is
+- **Node-push distribution (feluccad uploads to every node).** The fleet is
   the variable: NAT'd home-lab workers come and go, and a push model needs
   fleet-wide success tracking. Pull-on-miss + prefetch hint needs none.
 - **Registry-style content addressing (`<sha>.ext4` files).** The existing
@@ -91,7 +91,7 @@
 - **Capture from running/sleeping sandboxes.** A live FC owns the rootfs
   (dirty pages, torn ext4); sleeping VMs hold un-flushed page cache in the
   memory snapshot. Stopped-only keeps the sha meaningful.
-- **Build pipeline as a hearthd-internal job queue.** A script over the
+- **Build pipeline as a feluccad-internal job queue.** A script over the
   public API exercises the same surface users get, needs no new job
   machinery, and the capture endpoint is the only new primitive required.
 

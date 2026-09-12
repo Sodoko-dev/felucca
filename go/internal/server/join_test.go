@@ -18,10 +18,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alpham/infra-saas/hearth/internal/config"
-	"github.com/alpham/infra-saas/hearth/internal/model"
-	"github.com/alpham/infra-saas/hearth/internal/state"
-	"github.com/alpham/infra-saas/hearth/internal/store"
+	"github.com/alpham/infra-saas/felucca/internal/config"
+	"github.com/alpham/infra-saas/felucca/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/state"
+	"github.com/alpham/infra-saas/felucca/internal/store"
 )
 
 const testServerPubKey = "SERVERPUBKEY" + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" + "="
@@ -41,12 +41,12 @@ func newJoinServerWgIP(t *testing.T, wgIP string) *Server {
 		Token:       "admin-tok",
 		UIDir:       tmp,
 		StatePath:   filepath.Join(tmp, "state.json"),
-		DBPath:      filepath.Join(tmp, "hearth.db"),
+		DBPath:      filepath.Join(tmp, "felucca.db"),
 		WgIP:        wgIP,
 		WgEndpoint:  "1.2.3.4:51820",
 		WgKeepalive: 25,
 	}
-	db, err := store.OpenSQLite(filepath.Join(tmp, "hearth.db"))
+	db, err := store.OpenSQLite(filepath.Join(tmp, "felucca.db"))
 	if err != nil {
 		t.Fatalf("open test store: %v", err)
 	}
@@ -138,13 +138,13 @@ func TestJoinTokenAdminOnly(t *testing.T) {
 	if resp.ID == "" {
 		t.Error("admin mint: missing id")
 	}
-	if !strings.HasPrefix(resp.Token, "hearth_jt_") {
-		t.Errorf("admin mint: token %q lacks hearth_jt_ prefix", resp.Token)
+	if !strings.HasPrefix(resp.Token, "felucca_jt_") {
+		t.Errorf("admin mint: token %q lacks felucca_jt_ prefix", resp.Token)
 	}
 
-	// A tenant-shaped key (unknown hearth_sk_) must not reach the handler:
+	// A tenant-shaped key (unknown felucca_sk_) must not reach the handler:
 	// 401 from the bearer gate (or 404 from the admin-only route guard).
-	w = doRequest(srv.Handler(), "POST", "/api/v1/join-tokens", "", "Bearer hearth_sk_bogus")
+	w = doRequest(srv.Handler(), "POST", "/api/v1/join-tokens", "", "Bearer felucca_sk_bogus")
 	if w.Code != 401 && w.Code != 404 {
 		t.Errorf("tenant key: expected 401 or 404, got %d body=%s", w.Code, w.Body)
 	}
@@ -228,13 +228,13 @@ func TestNodeJoinUniformUnauthorized(t *testing.T) {
 	}
 
 	// Wrong credential shape (an API key, not a join token).
-	w = doRequest(srv.Handler(), "POST", "/api/v1/nodes/join", body, "Bearer hearth_sk_x")
+	w = doRequest(srv.Handler(), "POST", "/api/v1/nodes/join", body, "Bearer felucca_sk_x")
 	if w.Code != 401 {
-		t.Errorf("hearth_sk_ bearer: expected 401, got %d body=%s", w.Code, w.Body)
+		t.Errorf("felucca_sk_ bearer: expected 401, got %d body=%s", w.Code, w.Body)
 	}
 
 	// Correct shape but unknown token: shape check passes, CheckJoinToken fails.
-	w = doRequest(srv.Handler(), "POST", "/api/v1/nodes/join", body, "Bearer hearth_jt_unknown")
+	w = doRequest(srv.Handler(), "POST", "/api/v1/nodes/join", body, "Bearer felucca_jt_unknown")
 	if w.Code != 401 {
 		t.Errorf("unknown join token: expected 401, got %d body=%s", w.Code, w.Body)
 	}
@@ -252,7 +252,7 @@ func TestNodeJoinValidTokenSurvivesAnotherClientsGuessing(t *testing.T) {
 
 	blocked := false
 	for i := 1; i <= 60; i++ {
-		switch w := joinWith(srv, "hearth_jt_wrong", validPubKeyB, "attacker"); w.Code {
+		switch w := joinWith(srv, "felucca_jt_wrong", validPubKeyB, "attacker"); w.Code {
 		case 429:
 			blocked = true
 		case 401:
@@ -355,7 +355,7 @@ func TestNodeJoinOverlayDisabled(t *testing.T) {
 	body := `{"pubkey":"` + validPubKeyA + `","hostname":"w1"}`
 
 	// Any join-token-shaped bearer hits the 503 before token validation.
-	w := doRequest(srv.Handler(), "POST", "/api/v1/nodes/join", body, "Bearer hearth_jt_whatever")
+	w := doRequest(srv.Handler(), "POST", "/api/v1/nodes/join", body, "Bearer felucca_jt_whatever")
 	if w.Code != 503 {
 		t.Errorf("overlay disabled: expected 503, got %d body=%s", w.Code, w.Body)
 	}
@@ -364,7 +364,7 @@ func TestNodeJoinOverlayDisabled(t *testing.T) {
 // ---- Credential-throttle mechanics ----
 
 // Quiet time is the only thing that forgives an accumulated failure. A
-// success cannot, because the key is shared by every client hearthd cannot
+// success cannot, because the key is shared by every client feluccad cannot
 // tell apart; without a leak, though, an operator who mistyped a token once
 // would still be paying for it an hour later.
 func TestAuthThrottleDecaysWithQuietTimeOnly(t *testing.T) {
@@ -404,7 +404,7 @@ func TestAuthThrottleBoundsAccumulation(t *testing.T) {
 	}
 }
 
-// A key that stands for every client at once (hearthd behind an undeclared
+// A key that stands for every client at once (feluccad behind an undeclared
 // reverse proxy) is capped short: it can never refuse a valid credential —
 // gateAuth evaluates that first — but it should not answer a neighbour 429 for
 // a minute over someone else's guessing either.
@@ -475,7 +475,7 @@ func TestThrottleSourceSharedIsNotHeaderControlled(t *testing.T) {
 // naming the node is written by the caller, and a wireguard public key is
 // public. So a holder of any valid token could re-join under an enrolled
 // worker's key, and the rotation would hand that worker's credential slot to a
-// token it never receives: hearthd 401s on every call to it and the node is off
+// token it never receives: feluccad 401s on every call to it and the node is off
 // the control plane, killed by a credential that never established it.
 func TestRejoinCannotRotateAnotherNodesCredential(t *testing.T) {
 	srv := newJoinTestServer(t)
@@ -497,11 +497,11 @@ func TestRejoinCannotRotateAnotherNodesCredential(t *testing.T) {
 		t.Fatalf("re-join without proof of possession: got %d %s, want 409", w.Code, w.Body)
 	}
 	// A guessed proof is no better.
-	if w := rejoinWith(srv, attack, validPubKeyA, "attacker", "hearth_nt_guess"); w.Code != 409 {
+	if w := rejoinWith(srv, attack, validPubKeyA, "attacker", "felucca_nt_guess"); w.Code != 409 {
 		t.Fatalf("re-join with a wrong node token: got %d %s, want 409", w.Code, w.Body)
 	}
 
-	// The victim's credential is untouched: hearthd still dials it with the
+	// The victim's credential is untouched: feluccad still dials it with the
 	// token the victim actually holds.
 	if got := srv.agentTokenForHost(victim.OverlayIP); got != victim.AgentToken {
 		t.Fatalf("victim credential after the attempt: %q, want it unchanged", got)
@@ -514,7 +514,7 @@ func TestRejoinCannotRotateAnotherNodesCredential(t *testing.T) {
 	}
 }
 
-// The proof is "the credential hearthd currently hands that node", so a fleet
+// The proof is "the credential feluccad currently hands that node", so a fleet
 // grandfathered onto the shared token can still re-join — which is the whole
 // rollout path onto per-node credentials, and must not be locked out by the
 // check above.
@@ -529,7 +529,7 @@ func TestRejoinOfAGrandfatheredNodeProvesWithTheSharedToken(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &first)
 
 	// Put the node back into the grandfathered state: a Legacy row, no token of
-	// its own, so hearthd dials it with the shared control-plane token.
+	// its own, so feluccad dials it with the shared control-plane token.
 	if err := srv.db.PutNodeCred(&store.NodeCred{
 		Host: nodeCredKey(first.OverlayIP, agentPort), Legacy: true, CreatedAt: 1,
 	}); err != nil {
@@ -550,7 +550,7 @@ func TestRejoinOfAGrandfatheredNodeProvesWithTheSharedToken(t *testing.T) {
 	var again joinResponse
 	json.Unmarshal(w2.Body.Bytes(), &again)
 	if !strings.HasPrefix(again.AgentToken, nodeTokenPrefix) {
-		t.Errorf("rollout re-join agent_token: %q, want a fresh hearth_nt_ secret", again.AgentToken)
+		t.Errorf("rollout re-join agent_token: %q, want a fresh felucca_nt_ secret", again.AgentToken)
 	}
 }
 
@@ -656,7 +656,7 @@ func bogusAPIKey(i int) string {
 }
 
 // The bearer gate reaches LookupKeyByHash for any request whose bearer merely
-// begins with "hearth_sk_" — no credential, no throttle, nothing. store/sqlite
+// begins with "felucca_sk_" — no credential, no throttle, nothing. store/sqlite
 // caps the pool at ONE connection, so without a bound an unauthenticated client
 // opening N concurrent connections puts N queries in front of every other user
 // of that connection: the snapshot write behind each create/sleep/delete, the
@@ -665,11 +665,11 @@ func bogusAPIKey(i int) string {
 //
 // It must NOT be a refusal, though: whether the presented key is good is exactly
 // what the pending lookup is about, so shedding here would be refusing a
-// credential hearthd has not read yet — the lockout the previous round removed.
+// credential feluccad has not read yet — the lockout the previous round removed.
 // So the bound is a queue, and the assertions are both halves of that.
 func TestUnauthenticatedGuessingCannotMonopolizeTheCredentialStore(t *testing.T) {
 	tmp := t.TempDir()
-	sqlite, err := store.OpenSQLite(filepath.Join(tmp, "hearth.db"))
+	sqlite, err := store.OpenSQLite(filepath.Join(tmp, "felucca.db"))
 	if err != nil {
 		t.Fatalf("open test store: %v", err)
 	}
@@ -679,7 +679,7 @@ func TestUnauthenticatedGuessingCannotMonopolizeTheCredentialStore(t *testing.T)
 		Token:     "admin-tok",
 		UIDir:     tmp,
 		StatePath: filepath.Join(tmp, "state.json"),
-		DBPath:    filepath.Join(tmp, "hearth.db"),
+		DBPath:    filepath.Join(tmp, "felucca.db"),
 	}
 	srv := New(cfg, state.New(), blocking)
 	h := srv.Handler()
@@ -726,7 +726,7 @@ func TestUnauthenticatedGuessingCannotMonopolizeTheCredentialStore(t *testing.T)
 	_, peak := blocking.stats()
 
 	// The admin path never touches the store, so the control plane answers
-	// throughout — the flood cannot make hearthd unreachable to its operator.
+	// throughout — the flood cannot make feluccad unreachable to its operator.
 	if w := doRequest(h, "GET", "/api/v1/nodes", "", adminAuth); w.Code != 200 {
 		t.Errorf("admin request during the flood: got %d, want 200", w.Code)
 	}
@@ -748,7 +748,7 @@ func TestUnauthenticatedGuessingCannotMonopolizeTheCredentialStore(t *testing.T)
 }
 
 // The shape check is a filter, not a defence: it must reject what was never
-// issuable and accept everything hearthd ever minted.
+// issuable and accept everything feluccad ever minted.
 func TestAPIKeyShapeFilter(t *testing.T) {
 	real := apiKeyPrefix + newSecret(24)
 	if !validAPIKeyShape(real) {
@@ -771,7 +771,7 @@ func TestAPIKeyShapeFilter(t *testing.T) {
 // X-Forwarded-For is attacker-sized and parsed on the auth path. Splitting it
 // whole allocated one element per comma before anything was inspected, so a
 // header full of commas turned into a huge slice per request; and a chain longer
-// than any real topology is not something hearthd can attribute a client to
+// than any real topology is not something feluccad can attribute a client to
 // anyway. Both cases end at the peer.
 func TestForwardedHeaderParsingIsBounded(t *testing.T) {
 	srv := newJoinTestServer(t)
@@ -819,16 +819,16 @@ func mustCIDRs(t *testing.T, cidrs ...string) []*net.IPNet {
 	return out
 }
 
-// ---- Per-node hearthd→agent credentials ----
+// ---- Per-node feluccad→agent credentials ----
 //
 // The control-plane admin token used to be the credential on every outbound
 // call to a worker, and a node address is caller-supplied: registering
-// "203.0.113.9:9090" made hearthd deliver `Authorization: Bearer <admin
+// "203.0.113.9:9090" made feluccad deliver `Authorization: Bearer <admin
 // token>` there. These tests pin the replacement — each node gets its own
 // token at enrollment, and an address nobody enrolled gets none.
 
 // authRecorder is an httptest worker that records the Authorization header of
-// every call hearthd makes to it.
+// every call feluccad makes to it.
 type authRecorder struct {
 	mu    sync.Mutex
 	auths []string
@@ -865,7 +865,7 @@ func (a *authRecorder) waitForCall(t *testing.T) []string {
 }
 
 // The audit's payload: POST /api/v1/agents/register naming an address the
-// caller chose, which hearthd then dials (PUT /v1/pools). It must not arrive
+// caller chose, which feluccad then dials (PUT /v1/pools). It must not arrive
 // carrying the control-plane admin token.
 func TestRegisterNeverDeliversTheAdminTokenToANode(t *testing.T) {
 	srv := newJoinServerWgIP(t, "") // the shipped default: overlay off
@@ -876,7 +876,7 @@ func TestRegisterNeverDeliversTheAdminTokenToANode(t *testing.T) {
 	// Seed the address into the working set so the register passes
 	// knownNodeAddr — an httptest listener is loopback on a random port, which
 	// validNodeAddr refuses outright. This is the *friendlier* case for the
-	// attacker: the address is already one hearthd dials, and it still gets no
+	// attacker: the address is already one feluccad dials, and it still gets no
 	// admin token.
 	srv.st.RegisterNode("worker-1", ts.URL, 4, 8192, 1000)
 
@@ -887,7 +887,7 @@ func TestRegisterNeverDeliversTheAdminTokenToANode(t *testing.T) {
 
 	for _, auth := range rec.waitForCall(t) {
 		if strings.Contains(auth, "admin-tok") {
-			t.Fatalf("hearthd delivered the admin API token to a node address: %q", auth)
+			t.Fatalf("feluccad delivered the admin API token to a node address: %q", auth)
 		}
 		if auth != "" {
 			t.Errorf("unenrolled node got a credential: %q, want none", auth)
@@ -940,13 +940,13 @@ func TestNodeJoinMintsPerNodeAgentToken(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("join body: %v", err)
 	}
-	if !strings.HasPrefix(resp.AgentToken, "hearth_nt_") {
-		t.Fatalf("agent_token: %q, want a hearth_nt_ secret", resp.AgentToken)
+	if !strings.HasPrefix(resp.AgentToken, "felucca_nt_") {
+		t.Fatalf("agent_token: %q, want a felucca_nt_ secret", resp.AgentToken)
 	}
 	if resp.AgentToken == "admin-tok" {
 		t.Fatal("join handed out the admin token as the node credential")
 	}
-	// It is the credential hearthd will present to that overlay address.
+	// It is the credential feluccad will present to that overlay address.
 	if got := srv.agentTokenForHost(resp.OverlayIP); got != resp.AgentToken {
 		t.Errorf("credential for %s: %q, want the minted token", resp.OverlayIP, got)
 	}
@@ -988,8 +988,8 @@ func TestRegisterWithJoinTokenMintsPerNodeCredential(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("register body: %v", err)
 	}
-	if !strings.HasPrefix(resp.AgentToken, "hearth_nt_") || resp.AgentToken == "admin-tok" {
-		t.Fatalf("agent_token: %q, want a hearth_nt_ secret", resp.AgentToken)
+	if !strings.HasPrefix(resp.AgentToken, "felucca_nt_") || resp.AgentToken == "admin-tok" {
+		t.Fatalf("agent_token: %q, want a felucca_nt_ secret", resp.AgentToken)
 	}
 	if got := srv.agentTokenForHost("203.0.113.9"); got != resp.AgentToken {
 		t.Errorf("credential for the enrolled node: %q, want the minted token", got)
@@ -1002,7 +1002,7 @@ func TestRegisterWithJoinTokenMintsPerNodeCredential(t *testing.T) {
 
 	// A later plain registration of the same address never re-reveals the
 	// secret: one worker must not be able to read another's credential out of
-	// hearthd just by knowing its address.
+	// feluccad just by knowing its address.
 	plain := `{"hostname":"w1","addr":"203.0.113.9:9090","cpus":1,"mem_total_mib":512}`
 	w3 := doRequest(h, "POST", "/api/v1/agents/register", plain, "Bearer admin-tok")
 	if w3.Code != 200 {
@@ -1021,7 +1021,7 @@ func TestRegisterWithJoinTokenMintsPerNodeCredential(t *testing.T) {
 // with no credential.
 func TestRegisterRejectsBadJoinToken(t *testing.T) {
 	srv := newJoinServerWgIP(t, "")
-	for _, jt := range []string{"hearth_jt_unknown", "not-a-join-token"} {
+	for _, jt := range []string{"felucca_jt_unknown", "not-a-join-token"} {
 		body := `{"hostname":"w1","addr":"203.0.113.9:9090","cpus":1,"mem_total_mib":512,"join_token":"` + jt + `"}`
 		if w := doRequest(srv.Handler(), "POST", "/api/v1/agents/register", body, "Bearer admin-tok"); w.Code != 401 {
 			t.Errorf("register with %q: got %d %s, want 401", jt, w.Code, w.Body)
@@ -1057,7 +1057,7 @@ func registerBody(hostname, addr string) string {
 }
 
 // M3 is only finished end to end when a worker stops needing the FLEET ADMIN
-// token to talk to hearthd. Until then every worker holds the key to every other
+// token to talk to feluccad. Until then every worker holds the key to every other
 // worker, and "a harvested credential is worth one worker" is a claim about one
 // direction of the connection only.
 func TestNodeCredentialAuthenticatesTheAgentRoutes(t *testing.T) {
@@ -1135,7 +1135,7 @@ func TestNodeCredentialCannotActForAnotherNode(t *testing.T) {
 		}
 	}
 
-	// A: advertising B's address would make hearthd dial B's sandboxes here.
+	// A: advertising B's address would make feluccad dial B's sandboxes here.
 	if w := doRequest(h, "POST", "/api/v1/agents/register", registerBody("w1", addrB), "Bearer "+tokA); w.Code != 403 {
 		t.Errorf("node registering another node's address: got %d %s, want 403", w.Code, w.Body)
 	}
@@ -1181,7 +1181,7 @@ func TestNodeCredentialCannotActForAnotherNode(t *testing.T) {
 	}
 }
 
-// A rotation has to retire the previous secret in BOTH directions: hearthd stops
+// A rotation has to retire the previous secret in BOTH directions: feluccad stops
 // presenting it, and it stops authenticating its node.
 func TestRotatedNodeTokenStopsAuthenticating(t *testing.T) {
 	srv := newJoinTestServer(t)
@@ -1218,20 +1218,20 @@ func TestNodeCredentialsAreKeyedOnHostAndPort(t *testing.T) {
 	srv := newJoinServerWgIP(t, "")
 	now := time.Now().Unix()
 
-	if err := srv.putNodeCred("203.0.113.9", 9090, "hearth_nt_first", now); err != nil {
+	if err := srv.putNodeCred("203.0.113.9", 9090, "felucca_nt_first", now); err != nil {
 		t.Fatalf("put first: %v", err)
 	}
-	if err := srv.putNodeCred("203.0.113.9", 9191, "hearth_nt_second", now); err != nil {
+	if err := srv.putNodeCred("203.0.113.9", 9191, "felucca_nt_second", now); err != nil {
 		t.Fatalf("put second: %v", err)
 	}
-	if got := srv.agentTokenFor("203.0.113.9", 9090); got != "hearth_nt_first" {
+	if got := srv.agentTokenFor("203.0.113.9", 9090); got != "felucca_nt_first" {
 		t.Errorf("credential for :9090: %q", got)
 	}
-	if got := srv.agentTokenFor("203.0.113.9", 9191); got != "hearth_nt_second" {
+	if got := srv.agentTokenFor("203.0.113.9", 9191); got != "felucca_nt_second" {
 		t.Errorf("credential for :9191: %q, want the second agent's own", got)
 	}
 	// And inbound: each token resolves to its own endpoint, never the other's.
-	if key, ok := srv.nodeIdx.lookup("hearth_nt_second"); !ok || key != "203.0.113.9:9191" {
+	if key, ok := srv.nodeIdx.lookup("felucca_nt_second"); !ok || key != "203.0.113.9:9191" {
 		t.Errorf("inbound lookup of the second agent's token: %q ok=%v", key, ok)
 	}
 }
@@ -1242,14 +1242,14 @@ func TestNodeCredentialsAreKeyedOnHostAndPort(t *testing.T) {
 func TestBareHostCredentialRowIsMigratedOnce(t *testing.T) {
 	srv := newJoinServerWgIP(t, "")
 
-	if err := srv.db.PutNodeCred(&store.NodeCred{Host: "203.0.113.9", Token: "hearth_nt_old", CreatedAt: 7}); err != nil {
+	if err := srv.db.PutNodeCred(&store.NodeCred{Host: "203.0.113.9", Token: "felucca_nt_old", CreatedAt: 7}); err != nil {
 		t.Fatalf("seed bare-host row: %v", err)
 	}
-	if got := srv.agentTokenFor("203.0.113.9", agentPort); got != "hearth_nt_old" {
+	if got := srv.agentTokenFor("203.0.113.9", agentPort); got != "felucca_nt_old" {
 		t.Fatalf("credential from the pre-port row: %q, want it honoured", got)
 	}
 	c, err := srv.db.GetNodeCred("203.0.113.9:9090")
-	if err != nil || c == nil || c.Token != "hearth_nt_old" {
+	if err != nil || c == nil || c.Token != "felucca_nt_old" {
 		t.Fatalf("row was not rewritten under the host:port key: %+v err=%v", c, err)
 	}
 	if old, err := srv.db.GetNodeCred("203.0.113.9"); err != nil || old != nil {
@@ -1260,7 +1260,7 @@ func TestBareHostCredentialRowIsMigratedOnce(t *testing.T) {
 		t.Errorf("second agent on the same host resolved %q, want no credential", got)
 	}
 	// And the migrated credential authenticates its node inbound.
-	if key, ok := srv.nodeIdx.lookup("hearth_nt_old"); !ok || key != "203.0.113.9:9090" {
+	if key, ok := srv.nodeIdx.lookup("felucca_nt_old"); !ok || key != "203.0.113.9:9090" {
 		t.Errorf("migrated credential inbound: %q ok=%v", key, ok)
 	}
 }
@@ -1270,9 +1270,9 @@ func TestBareHostCredentialRowIsMigratedOnce(t *testing.T) {
 // token, and nothing else is.
 func TestLegacyFleetIsGrandfatheredOnceOnly(t *testing.T) {
 	tmp := t.TempDir()
-	dbPath := filepath.Join(tmp, "hearth.db")
+	dbPath := filepath.Join(tmp, "felucca.db")
 
-	// Pre-upgrade hearthd: a worker enrolled, snapshot persisted, process
+	// Pre-upgrade feluccad: a worker enrolled, snapshot persisted, process
 	// exits. No per-node credentials existed.
 	db1, err := store.OpenSQLite(dbPath)
 	if err != nil {
@@ -1367,7 +1367,7 @@ func newJoinServerStore(t *testing.T, db store.Store, tmp string) *Server {
 		Token:       "admin-tok",
 		UIDir:       tmp,
 		StatePath:   filepath.Join(tmp, "state.json"),
-		DBPath:      filepath.Join(tmp, "hearth.db"),
+		DBPath:      filepath.Join(tmp, "felucca.db"),
 		WgIP:        "10.100.0.1/24",
 		WgEndpoint:  "1.2.3.4:51820",
 		WgKeepalive: 25,
@@ -1378,7 +1378,7 @@ func newJoinServerStore(t *testing.T, db store.Store, tmp string) *Server {
 	return srv
 }
 
-// The re-join possession check asks "what does hearthd currently hand this
+// The re-join possession check asks "what does feluccad currently hand this
 // node" and refuses a re-join that cannot present it. The resolver behind that
 // question returns an empty string for THREE different things, and only one of
 // them — "the store was read and this node has no credential yet" — means there
@@ -1389,7 +1389,7 @@ func newJoinServerStore(t *testing.T, db store.Store, tmp string) *Server {
 // evicted worker is not.
 func TestRejoinFailsClosedWhenTheCredentialStoreCannotBeRead(t *testing.T) {
 	tmp := t.TempDir()
-	sqlite, err := store.OpenSQLite(filepath.Join(tmp, "hearth.db"))
+	sqlite, err := store.OpenSQLite(filepath.Join(tmp, "felucca.db"))
 	if err != nil {
 		t.Fatalf("open test store: %v", err)
 	}
@@ -1529,7 +1529,7 @@ func (p *panicStore) CheckJoinToken(hash string, now int64) (bool, error) {
 // a much worse one.
 func TestPanickingCredentialLookupDoesNotStrandItsGateSlot(t *testing.T) {
 	tmp := t.TempDir()
-	sqlite, err := store.OpenSQLite(filepath.Join(tmp, "hearth.db"))
+	sqlite, err := store.OpenSQLite(filepath.Join(tmp, "felucca.db"))
 	if err != nil {
 		t.Fatalf("open test store: %v", err)
 	}
@@ -1578,7 +1578,7 @@ func TestPanickingCredentialLookupDoesNotStrandItsGateSlot(t *testing.T) {
 
 	ps.armJoin(maxCredLookups)
 	for i := 0; i < maxCredLookups; i++ {
-		if !panicked(func() { joinWith(srv, "hearth_jt_"+strings.Repeat("a", 48), validPubKeyA, "w1") }) {
+		if !panicked(func() { joinWith(srv, "felucca_jt_"+strings.Repeat("a", 48), validPubKeyA, "w1") }) {
 			t.Fatalf("join-token lookup %d never reached the panicking store: the test is not exercising the path it claims to", i)
 		}
 	}
@@ -1759,7 +1759,7 @@ func TestAgentRegisterBoundsTheHostname(t *testing.T) {
 // released without defer is lost when the code in between panics; the GLOBAL
 // STATE LOCK released without defer is worse, because everything needs it.
 //
-// net/http recovers a handler panic and keeps the process alive, so hearthd goes
+// net/http recovers a handler panic and keeps the process alive, so feluccad goes
 // on answering its listener and passing a TCP health check while srv.st is held
 // forever: no create, no exec, no delete, no sweep, no /metrics. A silent total
 // control-plane outage from one panic in one request.
@@ -1773,7 +1773,7 @@ func TestAgentRegisterBoundsTheHostname(t *testing.T) {
 // This is the behavioural half — it shows what such a region actually costs.
 func TestAPanicUnderTheStateLockDoesNotDeadlockTheControlPlane(t *testing.T) {
 	tmp := t.TempDir()
-	sqlite, err := store.OpenSQLite(filepath.Join(tmp, "hearth.db"))
+	sqlite, err := store.OpenSQLite(filepath.Join(tmp, "felucca.db"))
 	if err != nil {
 		t.Fatalf("open test store: %v", err)
 	}

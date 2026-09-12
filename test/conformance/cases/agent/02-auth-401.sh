@@ -7,8 +7,8 @@
 #
 # Read AND write methods are covered: the gate is per-handler in the agent, so
 # a route that forgot the check would be invisible to a GET-only probe.
-if [ "${HEARTH_INSECURE_NO_AUTH:-0}" = "1" ]; then
-  skip "HEARTH_INSECURE_NO_AUTH=1; suite is running without a credential"
+if [ "${FELUCCA_INSECURE_NO_AUTH:-0}" = "1" ]; then
+  skip "FELUCCA_INSECURE_NO_AUTH=1; suite is running without a credential"
 else
   ag GET /v1/vms "" none
   assert_unauthorized "GET /v1/vms without token"

@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alpham/infra-saas/hearth/internal/config"
-	"github.com/alpham/infra-saas/hearth/internal/model"
-	"github.com/alpham/infra-saas/hearth/internal/state"
-	"github.com/alpham/infra-saas/hearth/internal/store"
+	"github.com/alpham/infra-saas/felucca/internal/config"
+	"github.com/alpham/infra-saas/felucca/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/state"
+	"github.com/alpham/infra-saas/felucca/internal/store"
 )
 
 // execAgent fakes the worker exec API: it records the forwarded body and,
@@ -78,7 +78,7 @@ func newExecStreamTestServer(t *testing.T, fa *execAgent, sbState model.SandboxS
 		Token:     "admin-tok",
 		UIDir:     tmp,
 		StatePath: filepath.Join(tmp, "state.json"),
-		DBPath:    filepath.Join(tmp, "hearth.db"),
+		DBPath:    filepath.Join(tmp, "felucca.db"),
 	}
 	db, err := store.OpenSQLite(cfg.DBPath)
 	if err != nil {
@@ -164,7 +164,7 @@ func TestExecStreamHappyPath(t *testing.T) {
 }
 
 func TestExecStreamInterrupted(t *testing.T) {
-	// Agent stream ends after one frame, no terminal done frame: hearthd
+	// Agent stream ends after one frame, no terminal done frame: feluccad
 	// must append the synthetic interruption event.
 	fa := &execAgent{frames: []string{`{"stream":"stdout","data":"partial\n"}`}}
 	srv, id := newExecStreamTestServer(t, fa, model.StateRunning)

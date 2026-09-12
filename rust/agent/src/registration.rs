@@ -12,14 +12,14 @@ use tracing::{error, info, warn};
 /// Shared node id set after successful registration.
 pub type NodeId = Arc<RwLock<String>>;
 
-/// This node's own hearthd credential (`hearth_nt_...`), empty until hearthd
+/// This node's own feluccad credential (`felucca_nt_...`), empty until feluccad
 /// issues one. Shared with the HTTP server: the agent presents it OUTBOUND on
-/// the agent routes and accepts it INBOUND from hearthd, so a rotation at
+/// the agent routes and accepts it INBOUND from feluccad, so a rotation at
 /// re-enrollment takes effect in both directions without a restart.
 pub type NodeToken = Arc<RwLock<String>>;
 
-/// The credential to present on hearthd's agent routes: this node's own token
-/// once hearthd has issued one, else the configured shared token.
+/// The credential to present on feluccad's agent routes: this node's own token
+/// once feluccad has issued one, else the configured shared token.
 ///
 /// The fallback is what makes this a rollout rather than a flag day — an agent
 /// that never joined, or a deployment older than per-node credentials, keeps
@@ -33,7 +33,7 @@ pub(crate) fn outbound_token(node_token: &NodeToken, shared: &str) -> String {
     if cur.is_empty() { shared.to_string() } else { cur.clone() }
 }
 
-/// Take up a per-node credential hearthd just issued: validate it, persist it
+/// Take up a per-node credential feluccad just issued: validate it, persist it
 /// 0600, and start using it for both directions.
 ///
 /// `Err` on an unusable credential (never adopted, never written) and on a
@@ -54,11 +54,11 @@ pub fn adopt_node_token(
     // A node token gets no exemption from the startup guards (C1/H5): refuse
     // it outright rather than trade a working credential for an unusable one.
     validate_token(issued)
-        .map_err(|e| format!("hearthd issued an unusable node token: {}", e))?;
+        .map_err(|e| format!("feluccad issued an unusable node token: {}", e))?;
 
     let persisted = save_node_token(data_dir, issued);
 
-    // Adopt in memory even when the write failed: hearthd has already switched
+    // Adopt in memory even when the write failed: feluccad has already switched
     // to this credential, so refusing it would 401 every control-plane call to
     // this node until an operator re-enrolls. The restart is the lossy part,
     // which is what the error tells the operator.
@@ -94,11 +94,11 @@ pub async fn heartbeat_loop(
     loop {
         match heartbeat_once(&mgr, &control_plane, &token, &node_id, &node_token).await {
             Ok(()) => {}
-            // hearthd has no record of our id. Retrying it forever would leave
+            // feluccad has no record of our id. Retrying it forever would leave
             // this worker invisible to the fleet with no way back, so drop the
             // stale id and enroll again — the same path taken at startup.
             Err(HeartbeatError::Unregistered) => {
-                warn!("hearthd has no record of this node — re-registering");
+                warn!("feluccad has no record of this node — re-registering");
                 {
                     let mut n = node_id.write().unwrap_or_else(|e| e.into_inner());
                     n.clear();
@@ -115,7 +115,7 @@ pub async fn heartbeat_loop(
     }
 }
 
-/// Register, retrying every 5s until hearthd accepts. `what` names the attempt
+/// Register, retrying every 5s until feluccad accepts. `what` names the attempt
 /// in the log so a re-enrollment is distinguishable from the startup one.
 #[allow(clippy::too_many_arguments)]
 async fn register_with_retry(
@@ -142,7 +142,7 @@ async fn register_with_retry(
 }
 
 /// Why a heartbeat failed. `Unregistered` is separated from every other failure
-/// because it is the one the agent can repair itself: hearthd 404s a node id it
+/// because it is the one the agent can repair itself: feluccad 404s a node id it
 /// holds no record of — reclaimed after a partition longer than the stale-node
 /// TTL, or lost when the control plane came back on an older snapshot.
 enum HeartbeatError {
@@ -153,7 +153,7 @@ enum HeartbeatError {
 impl std::fmt::Display for HeartbeatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HeartbeatError::Unregistered => f.write_str("hearthd has no record of this node"),
+            HeartbeatError::Unregistered => f.write_str("feluccad has no record of this node"),
             HeartbeatError::Failed(e) => f.write_str(e),
         }
     }
@@ -191,15 +191,15 @@ async fn register_once(
         return Err(format!("register rejected: {}", resp.status));
     }
 
-    // hearthd returns `agent_token` when this registration enrolled the node
+    // feluccad returns `agent_token` when this registration enrolled the node
     // (it carried a join token), and mints a fresh one every time — so this is
-    // also the rotation path. Additive: an older hearthd omits the field and
+    // also the rotation path. Additive: an older feluccad omits the field and
     // the agent stays on whatever credential it already had.
     if let Some(issued) = extract_json_str(&resp.body, "agent_token") {
         if !issued.trim().is_empty() {
             if let Err(e) = adopt_node_token(data_dir, node_token, &issued) {
                 // Not fatal to the registration: the node IS registered, and
-                // the credential it keeps using still works until hearthd
+                // the credential it keeps using still works until feluccad
                 // rotates. Loud enough to finish the rollout by hand.
                 error!(err = %e, "node credential from register");
             }
@@ -208,10 +208,10 @@ async fn register_once(
 
     // Parse {"id":"..."} from the response. The register response is the
     // frozen pre-P4 shape on purpose: warm-pool specs have exactly ONE
-    // delivery channel (PUT /v1/pools — hearthd pushes to a node right
+    // delivery channel (PUT /v1/pools — feluccad pushes to a node right
     // after it registers), so empty-list teardown semantics stay
     // unambiguous and this tolerant substring parse keeps working against
-    // any hearthd vintage.
+    // any feluccad vintage.
     let id = extract_json_str(&resp.body, "id")
         .ok_or("no id in register response")?;
     {
@@ -240,7 +240,7 @@ async fn heartbeat_once(
     let mem_free = read_mem_available_mib();
     let vm_count = mgr.live_count().await;
     let pool_size = mgr.pool_count().await;
-    // So hearthd can stop scheduling onto a worker whose guest-network fences
+    // So feluccad can stop scheduling onto a worker whose guest-network fences
     // are down: every sandbox placed there would share one flat network, and
     // nothing on the tenant's side would show it.
     let isolation_ok = mgr.isolation_ok();
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn test_heartbeat_404_drives_a_reregister() {
-        // hearthd reclaimed or lost this node's record. Heartbeating the dead
+        // feluccad reclaimed or lost this node's record. Heartbeating the dead
         // id forever would leave the worker invisible with no way back, so this
         // is the one status the agent repairs itself.
         assert!(matches!(
@@ -481,12 +481,12 @@ mod tests {
 
     // ---- per-node credential ----
 
-    const NT: &str = "hearth_nt_9f2c1b8a7d4e6f0312a5b9c8d7e6f504";
+    const NT: &str = "felucca_nt_9f2c1b8a7d4e6f0312a5b9c8d7e6f504";
     const SHARED: &str = "9f2c1b8a7d4e6f0312a5b9c8d7e6f504132435465768798a";
 
     fn scratch(name: &str) -> String {
         let d = std::env::temp_dir().join(format!(
-            "hearth-reg-{}-{}-{:?}",
+            "felucca-reg-{}-{}-{:?}",
             name,
             std::process::id(),
             std::thread::current().id()
@@ -499,13 +499,13 @@ mod tests {
     fn test_register_response_carries_the_node_credential() {
         // Was: the agent parsed only "id" and threw the credential away, so it
         // kept presenting the fleet admin token on the agent routes.
-        let body = r#"{"id":"node-1","agent_token":"hearth_nt_abc123"}"#;
+        let body = r#"{"id":"node-1","agent_token":"felucca_nt_abc123"}"#;
         assert_eq!(extract_json_str(body, "id").as_deref(), Some("node-1"));
         assert_eq!(
             extract_json_str(body, "agent_token").as_deref(),
-            Some("hearth_nt_abc123")
+            Some("felucca_nt_abc123")
         );
-        // An older hearthd omits the field: no credential, no error.
+        // An older feluccad omits the field: no credential, no error.
         assert!(extract_json_str(r#"{"id":"node-1"}"#, "agent_token").is_none());
     }
 
@@ -546,7 +546,7 @@ mod tests {
     fn test_adopt_rotates_to_a_freshly_issued_credential() {
         let dir = scratch("rotate");
         let nt: NodeToken = Arc::new(RwLock::new(String::new()));
-        adopt_node_token(&dir, &nt, "hearth_nt_1111111111111111111111").expect("first");
+        adopt_node_token(&dir, &nt, "felucca_nt_1111111111111111111111").expect("first");
         adopt_node_token(&dir, &nt, NT).expect("rotation");
         assert_eq!(outbound_token(&nt, SHARED), NT);
         assert_eq!(
@@ -557,7 +557,7 @@ mod tests {
         assert!(!crate::config::authorized_either(
             SHARED,
             &nt.read().unwrap(),
-            Some("Bearer hearth_nt_1111111111111111111111")
+            Some("Bearer felucca_nt_1111111111111111111111")
         ));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -568,7 +568,7 @@ mod tests {
         let dir = scratch("guards");
         let nt: NodeToken = Arc::new(RwLock::new(String::new()));
         adopt_node_token(&dir, &nt, NT).expect("adopt");
-        for bad in ["", "short", "hearth-lab-token", "REPLACE_WITH_SAME_TOKEN_AS_HEARTHD"] {
+        for bad in ["", "short", "felucca-lab-token", "REPLACE_WITH_SAME_TOKEN_AS_FELUCCAD"] {
             assert!(adopt_node_token(&dir, &nt, bad).is_err(), "adopted {:?}", bad);
         }
         assert_eq!(outbound_token(&nt, SHARED), NT);

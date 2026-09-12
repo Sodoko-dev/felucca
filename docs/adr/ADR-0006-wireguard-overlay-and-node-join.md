@@ -5,7 +5,7 @@
   amendment below)
 - Date: 2026-06-12
 - Context: third phase (P2, "deploy anywhere") of the v4 plan. Workers must
-  join a hearthd that is not on their L2 segment — across clouds and behind
+  join a feluccad that is not on their L2 segment — across clouds and behind
   NAT — without hand-distributing credentials or VPN config. Related:
   ADR-0002 (no Kubernetes; flat process model), ADR-0005 (isolation stays
   node-scoped until the overlay extends it), `docs/PLAN-v4.md` Phase 2.
@@ -15,17 +15,17 @@
 
 ## Decision
 
-1. **Hub-and-spoke WireGuard, hearthd is the hub.** hearthd owns interface
-   `wg-hearth` (`--wg-ip`, e.g. `10.100.0.1/24`; `--wg-endpoint` is its
+1. **Hub-and-spoke WireGuard, feluccad is the hub.** feluccad owns interface
+   `wg-felucca` (`--wg-ip`, e.g. `10.100.0.1/24`; `--wg-endpoint` is its
    public `host:port`). Each joined worker is one peer with a /32 inside the
    overlay network, allocated by the hub (`wg.AllocateOverlayIP`: lowest free
    host, skipping network/broadcast/server/taken — pure function, kept
-   deliberately store-non-transactional for the single-hearthd model,
+   deliberately store-non-transactional for the single-feluccad model,
    serialized by `joinMu`). Spokes talk to the hub only; the control plane's
-   node↔hearthd traffic is exactly hub↔spoke, so spoke↔spoke routing is not
+   node↔feluccad traffic is exactly hub↔spoke, so spoke↔spoke routing is not
    needed yet (see Deferred).
 2. **One-time join tokens, consumed last.** `POST /api/v1/join-tokens`
-   (admin-only) mints `hearth_jt_<secret>`; only the sha256 is stored
+   (admin-only) mints `felucca_jt_<secret>`; only the sha256 is stored
    (`hashSecret`, the single credential-hashing site), TTL 24h
    (`store.JoinTokenTTL`). `POST /api/v1/nodes/join` authenticates by the
    join token itself (routed before the bearer gate), validates the body
@@ -35,7 +35,7 @@
    kernel (`srv.addPeer`) → **only then** `ConsumeJoinToken`. Any failure
    before the last step leaves the token usable — a half-failed join never
    strands an operator with a burned token.
-3. **The agent enrolls once, then the file is the identity.** `hearth-agent
+3. **The agent enrolls once, then the file is the identity.** `felucca-agent
    --join <url> --join-token <tok>` generates a keypair only if none exists
    (`ensure_key` creates on NotFound only — never rotates silently), calls
    the join API (30s timeout), and persists the grant to
@@ -56,7 +56,7 @@
    tokens exist in plaintext only in the mint response and the enrolling
    agent's memory.
 5. **TLS terminates beside the join, not inside the overlay.** With
-   `--tls-domain`, hearthd adds an autocert listener on :443 (+ :80 for
+   `--tls-domain`, feluccad adds an autocert listener on :443 (+ :80 for
    HTTP-01); the plain `--port` listener stays unconditionally because
    overlay agents speak plain HTTP *inside* the tunnel (WireGuard is the
    transport security). First enrollment against an http:// hub is TOFU
@@ -67,22 +67,22 @@
    `seccomp(2)`) and `/dev/net/tun` in `DeviceAllow`; the agent's capability
    bounding set drops `CAP_DAC_OVERRIDE`, which is why wrong-owner state
    files are loud fatals rather than silent fallbacks (Decision 3);
-   `modules-load.d/hearth.conf` preloads `br_netfilter` + `wireguard`
+   `modules-load.d/felucca.conf` preloads `br_netfilter` + `wireguard`
    because `ProtectKernelModules=true` forbids the services loading them
    (load-bearing for ADR-0005's isolation).
 
 ## Amendment — 2026-08-29 (v4 security hardening): enrollment mints a per-node agent credential
 
-The join exchange gained one job. Until the hardening pass, hearthd presented
+The join exchange gained one job. Until the hardening pass, feluccad presented
 the **cluster admin token** on every proxy call to a worker. A node's `addr` is
 caller-supplied (`POST /api/v1/agents/register`), so every outbound dial was a
-decision about where to deliver that secret, and "talk hearthd into dialing a
+decision about where to deliver that secret, and "talk feluccad into dialing a
 host I control" was equivalent to "hand me the admin key" — one harvested token
 being remote root on the entire fleet.
 
-- Enrollment now mints `hearth_nt_<secret>` (its own prefix, so it is
-  distinguishable at a glance from an admin token, a tenant key `hearth_sk_`,
-  and a join token `hearth_jt_`), stores it keyed on the node's **`host:port`**,
+- Enrollment now mints `felucca_nt_<secret>` (its own prefix, so it is
+  distinguishable at a glance from an admin token, a tenant key `felucca_sk_`,
+  and a join token `felucca_jt_`), stores it keyed on the node's **`host:port`**,
   and returns it **once** in an additive `agent_token` field. Both enrollment
   paths do it: `POST /api/v1/nodes/join` (Decision 2 above) and
   `POST /api/v1/agents/register` when it carries a `join_token`.
@@ -95,7 +95,7 @@ being remote root on the entire fleet.
 - Ordering follows Decision 2's consume-last rule exactly: the credential is
   persisted **before** `ConsumeJoinToken`, so a store failure leaves the token
   usable and the operator un-stranded.
-- hearthd then presents that credential, and only that credential, when dialing
+- feluccad then presents that credential, and only that credential, when dialing
   the node (`Server.agentTokenForHost`). An address with **no** credential row
   gets no bearer at all — which is the case a forged registration lands in.
 - Re-join rotates it, and that is the deliberate recovery path for a worker that
@@ -132,7 +132,7 @@ being remote root on the entire fleet.
   its credential is a **fresh WireGuard key**: that is a first join, needs no
   proof, and costs an attacker the one thing they cannot forge.
 
-> **Two limits worth stating.** `hearth-agent` does not send `node_token` (its
+> **Two limits worth stating.** `felucca-agent` does not send `node_token` (its
 > join body is `pubkey` + `hostname` only), so re-enrolling an overlay worker
 > means removing both `wg.json` and `wg.key` and joining fresh. And workers
 > still need the shared token configured: template image pulls
@@ -166,10 +166,10 @@ being remote root on the entire fleet.
 - Mixed fleets are first-class: the lab runs one direct worker and one
   overlay worker simultaneously; `verify-v2` maps overlay IPs to nodes.
 - The hub is a single point of failure for *new* tunnels and control-plane
-  traffic; existing data-plane sandboxes keep running if hearthd dies
+  traffic; existing data-plane sandboxes keep running if feluccad dies
   (unchanged from pre-overlay).
 - Overlay state lives in two places by design — hub DB (`wg_peers`) and the
-  kernel — reconciled at hearthd startup by a batch `AddPeers` re-add
+  kernel — reconciled at feluccad startup by a batch `AddPeers` re-add
   (warn-don't-die).
 - Tenant isolation (ADR-0005) remains node-scoped; the overlay moves
   control traffic, not tenant networks.
@@ -177,13 +177,13 @@ being remote root on the entire fleet.
 ## Deferred (recorded during P2 review loops)
 
 - **Store-transactional overlay IP allocation** — needed only for HA/multi-
-  hearthd (ADR-0002's Postgres path); today `joinMu` is sufficient.
+  feluccad (ADR-0002's Postgres path); today `joinMu` is sufficient.
 - **Hub `ip_forward` for spoke↔spoke** — P3, when a gateway is not beside
-  hearthd.
+  feluccad.
 - **Go wg package client-side shape** — P3 may want the hub to also dial
   agents; the package is hub-only today.
-- **Same-host hub+worker collision** — both want `wg-hearth`; an agent
-  beside hearthd on one host would clobber the hub's interface. Documented
+- **Same-host hub+worker collision** — both want `wg-felucca`; an agent
+  beside feluccad on one host would clobber the hub's interface. Documented
   constraint, not auto-detected.
 - **TOFU bootstrap** — first join over plain http trusts the network once;
   use the https join (P2.3) wherever a domain exists. P2.6 verifies the

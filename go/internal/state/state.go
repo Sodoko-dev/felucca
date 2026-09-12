@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/alpham/infra-saas/hearth/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/model"
 )
 
 // State is the central in-memory store. All exported methods are safe for
@@ -109,7 +109,7 @@ func (s *State) findNodeByHostname(hostname string) *model.Node {
 // scanned linearly under this mutex by FindNode/PickNode/the registration
 // checks, and a full SaveSnapshot rewrites all of them on every state change —
 // so the list must not be able to grow without bound. The cap is far above the
-// ADR-0002 single-hearthd scale point, so it is a backstop and not a scheduling
+// ADR-0002 single-feluccad scale point, so it is a backstop and not a scheduling
 // limit; the caller-supplied admission check (see RegisterNodeGuarded) is what
 // actually closes the growth path.
 const MaxNodes = 1024
@@ -123,12 +123,12 @@ const MaxNodes = 1024
 // (rust/agent/src/registration.rs) retries register every 5s and never reaches
 // its heartbeat loop. So the ceiling needs a way down, and reclaiming a
 // LEGITIMATE node's record would be worse than the growth: it drops the address
-// hearthd dials that worker's VMs at.
+// feluccad dials that worker's VMs at.
 //
 // Seven days is therefore deliberately enormous. An agent heartbeats every 5s
 // and a node is "down" after 15s of silence (model.Node.NodeStatus), so this is
 // ~120,000 consecutive missed heartbeats: a reboot, a long maintenance window, a
-// network partition, or a hearthd restart from a slightly stale snapshot all sit
+// network partition, or a feluccad restart from a slightly stale snapshot all sit
 // many orders of magnitude below it. Nothing that is coming back is reclaimed.
 const StaleNodeTTL = 7 * 24 * 3600
 
@@ -225,7 +225,7 @@ func (s *State) RegisterNodeGuarded(hostname, addr string, cpus uint32, memTotal
 //
 //   - silent for at least StaleNodeTTL. See that constant: it is ~120,000 missed
 //     heartbeats, so a node that is merely rebooting is nowhere near it.
-//   - no sandbox references the record. A node id is how hearthd finds the
+//   - no sandbox references the record. A node id is how feluccad finds the
 //     address to reach a sandbox's microVM; dropping a record that still owns
 //     workloads would strand them exactly the way an orphaned VM is stranded.
 //     This is also what makes the eviction cheap to be wrong about — a reclaimed
@@ -448,7 +448,7 @@ func (s *State) Persist(path string) error {
 	}
 
 	// 0600, not 0644: this file is the whole fleet inventory — every node's
-	// address, every sandbox id and the tenant each belongs to. hearthd is the
+	// address, every sandbox id and the tenant each belongs to. feluccad is the
 	// only reader and it runs as root, so nothing needs the group/other bits,
 	// and the sibling persistence paths (store/sqlite.go's DB, wg.go's private
 	// keys) are already 0600. The mode is on the temp file because the rename

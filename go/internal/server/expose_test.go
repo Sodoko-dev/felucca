@@ -13,11 +13,11 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/alpham/infra-saas/hearth/internal/agentclient"
-	"github.com/alpham/infra-saas/hearth/internal/config"
-	"github.com/alpham/infra-saas/hearth/internal/model"
-	"github.com/alpham/infra-saas/hearth/internal/state"
-	"github.com/alpham/infra-saas/hearth/internal/store"
+	"github.com/alpham/infra-saas/felucca/internal/agentclient"
+	"github.com/alpham/infra-saas/felucca/internal/config"
+	"github.com/alpham/infra-saas/felucca/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/state"
+	"github.com/alpham/infra-saas/felucca/internal/store"
 )
 
 // fakeAgent stubs the worker's expose API: allocates sequential node ports
@@ -67,7 +67,7 @@ func newExposeTestServer(t *testing.T) (*Server, *fakeAgent, string) {
 		Token:         "admin-tok",
 		UIDir:         tmp,
 		StatePath:     filepath.Join(tmp, "state.json"),
-		DBPath:        filepath.Join(tmp, "hearth.db"),
+		DBPath:        filepath.Join(tmp, "felucca.db"),
 		IngressDomain: "sb.lab.test",
 	}
 	db, err := store.OpenSQLite(cfg.DBPath)
@@ -478,7 +478,7 @@ func newForkTestServer(t *testing.T) (*Server, *forkAgent, string) {
 		Token:     "admin-tok",
 		UIDir:     tmp,
 		StatePath: filepath.Join(tmp, "state.json"),
-		DBPath:    filepath.Join(tmp, "hearth.db"),
+		DBPath:    filepath.Join(tmp, "felucca.db"),
 	}
 	db, err := store.OpenSQLite(cfg.DBPath)
 	if err != nil {

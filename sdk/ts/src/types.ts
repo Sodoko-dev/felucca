@@ -1,4 +1,4 @@
-// Wire types for the hearthd REST API (docs/API-V2.md + conformance goldens).
+// Wire types for the feluccad REST API (docs/API-V2.md + conformance goldens).
 // Field names mirror the wire exactly (snake_case) — no renaming.
 
 /** Sandbox lifecycle states (API-V2 §1). */
@@ -16,7 +16,7 @@ export type SandboxState =
  * `hostname` and `url` are present in expose responses
  * (POST /api/v1/sandboxes/{id}/expose); the `exposes` array embedded in
  * sandbox JSON carries only `name`/`guest_port`/`node_port`. `url` is only
- * rendered when hearthd is configured with an `ingress_domain`.
+ * rendered when feluccad is configured with an `ingress_domain`.
  */
 export interface Expose {
   name: string;
@@ -28,7 +28,7 @@ export interface Expose {
 
 /**
  * Sandbox JSON as returned by every sandbox endpoint
- * (conformance golden hearthd/sandbox-create).
+ * (conformance golden feluccad/sandbox-create).
  */
 export interface Sandbox {
   id: string;
@@ -43,7 +43,7 @@ export interface Sandbox {
   /** Unix seconds. */
   created_at: number;
   parent_id: string | null;
-  /** Omitted by hearthd when empty (frozen pre-P3 wire shape). */
+  /** Omitted by feluccad when empty (frozen pre-P3 wire shape). */
   exposes?: Expose[];
   /** Omitted when false. */
   allow_dynamic_ports?: boolean;
@@ -115,7 +115,7 @@ export interface ExecRequest {
   timeout_ms?: number;
 }
 
-/** Buffered exec result (conformance golden hearthd/exec). */
+/** Buffered exec result (conformance golden feluccad/exec). */
 export interface ExecResult {
   ok: boolean;
   exit_code: number;

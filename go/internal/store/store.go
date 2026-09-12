@@ -1,10 +1,10 @@
-// Package store is the durable storage layer for hearthd. The control plane
+// Package store is the durable storage layer for feluccad. The control plane
 // keeps its working set in memory (internal/state) and writes through to a
 // Store; tenants, API keys, and usage events live only here.
 package store
 
 import (
-	"github.com/alpham/infra-saas/hearth/internal/state"
+	"github.com/alpham/infra-saas/felucca/internal/state"
 )
 
 // Tenant is an isolation + quota boundary. Zero quota values mean unlimited.
@@ -55,7 +55,7 @@ type JoinToken struct {
 	NodeHint  string `json:"node_hint"` // optional operator label, e.g. "hetzner-1"
 }
 
-// NodeCred is the credential hearthd presents when it dials ONE worker agent.
+// NodeCred is the credential feluccad presents when it dials ONE worker agent.
 //
 // It is the only credential that leaves the control plane outbound, and it is
 // deliberately NOT the admin API token: an agent address is attacker-supplied
@@ -69,7 +69,7 @@ type JoinToken struct {
 // nodes with two credentials. Rows written before that — keyed on the bare host —
 // are still readable and are migrated to the wider key on first use.
 //
-// Unlike APIKey/JoinToken this stores the secret itself, not a hash: hearthd is
+// Unlike APIKey/JoinToken this stores the secret itself, not a hash: feluccad is
 // the CLIENT here and has to be able to present it. A Legacy row carries no
 // token and means "this address was enrolled before per-node credentials
 // existed — keep using the shared token until it re-enrolls".
@@ -90,7 +90,7 @@ type WgPeer struct {
 
 // Template is a reusable sandbox recipe (v4 P4): a rootfs image plus the
 // default shape sandboxes created from it get. Image is an image name — the
-// file images/<image>.ext4 in hearthd's images dir. Captured templates have
+// file images/<image>.ext4 in feluccad's images dir. Captured templates have
 // Image == Name; registered ones may reference a pre-provisioned image like
 // "ubuntu-base". PoolSize is the per-node warm-pool target for this template
 // (0 = no warm pool).
@@ -128,7 +128,7 @@ type UsageEvent struct {
 	TS        int64
 }
 
-// Store is hearthd's durable storage boundary. SaveSnapshot/LoadInto move the
+// Store is feluccad's durable storage boundary. SaveSnapshot/LoadInto move the
 // whole in-memory working set (sandboxes, nodes, counters) in one transaction —
 // the same granularity the JSON file had, just transactional. Entity methods
 // are row-level.
@@ -169,9 +169,9 @@ type Store interface {
 	// it was valid, unused, and unexpired (single conditional UPDATE).
 	ConsumeJoinToken(hash string, now int64) (bool, error)
 
-	// Node credentials (the per-node hearthd→agent bearer token).
+	// Node credentials (the per-node feluccad→agent bearer token).
 	// GetNodeCred returns nil, nil when the host has none — which means
-	// hearthd has no credential to offer that address and must dial it
+	// feluccad has no credential to offer that address and must dial it
 	// without one.
 	GetNodeCred(host string) (*NodeCred, error)
 	// PutNodeCred upserts by host. A re-enrollment ROTATES the node's
@@ -185,7 +185,7 @@ type Store interface {
 	// same host resolving to the first one's credential, which is the whole
 	// point of widening the key.
 	DeleteNodeCred(host string) (bool, error)
-	// ListNodeCreds returns every credential row. hearthd loads them once at
+	// ListNodeCreds returns every credential row. feluccad loads them once at
 	// startup to build the in-memory token→node index that authenticates
 	// INBOUND agent calls, so a heartbeat never costs a database read.
 	ListNodeCreds() ([]*NodeCred, error)
@@ -194,7 +194,7 @@ type Store interface {
 	// (0 on every later call). Callers pass the hosts of the nodes the store
 	// loaded at startup — the fleet as of the previous shutdown.
 	//
-	// The once-only bound is the security property: hearthd offers the shared
+	// The once-only bound is the security property: feluccad offers the shared
 	// admin token only to a host with a Legacy row, so if "no credential yet"
 	// could mint one, registering any address would still hand the
 	// control-plane key to it.

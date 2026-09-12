@@ -36,19 +36,19 @@ JSON
 
 # The default docker0 bridge ignores default-network-opts (its options are
 # fixed at daemon bootstrap) and needs the raw table this kernel lacks —
-# pre-create a "hearth" network with the working gateway mode. It persists
+# pre-create a "felucca" network with the working gateway mode. It persists
 # in /var/lib/docker, so every sandbox built from this template has it:
-#   docker run --network hearth ...
+#   docker run --network felucca ...
 # Compose project networks pick the mode up from default-network-opts.
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemctl start docker
   # Idempotent: re-provisioning over a derived image keeps the network.
-  docker network inspect hearth >/dev/null 2>&1 || \
-    docker network create -o com.docker.network.bridge.gateway_mode_ipv4=nat-unprotected hearth
+  docker network inspect felucca >/dev/null 2>&1 || \
+    docker network create -o com.docker.network.bridge.gateway_mode_ipv4=nat-unprotected felucca
   systemctl stop docker docker.socket 2>/dev/null || true
 fi
 # (Non-systemd guests: the rc.local fallback starts dockerd at boot but the
-# "hearth" network must be created on first use — this builder flow only
+# "felucca" network must be created on first use — this builder flow only
 # pre-bakes it where dockerd can be cleanly started and stopped.)
 
 # Start at boot whichever init the guest runs.

@@ -1,5 +1,5 @@
 // Sandbox ingress (v4 P3): named multi-service expose API and the route
-// table the gateway (cmd/hearth-gw) consumes. Each expose maps the hostname
+// table the gateway (cmd/felucca-gw) consumes. Each expose maps the hostname
 // label "<name>--<sandbox-id>" to a worker node port that the agent DNATs to
 // the guest service. Design: ADR-0007.
 package server
@@ -11,8 +11,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/alpham/infra-saas/hearth/internal/agentclient"
-	"github.com/alpham/infra-saas/hearth/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/agentclient"
+	"github.com/alpham/infra-saas/felucca/internal/model"
 )
 
 // Every accepted expose burns one port from the worker's fleet-wide
@@ -400,7 +400,7 @@ func (srv *Server) unexposeSandbox(w http.ResponseWriter, r *http.Request, id, n
 	w.WriteHeader(204)
 }
 
-// routeView is one gateway routing entry: everything hearth-gw needs to take
+// routeView is one gateway routing entry: everything felucca-gw needs to take
 // a Host header to a worker backend and render state-aware errors.
 type routeView struct {
 	Hostname          string `json:"hostname"`

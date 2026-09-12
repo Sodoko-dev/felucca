@@ -1,7 +1,7 @@
 {
-  "name": "@hearth/sdk",
+  "name": "@felucca/sdk",
   "version": "0.1.0",
-  "description": "Typed TypeScript client for the Hearth control plane (hearthd) REST API. Zero runtime dependencies; uses global fetch (Node >= 18 / browsers).",
+  "description": "Typed TypeScript client for the Felucca control plane (feluccad) REST API. Zero runtime dependencies; uses global fetch (Node >= 18 / browsers).",
   "type": "module",
   "main": "dist/client.js",
   "types": "dist/client.d.ts",

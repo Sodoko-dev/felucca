@@ -18,11 +18,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alpham/infra-saas/hearth/internal/agentclient"
-	"github.com/alpham/infra-saas/hearth/internal/config"
-	"github.com/alpham/infra-saas/hearth/internal/model"
-	"github.com/alpham/infra-saas/hearth/internal/state"
-	"github.com/alpham/infra-saas/hearth/internal/store"
+	"github.com/alpham/infra-saas/felucca/internal/agentclient"
+	"github.com/alpham/infra-saas/felucca/internal/config"
+	"github.com/alpham/infra-saas/felucca/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/state"
+	"github.com/alpham/infra-saas/felucca/internal/store"
 )
 
 // ---- Pure helpers ----
@@ -97,7 +97,7 @@ type lcAgent struct {
 	mu    sync.Mutex
 	calls []string
 	// auths records the Authorization header of every call, in order — the
-	// sweep is a hearthd→agent dial and what it presents is a security
+	// sweep is a feluccad→agent dial and what it presents is a security
 	// property (see TestSweepNeverSendsTheAdminTokenToANode).
 	auths []string
 	// failDeletes makes every VM delete answer 500, standing in for the whole
@@ -190,7 +190,7 @@ func newLifecycleTestServer(t *testing.T, fa *lcAgent) (*Server, string) {
 		Token:     "admin-tok",
 		UIDir:     tmp,
 		StatePath: filepath.Join(tmp, "state.json"),
-		DBPath:    filepath.Join(tmp, "hearth.db"),
+		DBPath:    filepath.Join(tmp, "felucca.db"),
 	}
 	db, err := store.OpenSQLite(cfg.DBPath)
 	if err != nil {
@@ -359,7 +359,7 @@ func TestSweepAutoDelete(t *testing.T) {
 // An auto-delete that ignores the agent's answer and drops the record anyway
 // ORPHANS the microVM: it keeps running on the worker with its vCPUs, its
 // memory and its nft DNAT rules, it is unbillable, and no control-plane path can
-// reach it again — nobody will even go looking, because as far as hearthd is
+// reach it again — nobody will even go looking, because as far as feluccad is
 // concerned the sandbox is gone. The sweep runs this every 15 seconds against
 // every expired sleeper, so any agent-call failure was enough.
 //
@@ -780,7 +780,7 @@ func nodeHostOf(t *testing.T, srv *Server) (string, uint16) {
 	return nodeHostKey(host), port
 }
 
-// M3: the sweep is a hearthd→agent dial like any other and must present the
+// M3: the sweep is a feluccad→agent dial like any other and must present the
 // credential minted for THAT node. Both sweep call sites used to hand over
 // srv.cfg.Token — the control-plane admin key, which is remote root on every
 // worker. A tenant may set idle_sleep_s to the 5s minimum, PickNode schedules
@@ -793,8 +793,8 @@ func TestSweepNeverSendsTheAdminTokenToANode(t *testing.T) {
 	srv, id := newLifecycleTestServer(t, fa) // cfg.Token is "admin-tok"
 	now := time.Now().Unix()
 
-	// Enroll the node the way a join does: its own hearthd→agent bearer.
-	const nodeTok = "hearth_nt_lifecycle"
+	// Enroll the node the way a join does: its own feluccad→agent bearer.
+	const nodeTok = "felucca_nt_lifecycle"
 	host, port := nodeHostOf(t, srv)
 	if err := srv.putNodeCred(host, port, nodeTok, now); err != nil {
 		t.Fatalf("put node cred: %v", err)

@@ -59,7 +59,7 @@ this via an alternate `mem_backend` type in its snapshot load API.
 
 ### The API hook
 
-Today Hearth sends (`fc.rs:204–233`):
+Today Felucca sends (`fc.rs:204–233`):
 
 ```json
 {
@@ -138,7 +138,7 @@ faulted in. The remaining 3.8 GB stay on disk and are never read.
 
 ---
 
-## 3. Design sketch for Hearth
+## 3. Design sketch for Felucca
 
 ### Handler topology
 
@@ -247,7 +247,7 @@ may be terminated and the parent is free to sleep or be deleted again.
 | `mem.bin` mutation guard | High | Parent sleep/snapshot must be refused while handler is live; needs atomic reference count check in agent |
 | Parent DELETE race | High | Same reference-count guard; must be enforced under the inner lock |
 | Fork-of-fork chains | Medium | A child that sleeps gets its own `mem.bin`; if it is then forked, it would need its own handler referencing its own file. Two-level chains work structurally but increase handler count. Forbid for the prototype. |
-| Balloon device deflation | Medium | If the guest has a virtio-balloon device that has deflated pages, those page offsets may not be present in `mem.bin`. The handler would serve stale data. Hearth's guests do not currently use balloon devices; verify before enabling on custom templates. |
+| Balloon device deflation | Medium | If the guest has a virtio-balloon device that has deflated pages, those page offsets may not be present in `mem.bin`. The handler would serve stale data. Felucca's guests do not currently use balloon devices; verify before enabling on custom templates. |
 | NUMA effects | Low | Pages served by the handler are allocated on the handler's NUMA node; on NUMA hosts this adds remote-memory latency on every first fault. Non-issue in the current flat-memory lab. |
 | Overcommit exhaustion | Medium | Operator must understand that N uffd children of a 4 GB parent can consume up to N × 4 GB RAM in the worst case. Need an overcommit limit or monitoring metric. |
 | bench.sh does not yet exist | Blocking | Cannot claim improvement without a before number. |
@@ -267,7 +267,7 @@ and to be sub-perceptual for the Sodoko "branch this Odoo" UX.
   (simplest correctness model: parent's `mem.bin` is stable because parent
   is sleeping; no snapshot-overwrite race).
 - Gated behind `--enable-uffd-fork` agent config flag, default false.
-- No changes to the hearthd control-plane API — the fork endpoint is unchanged.
+- No changes to the feluccad control-plane API — the fork endpoint is unchanged.
 
 **Deliverables in order:**
 

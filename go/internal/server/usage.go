@@ -11,8 +11,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/alpham/infra-saas/hearth/internal/model"
-	"github.com/alpham/infra-saas/hearth/internal/store"
+	"github.com/alpham/infra-saas/felucca/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/store"
 )
 
 // usageTotals is the wire shape of the usage endpoint.

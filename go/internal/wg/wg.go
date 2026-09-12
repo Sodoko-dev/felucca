@@ -1,4 +1,4 @@
-// Package wg manages hearthd's WireGuard host interface (wg-hearth):
+// Package wg manages feluccad's WireGuard host interface (wg-felucca):
 // key generation, idempotent interface bring-up, peer registration, and
 // overlay IP allocation for the join endpoint.
 //
@@ -20,8 +20,8 @@ import (
 	"strings"
 )
 
-// InterfaceName is the WireGuard interface managed by hearthd.
-const InterfaceName = "wg-hearth"
+// InterfaceName is the WireGuard interface managed by feluccad.
+const InterfaceName = "wg-felucca"
 
 // run executes argv, trying unprivileged first, then `sudo -n` fallback.
 // stdout/stderr are discarded. Returns true if exit code 0.
@@ -77,7 +77,7 @@ func EnsureKey(path string) (string, error) {
 	}
 	// Generate ONLY when the file genuinely doesn't exist. Any other read
 	// error (permissions, I/O) must surface: silently regenerating would
-	// rotate hearthd's wg identity and strand every enrolled worker.
+	// rotate feluccad's wg identity and strand every enrolled worker.
 	if !errors.Is(err, fs.ErrNotExist) {
 		return "", fmt.Errorf("read key file %s: %w", path, err)
 	}
@@ -99,7 +99,7 @@ func EnsureKey(path string) (string, error) {
 	return pubkeyFromPriv(priv)
 }
 
-// EnsureInterface idempotently brings up wg-hearth: create the link (ignore
+// EnsureInterface idempotently brings up wg-felucca: create the link (ignore
 // "exists"), set listen port + private key, assign ipCIDR (ignore "exists"),
 // and bring the link up. Only the final link-up must succeed.
 func EnsureInterface(ipCIDR string, listenPort uint16, keyPath string) error {
@@ -143,7 +143,7 @@ func validIPv4(s string) bool {
 	return ip != nil && ip.To4() != nil
 }
 
-// AddPeer registers a peer on wg-hearth with allowed-ips <overlayIP>/32.
+// AddPeer registers a peer on wg-felucca with allowed-ips <overlayIP>/32.
 // Inputs are validated before any command runs (defense-in-depth: both
 // values arrive over the join API).
 func AddPeer(pubKey, overlayIP string) error {
@@ -189,7 +189,7 @@ func AddPeers(peers []Peer) error {
 }
 
 // AllocateOverlayIP returns the lowest free host address in serverCIDR
-// (hearthd's own overlay address, e.g. "10.100.0.1/16") that is not the
+// (feluccad's own overlay address, e.g. "10.100.0.1/16") that is not the
 // network address, the broadcast address, the server's own IP, or in taken.
 // Pure function: no shell. Errors when the CIDR is invalid (or not IPv4)
 // or the subnet is exhausted.

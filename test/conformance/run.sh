@@ -1,34 +1,34 @@
 #!/usr/bin/env bash
-# Hearth conformance suite — the executable form of docs/API-V2.md.
-# Implementation-agnostic: point it at any hearthd / hearth-agent (Zig, Go,
+# Felucca conformance suite — the executable form of docs/API-V2.md.
+# Implementation-agnostic: point it at any feluccad / felucca-agent (Zig, Go,
 # Rust) over plain HTTP. Run from inside any lab VM or any host with curl+jq.
 #
-#   HEARTH_API=http://127.0.0.1:8080 \
-#   HEARTH_TOKEN="$(cat ~/.config/hearth/lab-token)" \
+#   FELUCCA_API=http://127.0.0.1:8080 \
+#   FELUCCA_TOKEN="$(cat ~/.config/felucca/lab-token)" \
 #   AGENT_API=http://192.168.104.1:9090 SUITE=all \
 #   bash test/conformance/run.sh
 #
 # The token is REQUIRED and must be the one the target was started with: both
 # binaries refuse to start on an empty, placeholder, or short token, so there
 # is no unauthenticated target to fall back to (API-V2 §6). With no
-# HEARTH_TOKEN the suite reads $HEARTH_TOKEN_FILE (default
-# ~/.config/hearth/lab-token) and aborts if that is empty too. The one
-# tokenless path is HEARTH_INSECURE_NO_AUTH=1, against a hearthd started with
+# FELUCCA_TOKEN the suite reads $FELUCCA_TOKEN_FILE (default
+# ~/.config/felucca/lab-token) and aborts if that is empty too. The one
+# tokenless path is FELUCCA_INSECURE_NO_AUTH=1, against a feluccad started with
 # --insecure-no-auth: it skips the credential cases, and the tenant-scoping
 # cases will fail there because open mode has no tenants to scope. Only a
 # token-authenticated target can pass the whole contract.
 #
-# SUITE=hearthd|agent|all (default all). RECORD=1 re-records goldens instead
+# SUITE=feluccad|agent|all (default all). RECORD=1 re-records goldens instead
 # of comparing (use record.sh). Optional for local-only cases:
-#   CANDIDATE_HEARTHD=/path/to/binary  (case 15, state adoption)
+#   CANDIDATE_FELUCCAD=/path/to/binary  (case 15, state adoption)
 #   AGENT_DATA_DIR=/srv/ignis          (agent case 09, meta.json shape)
 set -u
 
 CONF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$CONF_DIR/lib.sh"
 
-HEARTH_API="${HEARTH_API:-http://127.0.0.1:8080}"
-HEARTH_TOKEN="${HEARTH_TOKEN:-}"
+FELUCCA_API="${FELUCCA_API:-http://127.0.0.1:8080}"
+FELUCCA_TOKEN="${FELUCCA_TOKEN:-}"
 AGENT_API="${AGENT_API:-}"
 SUITE="${SUITE:-all}"
 
@@ -70,8 +70,8 @@ run_suite() {
   done
 }
 
-if [ "$SUITE" = "hearthd" ] || [ "$SUITE" = "all" ]; then
-  run_suite hearthd
+if [ "$SUITE" = "feluccad" ] || [ "$SUITE" = "all" ]; then
+  run_suite feluccad
 fi
 if [ "$SUITE" = "agent" ] || [ "$SUITE" = "all" ]; then
   if [ -n "$AGENT_API" ]; then

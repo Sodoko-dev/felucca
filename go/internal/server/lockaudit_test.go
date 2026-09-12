@@ -4,7 +4,7 @@
 // without a deferred release is a slot that never comes back if the code between
 // acquire and release panics. The global state lock is the same shape and a much
 // worse outcome. net/http recovers a handler panic and keeps the process alive,
-// so a panic inside a bare Lock()/Unlock() region does not crash hearthd — it
+// so a panic inside a bare Lock()/Unlock() region does not crash feluccad — it
 // leaves srv.st locked forever. Every subsequent request blocks on it: no
 // creates, no execs, no deletes, no /metrics, no sweep. A total, silent control
 // plane outage from a process that still answers its listener and still passes a

@@ -1,0 +1,123 @@
+{
+  "__comment": "Felucca fleet dashboard (v4 P6). Import into Grafana >=10 with a Prometheus datasource scraping feluccad's open /metrics. The 'Tenants' row needs a SECOND scrape job against the authenticated admin surface GET /api/v1/metrics/tenants (Authorization: Bearer <admin token> via the scrape config's authorization block) — see deploy/grafana/README.md.",
+  "title": "Felucca — fleet",
+  "uid": "felucca-fleet",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "timezone": "browser",
+  "refresh": "15s",
+  "time": { "from": "now-3h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Prometheus"
+      }
+    ]
+  },
+  "panels": [
+    { "type": "row", "title": "Fleet", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 } },
+    {
+      "type": "stat",
+      "title": "Nodes ready",
+      "datasource": { "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 1 },
+      "targets": [{ "expr": "felucca_nodes_ready", "legendFormat": "ready" }],
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "Sandboxes by state",
+      "datasource": { "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 10, "x": 4, "y": 1 },
+      "targets": [{ "expr": "felucca_sandboxes_total", "legendFormat": "{{state}}" }],
+      "fieldConfig": { "defaults": { "custom": { "fillOpacity": 12, "stacking": { "mode": "normal" } } }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "Warm-pool depth per node",
+      "datasource": { "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 1 },
+      "targets": [{ "expr": "felucca_pool_size", "legendFormat": "{{node}}" }]
+    },
+    { "type": "row", "title": "Latency (histograms, ms)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 } },
+    {
+      "type": "timeseries",
+      "title": "Wake latency p50 / p95",
+      "datasource": { "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 10 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(felucca_wake_duration_ms_bucket[5m])) by (le))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum(rate(felucca_wake_duration_ms_bucket[5m])) by (le))", "legendFormat": "p95" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "Exec latency p50 / p95 (buffered, feluccad wall-clock)",
+      "datasource": { "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 10 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(felucca_exec_duration_ms_bucket[5m])) by (le))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum(rate(felucca_exec_duration_ms_bucket[5m])) by (le))", "legendFormat": "p95" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] }
+    },
+    {
+      "type": "timeseries",
+      "title": "Create latency p50 / p95 (to 201; cold boots + pool claims mixed)",
+      "datasource": { "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 10 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(felucca_create_duration_ms_bucket[5m])) by (le))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum(rate(felucca_create_duration_ms_bucket[5m])) by (le))", "legendFormat": "p95" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] }
+    },
+    { "type": "row", "title": "Throughput", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 } },
+    {
+      "type": "timeseries",
+      "title": "API requests / execs / forks / wakes (rate, 5m)",
+      "datasource": { "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 19 },
+      "targets": [
+        { "expr": "rate(felucca_api_requests_total[5m])", "legendFormat": "api req/s" },
+        { "expr": "rate(felucca_execs_total[5m])", "legendFormat": "exec/s" },
+        { "expr": "rate(felucca_forks_total[5m])", "legendFormat": "fork/s" },
+        { "expr": "rate(felucca_wake_total[5m])", "legendFormat": "wake/s" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Mean wake latency (legacy sum/total counters)",
+      "datasource": { "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 19 },
+      "targets": [
+        { "expr": "rate(felucca_wake_ms_sum[15m]) / rate(felucca_wake_total[15m])", "legendFormat": "mean wake ms (15m)" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] }
+    },
+    { "type": "row", "title": "Tenants (admin-scraped job: /api/v1/metrics/tenants)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 } },
+    {
+      "type": "timeseries",
+      "title": "Sandboxes per tenant",
+      "datasource": { "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "targets": [{ "expr": "felucca_tenant_sandboxes", "legendFormat": "{{tenant}}" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Allocated vCPU / mem (GiB) / disk (GB) per tenant",
+      "datasource": { "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "targets": [
+        { "expr": "felucca_tenant_vcpus", "legendFormat": "{{tenant}} vcpu" },
+        { "expr": "felucca_tenant_mem_mib / 1024", "legendFormat": "{{tenant}} mem GiB" },
+        { "expr": "felucca_tenant_disk_gb", "legendFormat": "{{tenant}} disk GB" }
+      ]
+    }
+  ]
+}

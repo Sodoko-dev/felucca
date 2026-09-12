@@ -1,4 +1,4 @@
-// node:test suite against a tiny in-process http server faking hearthd.
+// node:test suite against a tiny in-process http server faking feluccad.
 // Run: node --test test/client.test.ts
 // (Node >= 23.6 runs .ts via type stripping; on 22.6+ add
 //  --experimental-strip-types.)
@@ -13,9 +13,9 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-import { HearthClient, HearthError } from "../src/client.ts";
+import { FeluccaClient, FeluccaError } from "../src/client.ts";
 
-const API_KEY = "hearth_sk_test";
+const API_KEY = "felucca_sk_test";
 
 type Handler = (
   req: IncomingMessage,
@@ -23,8 +23,8 @@ type Handler = (
   body: string,
 ) => void;
 
-/** Start a one-test fake hearthd; returns its base URL and a closer. */
-function fakeHearthd(
+/** Start a one-test fake feluccad; returns its base URL and a closer. */
+function fakeFeluccad(
   handler: Handler,
 ): Promise<{ baseUrl: string; close: () => Promise<void> }> {
   return new Promise((resolve) => {
@@ -70,7 +70,7 @@ const SANDBOX = {
 
 test("createSandbox: POST /api/v1/sandboxes with bearer auth -> Sandbox", async () => {
   let seen: { method?: string; url?: string; auth?: string; body?: string } = {};
-  const { baseUrl, close } = await fakeHearthd((req, res, body) => {
+  const { baseUrl, close } = await fakeFeluccad((req, res, body) => {
     seen = {
       method: req.method,
       url: req.url,
@@ -80,7 +80,7 @@ test("createSandbox: POST /api/v1/sandboxes with bearer auth -> Sandbox", async 
     json(res, 201, SANDBOX);
   });
   try {
-    const c = new HearthClient({ baseUrl, apiKey: API_KEY });
+    const c = new FeluccaClient({ baseUrl, apiKey: API_KEY });
     const sb = await c.createSandbox({ name: "demo", vcpus: 1, mem_mib: 256 });
     assert.equal(seen.method, "POST");
     assert.equal(seen.url, "/api/v1/sandboxes");
@@ -101,7 +101,7 @@ test("createSandbox: POST /api/v1/sandboxes with bearer auth -> Sandbox", async 
 
 test("exec (buffered): POST .../exec -> ExecResult", async () => {
   let url = "";
-  const { baseUrl, close } = await fakeHearthd((req, res, body) => {
+  const { baseUrl, close } = await fakeFeluccad((req, res, body) => {
     url = req.url ?? "";
     assert.deepEqual(JSON.parse(body), {
       cmd: ["/bin/sh", "-c", "echo hi"],
@@ -116,7 +116,7 @@ test("exec (buffered): POST .../exec -> ExecResult", async () => {
     });
   });
   try {
-    const c = new HearthClient({ baseUrl, apiKey: API_KEY });
+    const c = new FeluccaClient({ baseUrl, apiKey: API_KEY });
     const out = await c.exec(SANDBOX.id, {
       cmd: ["/bin/sh", "-c", "echo hi"],
       timeout_ms: 5000,
@@ -135,7 +135,7 @@ test("exec (buffered): POST .../exec -> ExecResult", async () => {
 });
 
 test("execStream: multi-frame SSE, data split across chunks, done frame", async () => {
-  const { baseUrl, close } = await fakeHearthd((req, res) => {
+  const { baseUrl, close } = await fakeFeluccad((req, res) => {
     assert.equal(req.url, `/api/v1/sandboxes/${SANDBOX.id}/exec?stream=1`);
     res.writeHead(200, { "content-type": "text/event-stream" });
     // Frame 1 split across two writes mid-payload to exercise buffering.
@@ -152,7 +152,7 @@ test("execStream: multi-frame SSE, data split across chunks, done frame", async 
     }, 10);
   });
   try {
-    const c = new HearthClient({ baseUrl, apiKey: API_KEY });
+    const c = new FeluccaClient({ baseUrl, apiKey: API_KEY });
     let stdout = "";
     let stderr = "";
     const result = await c.execStream(
@@ -171,19 +171,19 @@ test("execStream: multi-frame SSE, data split across chunks, done frame", async 
   }
 });
 
-test("execStream: done.ok=false rejects with HearthError(200, error)", async () => {
-  const { baseUrl, close } = await fakeHearthd((_req, res) => {
+test("execStream: done.ok=false rejects with FeluccaError(200, error)", async () => {
+  const { baseUrl, close } = await fakeFeluccad((_req, res) => {
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.write('data: {"stream":"stdout","data":"partial"}\n\n');
     res.write('data: {"done":true,"ok":false,"error":"guest agent unavailable"}\n\n');
     res.end();
   });
   try {
-    const c = new HearthClient({ baseUrl, apiKey: API_KEY });
+    const c = new FeluccaClient({ baseUrl, apiKey: API_KEY });
     await assert.rejects(
       c.execStream(SANDBOX.id, { cmd: ["true"] }),
       (err: unknown) => {
-        assert.ok(err instanceof HearthError);
+        assert.ok(err instanceof FeluccaError);
         assert.equal(err.status, 200);
         assert.equal(err.body, "guest agent unavailable");
         return true;
@@ -195,13 +195,13 @@ test("execStream: done.ok=false rejects with HearthError(200, error)", async () 
 });
 
 test("execStream: stream ending without done frame rejects", async () => {
-  const { baseUrl, close } = await fakeHearthd((_req, res) => {
+  const { baseUrl, close } = await fakeFeluccad((_req, res) => {
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.write('data: {"stream":"stdout","data":"so far so good"}\n\n');
     res.end(); // interrupted: no done frame
   });
   try {
-    const c = new HearthClient({ baseUrl, apiKey: API_KEY });
+    const c = new FeluccaClient({ baseUrl, apiKey: API_KEY });
     let got = "";
     await assert.rejects(
       c.execStream(
@@ -210,7 +210,7 @@ test("execStream: stream ending without done frame rejects", async () => {
         { onStdout: (chunk) => (got += chunk) },
       ),
       (err: unknown) => {
-        assert.ok(err instanceof HearthError);
+        assert.ok(err instanceof FeluccaError);
         assert.equal(err.body, "stream ended without done frame");
         return true;
       },
@@ -221,14 +221,14 @@ test("execStream: stream ending without done frame rejects", async () => {
   }
 });
 
-test("404 maps to HearthError with status and body", async () => {
-  const { baseUrl, close } = await fakeHearthd((_req, res) => {
+test("404 maps to FeluccaError with status and body", async () => {
+  const { baseUrl, close } = await fakeFeluccad((_req, res) => {
     json(res, 404, { error: "not found" });
   });
   try {
-    const c = new HearthClient({ baseUrl, apiKey: API_KEY });
+    const c = new FeluccaClient({ baseUrl, apiKey: API_KEY });
     await assert.rejects(c.getSandbox("sb-nonexistent"), (err: unknown) => {
-      assert.ok(err instanceof HearthError);
+      assert.ok(err instanceof FeluccaError);
       assert.equal(err.status, 404);
       assert.equal(err.body, '{"error":"not found"}');
       return true;
@@ -240,7 +240,7 @@ test("404 maps to HearthError with status and body", async () => {
 
 test("deleteSandbox resolves void on 204; expose/unexpose round-trip", async () => {
   const calls: string[] = [];
-  const { baseUrl, close } = await fakeHearthd((req, res, body) => {
+  const { baseUrl, close } = await fakeFeluccad((req, res, body) => {
     calls.push(`${req.method} ${req.url}`);
     if (req.method === "POST" && req.url?.endsWith("/expose")) {
       assert.deepEqual(JSON.parse(body), { name: "web", port: 8069 });
@@ -257,7 +257,7 @@ test("deleteSandbox resolves void on 204; expose/unexpose round-trip", async () 
     res.end();
   });
   try {
-    const c = new HearthClient({ baseUrl, apiKey: API_KEY });
+    const c = new FeluccaClient({ baseUrl, apiKey: API_KEY });
     const exp = await c.expose(SANDBOX.id, { name: "web", port: 8069 });
     assert.equal(exp.hostname, `web--${SANDBOX.id}`);
     assert.equal(exp.node_port, 20001);
@@ -274,7 +274,7 @@ test("deleteSandbox resolves void on 204; expose/unexpose round-trip", async () 
 });
 
 test("listTemplates unwraps {templates:[...]}", async () => {
-  const { baseUrl, close } = await fakeHearthd((req, res) => {
+  const { baseUrl, close } = await fakeFeluccad((req, res) => {
     assert.equal(req.url, "/api/v1/templates");
     json(res, 200, {
       templates: [
@@ -294,7 +294,7 @@ test("listTemplates unwraps {templates:[...]}", async () => {
     });
   });
   try {
-    const c = new HearthClient({ baseUrl, apiKey: API_KEY });
+    const c = new FeluccaClient({ baseUrl, apiKey: API_KEY });
     const tpls = await c.listTemplates();
     assert.equal(tpls.length, 1);
     assert.equal(tpls[0]?.name, "odoo-18");
@@ -304,18 +304,18 @@ test("listTemplates unwraps {templates:[...]}", async () => {
   }
 });
 
-test("HearthError carries X-Hearth-Request-Id from error responses (v4 P6)", async () => {
-  const { baseUrl, close } = await fakeHearthd((_req, res) => {
+test("FeluccaError carries X-Felucca-Request-Id from error responses (v4 P6)", async () => {
+  const { baseUrl, close } = await fakeFeluccad((_req, res) => {
     res.writeHead(404, {
       "content-type": "application/json",
-      "x-hearth-request-id": "req-abc123",
+      "x-felucca-request-id": "req-abc123",
     });
     res.end(`{"error":"not found"}`);
   });
   try {
-    const c = new HearthClient({ baseUrl, apiKey: API_KEY });
+    const c = new FeluccaClient({ baseUrl, apiKey: API_KEY });
     await assert.rejects(c.getSandbox("sb-nope"), (err: unknown) => {
-      assert.ok(err instanceof HearthError);
+      assert.ok(err instanceof FeluccaError);
       assert.equal(err.status, 404);
       assert.equal(err.requestId, "req-abc123");
       assert.match(err.message, /request_id req-abc123/);
@@ -326,15 +326,15 @@ test("HearthError carries X-Hearth-Request-Id from error responses (v4 P6)", asy
   }
 });
 
-test("HearthError requestId is empty against pre-P6 servers", async () => {
-  const { baseUrl, close } = await fakeHearthd((_req, res) => {
+test("FeluccaError requestId is empty against pre-P6 servers", async () => {
+  const { baseUrl, close } = await fakeFeluccad((_req, res) => {
     res.writeHead(500, { "content-type": "application/json" });
     res.end(`{"error":"boom"}`);
   });
   try {
-    const c = new HearthClient({ baseUrl, apiKey: API_KEY });
+    const c = new FeluccaClient({ baseUrl, apiKey: API_KEY });
     await assert.rejects(c.getSandbox("sb-x"), (err: unknown) => {
-      assert.ok(err instanceof HearthError);
+      assert.ok(err instanceof FeluccaError);
       assert.equal(err.requestId, "");
       return true;
     });

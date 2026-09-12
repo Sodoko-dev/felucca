@@ -1,14 +1,14 @@
-# Hearth v3 — vsock exec + fork re-IP contract
+# Felucca v3 — vsock exec + fork re-IP contract
 
 Binding contract for the v3.1 work. Additive only: every API-V2.md behavior and
 every existing conformance golden stays valid. Three components integrate over
 this document: the guest agent (`rust/guest/`), the node agent (`rust/agent/`),
 and the control plane (`go/`).
 
-## 1. Guest agent (`hearth-guest`)
+## 1. Guest agent (`felucca-guest`)
 
-Static musl binary installed at `/usr/local/bin/hearth-guest` inside the base
-rootfs, started by a systemd unit (`hearth-guest.service`, multi-user.target).
+Static musl binary installed at `/usr/local/bin/felucca-guest` inside the base
+rootfs, started by a systemd unit (`felucca-guest.service`, multi-user.target).
 Listens on **vsock port 52** (AF_VSOCK, any CID).
 
 Protocol: one request per connection. Request = single JSON line (`\n`
@@ -36,7 +36,7 @@ non-empty array, timeout_ms default 30000, max 300000.
 
 Run on each worker (idempotent): loop-mounts `{data_dir}/images/ubuntu-base.ext4`
 read-write, installs the binary + systemd unit + enable symlink, then writes the
-marker file **`{data_dir}/images/.hearth-guest-v1`** on the worker. New VM rootfs
+marker file **`{data_dir}/images/.felucca-guest-v1`** on the worker. New VM rootfs
 copies inherit the agent. Existing VM copies (running/sleeping/pooled) do NOT —
 exec on them fails gracefully (below).
 
@@ -87,13 +87,13 @@ exec on them fails gracefully (below).
   agent 200 → 200 with the agent body verbatim;
   agent 501 → 501 `{"error":"guest agent unavailable"}`;
   other agent failures → 502 `{"error":"agent exec failed"}`.
-- Metric: `hearth_execs_total` counter (count attempts).
+- Metric: `felucca_execs_total` counter (count attempts).
 - No sandbox JSON shape changes. Fork responses are unchanged — the fix is that
   the child guest now actually USES the `ip` already reported.
 
 ## 5. Acceptance (end-to-end, lab)
 
-1. Fresh sandbox → `exec ["sh","-c","echo from-guest; id -u"]` through hearthd
+1. Fresh sandbox → `exec ["sh","-c","echo from-guest; id -u"]` through feluccad
    returns exit_code 0, stdout "from-guest\n0\n".
 2. exec on a pre-v3 sandbox → 501 through the whole chain.
 3. sleep → wake → exec still works (vsock survives snapshot/restore).

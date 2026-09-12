@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alpham/infra-saas/hearth/internal/model"
-	"github.com/alpham/infra-saas/hearth/internal/state"
+	"github.com/alpham/infra-saas/felucca/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/state"
 )
 
 // idRe matches the canonical ID format: prefix-<26 hex>. The random half is
@@ -496,7 +496,7 @@ func TestFullNodeTableReclaimsOnlyProvablyDeadRecords(t *testing.T) {
 			ids = append(ids, st.RegisterNode(fmt.Sprintf("h%d", i), "addr", 1, 1024, ancient))
 		}
 		// Every record is old enough, but each one still carries a workload:
-		// the node id is how hearthd finds the address to reach that VM.
+		// the node id is how feluccad finds the address to reach that VM.
 		st.Lock()
 		for _, id := range ids {
 			st.CreateSandbox("sb", "default", id, 1, 256, ancient)

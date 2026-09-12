@@ -15,18 +15,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/alpham/infra-saas/hearth/internal/store"
-	"github.com/alpham/infra-saas/hearth/internal/wg"
+	"github.com/alpham/infra-saas/felucca/internal/store"
+	"github.com/alpham/infra-saas/felucca/internal/wg"
 )
 
 // rejoinAuthorized decides whether a re-join — a join naming a pubkey that is
 // already enrolled — may rotate that node's credential.
 //
-// The proof is possession of the credential hearthd CURRENTLY hands that node:
-// its own hearth_nt_ token once it has one, or the shared token while it is
+// The proof is possession of the credential feluccad CURRENTLY hands that node:
+// its own felucca_nt_ token once it has one, or the shared token while it is
 // still grandfathered. One rule for both, resolved through the very function
 // that decides what goes on the wire (agentTokenFor), so "prove you are that
-// node" cannot drift from "this is what hearthd believes that node holds".
+// node" cannot drift from "this is what feluccad believes that node holds".
 //
 // An address with NO credential yet is authorized without proof, and that is not
 // a hole: there is nothing to take away, so this cannot be the availability
@@ -82,7 +82,7 @@ func (srv *Server) createJoinToken(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, []byte(`{"error":"node_hint too long (max 64)"}`))
 		return
 	}
-	secret := "hearth_jt_" + newSecret(24)
+	secret := "felucca_jt_" + newSecret(24)
 	jt := &store.JoinToken{
 		ID:        "jt-" + newSecret(4),
 		TokenHash: hashSecret(secret),
@@ -121,7 +121,7 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 	// Credential shape check before anything is revealed or parsed.
 	const prefix = "Bearer "
 	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, prefix) || !strings.HasPrefix(auth[len(prefix):], "hearth_jt_") {
+	if !strings.HasPrefix(auth, prefix) || !strings.HasPrefix(auth[len(prefix):], "felucca_jt_") {
 		srv.refuse(w, src, 401, `{"error":"unauthorized"}`)
 		return
 	}
@@ -135,7 +135,7 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		PubKey   string `json:"pubkey"`
 		Hostname string `json:"hostname"`
-		// NodeToken is the node's CURRENT hearth_nt_ credential, and it is
+		// NodeToken is the node's CURRENT felucca_nt_ credential, and it is
 		// required only to RE-join: an already-enrolled pubkey. See the
 		// possession check below.
 		NodeToken string `json:"node_token"`
@@ -165,7 +165,7 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 	prefixLen, _ := ipnet.Mask.Size()
 
 	// Serialize peek→allocate→persist→install→consume. In-process locking is
-	// sufficient at the ADR-0002 single-hearthd scale point; the HA path moves
+	// sufficient at the ADR-0002 single-feluccad scale point; the HA path moves
 	// allocation into a store transaction (see ADR-0006).
 	srv.joinMu.Lock()
 	defer srv.joinMu.Unlock()
@@ -211,7 +211,7 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		// say WHICH node, and the pubkey naming the node is written by the
 		// caller. So a holder of any valid token could re-join under an existing
 		// worker's public key, and the credential rotation below would replace
-		// that worker's token with one it never receives: hearthd then 401s on
+		// that worker's token with one it never receives: feluccad then 401s on
 		// every call to it and the node is off the control plane, from a
 		// credential that never established it. Possession of the node's current
 		// token is the cheapest thing that actually distinguishes the node from
@@ -261,17 +261,17 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, []byte(`{"error":"wg peer install failed"}`))
 		return
 	}
-	// Mint this node's own hearthd→agent credential, keyed on the overlay
+	// Mint this node's own feluccad→agent credential, keyed on the overlay
 	// address it will advertise. It replaces the shared admin token on every
 	// control-plane call to this worker, so a token harvested off one node
-	// (or off an address someone talked hearthd into dialing) is worth that
+	// (or off an address someone talked feluccad into dialing) is worth that
 	// node and nothing else. A re-join rotates it: the join token authorizing
 	// this exchange is one-time and operator-issued, which also makes re-join
 	// the recovery path for a worker that lost its copy.
 	//
 	// The address is keyed with the agent's own port: validNodeAddr accepts a
 	// new node address on no other, so this is the endpoint this worker will
-	// register and the one hearthd will dial.
+	// register and the one feluccad will dial.
 	agentToken := newNodeToken()
 	if err := srv.putNodeCred(overlayIP, agentPort, agentToken, now); err != nil {
 		// Before the token is burned, so the worker can retry.

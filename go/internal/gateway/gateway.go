@@ -1,7 +1,7 @@
-// Package gateway implements hearth-gw (v4 P3): the public ingress reverse
+// Package gateway implements felucca-gw (v4 P3): the public ingress reverse
 // proxy. It maps Host headers of the form "<name>--<sandbox-id>.<domain>" to
 // worker node ports (which the agent DNATs to the guest service) using the
-// route table served by hearthd's GET /api/v1/routes. Design: ADR-0007.
+// route table served by feluccad's GET /api/v1/routes. Design: ADR-0007.
 //
 // WebSocket upgrades pass through natively: net/http/httputil.ReverseProxy
 // has handled the Upgrade/Connection hop-by-hop dance since Go 1.12 (Odoo
@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-// Route is one entry of hearthd's route table (wire shape of /api/v1/routes).
+// Route is one entry of feluccad's route table (wire shape of /api/v1/routes).
 type Route struct {
 	Hostname          string `json:"hostname"`
 	SandboxID         string `json:"sandbox_id"`
@@ -37,7 +37,7 @@ type Route struct {
 }
 
 // TenantLimit is the per-tenant ingress policy (from the gateway's own
-// config — ingress policy lives at the ingress, not in hearthd's store).
+// config — ingress policy lives at the ingress, not in feluccad's store).
 type TenantLimit struct {
 	Enabled  *bool   `json:"enabled"`   // nil = enabled
 	RPS      float64 `json:"rps"`       // 0 = unlimited
@@ -47,8 +47,8 @@ type TenantLimit struct {
 // Config is the gateway's runtime configuration.
 type Config struct {
 	Domain       string // wildcard zone, e.g. "sb.example.com"
-	HearthdURL   string // e.g. "http://127.0.0.1:8080"
-	Token        string // hearthd admin token (routes are admin-only)
+	FeluccadURL   string // e.g. "http://127.0.0.1:8080"
+	Token        string // feluccad admin token (routes are admin-only)
 	Refresh      time.Duration
 	TenantLimits map[string]TenantLimit
 	// AutoWake (v4 P5.2, ADR-0007 deferral): a request for a sleeping
@@ -69,7 +69,7 @@ type Gateway struct {
 	limiters map[string]*bucket
 
 	// Sandboxes that served ingress traffic since the last activity report
-	// (v4 P5.2: hearthd's idle clock counts ingress, not just exec).
+	// (v4 P5.2: feluccad's idle clock counts ingress, not just exec).
 	amu    sync.Mutex
 	active map[string]struct{}
 
@@ -120,7 +120,7 @@ func (g *Gateway) Run(stop <-chan struct{}) {
 }
 
 // reportActivity flushes the batched "served traffic" sandbox ids to
-// hearthd. On failure the batch is re-queued — a hearthd blip must not make
+// feluccad. On failure the batch is re-queued — a feluccad blip must not make
 // an active sandbox look idle.
 func (g *Gateway) reportActivity() {
 	g.amu.Lock()
@@ -138,7 +138,7 @@ func (g *Gateway) reportActivity() {
 	payload, _ := json.Marshal(struct {
 		SandboxIDs []string `json:"sandbox_ids"`
 	}{ids})
-	req, err := http.NewRequest(http.MethodPost, g.cfg.HearthdURL+"/api/v1/routes/activity", strings.NewReader(string(payload)))
+	req, err := http.NewRequest(http.MethodPost, g.cfg.FeluccadURL+"/api/v1/routes/activity", strings.NewReader(string(payload)))
 	if err != nil {
 		return
 	}
@@ -202,11 +202,11 @@ func (g *Gateway) wakeAndWait(label, sandboxID string) (Route, bool) {
 	return call.route, call.ok
 }
 
-// doWake asks hearthd to wake the sandbox, then polls the route table (≤15s)
+// doWake asks feluccad to wake the sandbox, then polls the route table (≤15s)
 // until the label shows running. Even a failed wake call is followed by the
 // poll: a concurrent process may have won the race and woken it.
 func (g *Gateway) doWake(label, sandboxID string) (Route, bool) {
-	req, err := http.NewRequest(http.MethodPost, g.cfg.HearthdURL+"/api/v1/sandboxes/"+sandboxID+"/wake", nil)
+	req, err := http.NewRequest(http.MethodPost, g.cfg.FeluccadURL+"/api/v1/sandboxes/"+sandboxID+"/wake", nil)
 	if err != nil {
 		return Route{}, false
 	}
@@ -235,7 +235,7 @@ func (g *Gateway) doWake(label, sandboxID string) (Route, bool) {
 }
 
 // refresh swaps in the latest route table; on error the old table stays (a
-// hearthd blip must not take down working routes).
+// feluccad blip must not take down working routes).
 func (g *Gateway) refresh() {
 	routes, err := g.fetchRoutes()
 	if err != nil {
@@ -252,7 +252,7 @@ func (g *Gateway) refresh() {
 }
 
 func (g *Gateway) fetchRoutes() ([]Route, error) {
-	req, err := http.NewRequest(http.MethodGet, g.cfg.HearthdURL+"/api/v1/routes", nil)
+	req, err := http.NewRequest(http.MethodGet, g.cfg.FeluccadURL+"/api/v1/routes", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -274,14 +274,14 @@ func (g *Gateway) fetchRoutes() ([]Route, error) {
 	return body.Routes, nil
 }
 
-// ensureDynamic asks hearthd to lazily expose a port (the port-in-hostname
-// path); hearthd enforces the per-sandbox opt-in.
+// ensureDynamic asks feluccad to lazily expose a port (the port-in-hostname
+// path); feluccad enforces the per-sandbox opt-in.
 func (g *Gateway) ensureDynamic(sandboxID string, port uint16) (Route, int, error) {
 	payload, _ := json.Marshal(struct {
 		SandboxID string `json:"sandbox_id"`
 		Port      uint16 `json:"port"`
 	}{sandboxID, port})
-	req, err := http.NewRequest(http.MethodPost, g.cfg.HearthdURL+"/api/v1/routes/ensure", strings.NewReader(string(payload)))
+	req, err := http.NewRequest(http.MethodPost, g.cfg.FeluccadURL+"/api/v1/routes/ensure", strings.NewReader(string(payload)))
 	if err != nil {
 		return Route{}, 0, err
 	}
@@ -372,10 +372,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.mu.RUnlock()
 
 	if !found && allDigits(name) {
-		// Dynamic port-in-hostname: lazily ensure the expose via hearthd.
+		// Dynamic port-in-hostname: lazily ensure the expose via feluccad.
 		// Only the canonical decimal spelling routes ("08080" would ensure
 		// 8080 but never match the table — an unauthenticated per-request
-		// amplification loop against hearthd).
+		// amplification loop against feluccad).
 		port, err := strconv.ParseUint(name, 10, 16)
 		if err == nil && port > 0 && strconv.FormatUint(port, 10) == name {
 			rt, status, err := g.ensureDynamic(sandboxID, uint16(port))
@@ -411,7 +411,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if route.NodeHost == "" {
-		// The sandbox's node is gone (hearthd still serves the row so we can
+		// The sandbox's node is gone (feluccad still serves the row so we can
 		// answer with state instead of a generic 404).
 		httpError(w, 503, "sandbox is "+route.State)
 		return
@@ -440,7 +440,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The proxied request is activity for hearthd's idle clock; batched and
+	// The proxied request is activity for feluccad's idle clock; batched and
 	// reported on the refresh tick.
 	g.markActive(route.SandboxID)
 

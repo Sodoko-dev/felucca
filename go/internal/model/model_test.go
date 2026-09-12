@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/alpham/infra-saas/hearth/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/model"
 )
 
 func strPtr(s string) *string { return &s }

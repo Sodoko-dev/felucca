@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::thread;
 
-use hearth_guest::handle_connection;
+use felucca_guest::handle_connection;
 
 /// Send `request` over a socket pair handled by `handle_connection`, return the
 /// single response line (without the trailing newline).

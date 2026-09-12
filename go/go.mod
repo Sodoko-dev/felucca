@@ -1,4 +1,4 @@
-module github.com/alpham/infra-saas/hearth
+module github.com/alpham/infra-saas/felucca
 
 go 1.26.6
 

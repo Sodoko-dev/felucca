@@ -1,4 +1,4 @@
-# Hearth benchmarks
+# Felucca benchmarks
 
 Numbers from `scripts/bench.sh` (wall-clock at the API — what a caller
 experiences, agent round-trip included). Refreshed per release; a release

@@ -1,4 +1,6 @@
-# Hearth
+# Felucca
+
+*Renamed from Hearth — see [docs/CHANGELOG.md](docs/CHANGELOG.md#rename-hearth--felucca-2026-09-12) for the identifier mapping and upgrade steps.*
 
 Self-hosted infrastructure SaaS that manages **Firecracker microVMs for AI workloads** —
 sub-second sandbox wake, warm pools, fork/branch, and a clean dashboard. Built as two
@@ -12,9 +14,9 @@ and [Sprites](https://sprites.dev) (see `docs/research/`), self-hosted on your o
 
 | Component | Path | Runs on | Role |
 |---|---|---|---|
-| `hearthd` | `go/` | `infra-saas-lab` VM | Control plane (Go): REST API `:8080`, scheduler, node registry, state, serves the UI |
-| `hearth-agent` | `rust/agent/` | `kata-lab-0`, `kata-lab-1` VMs | Node agent (Rust) `:9090`: drives Firecracker over its unix-socket REST API |
-| UI | `ui/` | served by hearthd | Static SPA dashboard (fleet, sandboxes, fork tree) |
+| `feluccad` | `go/` | `infra-saas-lab` VM | Control plane (Go): REST API `:8080`, scheduler, node registry, state, serves the UI |
+| `felucca-agent` | `rust/agent/` | `kata-lab-0`, `kata-lab-1` VMs | Node agent (Rust) `:9090`: drives Firecracker over its unix-socket REST API |
+| UI | `ui/` | served by feluccad | Static SPA dashboard (fleet, sandboxes, fork tree) |
 | Conformance | `test/conformance/` | any VM | Executable form of the API contract; goldens recorded from the v2 reference |
 | Node setup | `infra/setup-node.sh` | workers | Installs Firecracker + guest kernel + base rootfs into `/srv/ignis` |
 
@@ -48,40 +50,40 @@ REPO=/Users/magdy/projects/github.com/alpham/infra-saas
 # build (inside the toolchain VM — never on the host)
 limactl shell infra-saas-lab -- bash -c \
   "export PATH=\$PATH:/usr/local/go/bin && cd $REPO/go && \
-   CGO_ENABLED=0 go build -o /tmp/hearthd ./cmd/hearthd"
+   CGO_ENABLED=0 go build -o /tmp/feluccad ./cmd/feluccad"
 limactl shell infra-saas-lab -- bash -c \
   "source ~/.cargo/env && cd $REPO/rust/agent && \
-   CARGO_TARGET_DIR=\$HOME/.cargo-target/hearth-agent \
+   CARGO_TARGET_DIR=\$HOME/.cargo-target/felucca-agent \
    cargo build --release --target aarch64-unknown-linux-musl"
 
-# one-time: mint the lab token. `hearth-lab-token` is a known placeholder now
+# one-time: mint the lab token. `felucca-lab-token` is a known placeholder now
 # and both binaries refuse to start on it — the lab runs on a real secret,
 # same as production (deploy/config/local-lab.md).
-mkdir -p ~/.config/hearth
-openssl rand -hex 32 > ~/.config/hearth/lab-token
-chmod 0600 ~/.config/hearth/lab-token
+mkdir -p ~/.config/felucca
+openssl rand -hex 32 > ~/.config/felucca/lab-token
+chmod 0600 ~/.config/felucca/lab-token
 
 # verify the running lab end-to-end (scripts read the token from that file,
-# or take it as $1 / $HEARTH_TOKEN)
+# or take it as $1 / $FELUCCA_TOKEN)
 bash scripts/verify-v2.sh          # 17 system checks incl. wake latency
 bash scripts/conformance-lab.sh    # full API contract suite
 
 # see docs/DEPLOYMENT.md for production installs (deploy/install.sh)
 ```
 
-> **Auth is not optional.** `hearthd` and `hearth-agent` refuse to start on an
+> **Auth is not optional.** `feluccad` and `felucca-agent` refuse to start on an
 > empty, too-short or placeholder token; `/metrics` needs the admin token; and
 > the console takes its token from a paste-in banner only — never from
 > `localStorage` or a `?token=` URL. Details in
 > [`docs/DEPLOYMENT.md` §6](docs/DEPLOYMENT.md#6-tokens-auth-and-bind-addresses).
 
-> **Running hearthd behind a reverse proxy?** Read
+> **Running feluccad behind a reverse proxy?** Read
 > [`docs/DEPLOYMENT.md` §7.1](docs/DEPLOYMENT.md#71-forwarded-client-addresses-required-reading)
-> first. hearthd ignores `X-Forwarded-For` unless the peer is inside
+> first. feluccad ignores `X-Forwarded-For` unless the peer is inside
 > `trusted_proxies` (default: empty, trust nothing). List a proxy there **only**
 > if it overwrites the header (`header_up X-Forwarded-For {remote_host}` in
 > Caddy, `proxy_set_header X-Forwarded-For $remote_addr` in nginx — nginx's bare
-> `proxy_pass` forwards the client's own header verbatim). hearthd cannot tell a
+> `proxy_pass` forwards the client's own header verbatim). feluccad cannot tell a
 > header its proxy wrote from one it copied through, so this is closed by
 > configuration or not at all: half of it, in the wrong direction, lets any
 > client choose its own throttle key.

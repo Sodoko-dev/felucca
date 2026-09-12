@@ -15,11 +15,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alpham/infra-saas/hearth/internal/config"
-	"github.com/alpham/infra-saas/hearth/internal/model"
-	"github.com/alpham/infra-saas/hearth/internal/server"
-	"github.com/alpham/infra-saas/hearth/internal/state"
-	"github.com/alpham/infra-saas/hearth/internal/store"
+	"github.com/alpham/infra-saas/felucca/internal/config"
+	"github.com/alpham/infra-saas/felucca/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/server"
+	"github.com/alpham/infra-saas/felucca/internal/state"
+	"github.com/alpham/infra-saas/felucca/internal/store"
 )
 
 // testToken is the admin token the API tests authenticate with. An empty
@@ -33,7 +33,7 @@ const (
 // newTestStore opens a throwaway SQLite store in the test's temp dir.
 func newTestStore(t *testing.T, tmp string) store.Store {
 	t.Helper()
-	db, err := store.OpenSQLite(filepath.Join(tmp, "hearth.db"))
+	db, err := store.OpenSQLite(filepath.Join(tmp, "felucca.db"))
 	if err != nil {
 		t.Fatalf("open test store: %v", err)
 	}
@@ -48,7 +48,7 @@ func newTestServer(t *testing.T, token string) (*server.Server, *state.State) {
 		Token:     token,
 		UIDir:     tmp,
 		StatePath: filepath.Join(tmp, "state.json"),
-		DBPath:    filepath.Join(tmp, "hearth.db"),
+		DBPath:    filepath.Join(tmp, "felucca.db"),
 	}
 	st := state.New()
 	return server.New(cfg, st, newTestStore(t, tmp)), st
@@ -75,7 +75,7 @@ func newProxiedServer(t *testing.T, token string, proxies []string, trustXRealIP
 		Token:          token,
 		UIDir:          tmp,
 		StatePath:      filepath.Join(tmp, "state.json"),
-		DBPath:         filepath.Join(tmp, "hearth.db"),
+		DBPath:         filepath.Join(tmp, "felucca.db"),
 		TrustedProxies: proxies,
 		TrustXRealIP:   trustXRealIP,
 	}
@@ -153,7 +153,7 @@ func TestAuthInsecureNoAuthOpensTheAPI(t *testing.T) {
 		InsecureNoAuth: true,
 		UIDir:          tmp,
 		StatePath:      filepath.Join(tmp, "state.json"),
-		DBPath:         filepath.Join(tmp, "hearth.db"),
+		DBPath:         filepath.Join(tmp, "felucca.db"),
 	}
 	srv := server.New(cfg, state.New(), newTestStore(t, tmp))
 	if w := do(srv.Handler(), "GET", "/api/v1/nodes", "", ""); w.Code != 200 {
@@ -269,7 +269,7 @@ func TestGuessingCannotLockOutValidCredentials(t *testing.T) {
 	}
 }
 
-// The shipped topology binds hearthd to loopback behind a reverse proxy, so
+// The shipped topology binds feluccad to loopback behind a reverse proxy, so
 // every client arrives as one address. Wiping the record on a success made
 // that a bypass: the console's own authenticated poll reset whatever a guesser
 // sharing the key had accumulated, and the guard never engaged.
@@ -406,7 +406,7 @@ func TestThrottleIgnoresForwardedHeaderFromUntrustedPeer(t *testing.T) {
 	}
 }
 
-// X-Real-IP carries no chain of custody: hearthd cannot tell a value the proxy
+// X-Real-IP carries no chain of custody: feluccad cannot tell a value the proxy
 // wrote from one it forwarded verbatim. nginx with a bare `proxy_pass` — a
 // configuration DEPLOYMENT.md sanctions — forwards the client's own X-Real-IP
 // untouched, which handed the client the very key it must not be able to
@@ -575,7 +575,7 @@ func TestAgentRegisterIdempotent(t *testing.T) {
 }
 
 func TestAgentRegisterRejectsUnroutableAddr(t *testing.T) {
-	// A registration aims hearthd's own admin-token-carrying client at the
+	// A registration aims feluccad's own admin-token-carrying client at the
 	// given address, so names and non-routable addresses must not enrol.
 	srv, st := newTestServer(t, testToken)
 	for _, addr := range []string{
@@ -614,7 +614,7 @@ func TestAgentRegisterRequiresOverlayAddrWhenWgConfigured(t *testing.T) {
 		Token:     testToken,
 		UIDir:     tmp,
 		StatePath: filepath.Join(tmp, "state.json"),
-		DBPath:    filepath.Join(tmp, "hearth.db"),
+		DBPath:    filepath.Join(tmp, "felucca.db"),
 		WgIP:      "10.100.0.1/16",
 	}
 	srv := server.New(cfg, state.New(), newTestStore(t, tmp))
@@ -917,8 +917,8 @@ func TestMetricsAllStates(t *testing.T) {
 func TestMetricsExecsTotal(t *testing.T) {
 	srv, _ := newTestServer(t, testToken)
 	w := do(srv.Handler(), "GET", "/metrics", "", testAuth)
-	if !strings.Contains(w.Body.String(), "hearth_execs_total") {
-		t.Error("metrics missing hearth_execs_total")
+	if !strings.Contains(w.Body.String(), "felucca_execs_total") {
+		t.Error("metrics missing felucca_execs_total")
 	}
 }
 
@@ -1142,13 +1142,13 @@ func TestBodyCapCoversPreAuthJoinRoute(t *testing.T) {
 	cfg := &config.Config{
 		UIDir:     tmp,
 		StatePath: filepath.Join(tmp, "state.json"),
-		DBPath:    filepath.Join(tmp, "hearth.db"),
+		DBPath:    filepath.Join(tmp, "felucca.db"),
 		WgIP:      "10.100.0.1/16",
 	}
 	srv := server.New(cfg, state.New(), newTestStore(t, tmp))
 
 	body := `{"pubkey":"` + strings.Repeat("A", 43) + `=","hostname":"` + strings.Repeat("x", 2<<20) + `"}`
-	w := do(srv.Handler(), "POST", "/api/v1/nodes/join", body, "Bearer hearth_jt_x")
+	w := do(srv.Handler(), "POST", "/api/v1/nodes/join", body, "Bearer felucca_jt_x")
 	if w.Code != 400 {
 		t.Fatalf("oversized join body: expected 400, got %d", w.Code)
 	}
@@ -1232,7 +1232,7 @@ func TestExecTimeoutRange(t *testing.T) {
 	}
 }
 
-// ---- M3: every hearthd→agent dial, audited structurally ----
+// ---- M3: every feluccad→agent dial, audited structurally ----
 
 // funcKey names a declaration for the audit below: "Recv.Name" for methods,
 // "Name" for plain functions.
@@ -1335,7 +1335,7 @@ func TestNoDialPathCanCarryTheAdminToken(t *testing.T) {
 								}
 								dialSites++
 								if !allowedDial[key] {
-									t.Errorf("%s: %s calls agentclient.%s directly — every hearthd→agent dial must go through the nodeDial choke point, which resolves the node's own credential (see nodeDial in server.go)",
+									t.Errorf("%s: %s calls agentclient.%s directly — every feluccad→agent dial must go through the nodeDial choke point, which resolves the node's own credential (see nodeDial in server.go)",
 										fset.Position(call.Pos()), key, d)
 								}
 							}

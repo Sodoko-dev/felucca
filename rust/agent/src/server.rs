@@ -26,7 +26,7 @@ pub struct AppState {
     pub mgr: Arc<Manager>,
     /// The shared token from this agent's own config.
     pub token: String,
-    /// This node's own credential, minted by hearthd at enrollment and shared
+    /// This node's own credential, minted by feluccad at enrollment and shared
     /// with the registration loop — so a rotation at re-enrollment is live on
     /// the inbound gate immediately, with no restart. Empty until issued.
     pub node_token: NodeToken,
@@ -65,7 +65,7 @@ fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
 
 /// The one inbound gate. It takes the whole state, never a token string, so no
 /// handler can be written that checks only one of this node's two credentials
-/// — the mistake that made every hearthd call to a join-enrolled node 401.
+/// — the mistake that made every feluccad call to a join-enrolled node 401.
 fn check_auth(state: &AppState, headers: &HeaderMap) -> bool {
     // A poisoned lock still holds the live credential; treating it as absent
     // would 401 the control plane for the rest of the process's life.
@@ -74,7 +74,7 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> bool {
 }
 
 /// Reject an id that is not a plain path component, before it reaches the
-/// manager. axum percent-decodes `:id` captures, so `..%2F..%2Fetc%2Fhearth`
+/// manager. axum percent-decodes `:id` captures, so `..%2F..%2Fetc%2Ffelucca`
 /// arrives here already decoded — every VM path on this node is derived from
 /// this string, so the check belongs at the edge as well as at the path build.
 fn reject_bad_id(id: &str) -> Option<Response> {
@@ -87,10 +87,10 @@ fn reject_bad_id(id: &str) -> Option<Response> {
     ))
 }
 
-/// Extract the X-Hearth-Request-Id header for structured log correlation.
+/// Extract the X-Felucca-Request-Id header for structured log correlation.
 fn req_id(headers: &HeaderMap) -> Option<String> {
     headers
-        .get("x-hearth-request-id")
+        .get("x-felucca-request-id")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
 }
@@ -195,7 +195,7 @@ async fn create_vm(State(state): State<AppState>, req: Request) -> Response {
         disk_gb: disk_gb as u32,
     };
     // tokio::spawn detaches the create from this request future: if the
-    // client times out and drops the connection (e.g. hearthd's 30s cap
+    // client times out and drops the connection (e.g. feluccad's 30s cap
     // during a first image pull), the create still converges to
     // running/error instead of leaving the record stuck in Creating.
     let mgr = Arc::clone(&state.mgr);
@@ -735,7 +735,7 @@ impl<R: tokio::io::AsyncRead + Unpin> futures_core::Stream for DeadlineStream<R>
     }
 }
 
-/// PUT /v1/pools (v4 P4): replace the hearthd-managed warm-pool templates.
+/// PUT /v1/pools (v4 P4): replace the feluccad-managed warm-pool templates.
 /// Body is a JSON array of PoolSpec; validation failure rejects the whole
 /// set (applied atomically or not at all). The 5s refill loop converges.
 async fn put_pools(State(state): State<AppState>, req: Request) -> Response {
@@ -802,10 +802,10 @@ mod tests {
     #[test]
     fn test_reject_bad_id_turns_traversal_into_400() {
         // What axum hands the handler after percent-decoding
-        // DELETE /v1/vms/..%2F..%2F..%2Fetc%2Fhearth.
+        // DELETE /v1/vms/..%2F..%2F..%2Fetc%2Ffelucca.
         for bad in [
-            "../../../etc/hearth",
-            "../../../../etc/hearth",
+            "../../../etc/felucca",
+            "../../../../etc/felucca",
             "..",
             ".",
             "a/b",
@@ -898,20 +898,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_auth_accepts_either_of_this_nodes_credentials() {
-        // Was: only the configured shared token was accepted, so once hearthd
+        // Was: only the configured shared token was accepted, so once feluccad
         // started presenting the per-node token it minted at join, every call
         // to this node 401'd — exec, expose, sleep, wake, delete and the
         // lifecycle sweep against a join-enrolled worker all failed.
         let dir = tempfile::tempdir().unwrap();
         let shared = "9f2c1b8a7d4e6f0312a5b9c8d7e6f504";
-        let node = "hearth_nt_9f2c1b8a7d4e6f0312a5b9c8d7e6f504";
+        let node = "felucca_nt_9f2c1b8a7d4e6f0312a5b9c8d7e6f504";
         let state = auth_state(dir.path(), shared, node);
 
         assert!(check_auth(&state, &bearer(&format!("Bearer {}", node))));
         // The shared token keeps working through a mixed-version rollout.
         assert!(check_auth(&state, &bearer(&format!("Bearer {}", shared))));
         // Nothing else does.
-        assert!(!check_auth(&state, &bearer("Bearer hearth_nt_someone_elses_node")));
+        assert!(!check_auth(&state, &bearer("Bearer felucca_nt_someone_elses_node")));
         assert!(!check_auth(&state, &bearer("Bearer wrong")));
         assert!(!check_auth(&state, &HeaderMap::new()));
         // The exact "Bearer " prefix is still the requirement.
@@ -929,14 +929,14 @@ mod tests {
         // authorizes nobody rather than everybody.
         assert!(check_auth(&state, &bearer(&format!("Bearer {}", shared))));
         assert!(!check_auth(&state, &bearer("Bearer ")));
-        assert!(!check_auth(&state, &bearer("Bearer hearth_nt_anything")));
+        assert!(!check_auth(&state, &bearer("Bearer felucca_nt_anything")));
 
         // A rotation lands on the handle the registration loop shares with the
         // server, so it is live on the inbound gate with no restart.
-        let first = "hearth_nt_1111111111111111111111";
+        let first = "felucca_nt_1111111111111111111111";
         *state.node_token.write().unwrap() = first.into();
         assert!(check_auth(&state, &bearer(&format!("Bearer {}", first))));
-        let second = "hearth_nt_2222222222222222222222";
+        let second = "felucca_nt_2222222222222222222222";
         *state.node_token.write().unwrap() = second.into();
         assert!(check_auth(&state, &bearer(&format!("Bearer {}", second))));
         // The superseded credential stops working.

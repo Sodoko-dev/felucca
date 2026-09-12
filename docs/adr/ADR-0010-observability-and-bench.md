@@ -33,14 +33,14 @@ uffd CoW fork), which get groundwork documents instead of code.
 
 ### Structured logging — stdlib/ecosystem defaults, message text preserved
 
-- **hearthd + hearth-gw**: Go `log/slog` with the stdlib TextHandler to
+- **feluccad + felucca-gw**: Go `log/slog` with the stdlib TextHandler to
   stderr (journald wraps it; no JSON handler — `key=value` text is grep-able
   by operators AND parseable, and journald already supplies timestamps/units).
   `log.Fatal` sites become `slog.Error` + explicit `os.Exit(1)` so exit
   semantics stay byte-identical.
-- **hearth-agent**: the `tracing` crate with `tracing-subscriber` (fmt
+- **felucca-agent**: the `tracing` crate with `tracing-subscriber` (fmt
   writer to stderr, ansi off, `RUST_LOG` env filter, default `info`).
-- **hearth-guest**: deliberately stays on `eprintln!` — it logs a handful of
+- **felucca-guest**: deliberately stays on `eprintln!` — it logs a handful of
   lines to the serial console and the tiny static binary in every rootfs
   image must not grow a subscriber stack.
 - Migration rule: the human-readable phrase of every existing message is
@@ -49,11 +49,11 @@ uffd CoW fork), which get groundwork documents instead of code.
   vocabulary: `err`, `sandbox`/`vm`, `tenant`, `node`, `image`, `template`,
   `addr`, `request_id`.
 
-### Request IDs — hearthd-minted, header-propagated
+### Request IDs — feluccad-minted, header-propagated
 
 Every `/api/` request gets `req-<hex>` minted in the router, echoed back as
-the `X-Hearth-Request-Id` response header, carried in the request context,
-and forwarded on every hearthd→agent proxy call via the same header; the
+the `X-Felucca-Request-Id` response header, carried in the request context,
+and forwarded on every feluccad→agent proxy call via the same header; the
 agent includes it as a `request_id` field on its handler log lines.
 Background actors mint their own prefixed ids (`sweep-`, `bg-`) so lifecycle
 and prefetch agent calls are traceable too. No wire-shape change — headers
@@ -65,22 +65,22 @@ only; pre-P6 agents simply ignore the header (mixed-fleet safe).
 admin-gated now. The histograms and their bounds are unchanged.)*
 
 - `/metrics` (open, unauthenticated — unchanged) gains three hand-rolled
-  Prometheus histograms: `hearth_wake_duration_ms`,
-  `hearth_exec_duration_ms`, `hearth_create_duration_ms`
+  Prometheus histograms: `felucca_wake_duration_ms`,
+  `felucca_exec_duration_ms`, `felucca_create_duration_ms`
   (`_bucket`/`_sum`/`_count`; shared ms bounds
   5,10,25,50,100,250,500,1000,2500,5000,10000,30000,+Inf — wide enough for
   ~70 ms wakes and multi-second cold creates alike). Wall-clock is measured
-  at hearthd around the agent call (the number a user experiences), not
+  at feluccad around the agent call (the number a user experiences), not
   agent-side. In-memory only; counter resets on restart are normal
-  Prometheus semantics. The legacy `hearth_wake_ms_{last,sum}` /
-  `hearth_wake_total` counters stay for pre-P6 dashboards.
-- Per-tenant gauges (`hearth_tenant_{sandboxes,running,vcpus,mem_mib,disk_gb}`)
+  Prometheus semantics. The legacy `felucca_wake_ms_{last,sum}` /
+  `felucca_wake_total` counters stay for pre-P6 dashboards.
+- Per-tenant gauges (`felucca_tenant_{sandboxes,running,vcpus,mem_mib,disk_gb}`)
   — the series ADR-0009 kept OFF the open endpoint as a tenant-inventory
   leak — return on an **authenticated admin surface**:
   `GET /api/v1/metrics/tenants` (admin token; 404 to tenant keys like every
   admin route). Prometheus scrapes it as a second job with bearer
   credentials; `deploy/grafana/README.md` shows the scrape config.
-- `deploy/grafana/hearth-dashboard.json`: fleet, latency (p50/p95 via
+- `deploy/grafana/felucca-dashboard.json`: fleet, latency (p50/p95 via
   `histogram_quantile`), throughput, and tenant rows.
 
 ### Bench — `scripts/bench.sh`, run per release
@@ -88,7 +88,7 @@ admin-gated now. The histograms and their bounds are unchanged.)*
 Wall-clock p50/p95/min/max over N iterations for: create-cold (off-pool
 shape), create-claim (pool shape), exec (buffered), exec-stream
 time-to-first-frame, wake (API wall-clock AND the agent-reported `wake_ms`),
-fork. Bash+curl+jq only, endpoint-parameterized like `hearth-verify.sh`,
+fork. Bash+curl+jq only, endpoint-parameterized like `felucca-verify.sh`,
 self-cleaning with an EXIT trap, per-op failure counts instead of aborts.
 Output is a paste-ready markdown table; the lab numbers are published in
 `docs/BENCHMARKS.md` and refreshed per release — the bare-metal datapoint
@@ -100,8 +100,8 @@ for the comparison table is the marketing artifact this exists for.
   stateless gateway, self-re-registering agents), the honest blockers
   (in-memory working set + snapshot-granularity persistence, singleton wg
   hub, local images dir), and the staged path with effort estimates
-  (litestream sidecar today → Postgres row-level store → N×hearthd).
-  Recommendation: single hearthd until SLOs demand otherwise; litestream is
+  (litestream sidecar today → Postgres row-level store → N×feluccad).
+  Recommendation: single feluccad until SLOs demand otherwise; litestream is
   deployable-today insurance.
 - `research/uffd-cow-fork.md`: the "branch a live Odoo system" research
   track — Firecracker uffd-backed snapshot load, a per-lineage page-fault
@@ -127,7 +127,7 @@ for the comparison table is the marketing artifact this exists for.
 ## Consequences
 
 - Journals become grep-AND-field searchable; one request id follows an API
-  call from hearthd into the owning agent. Log volume is unchanged (same
+  call from feluccad into the owning agent. Log volume is unchanged (same
   sites, same levels).
 - The agent gains two crates (`tracing`, `tracing-subscriber`) — a binary
   size cost accepted for the ecosystem-standard filter/env story; the guest
@@ -148,7 +148,7 @@ for the comparison table is the marketing artifact this exists for.
 - uffd CoW fork prototype (research/uffd-cow-fork.md).
 - OpenTelemetry/spans, log sampling, per-tenant metrics on a per-tenant
   (customer-facing) dashboard surface.
-- Structured logging for hearth-guest (deliberate non-goal).
+- Structured logging for felucca-guest (deliberate non-goal).
 - Context-scoped request logging (P6 review): request_id is hand-attached to
   key error sites, not every request-path line — a ctx-aware slog.Handler
   would stamp all of them; revisit if operators hit the gap in practice.

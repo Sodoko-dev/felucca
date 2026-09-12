@@ -1,8 +1,8 @@
 # shellcheck shell=bash
-# Shared helpers for the Hearth conformance suite. Sourced by run.sh.
+# Shared helpers for the Felucca conformance suite. Sourced by run.sh.
 #
 # The suite is the executable form of docs/API-V2.md: it must pass against any
-# implementation of hearthd / hearth-agent (Zig today, Go/Rust ports), so all
+# implementation of feluccad / felucca-agent (Zig today, Go/Rust ports), so all
 # JSON comparison is semantic (key set, types, null-vs-omitted) — never
 # byte-order — via normalize.jq + `jq -S`.
 
@@ -14,7 +14,7 @@ CONF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GOLDEN_DIR="$CONF_DIR/goldens"
 
 # Last response's Retry-After, in seconds ("" when absent). It is the
-# documented discriminator between hearthd's two 429s (API-V2 §6): the
+# documented discriminator between feluccad's two 429s (API-V2 §6): the
 # credential-gate throttle carries it, the tenant quota gate does not.
 R_RETRY_AFTER=""
 
@@ -27,15 +27,15 @@ skip() { SKIP=$((SKIP+1)); say "  SKIP: $*"; }
 #
 # Both binaries now REFUSE TO START on an empty, placeholder, or short token
 # (API-V2 §6), and an empty token authorizes nobody rather than turning auth
-# off. So a suite that quietly defaults to a literal — `hearth-lab-token` was
+# off. So a suite that quietly defaults to a literal — `felucca-lab-token` was
 # the old default here — can only ever produce a wall of 401s against a server
 # that either is not running or is not the one the operator thinks. Resolve
 # explicitly, gate the value, and say exactly what to do when there is none.
 #
-# Order: $HEARTH_TOKEN, then a file kept outside the tree — the same contract
+# Order: $FELUCCA_TOKEN, then a file kept outside the tree — the same contract
 # as scripts/verify-v2.sh and scripts/conformance-lab.sh, so one lab token
 # serves every script.
-HEARTH_TOKEN_FILE="${HEARTH_TOKEN_FILE:-${HOME:-}/.config/hearth/lab-token}"
+FELUCCA_TOKEN_FILE="${FELUCCA_TOKEN_FILE:-${HOME:-}/.config/felucca/lab-token}"
 
 # token_is_placeholder <token> — the values shipped in deploy/config/*.example.json
 # and hardcoded in the old lab scripts. Both binaries reject these outright, so
@@ -45,52 +45,52 @@ token_is_placeholder() {
   local low
   low=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   case "$low" in
-    *replace_with*|hearth-lab-token) return 0 ;;
+    *replace_with*|felucca-lab-token) return 0 ;;
   esac
   return 1
 }
 
-# resolve_token — fill HEARTH_TOKEN from the file fallback and refuse a value
+# resolve_token — fill FELUCCA_TOKEN from the file fallback and refuse a value
 # the target would refuse. Returns non-zero (caller aborts) rather than
-# limping on. HEARTH_INSECURE_NO_AUTH=1 is the ONLY tokenless path, and it
-# mirrors hearthd's own --insecure-no-auth: named, loud, and never a default.
+# limping on. FELUCCA_INSECURE_NO_AUTH=1 is the ONLY tokenless path, and it
+# mirrors feluccad's own --insecure-no-auth: named, loud, and never a default.
 resolve_token() {
-  if [ -z "${HEARTH_TOKEN:-}" ] && [ -r "$HEARTH_TOKEN_FILE" ]; then
-    HEARTH_TOKEN="$(tr -d ' \t\r\n' < "$HEARTH_TOKEN_FILE")"
+  if [ -z "${FELUCCA_TOKEN:-}" ] && [ -r "$FELUCCA_TOKEN_FILE" ]; then
+    FELUCCA_TOKEN="$(tr -d ' \t\r\n' < "$FELUCCA_TOKEN_FILE")"
   fi
-  if [ "${HEARTH_INSECURE_NO_AUTH:-0}" = "1" ]; then
-    if [ -n "${HEARTH_TOKEN:-}" ]; then
-      say "ERROR: HEARTH_INSECURE_NO_AUTH=1 and a token are both set — pick one."
-      say "  The flag means the target runs 'hearthd --insecure-no-auth' (no credential at all)."
+  if [ "${FELUCCA_INSECURE_NO_AUTH:-0}" = "1" ]; then
+    if [ -n "${FELUCCA_TOKEN:-}" ]; then
+      say "ERROR: FELUCCA_INSECURE_NO_AUTH=1 and a token are both set — pick one."
+      say "  The flag means the target runs 'feluccad --insecure-no-auth' (no credential at all)."
       return 1
     fi
-    say "WARNING: running tokenless (HEARTH_INSECURE_NO_AUTH=1). Valid ONLY against a target"
-    say "         started with 'hearthd --insecure-no-auth'. The credential cases SKIP, and"
+    say "WARNING: running tokenless (FELUCCA_INSECURE_NO_AUTH=1). Valid ONLY against a target"
+    say "         started with 'feluccad --insecure-no-auth'. The credential cases SKIP, and"
     say "         every case that proves TENANT SCOPING will FAIL — with auth off there are"
     say "         no tenants to scope, so a tenant key is the admin. Only a token-authenticated"
     say "         target can pass the whole contract."
     return 0
   fi
-  if [ -z "${HEARTH_TOKEN:-}" ]; then
+  if [ -z "${FELUCCA_TOKEN:-}" ]; then
     say "ERROR: no admin token."
-    say "  Set HEARTH_TOKEN, or write one to $HEARTH_TOKEN_FILE (HEARTH_TOKEN_FILE overrides)."
+    say "  Set FELUCCA_TOKEN, or write one to $FELUCCA_TOKEN_FILE (FELUCCA_TOKEN_FILE overrides)."
     say "  Generate one with: openssl rand -hex 32"
-    say "  It must be the token the target hearthd/hearth-agent were STARTED with — both"
+    say "  It must be the token the target feluccad/felucca-agent were STARTED with — both"
     say "  binaries refuse to start without a real one, so there is no tokenless target to"
-    say "  fall back to. For a loopback lab on 'hearthd --insecure-no-auth', run the suite"
-    say "  with HEARTH_INSECURE_NO_AUTH=1 instead."
+    say "  fall back to. For a loopback lab on 'feluccad --insecure-no-auth', run the suite"
+    say "  with FELUCCA_INSECURE_NO_AUTH=1 instead."
     return 1
   fi
-  if token_is_placeholder "$HEARTH_TOKEN"; then
-    say "ERROR: HEARTH_TOKEN is a shipped placeholder — it is published in this repo, and both"
+  if token_is_placeholder "$FELUCCA_TOKEN"; then
+    say "ERROR: FELUCCA_TOKEN is a shipped placeholder — it is published in this repo, and both"
     say "       binaries refuse to start with it, so nothing is listening on it."
     say "  Generate a real one with: openssl rand -hex 32"
     return 1
   fi
-  # 32 is hearthd's minimum (the agent's is 16): gate on the stricter of the
+  # 32 is feluccad's minimum (the agent's is 16): gate on the stricter of the
   # two, since the suite drives both.
-  if [ "${#HEARTH_TOKEN}" -lt 32 ]; then
-    say "ERROR: HEARTH_TOKEN is ${#HEARTH_TOKEN} chars; hearthd requires at least 32 and"
+  if [ "${#FELUCCA_TOKEN}" -lt 32 ]; then
+    say "ERROR: FELUCCA_TOKEN is ${#FELUCCA_TOKEN} chars; feluccad requires at least 32 and"
     say "       refuses to start below that, so nothing is listening on it."
     say "  Generate a real one with: openssl rand -hex 32"
     return 1
@@ -109,7 +109,7 @@ req() {
   hdr=$(mktemp) bod=$(mktemp)
   local args=(-s -m "${REQ_MAX_TIME:-30}" -X "$method" -D "$hdr" -o "$bod" -w '%{http_code}')
   case "$auth" in
-    token) [ -n "${HEARTH_TOKEN:-}" ] && args+=(-H "Authorization: Bearer $HEARTH_TOKEN") ;;
+    token) [ -n "${FELUCCA_TOKEN:-}" ] && args+=(-H "Authorization: Bearer $FELUCCA_TOKEN") ;;
     badtoken) args+=(-H "Authorization: Bearer definitely-not-the-token") ;;
     none) ;;
   esac
@@ -146,7 +146,7 @@ req() {
   fi
 }
 
-hd() { req "$HEARTH_API" "$@"; }
+hd() { req "$FELUCCA_API" "$@"; }
 ag() { req "$AGENT_API" "$@"; }
 
 # req_file <base> <method> <path> <body-file> [auth] — like req, but streams
@@ -162,7 +162,7 @@ req_file() {
   hdr=$(mktemp) bod=$(mktemp)
   local args=(-s -m "${REQ_MAX_TIME:-30}" -X "$method" -D "$hdr" -o "$bod" -w '%{http_code}')
   case "$auth" in
-    token) [ -n "${HEARTH_TOKEN:-}" ] && args+=(-H "Authorization: Bearer $HEARTH_TOKEN") ;;
+    token) [ -n "${FELUCCA_TOKEN:-}" ] && args+=(-H "Authorization: Bearer $FELUCCA_TOKEN") ;;
     badtoken) args+=(-H "Authorization: Bearer definitely-not-the-token") ;;
     none) ;;
   esac
@@ -174,13 +174,13 @@ req_file() {
   rm -f "$hdr" "$bod"
 }
 
-hd_file() { req_file "$HEARTH_API" "$@"; }
+hd_file() { req_file "$FELUCCA_API" "$@"; }
 ag_file() { req_file "$AGENT_API" "$@"; }
 
 # req_as <key> <base> <method> <path> [json-body]
 # Like req with auth=token but uses <key> as the bearer token instead of
-# $HEARTH_TOKEN. Used by the tenancy suite to send requests as a specific
-# tenant API key without touching the global HEARTH_TOKEN.
+# $FELUCCA_TOKEN. Used by the tenancy suite to send requests as a specific
+# tenant API key without touching the global FELUCCA_TOKEN.
 # Sets R_STATUS, R_BODY, R_CT identically to req.
 req_as() {
   local key="$1" base="$2" method="$3" path="$4" body="${5:-}"
@@ -265,14 +265,14 @@ normalize() { jq -S -f "$CONF_DIR/normalize.jq"; }
 # wait_guest_ready <hd|ag> <id> [timeout-s] — poll exec(["true"]) until the
 # guest agent answers (default 45s). Two contract constraints at once: the
 # guest must finish booting (snapshots of mid-boot guests are poisoned — the
-# guest panics on resume) and hearth-guest must be listening before
+# guest panics on resume) and felucca-guest must be listening before
 # sleep/exec/fork are exercised. Raw curl on purpose: must not clobber the
 # caller's R_STATUS/R_BODY from a previous req.
 wait_guest_ready() {
   local suite="$1" id="$2" timeout="${3:-45}"
   local base path
   case "$suite" in
-    hd) base="$HEARTH_API"; path="/api/v1/sandboxes/$id/exec" ;;
+    hd) base="$FELUCCA_API"; path="/api/v1/sandboxes/$id/exec" ;;
     ag) base="$AGENT_API";  path="/v1/vms/$id/exec" ;;
     *)  bad "wait_guest_ready: unknown suite '$suite'"; return 1 ;;
   esac
@@ -281,7 +281,7 @@ wait_guest_ready() {
   # poll would spend 45 failed attempts and trip the per-source brute-force
   # guard — locking the rest of the suite out with 429s.
   local auth=()
-  [ -n "${HEARTH_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $HEARTH_TOKEN")
+  [ -n "${FELUCCA_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $FELUCCA_TOKEN")
   local i=0
   while [ "$i" -lt "$timeout" ]; do
     if curl -s -m 5 -X POST ${auth[@]+"${auth[@]}"} \
@@ -327,12 +327,12 @@ check_golden() {
 $norm"
 }
 
-# check_golden_metrics <suite/name> — golden of the hearth_* metric-name set
+# check_golden_metrics <suite/name> — golden of the felucca_* metric-name set
 # (label values erased except `state`, which is contract-bound), values stripped.
 check_golden_metrics() {
   local norm
   norm=$(printf '%s' "$R_BODY" \
-    | grep -oE '^hearth_[a-z_]+(\{[^}]*\})?' \
+    | grep -oE '^felucca_[a-z_]+(\{[^}]*\})?' \
     | sed -E 's/\{node="[^"]*"\}/{node=*}/' \
     | sort -u)
   _golden_cmp "$1" "$R_STATUS $R_CT

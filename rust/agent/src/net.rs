@@ -1,4 +1,4 @@
-//! Guest networking for hearth-agent: Linux bridge (`hearth0`), per-VM tap
+//! Guest networking for felucca-agent: Linux bridge (`felucca0`), per-VM tap
 //! devices enslaved to it, and an nftables masquerade rule for egress NAT.
 //!
 //! Port of backend/src/agent/net.zig — shell-out to ip/nft/sysctl with
@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
 use tracing::{error, warn};
 
-pub const BRIDGE_NAME: &str = "hearth0";
+pub const BRIDGE_NAME: &str = "felucca0";
 
 /// Guest CIDR in "base/prefix" form, recorded by `ensure_bridge`. Rebuilds need
 /// it (conntrack scoping) but cannot take it as a parameter without changing a
@@ -175,13 +175,13 @@ fn ensure_nat(cidr: Cidr) {
     let src = format!("{}/{}", base, cidr.prefix);
 
     // Idempotent: ensure table+chain exist, flush then re-add the masquerade rule.
-    run(&["nft", "add", "table", "ip", "hearth"]);
+    run(&["nft", "add", "table", "ip", "felucca"]);
     run(&[
-        "nft", "add", "chain", "ip", "hearth", "postrouting",
+        "nft", "add", "chain", "ip", "felucca", "postrouting",
         "{ type nat hook postrouting priority 100 ; }",
     ]);
-    run(&["nft", "flush", "chain", "ip", "hearth", "postrouting"]);
-    run(&["nft", "add", "rule", "ip", "hearth", "postrouting", "ip", "saddr", &src, "masquerade"]);
+    run(&["nft", "flush", "chain", "ip", "felucca", "postrouting"]);
+    run(&["nft", "add", "rule", "ip", "felucca", "postrouting", "ip", "saddr", &src, "masquerade"]);
 }
 
 /// Render the guest→host fence as one `nft -f -` file.
@@ -200,35 +200,35 @@ fn ensure_nat(cidr: Cidr) {
 /// host. Pure for unit tests.
 fn guest_input_ruleset(agent_port: Option<u16>) -> String {
     let mut s = String::new();
-    s.push_str("add table ip hearth\n");
-    s.push_str("add chain ip hearth input { type filter hook input priority 0 ; policy accept ; }\n");
-    s.push_str("flush chain ip hearth input\n");
+    s.push_str("add table ip felucca\n");
+    s.push_str("add chain ip felucca input { type filter hook input priority 0 ; policy accept ; }\n");
+    s.push_str("flush chain ip felucca input\n");
     s.push_str(&format!(
-        "add rule ip hearth input iifname != \"{}\" accept\n",
+        "add rule ip felucca input iifname != \"{}\" accept\n",
         BRIDGE_NAME
     ));
     // Named explicitly so the rule reads as the deny it is, and so it can never
     // be shadowed by a hole opened below it.
     if let Some(port) = agent_port {
         s.push_str(&format!(
-            "add rule ip hearth input iifname \"{}\" tcp dport {} drop\n",
+            "add rule ip felucca input iifname \"{}\" tcp dport {} drop\n",
             BRIDGE_NAME, port
         ));
     }
     // ICMP stays open: guests ping the gateway to prove egress works, and path
     // MTU discovery depends on the error types.
     s.push_str(&format!(
-        "add rule ip hearth input iifname \"{}\" icmp type {{ echo-request, echo-reply, destination-unreachable, time-exceeded, parameter-problem }} accept\n",
+        "add rule ip felucca input iifname \"{}\" icmp type {{ echo-request, echo-reply, destination-unreachable, time-exceeded, parameter-problem }} accept\n",
         BRIDGE_NAME
     ));
     // Replies to flows the host itself opened. A guest cannot forge this: a
     // dropped SYN never confirms a conntrack entry.
     s.push_str(&format!(
-        "add rule ip hearth input iifname \"{}\" ct state established,related accept\n",
+        "add rule ip felucca input iifname \"{}\" ct state established,related accept\n",
         BRIDGE_NAME
     ));
     s.push_str(&format!(
-        "add rule ip hearth input iifname \"{}\" drop\n",
+        "add rule ip felucca input iifname \"{}\" drop\n",
         BRIDGE_NAME
     ));
     s
@@ -248,20 +248,20 @@ fn guest_input_ruleset(agent_port: Option<u16>) -> String {
 /// Pure for unit tests.
 fn bridge_l2_ruleset() -> String {
     let mut s = String::new();
-    s.push_str("add table bridge hearth\n");
-    s.push_str("add chain bridge hearth forward { type filter hook forward priority -200 ; policy accept ; }\n");
-    s.push_str("flush chain bridge hearth forward\n");
+    s.push_str("add table bridge felucca\n");
+    s.push_str("add chain bridge felucca forward { type filter hook forward priority -200 ; policy accept ; }\n");
+    s.push_str("flush chain bridge felucca forward\n");
     s.push_str(&format!(
-        "add rule bridge hearth forward meta ibrname != \"{}\" accept\n",
+        "add rule bridge felucca forward meta ibrname != \"{}\" accept\n",
         BRIDGE_NAME
     ));
     s.push_str(&format!(
-        "add rule bridge hearth forward meta obrname != \"{}\" accept\n",
+        "add rule bridge felucca forward meta obrname != \"{}\" accept\n",
         BRIDGE_NAME
     ));
-    s.push_str("add rule bridge hearth forward ether type arp accept\n");
-    s.push_str("add rule bridge hearth forward ether type ip accept\n");
-    s.push_str("add rule bridge hearth forward drop\n");
+    s.push_str("add rule bridge felucca forward ether type arp accept\n");
+    s.push_str("add rule bridge felucca forward ether type ip accept\n");
+    s.push_str("add rule bridge felucca forward drop\n");
     s
 }
 
@@ -402,7 +402,7 @@ impl std::fmt::Display for GuestMac {
 }
 
 /// Deterministic MAC for a guest slot: locally-administered (0x02) and unicast,
-/// with 0x48 0x54 ("HT") marking it as a hearth tap and the slot index in the
+/// with 0x48 0x54 ("HT") marking it as a felucca tap and the slot index in the
 /// low three octets.
 ///
 /// Deterministic because the tenant ruleset keys on `ip saddr . ip daddr`, and
@@ -465,26 +465,26 @@ fn antispoof_ruleset(tap: &str, guest_ip: &str, guest_mac: &GuestMac) -> Option<
 
     let chain = antispoof_chain(tap);
     let mut s = String::new();
-    s.push_str("add table netdev hearth\n");
+    s.push_str("add table netdev felucca\n");
     s.push_str(&format!(
-        "add chain netdev hearth {} {{ type filter hook ingress device \"{}\" priority 0 ; policy drop ; }}\n",
+        "add chain netdev felucca {} {{ type filter hook ingress device \"{}\" priority 0 ; policy drop ; }}\n",
         chain, tap
     ));
-    s.push_str(&format!("flush chain netdev hearth {}\n", chain));
+    s.push_str(&format!("flush chain netdev felucca {}\n", chain));
     s.push_str(&format!(
-        "add rule netdev hearth {} ether saddr != {} drop\n",
+        "add rule netdev felucca {} ether saddr != {} drop\n",
         chain, mac
     ));
     s.push_str(&format!(
-        "add rule netdev hearth {} arp operation {{ request, reply }} arp saddr ether != {} drop\n",
+        "add rule netdev felucca {} arp operation {{ request, reply }} arp saddr ether != {} drop\n",
         chain, mac
     ));
     s.push_str(&format!(
-        "add rule netdev hearth {} arp operation {{ request, reply }} arp saddr ip != {} drop\n",
+        "add rule netdev felucca {} arp operation {{ request, reply }} arp saddr ip != {} drop\n",
         chain, ip
     ));
-    s.push_str(&format!("add rule netdev hearth {} ether type arp accept\n", chain));
-    s.push_str(&format!("add rule netdev hearth {} ip saddr {} accept\n", chain, ip));
+    s.push_str(&format!("add rule netdev felucca {} ether type arp accept\n", chain));
+    s.push_str(&format!("add rule netdev felucca {} ip saddr {} accept\n", chain, ip));
     Some(s)
 }
 
@@ -524,7 +524,7 @@ pub fn ensure_tap_antispoof(tap: &str, guest_ip: &str, guest_mac: &GuestMac) -> 
 /// Drop a tap's ingress filter (best effort), for when the slot is released.
 pub fn clear_tap_antispoof(tap: &str) {
     if !valid_ifname(tap) { return; }
-    run(&["nft", "delete", "chain", "netdev", "hearth", &antispoof_chain(tap)]);
+    run(&["nft", "delete", "chain", "netdev", "felucca", &antispoof_chain(tap)]);
 }
 
 // ---- cross-tenant isolation (v4 P1) ----
@@ -564,12 +564,12 @@ fn ensure_bridge_netfilter() -> bool {
         eprintln!(
             "error: br_netfilter is not active (module missing and modprobe denied?) — \
              CROSS-TENANT ISOLATION IS NOT ENFORCED on this node. \
-             Preload the module (modules-load.d/hearth.conf) and restart."
+             Preload the module (modules-load.d/felucca.conf) and restart."
         );
         error!(
             "br_netfilter is not active (module missing and modprobe denied?) — \
              CROSS-TENANT ISOLATION IS NOT ENFORCED on this node. \
-             Preload the module (modules-load.d/hearth.conf) and restart."
+             Preload the module (modules-load.d/felucca.conf) and restart."
         );
     }
     confirmed
@@ -622,29 +622,29 @@ fn tenant_pair_elements(members: &[(String, String)]) -> Vec<String> {
 /// `oifname` rules. Pure for unit tests.
 fn isolation_ruleset(members: &[(String, String)]) -> String {
     let mut s = String::new();
-    s.push_str("add table ip hearth\n");
-    s.push_str("add set ip hearth tenant_pairs { type ipv4_addr . ipv4_addr ; }\n");
-    s.push_str("add chain ip hearth forward { type filter hook forward priority 0 ; policy drop ; }\n");
-    s.push_str("flush chain ip hearth forward\n");
-    s.push_str("flush set ip hearth tenant_pairs\n");
+    s.push_str("add table ip felucca\n");
+    s.push_str("add set ip felucca tenant_pairs { type ipv4_addr . ipv4_addr ; }\n");
+    s.push_str("add chain ip felucca forward { type filter hook forward priority 0 ; policy drop ; }\n");
+    s.push_str("flush chain ip felucca forward\n");
+    s.push_str("flush set ip felucca tenant_pairs\n");
     let elems = tenant_pair_elements(members);
     if !elems.is_empty() {
         s.push_str(&format!(
-            "add element ip hearth tenant_pairs {{ {} }}\n",
+            "add element ip felucca tenant_pairs {{ {} }}\n",
             elems.join(", ")
         ));
     }
     s.push_str(&format!(
-        "add rule ip hearth forward iifname != \"{}\" accept\n",
+        "add rule ip felucca forward iifname != \"{}\" accept\n",
         BRIDGE_NAME
     ));
     s.push_str(&format!(
-        "add rule ip hearth forward oifname != \"{}\" accept\n",
+        "add rule ip felucca forward oifname != \"{}\" accept\n",
         BRIDGE_NAME
     ));
-    s.push_str("add rule ip hearth forward ip saddr . ip daddr @tenant_pairs accept\n");
+    s.push_str("add rule ip felucca forward ip saddr . ip daddr @tenant_pairs accept\n");
     s.push_str(&format!(
-        "add rule ip hearth forward iifname \"{}\" oifname \"{}\" drop\n",
+        "add rule ip felucca forward iifname \"{}\" oifname \"{}\" drop\n",
         BRIDGE_NAME, BRIDGE_NAME
     ));
     s
@@ -676,7 +676,7 @@ pub fn netfilter_ready() -> bool {
 /// and applied as a single atomic nft transaction.
 ///
 /// `members` is `(tenant_id, guest_ip)` for every VM that currently holds an IP.
-/// Guest-to-guest traffic on `hearth0` is dropped by default; only ordered IP
+/// Guest-to-guest traffic on `felucca0` is dropped by default; only ordered IP
 /// pairs that share a (valid) tenant are allowed, via a single concatenated
 /// `ipv4_addr . ipv4_addr` set. VMs with no/invalid tenant join no pair and are
 /// thus isolated from every peer. Egress and host↔guest traffic are unaffected.
@@ -726,14 +726,14 @@ fn ingress_rule_parts(node_port: u16, guest_ip: &str, guest_port: u16) -> Option
 /// VM that currently holds an IP. node_ports come from our own 20000-range
 /// allocator and guest IPs from ipalloc — never user strings.
 pub fn rebuild_ingress(members: &[(u16, String, u16)]) {
-    run(&["nft", "add", "table", "ip", "hearth"]);
-    run(&["nft", "add", "chain", "ip", "hearth", "ingress",
+    run(&["nft", "add", "table", "ip", "felucca"]);
+    run(&["nft", "add", "chain", "ip", "felucca", "ingress",
           "{ type nat hook prerouting priority -100 ; }"]);
-    run(&["nft", "flush", "chain", "ip", "hearth", "ingress"]);
+    run(&["nft", "flush", "chain", "ip", "felucca", "ingress"]);
     for (node_port, guest_ip, guest_port) in members {
         match ingress_rule_parts(*node_port, guest_ip, *guest_port) {
             Some((dport, target)) => {
-                run(&["nft", "add", "rule", "ip", "hearth", "ingress",
+                run(&["nft", "add", "rule", "ip", "felucca", "ingress",
                       "tcp", "dport", &dport, "dnat", "to", &target]);
             }
             // Should be unreachable (IPs come from ipalloc); skipping is the
@@ -757,15 +757,15 @@ mod tests {
         // rule last — every guest-to-guest packet was accepted in between.
         // The flush and the drop rule must now be in the same batch.
         let rs = isolation_ruleset(&[member("tn-a", "10.231.0.2")]);
-        let flush = rs.find("flush chain ip hearth forward").expect("chain flushed");
+        let flush = rs.find("flush chain ip felucca forward").expect("chain flushed");
         let drop = rs
             .find(&format!(
-                "add rule ip hearth forward iifname \"{}\" oifname \"{}\" drop",
+                "add rule ip felucca forward iifname \"{}\" oifname \"{}\" drop",
                 BRIDGE_NAME, BRIDGE_NAME
             ))
             .expect("drop rule present");
         assert!(flush < drop);
-        assert!(rs.contains("flush set ip hearth tenant_pairs"));
+        assert!(rs.contains("flush set ip felucca tenant_pairs"));
     }
 
     #[test]
@@ -800,7 +800,7 @@ mod tests {
         // service bound to the wildcard — the agent's own API included.
         let rs = guest_input_ruleset(Some(9090));
         let drop_all = rs
-            .find(&format!("add rule ip hearth input iifname \"{}\" drop", BRIDGE_NAME))
+            .find(&format!("add rule ip felucca input iifname \"{}\" drop", BRIDGE_NAME))
             .expect("guest default-drop present");
         // Every permit must sit above the default-drop to have any effect.
         let icmp = rs.find("icmp type").expect("icmp permitted");
@@ -814,7 +814,7 @@ mod tests {
         let rs = guest_input_ruleset(Some(9090));
         let port_drop = rs
             .find(&format!(
-                "add rule ip hearth input iifname \"{}\" tcp dport 9090 drop",
+                "add rule ip felucca input iifname \"{}\" tcp dport 9090 drop",
                 BRIDGE_NAME
             ))
             .expect("agent port dropped");
@@ -839,7 +839,7 @@ mod tests {
             .find(&format!("input iifname != \"{}\" accept", BRIDGE_NAME))
             .expect("non-guest traffic exempted");
         assert!(exempt < rs.find("tcp dport 9090 drop").unwrap());
-        assert!(rs.contains("flush chain ip hearth input"));
+        assert!(rs.contains("flush chain ip felucca input"));
     }
 
     #[test]
@@ -848,7 +848,7 @@ mod tests {
         // over autoconfigured link-local IPv6 with no netfilter hook involved.
         let rs = bridge_l2_ruleset();
         let drop_all = rs
-            .find("add rule bridge hearth forward drop")
+            .find("add rule bridge felucca forward drop")
             .expect("L2 default-drop present");
         // ARP and IPv4 must still pass — same-tenant IPv4 depends on both, and
         // the ip forward chain is what polices IPv4.
@@ -870,10 +870,10 @@ mod tests {
         let obr = rs
             .find(&format!("meta obrname != \"{}\" accept", BRIDGE_NAME))
             .expect("other bridges exempted");
-        let drop_all = rs.find("add rule bridge hearth forward drop").unwrap();
+        let drop_all = rs.find("add rule bridge felucca forward drop").unwrap();
         assert!(ibr < drop_all);
         assert!(obr < drop_all);
-        assert!(rs.contains("flush chain bridge hearth forward"));
+        assert!(rs.contains("flush chain bridge felucca forward"));
     }
 
     #[test]
@@ -926,8 +926,8 @@ mod tests {
         assert!(rs.contains("ip saddr 10.231.0.5 accept"));
         // Only this guest's own ARP and IPv4 are permitted; the policy denies
         // everything else, IPv6 included.
-        assert!(rs.contains("flush chain netdev hearth as_hth_3"));
-        assert!(!rs.contains("accept\nadd rule netdev hearth as_hth_3 ip saddr != "));
+        assert!(rs.contains("flush chain netdev felucca as_hth_3"));
+        assert!(!rs.contains("accept\nadd rule netdev felucca as_hth_3 ip saddr != "));
     }
 
     #[test]
@@ -993,14 +993,14 @@ mod tests {
     fn test_ensure_ipv6_disabled_rejects_bad_ifname() {
         // The name reaches a sysctl key and a /proc path, so nothing outside
         // the interface charset may get that far.
-        assert!(!ensure_ipv6_disabled("hearth0; rm -rf /"));
+        assert!(!ensure_ipv6_disabled("felucca0; rm -rf /"));
         assert!(!ensure_ipv6_disabled("../../../proc/sys/net/ipv4/ip_forward"));
         assert!(!ensure_ipv6_disabled(""));
     }
 
     #[test]
     fn test_valid_ifname() {
-        assert!(valid_ifname("hearth0"));
+        assert!(valid_ifname("felucca0"));
         assert!(valid_ifname("hth-3"));
         assert!(!valid_ifname(""));
         assert!(!valid_ifname("hth-3; rm -rf /"));
@@ -1029,7 +1029,7 @@ mod tests {
         // newline would start a new command.
         let elems = tenant_pair_elements(&[
             member("tn-a", "10.231.0.2"),
-            member("tn-a", "10.231.0.3\nadd rule ip hearth forward accept"),
+            member("tn-a", "10.231.0.3\nadd rule ip felucca forward accept"),
         ]);
         assert!(elems.is_empty());
         let elems2 = tenant_pair_elements(&[

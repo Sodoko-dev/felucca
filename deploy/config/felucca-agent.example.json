@@ -1,0 +1,13 @@
+{
+  "_bind_note": "Replace 10.0.1.42 with THIS node's management address. Never 0.0.0.0: the wildcard includes the bridge gateway 10.231.0.1 that every guest has as its default route, and guest-to-host packets hit the INPUT hook, which the agent's own forward-chain tenant isolation never sees — a tenant with root in their own sandbox would reach this root API and exec into every other tenant's guest. On a WireGuard-overlay fleet bind the node's overlay address instead (DEPLOYMENT.md 6.3).",
+  "bind": "10.0.1.42:9090",
+  "control_plane": "https://felucca.internal.example.com",
+  "advertise_addr": "10.0.1.42",
+  "data_dir": "/srv/felucca",
+  "token": "REPLACE_WITH_SAME_TOKEN_AS_FELUCCAD",
+  "pool_size": 2,
+  "net": "on",
+  "net_cidr": "10.231.0.0/24",
+  "join_url": "",
+  "join_token": ""
+}

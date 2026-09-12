@@ -1,11 +1,11 @@
-# Hearth CI — runs on every pull request and on pushes to main.
+# Felucca CI — runs on every pull request and on pushes to main.
 #
 # What runs here is exactly what the repo documents as the local check
 # (go/README.md "Build & test", docs/DEPLOYMENT.md build commands,
 # sdk/ts/package.json scripts, scripts/verify-units.sh), on GitHub-hosted
 # Linux runners. Nothing here needs /dev/kvm.
 #
-# Deliberately NOT here: test/conformance (needs a live hearthd + hearth-agent
+# Deliberately NOT here: test/conformance (needs a live feluccad + felucca-agent
 # with Firecracker, i.e. the lab fleet), scripts/verify-v2.sh, bench.sh.
 # Those stay lab-only until self-hosted KVM runners exist.
 #
@@ -34,7 +34,7 @@ env:
 
 jobs:
   go:
-    name: hearthd + hearth-gw (Go)
+    name: feluccad + felucca-gw (Go)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -52,12 +52,12 @@ jobs:
       - name: static cross-builds (the shipped shape, CGO off)
         run: |
           for arch in amd64 arm64; do
-            for bin in hearthd hearth-gw; do
+            for bin in feluccad felucca-gw; do
               CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
                 go build -trimpath -ldflags='-s -w' -o "/tmp/$bin-$arch" "./cmd/$bin"
             done
           done
-          ls -l /tmp/hearthd-* /tmp/hearth-gw-*
+          ls -l /tmp/feluccad-* /tmp/felucca-gw-*
 
   rust:
     name: ${{ matrix.crate }} (Rust)
@@ -85,7 +85,7 @@ jobs:
         run: |
           sudo apt-get update -q && sudo apt-get install -y -q musl-tools
           cargo build --release --locked --target x86_64-unknown-linux-musl
-          ls -l target/x86_64-unknown-linux-musl/release/hearth-${{ matrix.crate }}
+          ls -l target/x86_64-unknown-linux-musl/release/felucca-${{ matrix.crate }}
 
   sdk-ts:
     name: TypeScript SDK

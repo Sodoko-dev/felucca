@@ -1,7 +1,7 @@
-# Hearth — Adopted Implementation Plan (Zig-first microVM platform)
+# Felucca — Adopted Implementation Plan (Zig-first microVM platform)
 
 > Status: implementation-ready. Phases 1–2 are to be built immediately.
-> Codename: **Hearth**. Backend codenames: **hearthd** (control plane), **hearth-agent** (node agent).
+> Codename: **Felucca**. Backend codenames: **feluccad** (control plane), **felucca-agent** (node agent).
 > Supersedes the architecture in `docs/adr/ADR-0000-original-hearth-plan.md` (preserved as baseline).
 > Key ADRs: `ADR-0001-zig-backend.md`, `ADR-0002-no-kubernetes-control-plane.md`.
 
@@ -40,7 +40,7 @@ any host-level install. Control-plane↔agent traffic uses the user-v2 addresses
 
 ---
 
-## 2. Hearth baseline vs adopted design — what we keep / replace / defer (and why)
+## 2. Felucca baseline vs adopted design — what we keep / replace / defer (and why)
 
 The baseline (ADR-0000) is a faithful clone of the E2B/Fly/Northflank stack: k3s + CRDs + operator,
 Cilium, JuiceFS, Keycloak, SPIRE, Vault, Postgres, Go node-agent, gRPC, Next.js UI. That is the
@@ -53,8 +53,8 @@ to bypass.
 
 | Baseline component | Decision | Adopted replacement | Why |
 |---|---|---|---|
-| k3s cluster + CRDs + operator | **REPLACE** | Single Zig binary `hearthd` + SQLite (WAL) | No Zig k8s/CRD/operator ecosystem; reconcile loop is ~200 lines of Zig, not an operator runtime. See ADR-0002. |
-| Go node-agent + gRPC | **REPLACE** | Zig `hearth-agent` + REST/JSON over HTTP/UDS | User mandate; no Zig gRPC ecosystem; Firecracker itself is REST-over-UDS — Zig std fits perfectly. See ADR-0001. |
+| k3s cluster + CRDs + operator | **REPLACE** | Single Zig binary `feluccad` + SQLite (WAL) | No Zig k8s/CRD/operator ecosystem; reconcile loop is ~200 lines of Zig, not an operator runtime. See ADR-0002. |
+| Go node-agent + gRPC | **REPLACE** | Zig `felucca-agent` + REST/JSON over HTTP/UDS | User mandate; no Zig gRPC ecosystem; Firecracker itself is REST-over-UDS — Zig std fits perfectly. See ADR-0001. |
 | Postgres | **REPLACE (lab)** | SQLite WAL, one file on control plane | Single control node in lab; relational queries for quotas/audit retained; Postgres is the scale-out swap (§10). |
 | Cilium (eBPF CNI) | **REPLACE** | Linux bridge + tap + `nft` per-tenant rules | No CNI without k8s; bridge/tap/nftables is the Firecracker-native datapath and is already toolchain-present (`ip`,`nft`). DSR/Maglev/XDP deferred to bare metal. |
 | JuiceFS + MinIO + Redis metadata | **DEFER** | Per-VM `overlayfs` root over shared RO base ext4; named persistent data disks = plain ext4 files on the worker | overlayfs gives the dedup + fast-fork win immediately; "infinite object-backed" data tier is a Phase-5+ swap, not a Phase-1 dependency. Node-independent durable storage is explicitly out of lab scope (kills live reschedule — honest risk §11). |
@@ -62,12 +62,12 @@ to bypass.
 | SPIRE / SPIFFE mTLS | **DEFER** | Plaintext on the lab L2 + token on every call | No internal mTLS until multi-tenant prod; documented as a known gap. |
 | Vault | **DEFER** | Secrets as env injected from SQLite secret rows | Real secret lifecycle is post-MVP. |
 | gRPC streaming for logs | **REPLACE** | HTTP chunked / SSE + vsock for exec/PTY | Zig std.http supports chunked responses; vsock is the Firecracker-native console/exec channel. |
-| Next.js + Node build toolchain | **REPLACE** | Static SPA (designer-produced) served by `hearthd` from an embedded/served dir | Mandate: no Node on the serving path. `hearthd` serves `/` from a static dir; xterm.js loads as a static asset. |
+| Next.js + Node build toolchain | **REPLACE** | Static SPA (designer-produced) served by `feluccad` from an embedded/served dir | Mandate: no Node on the serving path. `feluccad` serves `/` from a static dir; xterm.js loads as a static asset. |
 | MkDocs + OpenAPI-gen + ADRs | **KEEP (trimmed)** | Markdown docs in `docs/`, hand-maintained OpenAPI for v1, ADRs | Docs-as-code retained; CI doc-build deferred. |
 | Firecracker VMM | **KEEP** | Firecracker v1.16.0 (installed) | Smallest footprint, native snapshot/restore, REST-over-UDS. CLH pluggability deferred (no live migration in lab). |
 | overlayfs root tier | **KEEP** | squashfs/ext4 RO base + per-VM ext4 upper | Exactly the E2B/Modal-image-dedup pattern; fastest fork path. |
-| Prometheus metrics taxonomy | **KEEP** | `/metrics` text-format endpoint on `hearthd` and `hearth-agent` | No exporter needed; Zig writes the text format directly. Scrape with any Prometheus later. |
-| "Sandboxes are not pods" / node-agent hot path | **KEEP+STRENGTHEN** | hearth-agent owns warm pool, snapshot, fork on-box | Core thesis; with no k8s there is literally no slow declarative path to bypass. |
+| Prometheus metrics taxonomy | **KEEP** | `/metrics` text-format endpoint on `feluccad` and `felucca-agent` | No exporter needed; Zig writes the text format directly. Scrape with any Prometheus later. |
+| "Sandboxes are not pods" / node-agent hot path | **KEEP+STRENGTHEN** | felucca-agent owns warm pool, snapshot, fork on-box | Core thesis; with no k8s there is literally no slow declarative path to bypass. |
 | Snapshot/restore + warm pool + CoW fork | **KEEP (hot path)** | See §3 | This *is* the product. Informed by Modal/Sprites (§4). |
 
 **Net:** we trade away every stateful distributed dependency for two Zig binaries + SQLite + Firecracker,
@@ -84,24 +84,24 @@ mechanisms, fastest first — this is the synthesis of what Modal, Sprites, and 
 
 ```
                  ┌──────────────────────── infra-saas-lab ────────────────────────┐
-  UI / CLI ─────▶│  hearthd (:8080)                                                │
-  REST/JSON      │   REST API · scheduler · node registry · SQLite(WAL) · /metrics │
-                 │   static SPA at  /                                              │
-                 └───────────────┬────────────────────────────────────────────────┘
-                                 │ REST/JSON over lab L2  (placement decision only;
-                                 │ NOT on the per-request wake hot path)
+  UI / CLI ─────▶│  feluccad (:8080)                                              │
+  REST/JSON      │   REST API · scheduler · node registry · SQLite(WAL) · /metrics│
+                 │   static SPA at  /                                             │
+                 └────────────────┬───────────────────────────────────────────────┘
+                                  │ REST/JSON over lab L2  (placement decision only;
+                                  │ NOT on the per-request wake hot path)
                  ┌───────────────▼──────────────┐        ┌──────────────────────────┐
-                 │  hearth-agent (:9090)         │  UDS   │  Firecracker per microVM │
-   wake req ────▶│  warm pool · snapshot/restore │──REST─▶│  /run/hearth/<id>.sock   │
-   (hot path)    │  CoW fork · tap/bridge · nft  │        └──────────────────────────┘
-                 └───────────────┬───────────────┘
+                 │  felucca-agent (:9090)       │  UDS   │  Firecracker per microVM │
+   wake req ────▶│  warm pool · snapshot/restore│──REST─▶│  /run/felucca/<id>.sock  │
+   (hot path)    │  CoW fork · tap/bridge · nft │        └──────────────────────────┘
+                 └───────────────┬──────────────┘
                                  │ overlayfs root (RO base + per-VM upper)
                          /srv/ignis/{kernels,images,instances}
 ```
 
 ### 3.1 Wake tier A — warm pool hand-out (target: low tens of ms, no control-plane round trip)
-`hearth-agent` keeps **N pre-restored, paused microVMs** per template parked on each worker. A wake
-request that hits a warm VM is answered by the agent **without any call back to hearthd** — the agent
+`felucca-agent` keeps **N pre-restored, paused microVMs** per template parked on each worker. A wake
+request that hits a warm VM is answered by the agent **without any call back to feluccad** — the agent
 resumes the paused VM, attaches the caller, and returns. This is the Modal "pre-warmed pool +
 snapshot routing" pattern and the Sprites "resume in <100 ms" pattern. The pool is refilled
 asynchronously off the hot path.
@@ -148,7 +148,7 @@ failure loops; the substantive, training-grounded findings worth adopting:
   composable API (create/start/exec/snapshot/destroy). **Adopted:** the exact verb set (§5), warm
   resume as tier-A, per-tenant nft egress, per-sandbox data disks.
 - **Northflank** — k8s-native, **runc** on shared clusters (no microVM isolation) — i.e. the
-  isolation gap Hearth fills. Whole-GPU allocation only; BYOC agent is outbound-only. **Adopted:**
+  isolation gap Felucca fills. Whole-GPU allocation only; BYOC agent is outbound-only. **Adopted:**
   microVM-per-tenant *is* our differentiation; the agent model is outbound-registration-friendly
   (relevant to the vzNAT finding, §8 Phase 0). GPU/MIG and BYOC are explicitly out of lab scope.
 
@@ -160,7 +160,7 @@ scaffolding we can defer.
 
 ## 5. Component breakdown
 
-### 5.1 `hearthd` — Zig control plane (runs on `infra-saas-lab:8080`)
+### 5.1 `feluccad` — Zig control plane (runs on `infra-saas-lab:8080`)
 - **REST API** (`std.http.Server`): tenants, nodes, sandboxes, snapshots, volumes, templates; auth
   middleware (hashed bearer token lookup in SQLite).
 - **Node registry:** workers register via `POST /v1/nodes`; heartbeat + capacity (free KVM slots,
@@ -173,21 +173,21 @@ scaffolding we can defer.
 - **Static UI serving:** serves the designer's SPA from a static dir at `/`; `/v1/*` is the API.
 - **`/metrics`** (Prometheus text) and **`/healthz`**.
 
-### 5.2 `hearth-agent` — Zig node agent (runs on each worker `:9090`)
+### 5.2 `felucca-agent` — Zig node agent (runs on each worker `:9090`)
 - **Firecracker lifecycle** via UDS REST: boot, configure (machine/boot-source/drives/net), pause,
   resume, snapshot create/load, kill. One Firecracker process per microVM, one UDS per VM under
-  `/run/hearth/<id>.sock`.
-- **Tap networking:** create `tap<n>`, attach to a `hearth0` bridge, assign tenant subnet, program
+  `/run/felucca/<id>.sock`.
+- **Tap networking:** create `tap<n>`, attach to a `felucca0` bridge, assign tenant subnet, program
   `nft` rules (intra-tenant allow, cross-tenant default-deny, egress policy).
 - **Storage:** assemble `overlayfs` root (RO base lower + per-VM upper); attach named data disks.
-- **Warm pool:** maintain N paused VMs per template; hand out on the hot path without hearthd.
+- **Warm pool:** maintain N paused VMs per template; hand out on the hot path without feluccad.
 - **Snapshots & fork:** snapshot create/load; CoW fork/branch (§3.3).
-- **Registration & heartbeat** to hearthd; **`/metrics`** and **`/healthz`** locally.
-- **exec/PTY** to a guest via **vsock** (xterm.js → hearthd WS/SSE → agent → vsock).
+- **Registration & heartbeat** to feluccad; **`/metrics`** and **`/healthz`** locally.
+- **exec/PTY** to a guest via **vsock** (xterm.js → feluccad WS/SSE → agent → vsock).
 
-### 5.3 `hearth` CLI — optional thin client
-A small Zig (or shell, for Phase 1) client over the REST API: `hearth node ls`,
-`hearth sandbox create|start|stop|fork|exec|rm`. Phase 1 ships a `curl`-based smoke script; a real
+### 5.3 `felucca` CLI — optional thin client
+A small Zig (or shell, for Phase 1) client over the REST API: `felucca node ls`,
+`felucca sandbox create|start|stop|fork|exec|rm`. Phase 1 ships a `curl`-based smoke script; a real
 CLI is additive.
 
 ---
@@ -197,13 +197,13 @@ CLI is additive.
 All bodies JSON. Auth: `Authorization: Bearer <token>` on every `/v1/*` call except `/healthz`,
 `/metrics`. Errors: `{ "error": { "code": "...", "message": "..." } }`. IDs are ULIDs.
 
-### 6.1 hearthd — control plane (`:8080`)
+### 6.1 feluccad — control plane (`:8080`)
 
 **Nodes**
 - `POST   /v1/nodes`                 register a node `{name, addr, capacity:{vcpu,mem_mb,kvm_slots}}` → `{id, token}`
 - `GET    /v1/nodes`                 list nodes + live capacity/heartbeat
 - `GET    /v1/nodes/{id}`            node detail
-- `POST   /v1/nodes/{id}/heartbeat`  `{free_slots, load}` (agent→hearthd, TTL refresh)
+- `POST   /v1/nodes/{id}/heartbeat`  `{free_slots, load}` (agent→feluccad, TTL refresh)
 - `DELETE /v1/nodes/{id}`            drain + deregister
 
 **Sandboxes** (CRUD + lifecycle verbs — verb set mirrors Sprites/baseline)
@@ -225,11 +225,11 @@ All bodies JSON. Auth: `Authorization: Bearer <token>` on every `/v1/*` call exc
 - `POST /v1/tenants` `{name}` → `{id}` ; `POST /v1/tenants/{id}/tokens` → `{token}` (scoped)
 
 **Ops**
-- `GET /metrics`   Prometheus text: `hearth_wake_seconds` histogram, `hearth_pool_hit_total`,
-  `hearth_fork_seconds`, `hearth_sandboxes{state}`, `hearth_nodes{state}`.
+- `GET /metrics`   Prometheus text: `felucca_wake_seconds` histogram, `felucca_pool_hit_total`,
+  `felucca_fork_seconds`, `felucca_sandboxes{state}`, `felucca_nodes{state}`.
 - `GET /healthz`   `{ "status":"ok", "db":"ok", "nodes":N }`
 
-### 6.2 hearth-agent — node agent (`:9090`, called by hearthd; token-authed)
+### 6.2 felucca-agent — node agent (`:9090`, called by feluccad; token-authed)
 
 - `GET  /healthz`                              `{status, fc_version, kvm:true, free_slots}`
 - `GET  /metrics`                              node-local Prometheus text
@@ -239,7 +239,7 @@ All bodies JSON. Auth: `Authorization: Bearer <token>` on every `/v1/*` call exc
 - `DELETE /agent/v1/sandboxes/{id}`            kill FC, tear down tap/overlay
 - `POST /agent/v1/pool`                        `{template, target}` set warm-pool depth
 
-Agent ↔ Firecracker is Firecracker's own REST over `/run/hearth/<id>.sock`
+Agent ↔ Firecracker is Firecracker's own REST over `/run/felucca/<id>.sock`
 (`PUT /machine-config`, `/boot-source`, `/drives/*`, `/network-interfaces/*`, `/actions`,
 `/snapshot/create`, `/snapshot/load`).
 
@@ -249,10 +249,10 @@ Agent ↔ Firecracker is Firecracker's own REST over `/run/hearth/<id>.sock`
 
 ```
 infra-saas/
-  hearthd/            # Zig control plane (build.zig, src/{http,api,db,sched,registry,metrics}.zig)
-  hearth-agent/       # Zig node agent  (src/{http,firecracker,net,overlay,pool,snapshot,vsock}.zig)
-  hearth-cli/         # optional Zig CLI (Phase 1: scripts/smoke.sh stand-in)
-  ui/                 # designer's static SPA (served by hearthd; no Node on serving path)
+  feluccad/           # Zig control plane (build.zig, src/{http,api,db,sched,registry,metrics}.zig)
+  felucca-agent/      # Zig node agent  (src/{http,firecracker,net,overlay,pool,snapshot,vsock}.zig)
+  felucca-cli/        # optional Zig CLI (Phase 1: scripts/smoke.sh stand-in)
+  ui/                 # designer's static SPA (served by feluccad; no Node on serving path)
   images/             # base rootfs + template build tooling (stages /srv/ignis assets)
   scripts/            # lab bootstrap, net setup, smoke/acceptance tests
   docs/
@@ -271,26 +271,26 @@ Each phase has a runnable acceptance test against the named Lima VMs. Phases 1�
 **Goal:** one routable inter-VM path (the vzNAT finding makes this mandatory) and Phase-1 assets present.
 - Establish a control-plane↔worker path. Options, in order of preference:
   (a) add a shared Lima network (`socket_vmnet` / `user-v2`) so each VM gets a distinct routable IP; or
-  (b) bootstrap registration over an SSH-forwarded tunnel from each worker to `hearthd`. Document the
+  (b) bootstrap registration over an SSH-forwarded tunnel from each worker to `feluccad`. Document the
   chosen path in `scripts/`.
 - Stage `/srv/ignis/kernels/vmlinux` and `/srv/ignis/images/ubuntu-base.ext4` on both workers.
-**Acceptance:** from `kata-lab-0`, `curl http://<hearthd-addr>:8080/healthz` returns `ok`; both
+**Acceptance:** from `kata-lab-0`, `curl http://<feluccad-addr>:8080/healthz` returns `ok`; both
 workers show non-empty `/srv/ignis/kernels` and `/srv/ignis/images`; `firecracker --version` = v1.16.0.
 
-### Phase 1 — Boot one microVM end-to-end: hearthd → agent → Firecracker (FIRST)
-**Goal:** the full vertical slice. `hearthd` accepts a create, places it on a registered
-`hearth-agent`, the agent boots a Firecracker microVM with an overlayfs root + tap NIC, and a command
+### Phase 1 — Boot one microVM end-to-end: feluccad → agent → Firecracker (FIRST)
+**Goal:** the full vertical slice. `feluccad` accepts a create, places it on a registered
+`felucca-agent`, the agent boots a Firecracker microVM with an overlayfs root + tap NIC, and a command
 runs inside it.
-- `hearth-agent` on `kata-lab-1` registers with `hearthd` on `infra-saas-lab`.
+- `felucca-agent` on `kata-lab-1` registers with `feluccad` on `infra-saas-lab`.
 - `POST /v1/sandboxes {template:"ubuntu-base"}` → placed on the agent → FC microVM boots → tap up.
 - `POST /v1/sandboxes/{id}/exec {cmd:"uname -a"}` returns guest output over vsock.
 - `DELETE` tears everything down (FC killed, tap removed, overlay unmounted).
 **Acceptance (runnable):**
 ```
 # on infra-saas-lab
-hearthd &                                   # :8080
+feluccad &                                    # :8080
 # on kata-lab-1
-hearth-agent --hearthd http://<cp>:8080 &   # :9090, registers
+felucca-agent --feluccad http://<cp>:8080 &   # :9090, registers
 # from anywhere with a token
 curl -XPOST .../v1/sandboxes -d '{"template":"ubuntu-base"}'   # -> {id}
 curl -XPOST .../v1/sandboxes/<id>/exec -d '{"cmd":"uname -a"}' # -> "Linux ... aarch64"
@@ -302,11 +302,11 @@ curl .../v1/nodes                                              # kata-lab-1 Read
 **Goal:** tier-A/B wake (§3.1–3.2) and measurement from day one.
 - Agent boots+warms+networks+mounts a template, then `snapshot/create` (paused, post-mount).
 - `POST /agent/v1/pool {template, target:3}` keeps 3 paused VMs ready.
-- A `start` on a pooled template resumes a warm VM with no hearthd round trip.
-- `hearth_wake_seconds` histogram + `hearth_pool_hit_total` exported on `/metrics`.
+- A `start` on a pooled template resumes a warm VM with no feluccad round trip.
+- `felucca_wake_seconds` histogram + `felucca_pool_hit_total` exported on `/metrics`.
 **Acceptance:** cold create vs warm-pool start both measured; warm wake p50 < 200 ms locally (or, if
 aarch64 snapshot is unstable, warm boot+pause hand-out < 1 s — recorded either way);
-`curl .../metrics | grep hearth_wake_seconds` shows a populated histogram; pool refills after hand-out.
+`curl .../metrics | grep felucca_wake_seconds` shows a populated histogram; pool refills after hand-out.
 
 ### Phase 3 — Fork / branch (CoW)
 **Goal:** tier-C (§3.3).
@@ -326,13 +326,13 @@ volume and reads the data back; an unauthenticated `/v1/*` call is `401`; a per-
 only for its sandbox; audit rows recorded in SQLite.
 
 ### Phase 6 — Static UI + web terminal
-**Goal:** designer SPA served by hearthd; xterm.js over vsock.
+**Goal:** designer SPA served by feluccad; xterm.js over vsock.
 **Acceptance:** from a browser, create a sandbox, open a terminal into it, run a command — entirely in
 the SPA, with no Node process on the serving path.
 
 ### Phase 7 — Metrics dashboard + scale-out dry run
 **Goal:** prove the §10 path.
-**Acceptance:** Prometheus scrapes hearthd + both agents; wake p50/p99, pool-hit rate, per-sandbox
+**Acceptance:** Prometheus scrapes feluccad + both agents; wake p50/p99, pool-hit rate, per-sandbox
 CPU/mem visible; a third agent (e.g. a transient Lima worker) joins by running one binary and appears
 in `/v1/nodes` with zero reconfiguration of existing nodes.
 
@@ -352,12 +352,12 @@ and OIDC are deferred (§2) and documented as gaps.
 ## 10. Scale-out path (lab → bare metal, no rearchitect)
 
 The lab choices are deliberately swap-points, not dead ends:
-- **SQLite → Postgres:** `hearthd` talks to a DB module behind an interface; swap the driver. Schema
+- **SQLite → Postgres:** `feluccad` talks to a DB module behind an interface; swap the driver. Schema
   is already relational.
-- **Single hearthd → HA hearthd:** state is in the DB, control plane is otherwise stateless; run N
-  hearthd behind a load balancer once on Postgres.
+- **Single feluccad → HA feluccad:** state is in the DB, control plane is otherwise stateless; run N
+  feluccad behind a load balancer once on Postgres.
 - **Static node list → dynamic fleet:** node registry already supports one-command join (Phase 7);
-  adding bare-metal hosts = run `hearth-agent` on them.
+  adding bare-metal hosts = run `felucca-agent` on them.
 - **bridge/nft → Cilium/SR-IOV; overlayfs-only → JuiceFS/object-backed data tier; token → OIDC +
   Terraform dynamic credentials; FC-only → CLH for live-migration workloads.** Each is an additive
   module behind an interface the lab code already defines.
@@ -389,10 +389,10 @@ The lab choices are deliberately swap-points, not dead ends:
 ## 12. Immediate next actions (for the implementing agent)
 
 1. **Phase 0 net path:** pick shared-Lima-net vs SSH-tunnel registration; script it; confirm
-   `kata-lab-1 → hearthd:/healthz`. Stage kernel + `ubuntu-base.ext4` into `/srv/ignis` on both workers.
-2. **Phase 1 slice:** scaffold `hearthd` (std.http + SQLite + `/v1/nodes`, `/v1/sandboxes`,
-   `/healthz`, `/metrics`) and `hearth-agent` (register + Firecracker-over-UDS boot + tap + overlay +
+   `kata-lab-1 → feluccad:/healthz`. Stage kernel + `ubuntu-base.ext4` into `/srv/ignis` on both workers.
+2. **Phase 1 slice:** scaffold `feluccad` (std.http + SQLite + `/v1/nodes`, `/v1/sandboxes`,
+   `/healthz`, `/metrics`) and `felucca-agent` (register + Firecracker-over-UDS boot + tap + overlay +
    vsock exec). Land the runnable Phase-1 acceptance script in `scripts/`.
-3. **Phase 2:** snapshot-after-warmup + warm pool + `hearth_wake_seconds` histogram; measure aarch64
+3. **Phase 2:** snapshot-after-warmup + warm pool + `felucca_wake_seconds` histogram; measure aarch64
    snapshot behavior and record the degrade path.
 ```
