@@ -71,6 +71,38 @@ bash scripts/conformance-lab.sh    # full API contract suite
 # see docs/DEPLOYMENT.md for production installs (deploy/install.sh)
 ```
 
+## Run the server locally
+
+Binaries are built inside `infra-saas-lab` and run there too (Firecracker needs
+`/dev/kvm`, which the macOS host doesn't have). After the build step above and
+minting a lab token:
+
+```sh
+limactl shell infra-saas-lab -- bash -c \
+  "/tmp/feluccad --bind 0.0.0.0:8080 --state /tmp/felucca-state.json \
+   --ui-dir $REPO/ui --token \$(cat ~/.config/felucca/lab-token)"
+```
+
+feluccad serves the REST API and the dashboard UI on `:8080`. Reach it from the
+host via the VM's forwarded address (`limactl list` shows the SSH port; the app
+port is reachable directly at the VM's `user-v2` IP, e.g.
+`http://<infra-saas-lab-ip>:8080`). See `go/README.md#run` for all flags/env
+vars, and `docs/DEPLOYMENT.md` for production installs.
+
+## Testing
+
+```sh
+# Go unit tests + vet (inside the toolchain VM)
+limactl shell infra-saas-lab -- bash -c \
+  "export PATH=\$PATH:/usr/local/go/bin GOCACHE=\$HOME/.cache/go-build && \
+   cd $REPO/go && go vet ./... && go test ./..."
+
+# end-to-end checks against a running lab
+bash scripts/verify-v2.sh          # 17 system checks incl. wake latency
+bash scripts/conformance-lab.sh    # full API contract suite
+bash scripts/verify-units.sh       # unit-level verification
+```
+
 > **Auth is not optional.** `feluccad` and `felucca-agent` refuse to start on an
 > empty, too-short or placeholder token; `/metrics` needs the admin token; and
 > the console takes its token from a paste-in banner only — never from
@@ -87,3 +119,7 @@ bash scripts/conformance-lab.sh    # full API contract suite
 > header its proxy wrote from one it copied through, so this is closed by
 > configuration or not at all: half of it, in the wrong direction, lets any
 > client choose its own throttle key.
+
+## License
+
+[MIT](LICENSE)
