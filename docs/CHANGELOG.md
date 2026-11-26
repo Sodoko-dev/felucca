@@ -764,6 +764,45 @@ correct token", which survived a sweep that edited the paragraph around it — s
 this round re-verified every authentication, throttling and 429 statement in
 `docs/` against the source rather than against the previous text.
 
+## Stability wave 0 — worker restarts (2026-11-26, Rust + units)
+
+First wave of the 2026-11 stability audit: the three findings that each took
+down **every sandbox on a worker** in one ordinary event. Decisions and the
+alternatives that lost: [ADR-0011](adr/ADR-0011-worker-restarts.md).
+
+**Firewall changes no longer touch the agent (FLU-3, audit F-20)**
+
+- `felucca-agent.service`: `Requires=felucca-firewall.service` →
+  `Wants=` + `After=` + `ExecStartPre=/usr/sbin/nft list chain inet
+  felucca_host input`. The agent now checks the kernel table on every start
+  instead of trusting that a unit once ran; restarting the firewall unit no
+  longer restarts the agent; a firewall unit that fails no longer leaves the
+  agent down with no retry.
+- `felucca-firewall.service` loads the rules as one nft transaction (create,
+  delete, include the file, require the input chain), identical for `start`,
+  `reload` and `restart`. A file that does not load changes nothing. No
+  `ExecStop=`: stopping the unit leaves the rules in force. Ordered after
+  `nftables.service`.
+- `deploy/install.sh`: keeps an existing rules file unless
+  `FELUCCA_CONTROL_PLANE_IP` is given; takes a validated **list** of literal
+  addresses; dry-runs, replaces by rename, installs `root:root 0640`, applies
+  with `reload`; puts the old file back and exits non-zero if the apply fails;
+  never restarts a running agent.
+- `scripts/verify-units.sh` asserts the lines above (and that `Requires=` and
+  `ExecStop=` stay gone), and stubs every `Exec*=` path, not just `ExecStart`.
+- `test/installer/allowlist.sh` (CI): 30 cases on the address-list parser,
+  including the injection strings. New lab gate: `scripts/verify-firewall.sh`.
+
+**Upgrading an existing worker**
+
+- [ ] Re-run `deploy/install.sh worker` (or copy both units and
+      `systemctl daemon-reload`). **Do not pass `FELUCCA_CONTROL_PLANE_IP`
+      unless you mean to rewrite the allow-list** — without it the installer
+      leaves `/etc/felucca/firewall.nft` alone.
+- [ ] `systemctl reload felucca-firewall` if you installed the units by hand
+      (the installer does it). `restart` works too and is now harmless.
+- [ ] If you edit the rules file from here on, apply it with `reload`.
+
 ## Backlog (v3+, in order)
 
 branch (uffd CoW fork of running VMs) → cross-tenant nftables isolation →

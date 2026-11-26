@@ -13,7 +13,14 @@ Wants=network-online.target
 # without the felucca0 drop a tenant with root in their own sandbox reaches the
 # node's root control API. install.sh writes /etc/felucca/firewall.nft and the
 # felucca-firewall unit; a node without them must not serve the API.
-Requires=felucca-firewall.service
+#
+# That rule is enforced by ExecStartPre= below, which looks for the table in
+# the kernel, not by a Requires= on the unit that loads it. Requires= only says
+# the firewall unit ran once: the table can be flushed afterwards and the agent
+# still starts. It also restarted the agent whenever the firewall unit was
+# restarted, and left the agent down with no retry when that unit failed to
+# start. Wants= + After= still loads the rules first at boot (ADR-0011).
+Wants=felucca-firewall.service
 After=felucca-firewall.service
 # Firecracker must be present before the agent starts.
 ConditionPathExists=/usr/local/bin/firecracker
@@ -33,6 +40,13 @@ EnvironmentFile=-/etc/felucca/agent.env
 # e.g. RUST_LOG=debug in agent.env for a debugging session. Journald captures
 # the structured key=value output; grep by request_id to follow one feluccad
 # API call into this agent.
+#
+# Refuse to start while the host firewall table is not loaded (see [Unit]).
+# Read-only; it prints the rules in force into the journal at each start. When
+# it fails the unit retries every RestartSec, so the agent comes back by itself
+# once `systemctl reload felucca-firewall` (or start) has loaded the table.
+# install.sh rewrites the path when nft lives somewhere other than /usr/sbin.
+ExecStartPre=/usr/sbin/nft list chain inet felucca_host input
 ExecStart=/usr/local/bin/felucca-agent --config /etc/felucca/felucca-agent.json
 
 # Restart policy

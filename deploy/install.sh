@@ -149,6 +149,11 @@ install_unit() {
 
     info "Installing systemd unit ${unit_name}.service"
     install -m 0644 "${src}" "${dest}"
+    # felucca-agent.service names nft in its ExecStartPre= check.
+    rewrite_unit_paths "${dest}"
+    # daemon-reload applies the new unit to a service that is already running
+    # (KillMode= and the restart policy take effect at once); it does not
+    # restart anything.
     systemctl daemon-reload
     ok "${dest}"
 }
@@ -275,31 +280,114 @@ install_config_stub() {
 # sandbox (the expected design) reaches the node's root control API.
 #
 # The rules live in their own `inet felucca_host` table so they never collide
-# with the agent's `ip felucca` table or with the host's existing filter table,
-# and the file is regenerated on every run — it is derived from the role and
-# FELUCCA_CONTROL_PLANE_IP, not operator state.
+# with the agent's `ip felucca` table or with the host's existing filter table.
+#
+# Re-running this installer must not change who can reach the node behind the
+# operator's back, and must not disturb what is running on it:
+#   * an existing rules file is left exactly as it is unless
+#     FELUCCA_CONTROL_PLANE_IP is given on this run.  (It used to be rewritten
+#     on every run, so a re-run without the variable narrowed port 9090 to
+#     loopback and locked the control plane out.)
+#   * a new rules file is dry-run through nft before it replaces the old one;
+#   * rules are applied with `systemctl reload` — one nft transaction, see the
+#     unit — never with a restart, so neither the agent nor any sandbox is
+#     touched.
 
 FIREWALL_NFT="${CONF_DIR}/firewall.nft"
 FIREWALL_UNIT=/etc/systemd/system/felucca-firewall.service
+FIREWALL_FAILED=""
+NFT_BIN=""
+
+# The units ship with /usr/sbin/nft and /etc/felucca/firewall.nft written into
+# them; point them at this host's paths where those differ.
+rewrite_unit_paths() {
+    local unit="$1"
+    [ -n "${NFT_BIN}" ] || NFT_BIN="$(command -v nft || true)"
+    if [ -n "${NFT_BIN}" ] && [ "${NFT_BIN}" != /usr/sbin/nft ]; then
+        sed -i "s#/usr/sbin/nft#${NFT_BIN}#g" "${unit}"
+    fi
+    if [ "${FIREWALL_NFT}" != /etc/felucca/firewall.nft ]; then
+        sed -i "s#/etc/felucca/firewall.nft#${FIREWALL_NFT}#g" "${unit}"
+    fi
+}
+
+# FELUCCA_CONTROL_PLANE_IP → CP_V4 / CP_V6, comma-joined nft set elements.
+#
+# The value ends up inside a ruleset that root loads, so nothing is copied out
+# of it unexamined: the string may only contain address characters, and every
+# element must be a literal IPv4 or IPv6 address, optionally with a prefix
+# length.  One or more, separated by commas or spaces — a control plane that
+# reaches this node over both its LAN and its overlay address needs two.
+# Hostnames are refused: the rules are loaded at boot, before DNS is up.
+CP_V4=""
+CP_V6=""
+parse_control_plane_ips() {
+    CP_V4=""; CP_V6=""
+    local raw="${FELUCCA_CONTROL_PLANE_IP:-}"
+    [ -n "${raw}" ] || return 0
+
+    local hint="expected literal IPv4/IPv6 addresses, optionally with /prefix, separated by commas or spaces — e.g. FELUCCA_CONTROL_PLANE_IP='10.0.1.10, fd00::10'"
+    # Whole-string allow-list first, so braces, quotes, semicolons, '#' and
+    # newlines never reach the per-element checks.
+    local allowed='^[0-9A-Fa-f:./, ]+$'
+    [[ "${raw}" =~ ${allowed} ]] \
+        || die "FELUCCA_CONTROL_PLANE_IP contains characters that cannot be part of an address list (${hint})."
+
+    local o='(0|[1-9][0-9]{0,2})'
+    local v4="^${o}\\.${o}\\.${o}\\.${o}(/([0-9]|[12][0-9]|3[0-2]))?\$"
+    local h='[0-9A-Fa-f]{1,4}'
+    local v6="^((${h}:){7}${h}|((${h}:){0,6}${h})?::((${h}:){0,6}${h})?)(/([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8]))?\$"
+
+    local -a toks
+    IFS=', ' read -r -a toks <<< "${raw}"
+    local tok octet
+    for tok in "${toks[@]}"; do
+        [ -n "${tok}" ] || continue
+        if [[ "${tok}" =~ ${v4} ]]; then
+            for octet in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+                [ "${octet}" -le 255 ] \
+                    || die "FELUCCA_CONTROL_PLANE_IP: '${tok}' is not an IPv4 address (${hint})."
+            done
+            # Loopback is always allowed by the generator; never list it twice.
+            [ "${tok}" = 127.0.0.1 ] && continue
+            case ", ${CP_V4}, " in
+                *", ${tok}, "*) ;;
+                *) CP_V4="${CP_V4:+${CP_V4}, }${tok}" ;;
+            esac
+        elif [[ "${tok}" =~ ${v6} ]]; then
+            [ "${tok}" = ::1 ] && continue
+            case ", ${CP_V6}, " in
+                *", ${tok}, "*) ;;
+                *) CP_V6="${CP_V6:+${CP_V6}, }${tok}" ;;
+            esac
+        else
+            die "FELUCCA_CONTROL_PLANE_IP: '${tok}' is not an address (${hint})."
+        fi
+    done
+}
 
 write_worker_firewall() {
+    local dest="$1"
     # Loopback stays allowed either way so `curl 127.0.0.1:9090/healthz` still
     # works for on-node diagnostics; the API is bearer-authenticated regardless.
     # An inet-table `ip saddr` match never sees IPv6 packets, so each family
-    # needs its own rule.
-    local v4_allow="127.0.0.1" v6_allow="::1"
-    case "${FELUCCA_CONTROL_PLANE_IP:-}" in
-        "")   ;;  # deny by default rather than open the root API to the whole
-                  # private network on the strength of an unset variable
-        *:*)  v6_allow="::1, ${FELUCCA_CONTROL_PLANE_IP}" ;;
-        *)    v4_allow="127.0.0.1, ${FELUCCA_CONTROL_PLANE_IP}" ;;
-    esac
-    local cp_rule="        tcp dport 9090 ip saddr != { ${v4_allow} } drop
-        tcp dport 9090 ip6 saddr != { ${v6_allow} } drop"
+    # needs its own rule.  With no control-plane address given the port is
+    # loopback-only: deny by default rather than open the root API to the
+    # whole private network on the strength of an unset variable.
+    parse_control_plane_ips
+    local v4_allow="127.0.0.1${CP_V4:+, ${CP_V4}}"
+    local v6_allow="::1${CP_V6:+, ${CP_V6}}"
 
-    cat > "${FIREWALL_NFT}" <<NFTEOF
-# Generated by deploy/install.sh — regenerated on every run, do not hand-edit.
-# Additional local policy belongs in its own table.
+    cat > "${dest}" <<NFTEOF
+# Generated by deploy/install.sh.
+#
+# Re-running the installer leaves this file alone unless
+# FELUCCA_CONTROL_PLANE_IP is given, in which case it is regenerated from that
+# value; the two port-9090 rules below are the only part that depends on it.
+# After editing by hand:    systemctl reload felucca-firewall
+# The reload is one nft transaction — a file that does not load leaves the
+# rules already in force untouched.  Other local policy belongs in its own
+# table.
 table inet felucca_host {
     chain input {
         type filter hook input priority filter; policy accept;
@@ -315,17 +403,23 @@ table inet felucca_host {
         iifname "felucca0" drop
 
         # The agent API answers the control plane only.
-${cp_rule}
+        tcp dport 9090 ip saddr != { ${v4_allow} } drop
+        tcp dport 9090 ip6 saddr != { ${v6_allow} } drop
     }
 }
 NFTEOF
-    chmod 0640 "${FIREWALL_NFT}"
 }
 
 write_control_plane_firewall() {
-    cat > "${FIREWALL_NFT}" <<'NFTEOF'
-# Generated by deploy/install.sh — regenerated on every run, do not hand-edit.
-# Additional local policy belongs in its own table.
+    local dest="$1"
+    cat > "${dest}" <<'NFTEOF'
+# Generated by deploy/install.sh.
+#
+# Re-running the installer leaves this file alone; delete it and re-run to get
+# a fresh copy.  After editing by hand:    systemctl reload felucca-firewall
+# The reload is one nft transaction — a file that does not load leaves the
+# rules already in force untouched.  Other local policy belongs in its own
+# table.
 table inet felucca_host {
     chain input {
         type filter hook input priority filter; policy accept;
@@ -338,61 +432,146 @@ table inet felucca_host {
     }
 }
 NFTEOF
-    chmod 0640 "${FIREWALL_NFT}"
+}
+
+# The rules for the role's port that are in the kernel right now.
+firewall_port_rules() {
+    local port="$1" out
+    out="$("${NFT_BIN}" list chain inet felucca_host input 2>/dev/null \
+        | grep -E "dport ${port} " | sed -E 's/^[[:space:]]+//' || true)"
+    if [ -n "${out}" ]; then
+        printf '%s\n' "${out}"
+    else
+        echo "(table inet felucca_host is not loaded)"
+    fi
+}
+
+# Dry-run a candidate rules file through exactly the script that
+# felucca-firewall.service feeds to nft.  Nothing is changed.
+firewall_check() {
+    local file="$1"
+    printf 'table inet felucca_host\ndelete table inet felucca_host\ninclude "%s"\nlist chain inet felucca_host input\n' "${file}" \
+        | "${NFT_BIN}" -c -f - >/dev/null
 }
 
 install_firewall() {
-    local role="$1"
+    local role="$1" port=9090
+    [ "${role}" = control-plane ] && port=8080
 
-    local nft_bin
-    nft_bin="$(command -v nft || true)"
-    if [ -z "${nft_bin}" ]; then
+    NFT_BIN="$(command -v nft || true)"
+    if [ -z "${NFT_BIN}" ]; then
         echo "    ERROR: nft not found — the host firewall rules cannot be installed."
-        echo "    felucca-agent.service Requires=felucca-firewall.service and will refuse"
-        echo "    to start until they are. Install nftables and re-run this installer."
+        if [ "${role}" = worker ]; then
+            echo "    felucca-agent.service looks for them before every start and will not come"
+            echo "    up until they are loaded. Install nftables and re-run this installer."
+        else
+            echo "    Install nftables and re-run this installer before feluccad listens on"
+            echo "    anything but loopback: nothing else stops it from starting unfiltered."
+        fi
+        FIREWALL_FAILED="nft is not installed"
         return
     fi
 
     info "Installing host firewall rules"
-    case "${role}" in
-        worker)        write_worker_firewall ;;
-        control-plane) write_control_plane_firewall ;;
-    esac
-    ok "${FIREWALL_NFT}"
+    local before
+    before="$(firewall_port_rules "${port}")"
 
-    # A oneshot unit re-applies the ruleset on every boot; the service units
-    # order themselves after it so a node never serves its API unfiltered.
-    #
-    # The unit ships in deploy/systemd/ like every other one rather than being
-    # generated here: felucca-agent.service's Requires= points at it, so it is
-    # part of the enforcement path and belongs somewhere it gets reviewed and
-    # run through `systemd-analyze verify` (scripts/verify-units.sh) instead of
-    # living only inside an installer heredoc. Only the two paths are
-    # substituted, and only when they differ from the shipped defaults.
+    local generated=no backup=""
+    if [ -s "${FIREWALL_NFT}" ] && [ -z "${FELUCCA_CONTROL_PLANE_IP:-}" ]; then
+        if [ "${role}" = worker ]; then
+            ok "${FIREWALL_NFT} kept as it is (FELUCCA_CONTROL_PLANE_IP not given)"
+        else
+            ok "${FIREWALL_NFT} kept as it is"
+        fi
+    else
+        # Same directory as the destination, so the final mv is a rename: no
+        # reader ever sees a half-written rules file.
+        local tmp
+        tmp="$(mktemp "${CONF_DIR}/.firewall.nft.XXXXXX")"
+        case "${role}" in
+            worker)        write_worker_firewall "${tmp}" ;;
+            control-plane) write_control_plane_firewall "${tmp}" ;;
+        esac
+        if ! firewall_check "${tmp}"; then
+            rm -f "${tmp}"
+            die "The generated firewall rules do not load (nft -c refused them). ${FIREWALL_NFT} and the rules in force were not changed."
+        fi
+        if [ -s "${FIREWALL_NFT}" ]; then
+            backup="${FIREWALL_NFT}.prev"
+            cp -p "${FIREWALL_NFT}" "${backup}"
+        fi
+        chown root:root "${tmp}"
+        chmod 0640 "${tmp}"
+        mv -f "${tmp}" "${FIREWALL_NFT}"
+        generated=yes
+        ok "${FIREWALL_NFT}"
+    fi
+    # root loads this file, so only root may write it.  (The control-plane
+    # role's recursive chown of ${CONF_DIR} would otherwise hand a ruleset
+    # that root applies to the unprivileged service user.)
+    chown root:root "${FIREWALL_NFT}"
+    chmod 0640 "${FIREWALL_NFT}"
+
+    # A oneshot unit applies the ruleset on every boot, ordered before the
+    # service units.  It ships in deploy/systemd/ like every other unit rather
+    # than being generated here, so it gets reviewed and run through
+    # `systemd-analyze verify` (scripts/verify-units.sh) instead of living only
+    # inside an installer heredoc. Only the two paths are substituted, and only
+    # when they differ from the shipped defaults.
     local unit_src="${SCRIPT_DIR}/systemd/felucca-firewall.service"
     [ -f "${unit_src}" ] || die "Unit file not found: ${unit_src}"
     install -m 0644 "${unit_src}" "${FIREWALL_UNIT}"
-    if [ "${nft_bin}" != /usr/sbin/nft ]; then
-        sed -i "s#/usr/sbin/nft#${nft_bin}#g" "${FIREWALL_UNIT}"
-    fi
-    if [ "${FIREWALL_NFT}" != /etc/felucca/firewall.nft ]; then
-        sed -i "s#/etc/felucca/firewall.nft#${FIREWALL_NFT}#g" "${FIREWALL_UNIT}"
-    fi
+    rewrite_unit_paths "${FIREWALL_UNIT}"
     ok "${FIREWALL_UNIT}"
     systemctl daemon-reload
     systemctl enable felucca-firewall >/dev/null 2>&1 || true
 
-    if systemctl restart felucca-firewall >/dev/null 2>&1; then
-        ok "Firewall rules active (table inet felucca_host)"
+    # reload, not restart: the unit loads the file as one transaction, and a
+    # reload reaches nothing else on the node.  `start` covers a first install
+    # and a unit that is stopped or failed.
+    local verb=start
+    if systemctl is-active --quiet felucca-firewall; then
+        verb=reload
+    fi
+    if systemctl "${verb}" felucca-firewall >/dev/null 2>&1; then
+        ok "Firewall rules applied (systemctl ${verb} felucca-firewall)"
+        [ -n "${backup}" ] && rm -f "${backup}"
     else
-        echo "    WARNING: could not apply the rules now — check 'systemctl status felucca-firewall'."
-        echo "    ${role} services will not start until it succeeds."
+        # The load is transactional, so whatever was in force before still is.
+        # Put the previous file back so the disk matches the kernel and the
+        # next boot does not trip over the file that just failed.
+        if [ -n "${backup}" ]; then
+            mv -f "${backup}" "${FIREWALL_NFT}"
+            echo "    ERROR: 'systemctl ${verb} felucca-firewall' failed. The previous rules are still in force and"
+            echo "    the previous ${FIREWALL_NFT} was put back — see 'systemctl status felucca-firewall'."
+        else
+            echo "    ERROR: 'systemctl ${verb} felucca-firewall' failed — see 'systemctl status felucca-firewall'."
+        fi
+        if [ "${role}" = worker ]; then
+            echo "    felucca-agent will not start while table inet felucca_host is not loaded."
+        else
+            echo "    feluccad does NOT wait for these rules: keep it on loopback until this is fixed."
+        fi
+        FIREWALL_FAILED="systemctl ${verb} felucca-firewall failed"
+        return
     fi
 
-    if [ "${role}" = worker ] && [ -z "${FELUCCA_CONTROL_PLANE_IP:-}" ]; then
+    local after
+    after="$(firewall_port_rules "${port}")"
+    if [ "${before}" = "${after}" ]; then
+        echo "    Port ${port} rules in force (unchanged):"
+    else
+        echo "    Port ${port} rules before this run:"
+        printf '%s\n' "${before}" | sed 's/^/        /'
+        echo "    Port ${port} rules in force now:"
+    fi
+    printf '%s\n' "${after}" | sed 's/^/        /'
+
+    if [ "${role}" = worker ] && [ "${generated}" = yes ] && [ -z "${CP_V4}${CP_V6}" ]; then
         echo "    NOTE: FELUCCA_CONTROL_PLANE_IP was not set, so port 9090 is currently"
-        echo "    loopback-only. Re-run with FELUCCA_CONTROL_PLANE_IP=<control plane IP>"
-        echo "    (or edit ${FIREWALL_NFT}) before the control plane can drive this node."
+        echo "    loopback-only. Re-run with FELUCCA_CONTROL_PLANE_IP=<control plane address(es)>"
+        echo "    (or edit ${FIREWALL_NFT} and 'systemctl reload felucca-firewall') before the"
+        echo "    control plane can drive this node."
     fi
 }
 
@@ -589,9 +768,24 @@ ENVEOF
             ok "Env stub installed: ${CONF_DIR}/agent.env"
         fi
         install_firewall "worker"
-        info "Enabling felucca-agent (not starting it yet)"
-        systemctl enable felucca-agent
-        ok "felucca-agent enabled — start it once the steps below are done"
+        if systemctl is-active --quiet felucca-agent; then
+            # An upgrade. This installer never restarts a running agent: the
+            # operator picks the moment, and the restart is the only step left.
+            systemctl enable felucca-agent >/dev/null 2>&1 || true
+            echo ""
+            echo "felucca-agent is running and was NOT restarted. The new unit is already in"
+            echo "effect (KillMode=$(systemctl show felucca-agent -p KillMode --value)); the new binary is not, until you run:"
+            echo "    sudo systemctl restart felucca-agent"
+            echo "Sandboxes keep running across that restart when KillMode above says 'process'."
+            echo "The firewall rules were applied with a reload, which touches neither the agent"
+            echo "nor any sandbox."
+            echo ""
+            echo "The checklist below is for a first install."
+        else
+            info "Enabling felucca-agent (not starting it yet)"
+            systemctl enable felucca-agent
+            ok "felucca-agent enabled — start it once the steps below are done"
+        fi
         echo ""
         echo "Before starting the agent:"
         echo "  1. Set control_plane, advertise_addr and bind in ${CONF_DIR}/felucca-agent.json"
@@ -622,6 +816,14 @@ if [ "${TOKEN_IS_NEW}" = yes ] && [ "${CONFIG_WAS_WRITTEN}" = yes ]; then
 elif [ "${CONFIG_WAS_WRITTEN}" = no ]; then
     echo ""
     echo "The existing config was kept, so its token is still in force — nothing new to copy."
+fi
+
+if [ -n "${FIREWALL_FAILED}" ]; then
+    # Everything else was installed and reported above (the token is only
+    # printed once, so the run is not cut short), but an installer that says
+    # "complete" with no host firewall loaded would be lying.
+    echo ""
+    die "Host firewall rules were NOT applied (${FIREWALL_FAILED}). Fix that and re-run this installer."
 fi
 
 echo ""

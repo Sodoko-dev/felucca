@@ -224,12 +224,26 @@ The installer:
    `/etc/felucca/agent.env` stub.
 5. Writes `/etc/felucca/firewall.nft` and installs
    `deploy/systemd/felucca-firewall.service`, then applies them (§8).
-6. **Enables but does not start** felucca-agent.
+6. **Enables but does not start** felucca-agent. On a node where the agent is
+   already running (an upgrade) it is **not restarted** either — the installer
+   prints the one command left to run (§10).
 
 `FELUCCA_TOKEN` is not optional in practice: without it the worker mints its own
 token, which is safe but will not match the control plane, so the node never
 registers. `FELUCCA_CONTROL_PLANE_IP` is what opens port 9090 to the control
-plane — leave it unset and 9090 stays loopback-only.
+plane — leave it unset on a first install and 9090 stays loopback-only. It
+takes one or more literal addresses (IPv4 or IPv6, optionally `/prefix`),
+separated by commas or spaces; a control plane that reaches this worker over
+both its LAN and its overlay address needs both:
+
+```sh
+FELUCCA_CONTROL_PLANE_IP='10.0.1.10, 10.100.0.1' sudo -E bash deploy/install.sh worker
+```
+
+Anything that is not a literal address aborts the install — hostnames
+included, because the rules are loaded at boot before DNS is up. **Re-running
+the installer without the variable keeps the rules file exactly as it is**; it
+only rewrites the allow-list when you pass the variable again (§8).
 
 Then finish the config — `bind` must be this node's management address, never
 `0.0.0.0`, because `0.0.0.0` includes the bridge gateway every guest routes
@@ -1067,17 +1081,37 @@ adding them rather than trusting them on sight.
 
 **These rules are installed, not suggested.** `deploy/install.sh` writes
 `/etc/felucca/firewall.nft` and installs `deploy/systemd/felucca-firewall.service`
-to apply it, and `felucca-agent.service` has `Requires=felucca-firewall.service` —
-a worker whose rules are missing does not serve its API at all. The ruleset
-lives in its own `inet felucca_host` table, so it never collides with the agent's
-`ip felucca` table or with whatever else the host runs.
+to apply it. A worker whose rules are missing does not serve its API at all:
+`felucca-agent.service` runs `nft list chain inet felucca_host input` as an
+`ExecStartPre=` and refuses to start when the table is not in the kernel. The
+ruleset lives in its own `inet felucca_host` table, so it never collides with
+the agent's `ip felucca` table or with whatever else the host runs.
+
+That check looks at the kernel, not at the firewall unit's state. Until
+ADR-0011 the agent had `Requires=felucca-firewall.service` instead, which only
+attested that the unit had run once (flush the table afterwards and the agent
+still started), restarted the agent every time the firewall unit was restarted,
+and left the agent **down with no retry** when that unit failed to start. The
+agent now `Wants=` the firewall unit and orders itself after it, so the rules
+are still loaded first at boot; and because a failed check is an ordinary start
+failure, the agent retries every 5 s and comes up by itself as soon as the
+table is loaded.
+
+The firewall unit loads the file as **one nft transaction**: create the table
+if it is absent, delete it, load `/etc/felucca/firewall.nft`, then require that
+the file really defined the `input` chain. A file that does not parse, is
+empty, or defines no `input` chain commits nothing — the rules that were in
+force stay in force — and loading twice never duplicates a rule. `start`,
+`reload` and `restart` all run that same transaction. `stop` does **not** remove
+the rules: sandboxes keep running when their agent is stopped (§10), so a stop
+that deleted the table would expose the host to every guest still up. To take
+the rules out on purpose: `nft delete table inet felucca_host`.
 
 The unit is a reviewable file under `deploy/systemd/` rather than a heredoc
-inside the installer, because it is part of that enforcement path: it is what
-the agent's `Requires=` resolves to, and it is covered by
-`scripts/verify-units.sh` along with the other three units. The installer only
-rewrites the two absolute paths in it, and only when `nft` or the config
-directory is somewhere other than the shipped default.
+inside the installer, because it is part of that enforcement path, and it is
+covered by `scripts/verify-units.sh` along with the other three units. The
+installer only rewrites the two absolute paths in the units, and only when
+`nft` or the config directory is somewhere other than the shipped default.
 
 ```bash
 bash scripts/verify-units.sh    # systemd-analyze verify over deploy/systemd/*
@@ -1091,6 +1125,10 @@ unresolved `felucca-firewall.service`, and both of those are artifacts of the
 checkout rather than defects. It treats any output as failure: systemd exits 0
 on a malformed `RestrictAddressFamilies=` or an unknown directive while only
 warning about it, which would otherwise let a hardening regression through.
+After the parse it also asserts, line by line, that the directives the fleet's
+availability rests on are present (and that `Requires=` on the firewall unit
+and an `ExecStop=` that deletes the table have not come back) — a unit can
+parse perfectly and still have lost the one line that mattered.
 
 The rule that matters most is the worker's `iifname "felucca0" drop`. The agent
 listens on the bridge gateway that every guest has as its default route, and
@@ -1132,13 +1170,32 @@ Inspect and manage them with:
 ```sh
 sudo nft list table inet felucca_host
 sudo systemctl status felucca-firewall
-sudo systemctl restart felucca-firewall     # re-apply after editing the file
+sudo systemctl reload felucca-firewall      # apply an edited rules file
 ```
 
-The installer regenerates `/etc/felucca/firewall.nft` on every run, so local
-additions belong in a separate table of your own. If workers reach feluccad
-directly on 8080 rather than through Caddy, widen the control-plane rule there —
-and note that the API is then exposed to whatever you widen it to.
+`reload` touches nothing but the table: not the agent, not a single sandbox.
+If the edited file does not load, the command fails, the unit stays active and
+the previous rules stay in force — fix the file and reload again. `restart`
+does the same thing to the rules and is equally safe; before ADR-0011 it
+restarted the agent, which killed every sandbox on the worker.
+
+The installer **keeps an existing `/etc/felucca/firewall.nft`** and only
+regenerates it when `FELUCCA_CONTROL_PLANE_IP` is given on that run (it used to
+rewrite the file every time, so a re-run without the variable silently narrowed
+port 9090 to loopback and locked the control plane out). Whenever it does write
+the file it first dry-runs the result through the same transaction the unit
+uses, replaces the file atomically, applies it with `reload`, and prints the
+port rules in force before and after; if the apply fails it puts the previous
+file back and exits non-zero. To get a freshly generated file, delete it and
+re-run the installer. The file is installed `root:root 0640` on every run: root
+loads it, so nothing else may write it.
+
+Local additions still belong in a separate table of your own. If workers reach
+feluccad directly on 8080 rather than through Caddy, widen the control-plane
+rule there — and note that the API is then exposed to whatever you widen it to.
+`feluccad.service` does **not** wait for these rules the way the agent does:
+on a control plane that binds anything but loopback, check
+`systemctl is-active felucca-firewall` yourself before starting it.
 
 Ports 443/80 for Caddy are yours to open as usual:
 
@@ -1179,8 +1236,15 @@ Two operational consequences:
 
 These sit **under** the installer's `inet felucca_host` rules from §8, not
 instead of them. Both layers exist because they fail independently: the agent's
-own fence is gone if the agent is not running, and the installer's is gone if
-the firewall unit was never installed.
+tables are only (re)built when the agent starts, and the installer's are gone
+if the firewall unit was never installed. Neither disappears when its process
+stops — nft tables live in the kernel, so the agent's fences stay in force
+while the agent is down or restarting, which is what keeps the sandboxes that
+outlive it (§10) fenced. What does remove them is a `nft flush ruleset`, by
+hand or by the distribution's own `nftables.service`: after one, run
+`systemctl reload felucca-firewall` **and** `systemctl restart felucca-agent`.
+The firewall unit is ordered after `nftables.service` so that at boot the
+distribution's loader cannot wipe a table that is already loaded.
 
 `felucca-agent` also refuses a `bind` inside the guest CIDR outright, for the
 same reason the wildcard is not the default (§6.3):
@@ -1214,7 +1278,7 @@ The binaries are identical. Only the config values change.
 | `pool_size` | `0` (lab is too small) | `2`–`5` per node |
 | `state_path` | `/var/lib/felucca/state.json` | same |
 | `data_dir` | `/srv/felucca` | same |
-| systemd | not used in lab (so the host firewall unit is not installed either — do not expose a lab VM) | `feluccad.service` / `felucca-agent.service` + `felucca-firewall.service` |
+| systemd | workers: `felucca-agent.service` + `felucca-firewall.service`, as in production; control plane: `feluccad.service` only — the lab control plane has **no** host firewall unit, so do not expose that VM | `feluccad.service` / `felucca-agent.service` + `felucca-firewall.service` |
 
 The Lima lab uses the same JSON config structure. See `deploy/config/local-lab.md`
 for the exact values used in each Lima VM.
@@ -1328,8 +1392,9 @@ ritual: `scripts/bench.sh <endpoint> <token>` and refresh `docs/BENCHMARKS.md`.
 | `feluccad` exits: `msg=trusted-proxies err="… is not a CIDR"` | A malformed entry in `trusted_proxies` — deliberately fatal, never skipped | Write CIDRs (`127.0.0.1/32`, `10.0.0.0/8`); a bare IP is accepted and normalised. See §7.1 |
 | `feluccad` exits: `msg=trusted-proxies err="trust_x_real_ip is set but no trusted_proxies are declared"` | `trust_x_real_ip` on with nothing declared would believe `X-Real-IP` from every peer — a header any client can set | Either list the proxy in `trusted_proxies`, or drop `trust_x_real_ip` and have the proxy send `X-Forwarded-For` (preferred). See §7.1 |
 | One client's bad token turns everyone else's `401`s into `429`s | Behind a proxy with no forwarded-header config, every client shares the proxy's address as its throttle key (holders of a valid token are unaffected — §6.2) | Configure both halves in §7.1: proxy **overwrites** `X-Forwarded-For`, feluccad lists the proxy in `trusted_proxies`. Never one without the other |
-| `felucca-agent` will not start: `Unit felucca-firewall.service not found` | Worker installed without the host firewall (or `nft` was missing when the installer ran) | Install nftables and re-run `deploy/install.sh worker`; this is deliberate — see §8 |
-| Control plane cannot reach a worker on 9090 | `FELUCCA_CONTROL_PLANE_IP` was not set at install, so 9090 is loopback-only | Re-run the worker installer with it set, or edit `/etc/felucca/firewall.nft` and `systemctl restart felucca-firewall` |
+| `felucca-agent` keeps restarting; journal shows `nft list chain inet felucca_host input` failing with `No such file or directory` | The host firewall table is not loaded: the firewall unit never ran or failed, `nft` was missing when the installer ran, or something flushed the ruleset | `systemctl status felucca-firewall`, fix what it reports, then `systemctl reload felucca-firewall` (or `start`). The agent comes up by itself within 5 s; sandboxes that were running were not touched. Deliberate — see §8 |
+| `systemctl reload felucca-firewall` fails | The rules file does not parse, is empty, or defines no `input` chain | Nothing was changed — the previous rules are still in force. Fix `/etc/felucca/firewall.nft` and reload again |
+| Control plane cannot reach a worker on 9090 | `FELUCCA_CONTROL_PLANE_IP` was not set at the first install, so 9090 is loopback-only — or the control plane reaches the worker from an address that is not in the list (LAN vs overlay) | Re-run the worker installer with every address it comes from (`FELUCCA_CONTROL_PLANE_IP='10.0.1.10, 10.100.0.1'`), or edit `/etc/felucca/firewall.nft` and `systemctl reload felucca-firewall` |
 | Installer aborts: `failed SHA-256 verification` | The pinned Firecracker or guest asset did not match its recorded digest | Do not bypass it. Re-download; if the upstream artifact genuinely changed, refresh the pin per the comment block in the script |
 | `GET /healthz` returns `connection refused` from another host | feluccad binds `127.0.0.1:8080` (the shipped default — Caddy fronts it) | Intended. Reach it through Caddy, or widen `bind` *and* the §8 rule if you really need direct access |
 | `GET /healthz` returns `connection refused` on the server itself | feluccad not listening | Check `bind` in config; `journalctl -u feluccad -n 50` |

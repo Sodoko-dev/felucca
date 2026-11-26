@@ -1,11 +1,10 @@
 [Unit]
 Description=Felucca host firewall rules
 Documentation=https://github.com/alpham/infra-saas/docs/DEPLOYMENT.md
-# This unit is the enforcement point for DEPLOYMENT.md §8, not a convenience:
-# felucca-agent.service has Requires=felucca-firewall.service, so a worker whose
-# rules are missing refuses to serve its API at all. The agent listens on the
-# bridge gateway that every guest routes through, and guest->host packets hit
-# the INPUT hook, which the agent's own forward-chain isolation never sees —
+
+# This unit loads the rules DEPLOYMENT.md §8 depends on. The agent listens on
+# the bridge gateway that every guest routes through, and guest->host packets
+# hit the INPUT hook, which the agent's own forward-chain isolation never sees —
 # without the felucca0 drop a tenant with root in their own sandbox reaches the
 # node's root control API.
 #
@@ -14,18 +13,54 @@ Documentation=https://github.com/alpham/infra-saas/docs/DEPLOYMENT.md
 # control plane; control plane: restrict 8080). They live in their own
 # `inet felucca_host` table so they never collide with the agent's `ip felucca`
 # table or with whatever else the host runs.
+#
+# What keeps an unfiltered worker from serving is felucca-agent.service's
+# ExecStartPre=, which looks for this table in the kernel every time the agent
+# starts. It is deliberately NOT Requires=: that only attests that this unit ran
+# once, restarts the agent whenever this unit is restarted, and leaves the agent
+# down with no retry when this unit fails to start (ADR-0011).
 Before=felucca-agent.service feluccad.service
+# The distribution's own ruleset loader commonly begins with `flush ruleset`.
+# Ordering after it means that at boot it cannot wipe this table once loaded.
+# (Ordering only: nothing is pulled in, and a host without that unit is fine.)
+After=nftables.service
 
 [Service]
-# oneshot + RemainAfterExit so the ruleset is applied once at boot and the unit
-# then counts as active for the Requires= above. A failure here is meant to
-# keep felucca-agent down rather than let it serve unfiltered.
+# oneshot + RemainAfterExit: applied once at boot, then the unit counts as
+# active so `systemctl reload` works.
 Type=oneshot
 RemainAfterExit=true
-# install.sh rewrites this path when nft lives somewhere other than /usr/sbin.
-ExecStart=/usr/sbin/nft -f /etc/felucca/firewall.nft
-# Leading '-' so a stop with the table already gone is not a unit failure.
-ExecStop=-/usr/sbin/nft delete table inet felucca_host
+
+# The script nft runs. It is one transaction: create the table if it is not
+# there (so the delete cannot fail on a first load), delete it, load the rules
+# file, then require that the file really defined the input chain. If the file
+# does not parse, is empty, or defines no input chain, nothing is committed and
+# the rules that were loaded before stay in force — there is never a moment
+# with no rules, and loading twice does not duplicate them. Keeping these four
+# lines here rather than in the rules file means any rules file gets the same
+# treatment, including one written by hand.
+#
+# install.sh rewrites the two paths below when nft or the rules file live
+# somewhere else.
+StandardInputText=table inet felucca_host
+StandardInputText=delete table inet felucca_host
+StandardInputText=include "/etc/felucca/firewall.nft"
+StandardInputText=list chain inet felucca_host input
+ExecStart=/usr/sbin/nft -f -
+# Second look, from outside the transaction: an nft too old to see its own
+# pending changes passes the in-script check on a stale view. This cannot undo
+# anything, but it fails the unit loudly instead of leaving it green.
+ExecStartPost=/usr/sbin/nft list chain inet felucca_host input
+
+# Applying an edited rules file: `systemctl reload felucca-firewall`. Same
+# transaction as a start, nothing else on the node is touched.
+ExecReload=/usr/sbin/nft -f -
+ExecReload=/usr/sbin/nft list chain inet felucca_host input
+
+# No ExecStop=. Stopping this unit leaves the rules loaded: VMs keep running
+# when their agent is stopped, so a stop that removed the fence would expose
+# the host to every guest still up. To remove the rules on purpose:
+#   nft delete table inet felucca_host
 
 [Install]
 WantedBy=multi-user.target
