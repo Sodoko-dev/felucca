@@ -119,5 +119,5 @@ jobs:
       # loads; this is the test that only literal addresses get through.
       # Under sudo so the nft parse check runs too when nft is on the runner
       # (it is skipped, not failed, when it is not).
-      - name: installer address-list parsing (deploy/install.sh)
+      - name: installer firewall code — address list, generated rules, install and rollback (deploy/install.sh)
         run: sudo bash test/installer/allowlist.sh

@@ -12,14 +12,16 @@ Wants=network-online.target
 # INPUT hook, which the agent's own forward-chain isolation never sees — so
 # without the felucca0 drop a tenant with root in their own sandbox reaches the
 # node's root control API. install.sh writes /etc/felucca/firewall.nft and the
-# felucca-firewall unit; a node without them must not serve the API.
+# felucca-firewall unit; a node without that rule must not serve the API, and
+# must not carry guest traffic either.
 #
-# That rule is enforced by ExecStartPre= below, which looks for the table in
-# the kernel, not by a Requires= on the unit that loads it. Requires= only says
-# the firewall unit ran once: the table can be flushed afterwards and the agent
-# still starts. It also restarted the agent whenever the firewall unit was
-# restarted, and left the agent down with no retry when that unit failed to
-# start. Wants= + After= still loads the rules first at boot (ADR-0011).
+# That is enforced by the two ExecStartPre= lines below, which look for the
+# rule itself in the kernel — not by a Requires= on the unit that loads it.
+# Requires= only says the firewall unit ran once: the table can be flushed
+# afterwards and the agent still starts. It also restarted the agent whenever
+# the firewall unit was restarted, and left the agent down with no retry when
+# that unit failed to start. Wants= + After= still loads the rules first at
+# boot (ADR-0011).
 Wants=felucca-firewall.service
 After=felucca-firewall.service
 # Firecracker must be present before the agent starts.
@@ -47,12 +49,35 @@ EnvironmentFile=-/etc/felucca/agent.env
 # the structured key=value output; grep by request_id to follow one feluccad
 # API call into this agent.
 #
-# Refuse to start while the host firewall table is not loaded (see [Unit]).
-# Read-only; it prints the rules in force into the journal at each start. When
-# it fails the unit retries every RestartSec, so the agent comes back by itself
-# once `systemctl reload felucca-firewall` (or start) has loaded the table.
-# install.sh rewrites the path when nft lives somewhere other than /usr/sbin.
-ExecStartPre=/usr/sbin/nft list chain inet felucca_host input
+# Start gate: the guest fence must be in the kernel (see [Unit]).
+#
+# "The fence" is the rule `iifname "felucca0" drop` in chain input of table
+# inet felucca_host, exactly as install.sh generates it. A chain that merely
+# exists does not pass, and neither does a rules file that lost that line or
+# rewrote it (to count or log what it drops, add a rule of its own in front
+# of it — do not change the line).
+#
+# Step 1 heals. Sandboxes outlive the agent, so the usual way to get here
+# without the fence is a ruleset flush while guests are running — and
+# felucca-firewall is then still "active (exited)", so Wants= above does
+# nothing. This asks systemd to load the rules file again: a reload when that
+# unit is active, a start when it is stopped or failed. Best effort ("-").
+# "+" so that it does not depend on what a given systemd lets a caller with
+# only this unit's two capabilities do (on systemd 255 it works either way).
+# When the fence is loaded this step does nothing at all.
+#
+# Step 2 is the gate. Still no fence: take the guests' bridge down — they keep
+# running, but must not stay on a network that has no fence between them and
+# this host while no agent is there — say why, and fail. The unit retries
+# every RestartSec and every retry runs step 1 again, so once the rules file
+# loads the agent comes back by itself: no reload, no start. The agent raises
+# felucca0 again itself, and only after its own isolation checks have passed.
+#
+# Neither step prints the rules into the journal. nft is named by its absolute
+# path on purpose (install.sh rewrites it where nft lives somewhere else);
+# grep, ip and systemctl are found through PATH.
+ExecStartPre=-+/bin/sh -c '/usr/sbin/nft list chain inet felucca_host input 2>/dev/null | grep -q "iifname .felucca0. drop" || systemctl reload-or-restart felucca-firewall.service'
+ExecStartPre=/bin/sh -c '/usr/sbin/nft list chain inet felucca_host input 2>/dev/null | grep -q "iifname .felucca0. drop" && exit 0; ip link set dev felucca0 down 2>/dev/null; echo "felucca-agent: not starting: the guest fence (iifname felucca0 drop) is not loaded in table inet felucca_host, so the guest bridge felucca0 was taken down. Fix /etc/felucca/firewall.nft - systemctl status felucca-firewall shows why it does not load - and the next start attempt loads it by itself, no reload needed." >&2; exit 1'
 ExecStart=/usr/local/bin/felucca-agent --config /etc/felucca/felucca-agent.json
 
 # Stopping, restarting or losing the agent must not touch the sandboxes.
@@ -75,9 +100,16 @@ ExecStart=/usr/local/bin/felucca-agent --config /etc/felucca/felucca-agent.json
 #       systemctl stop felucca-agent && systemctl kill felucca-agent
 #   each restart logs, per running sandbox, one "Unit process N (firecracker)
 #   remains running after unit stopped." and two "Found left-over process N
-#   (firecracker) in control group while starting unit. Ignoring." (one per
-#   start command): expected, do not alert on them.
-# Not "mixed": that still SIGKILLs the whole cgroup after TimeoutStopSec.
+#   (firecracker) in control group while starting unit. Ignoring." (once
+#   before the pre-start commands, once before the agent itself): expected,
+#   do not alert on them.
+#   a start that keeps failing never turns the unit `failed`
+#   (StartLimitIntervalSec=0 above): it stays activating/auto-restart and
+#   repeats two or three of those lines per sandbox every RestartSec. Alert on
+#   the agent being away (NRestarts, the node `down` in feluccad), not on
+#   `failed`.
+# Not "mixed": that SIGKILLs whatever is left in the cgroup as soon as the
+# agent itself has exited.
 KillMode=process
 # One out-of-memory kill must cost one sandbox, not all of them.
 #

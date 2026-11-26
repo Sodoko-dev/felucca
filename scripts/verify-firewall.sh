@@ -13,16 +13,23 @@
 #    number not being zero.
 # 2. On the worker (test/lab/firewall.sh): reload, restart and stop leave the
 #    agent's pid and every Firecracker alone; a rules file that does not load
-#    changes nothing; with the table gone the agent refuses to start and comes
-#    back by itself once it is loaded again.
+#    changes nothing. With every rule flushed under a running sandbox, a
+#    restart of the agent loads all of it again by itself. With a rules file
+#    that cannot give it the guest fence (broken, or the line removed) the
+#    agent refuses to start and the guest bridge goes down — the sandbox keeps
+#    running — and once the file is right again it comes back with no reload
+#    or start by hand.
 #
 # Optional, to also re-run the installer on the worker the way an upgrade
-# does (rules file kept without the variable, address list validated):
+# does (rules file kept without the variable; values that are refused are
+# refused before anything is installed):
 #
 #   FELUCCA_LAB_AGENT_BIN=/path/to/static/felucca-agent bash scripts/verify-firewall.sh
 #
 # Other VMs used: FELUCCA_LAB_CP (default infra-saas-lab) and FELUCCA_LAB_OTHER
-# (default: the other of kata-lab-0 / kata-lab-1). Takes about 4 minutes.
+# (default: the other of kata-lab-0 / kata-lab-1). Takes about 7 minutes. The
+# agent on the worker is restarted several times and is down for about half a
+# minute in two of the cases; its sandboxes are not touched.
 set -u
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
