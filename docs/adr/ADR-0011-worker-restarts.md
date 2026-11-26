@@ -64,7 +64,10 @@ what makes that safe:
    pool VM is handed to a tenant. A pooled record whose VMM is gone (a host
    reboot) is removed at start-up, record, tap and directory: it was never
    handed to anyone, cannot be claimed, and used to stay behind as a `stopped`
-   record for good (FLU-29).
+   record for good (FLU-29). The same happens to a pool VM whose VMM dies
+   while the agent is running — it is removed, not left as an `error` record
+   that nothing ever deletes — and its pool is then not refilled for five
+   minutes: whatever killed it is most likely the node running out of memory.
 
 3. **The record is the truth; the VMM is brought back to it.** Sleep and fork
    pause the guest before they write anything, so an agent that stops in the
@@ -74,22 +77,48 @@ what makes that safe:
    match the record. An operation that was cut short was never acknowledged
    to anyone, so rolling it back is the answer that surprises nobody.
 
+   A Firecracker serves one API request at a time, and one that is still
+   writing the snapshot of a large guest answers nothing until it has
+   finished — seconds to minutes (`mem.bin` is as large as the guest's
+   memory). Start-up asks all adopted VMMs at once and waits two seconds in
+   total. One that has not answered is not given up on: it is asked again
+   every five seconds until it does, and until then `pause` and `resume` on
+   that VM go to the VMM instead of answering "already so" from the record.
+
 4. **An orphan sweep that errs towards leaving things alone.** Killed: a
    Firecracker in a directory that never got a `meta.json` (the create was
-   never acknowledged), and one whose record did not adopt it (a wake or start
-   that never committed, or a duplicate). Left running, with an ERROR: a
-   Firecracker beside a `meta.json` that does not load — far more likely a
-   healthy tenant VM with a damaged record than garbage. Never considered: a
-   process in another cgroup, i.e. not started by this unit.
+   never acknowledged), and a second Firecracker in a directory whose record
+   adopted another. Left running, with an ERROR: a Firecracker beside a
+   `meta.json` that does not load — far more likely a healthy tenant VM with a
+   damaged record than garbage. Never considered: a process in another cgroup,
+   i.e. not started by this unit.
 
-   The sweep runs only while the agent holds `{data_dir}/agent.lock`. Without
-   that, a second agent started by hand on the same data dir would reconcile,
-   find the first one's in-flight creates — which have no `meta.json` yet —
-   and kill them before failing to bind.
+   **Asked first:** a Firecracker beside a record that holds none and says the
+   VM is asleep, stopped or in error. That is what a wake or a start leaves
+   when the agent goes away after the guest is running and before the record
+   says so. If its guest is running, the record is what is behind: the guest
+   has been writing to its disk, and killing it would leave `sleeping` on top
+   of a snapshot the disk has outrun. The VMM is adopted and the record
+   brought up to it. In every other case — never started, paused, no answer —
+   nothing has run since the state on disk was taken, and the VMM is killed.
 
-5. **`meta.json` is replaced by rename.** It was truncated and rewritten in
-   place; an agent killed between the two left an empty file, and since (4) a
-   record that does not load is a VM the agent no longer manages.
+   **One agent per data dir.** The agent takes `{data_dir}/agent.lock` before
+   it does anything else at start-up and exits without it. A second agent
+   started by hand while the unit is up would otherwise run the whole of
+   start-up against the first one's sandboxes, from records that are stale by
+   the time it acts: kill its in-flight creates (no `meta.json` yet), pause a
+   pool VM handed to a tenant a moment ago, rebuild the node's rulesets
+   without the VMs created since — and only then fail to bind.
+
+5. **`meta.json` is replaced by rename, and is on disk when the write
+   returns.** It was truncated and rewritten in place; an agent killed between
+   the two left an empty file, and since (4) a record that does not load is a
+   VM the agent no longer manages. The temp file and the directory are
+   fsynced: "no `meta.json`" now means "remove the directory", so an
+   acknowledged create must not lose its record to a power cut. A write that
+   fails (a full disk) or whose caller goes away is owed, and repeated every
+   five seconds until it lands — otherwise the retried request is answered
+   from memory and the stale file is what the next start believes.
 
 6. **A killed VMM is waited for until every thread of it is gone.** `waitpid`
    returns at once for a process that is not a child, and a process loses its
@@ -104,12 +133,37 @@ what makes that safe:
    force — refusing to serve", the agent takes the guest bridge down before
    it exits: that exit used to kill the guests, and they must not stay on a
    network the agent could not fence. Both are undone by the next start that
-   succeeds.
+   succeeds — and only by that one. The bridge is brought up in exactly one
+   place, after the fences have been checked; setting the host up no longer
+   raises it, or every retry of a failing start would put the guests back on
+   an unfenced bridge for as long as the attempt lasts.
 
 8. **Pool specs are not forgotten into a drain.** feluccad pushes template
    pool specs after a node registers; until that has happened in the new
    agent's lifetime an empty list means "not told yet". Only the config
    pool's own excess is drained before the first push.
+
+9. **An operation runs to its end, whoever is still listening.** Every
+   lifecycle request (sleep, wake, pause, resume, stop, start, delete — create
+   and fork already were) runs on its own task. A caller that hangs up, as
+   feluccad does after 30 seconds, used to cut the operation wherever it was.
+   Inside the operations, the step that makes a record stop naming a VMM and
+   the signal to that VMM are one step with nothing in between: sleep records
+   `sleeping`, drops the pid and kills; stop records `stopped`, drops the pid
+   and signals. A stop is also written to disk now. It was not, so a stopped
+   VM read as `running` with a dead pid at the next start — and from there as
+   `sleeping` whenever an old snapshot was lying in its directory, a state
+   `start` refuses.
+
+10. **A directory is never removed from under a running Firecracker.** Before
+    `delete` removes an instance directory it ends whatever VMM still serves a
+    socket in it — the one case being a VM whose record did not load, which
+    start-up left running and which the control plane can still delete by id.
+    A VMM whose directory is gone cannot be found by any later start. If the
+    process cannot be ended, the delete fails and feluccad keeps its record. A
+    delete of a pool VM takes it out of the claimable set in the same critical
+    section that reads it, so a create cannot be handed a VM that is being
+    removed (FLU-60).
 
 ### One out-of-memory kill takes one sandbox (FLU-2)
 
@@ -140,18 +194,24 @@ die. With the unit at 0, the lowest a VMM can go is level with the agent.
 ### The host firewall is checked in the kernel and loaded in one transaction (FLU-3)
 
 **`felucca-agent.service` no longer `Requires=` the firewall unit.** It
-`Wants=` it, is ordered `After=` it, and runs
+`Wants=` it, is ordered `After=` it, and has a start gate of two
+`ExecStartPre=` steps. Both test the same thing — is the guest fence, the rule
+`iifname "felucca0" drop`, in chain `input` of table `inet felucca_host` in the
+kernel:
 
 ```
-ExecStartPre=/usr/sbin/nft list chain inet felucca_host input
+ExecStartPre=-+/bin/sh -c '<fence loaded> || systemctl reload-or-restart felucca-firewall.service'
+ExecStartPre=/bin/sh -c '<fence loaded> && exit 0; ip link set dev felucca0 down 2>/dev/null; echo "<why>" >&2; exit 1'
+
+<fence loaded> = /usr/sbin/nft list chain inet felucca_host input 2>/dev/null | grep -q "iifname .felucca0. drop"
 ```
 
 The property DEPLOYMENT.md §8 rests on is "a worker without the host firewall
 does not serve its API". `Requires=` never delivered it: it attests that the
 firewall unit *ran once*, not that the table exists. Flush the ruleset (by
 hand, or the distribution's `nftables.service` doing it at a reload) and the
-agent started regardless. The `ExecStartPre=` check looks at the kernel every
-time the agent starts.
+agent started regardless. The gate looks at the kernel every time the agent
+starts.
 
 Dropping `Requires=` also removes what it did deliver and nobody wanted:
 
@@ -160,12 +220,51 @@ Dropping `Requires=` also removes what it did deliver and nobody wanted:
   result `dependency`, which `Restart=` does not retry — the agent stayed down
   until a human started it.
 
-With the check, a missing table is an ordinary start failure: the agent
-retries every `RestartSec` and comes up by itself once the table is loaded.
+**Step 1 heals, step 2 refuses and quarantines.** The first version of this
+gate was the second step alone, testing only that the chain existed. A second
+review found what that does once sandboxes outlive the agent:
+
+- After a ruleset flush the firewall unit is still `active (exited)`. `Wants=`
+  does not start an active unit and nothing else runs it, so the gate failed
+  every 5 s for good — and the sandboxes that had survived the restart sat on
+  a bridge with no fence at all, their agent locked out of the only code that
+  rebuilds the rules. Before `KillMode=process` the same restart would have
+  killed those guests. Step 1 is the missing half: when the fence is not
+  loaded, ask systemd to load the rules file again (`reload-or-restart`: a
+  reload when the unit is active, a start when it is stopped or failed). It is
+  best effort (`-`), it does nothing at all when the fence is loaded, and it
+  runs on every retry — so a rules file that someone repairs is picked up by
+  the next attempt with no manual reload.
+- When the fence still cannot be had — the rules file does not load, or loads
+  without the line — the guests must not stay on the network while no agent is
+  there. Step 2 takes `felucca0` down before it fails the start. The guests
+  keep running; the agent raises the bridge again itself, after its own
+  isolation checks have passed.
+- A chain called `input` is not the fence. A rules file generated for the
+  control-plane role, a flushed chain, or a hand edit that drops the line all
+  have the chain. The gate greps the listing for the rule itself.
+
+`+` on step 1 runs it outside the unit's sandbox. Measured on systemd 255 it is
+not needed — `systemctl reload-or-restart` works from a root process holding
+only `CAP_NET_ADMIN`/`CAP_NET_RAW`, and `ip link set … down` and `nft list`
+work inside the sandbox — but whether systemd accepts such a caller is not
+something the unit should depend on. The same run showed no deadlock, with the
+firewall unit ordered `Before=` the agent, for a manual `systemctl restart`, an
+automatic restart after `SIGKILL`, and a cold start of both units. (It was
+made with copies of the two shipped units, names swapped for a scratch table
+and bridge, on a host with no sandboxes; the lab gate repeats it on a worker
+with one running.)
+
+With the gate, a missing fence is an ordinary start failure: the agent retries
+every `RestartSec`, reloads the rules file on each attempt, and comes up by
+itself once the fence loads.
 
 **`felucca-firewall.service` loads the rules as one nft transaction**, the same
 one for `start`, `reload` and `restart`. The unit feeds nft this script on
-stdin (`StandardInputText=`, `ExecStart=/usr/sbin/nft -f -`):
+stdin (`StandardInput=data`, `StandardInputText=`, `ExecStart=/usr/sbin/nft -f
+-`; systemd 255 infers the first from the second, the unit states it anyway,
+because an nft that was handed `/dev/null` instead exits 0 having loaded
+nothing):
 
 ```
 table inet felucca_host
@@ -180,17 +279,35 @@ that does not parse, is empty, or defines no input chain commits nothing, and
 the rules that were in force stay in force. Loading twice does not duplicate
 rules (loading the plain file twice did). Because the four lines live in the
 unit and not in the rules file, every rules file gets this treatment —
-including one written by hand, and the ones already on disk.
+including one written by hand, and the ones already on disk. The other side of
+including the file verbatim: the transaction does whatever the file says. One
+that begins with `flush ruleset` wipes every other table on the node, the
+agent's among them, and the load succeeds. The generated file defines one
+table and nothing else.
 
 A second `nft list chain …` runs after the transaction (`ExecStartPost=`, and
 a second `ExecReload=`). On the nft we tested the in-script check is enough;
 an nft too old to see its own pending changes would pass it on a stale view,
 and the second look turns that into a failed unit instead of a green one.
 
-**The unit has no `ExecStop=`.** Stopping it leaves the rules loaded. Sandboxes
-now keep running when their agent is stopped, so a stop that deleted the table
-would leave live guests facing an unfiltered host; and a `restart` no longer
-has a moment between "deleted" and "loaded".
+**Stopping the unit leaves the rules loaded.** Sandboxes now keep running when
+their agent is stopped, so a stop that deleted the table would leave live
+guests facing an unfiltered host; and a `restart` no longer has a moment
+between "deleted" and "loaded".
+
+**At host shutdown the unit ends the sandboxes.** This is the one thing its
+`ExecStop=` does, and only while `systemctl is-system-running` says
+`stopping`. `KillMode=process` means a shutdown, which only stops units,
+leaves every Firecracker running until systemd's final kill pass — after other
+units have unloaded rules. The distribution's `nftables.service` runs
+`nft flush ruleset` when it stops; with it enabled the lab measured the flush
+0.2 s before the last Firecracker was killed, on an idle worker. For that long
+guests ran with no host fence and no tenant isolation. The firewall unit is
+the right place for the step because of its ordering — after the
+distribution's loader, before the agent, so stopped between the two at
+shutdown — and because it is active whether or not the agent is running. An
+`ExecStopPost=` on the agent's unit would not run when the agent is in its
+retry loop.
 
 **The unit is ordered `After=nftables.service`**, so the distribution's loader,
 which commonly starts with `flush ruleset`, cannot wipe the table at boot after
@@ -198,26 +315,50 @@ it has been loaded.
 
 **The installer does not change policy or disturb the node on a re-run.**
 
-- An existing `/etc/felucca/firewall.nft` is kept unless
-  `FELUCCA_CONTROL_PLANE_IP` is given on that run. It used to be regenerated
-  every time, so a re-run without the variable narrowed port 9090 to loopback
-  and locked the control plane out — applied at once, because the installer
-  also restarted the firewall unit.
-- `FELUCCA_CONTROL_PLANE_IP` is a list of literal IPv4/IPv6 addresses
-  (optionally `/prefix`). It is validated character by character and element
-  by element before any of it is written into a ruleset that root loads;
-  `1.2.3.4 } accept; tcp dport 9090 accept #` used to be pasted in as it came.
-- A generated file is dry-run through the unit's own transaction (`nft -c`)
-  before it replaces the old one, replaced by rename, owned `root:root 0640`,
-  and applied with `systemctl reload`. If the apply fails the previous file is
-  put back and the installer exits non-zero.
+- An existing `/etc/felucca/firewall.nft` is kept, byte for byte. It used to
+  be regenerated every time, so a re-run without the variable narrowed port
+  9090 to loopback and locked the control plane out — applied at once, because
+  the installer also restarted the firewall unit.
+- The one thing that rewrites it is a **worker** run that names the control
+  plane with `FELUCCA_CONTROL_PLANE_IP`. The decision is taken on what the
+  value parses to and on the role, not on the variable being non-empty: the
+  first cut regenerated whenever it was set, so a control-plane re-run from a
+  shell that still had it exported replaced a hand-widened 8080 rule with the
+  stock loopback-only one, and a worker value of `,` wrote a loopback-only
+  allow-list over a working one. The control-plane role no longer reads the
+  variable; a worker value that names nobody is an error.
+- `FELUCCA_CONTROL_PLANE_IP` is a list of literal IPv4/IPv6 addresses. It is
+  validated character by character and element by element before any of it is
+  written into a ruleset that root loads; `1.2.3.4 } accept; tcp dport 9090
+  accept #` used to be pasted in as it came. No `/prefix`: `192.168.104.1/24`
+  pasted from `ip addr`, or a `/0`, would widen the port without a word, and a
+  subnet is a hand edit that later runs keep.
+- All of that is checked **before anything is installed**. A refusal used to
+  come after the new binary and unit were in place, left a temp file behind,
+  and on a first install skipped the one-time print of the minted token.
+- A kept file is checked before it is applied again: it must pass a dry run
+  of the unit's own transaction (`nft -c`), and on a worker it must contain the
+  fence line — applying a file without it would take a loaded fence away, and
+  the agent would refuse to start afterwards anyway. Either failure leaves the
+  file and the kernel alone and makes the installer exit non-zero.
+- A generated file is dry-run the same way, created `root:root 0640`, and
+  replaces the old one by rename. The firewall unit is installed and loaded by
+  systemd before that, so nothing that can fail sits between the rename and
+  the `systemctl reload` that applies it. If the apply fails the previous file
+  is put back and applied again, and the installer exits non-zero.
+- The rules file is root's on both roles, always: the control-plane role's
+  ownership pass over `/etc/felucca` skips it instead of handing it to the
+  service user until a later step takes it back.
 - The installer never restarts a running agent. It says which command is left.
+- Without `nft` it exits non-zero. That used to be a warning.
 
 ## Alternatives considered
 
-- **`KillMode=mixed`.** The agent gets SIGTERM, but whatever is left in the
-  cgroup is SIGKILLed after `TimeoutStopSec`. Sandboxes would survive exactly
-  until the first slow stop.
+- **`KillMode=mixed`.** The agent gets SIGTERM, and whatever is left in the
+  cgroup is SIGKILLed as soon as the agent has exited — it does not wait for
+  `TimeoutStopSec` (measured on systemd 255: `systemctl stop` returned after
+  12 ms with the second process of the unit already gone). No sandbox would
+  survive a single stop.
 - **One systemd scope per VM**, so the agent unit could keep the default kill
   mode and each VM had its own cgroup (and OOM accounting). The right shape
   eventually, and not a one-line change: starting a transient unit needs
@@ -247,6 +388,25 @@ it has been loaded.
   before it was challenged. It keeps the restart propagation (harmless once
   sandboxes survive an agent restart) but also keeps the trap: a firewall unit
   that fails to start takes the agent down with no retry.
+- **A gate that only refuses** (one `ExecStartPre=` that fails when the table
+  is missing). This shipped in the first cut and is described above: after a
+  flush it never passes again by itself, and meanwhile the guests are unfenced.
+- **A gate that looks for the chain rather than the rule.** Also the first
+  cut. It passes for any file that defines `chain input`.
+- **Have the firewall unit add the fence itself**, as a fifth line of its
+  script, so that the rule exists in one canonical spelling whatever the rules
+  file says and no hand edit can make the gate's text match fail. Not done:
+  the unit is shared with the control-plane role, the generated worker file
+  would carry the rule twice, and "the file is the whole policy" is worth
+  keeping. The price is the rule in "Consequences": the fence line must stay
+  exactly as generated.
+- **Restart back-off for a start that keeps failing** (`RestartSteps=`,
+  `RestartMaxDelaySec=`, systemd ≥ 254) to bound the journal volume of a
+  crash loop. Not used: systemd does not reset the step counter when a start
+  succeeds (measured on systemd 255: three failed starts, one that stayed up,
+  then a kill — the next start waited the full `RestartMaxDelaySec`). A
+  long-lived unit would drift to the maximum delay and stay there, and a slow
+  return of the agent costs more than the log lines do.
 - **Put the delete/re-add preamble in the generated rules file.** Then the
   safety of a reload depends on what is in the file. A hand-written file, or
   one generated by an older installer, would append duplicate rules on every
@@ -265,14 +425,24 @@ it has been loaded.
 - `systemctl stop felucca-agent` leaves sandboxes running. Powering a node's
   sandboxes off is `systemctl stop felucca-agent && systemctl kill
   felucca-agent`; `systemctl kill felucca-agent` on a running unit hits every
-  sandbox. Host shutdown no longer stops them with the unit — they end in
-  systemd's final kill pass.
+  sandbox. A host shutdown no longer stops them with the agent's unit
+  either; the firewall unit ends them, right after the agent has stopped and
+  before any unit can unload firewall rules (above; FLU-62). They are killed,
+  not shut down, as before.
 - Every agent restart logs three systemd warnings per running sandbox (one
   "remains running after unit stopped", two "Found left-over process").
-- Upgrade order matters once: units, `daemon-reload`, binary, restart. The
-  first restart from a pre-ADR-0011 agent is already non-disruptive. Rolling
-  back the binary alone under the new unit orphans pool VMs per restart;
-  rolling back the unit is a node drain.
+- A start that keeps failing is retried every `RestartSec` for good and the
+  unit never becomes `failed`: it shows `activating (auto-restart)`, and an
+  alert on failed units does not fire. Each attempt repeats two (the gate
+  refused) or three (the agent ran and exited) of those warnings per sandbox.
+- What must be in place before an agent is next restarted is the new unit,
+  loaded (`daemon-reload`). By hand: units, `daemon-reload`, check
+  `KillMode=process`, binary, restart. `install.sh worker` copies the binary
+  first and the units right after, and restarts nothing — the order of the
+  two copies does not matter, since nothing runs the new binary until the
+  restart. The first restart from a pre-ADR-0011 agent is already
+  non-disruptive. Rolling back the binary alone under the new unit orphans
+  pool VMs per restart; rolling back the unit is a node drain.
 - "Agent down" no longer means "sandboxes down". The node shows `down` in
   feluccad while its sandboxes serve traffic; nothing sweeps, refills or
   heartbeats until the agent is back.
@@ -282,9 +452,11 @@ it has been loaded.
   program remain).
 - Not fixed here, and now more visible: a VM whose Firecracker died while the
   agent was down reconciles as `stopped`, or `sleeping` on an old snapshot
-  (FLU-4); in-flight operations fail on every restart (no graceful stop); NAT
-  and ingress rules are rebuilt non-atomically at each start; helper processes
-  (`cp`, `curl`, `e2fsck`) outlive the agent that started them.
+  (FLU-4); in-flight operations fail on every restart (no graceful stop,
+  FLU-61); NAT and ingress rules are rebuilt non-atomically at each start
+  (FLU-45); helper processes (`cp`, `curl`, `e2fsck`, `resize2fs`) outlive
+  the agent that started them (FLU-63); a create that was committed but never
+  answered leaves a running VM the caller was told had failed (FLU-28).
 - A worker can still be promised more memory than it has (admission is
   FLU-24). What changes is the price: the sandbox whose guest grew the most
   dies, instead of all of them. A badly over-committed worker loses sandboxes
@@ -294,12 +466,33 @@ it has been loaded.
   unit cgroup's `memory.events`. The control plane is not told (FLU-13).
 - `systemctl reload felucca-firewall` is the way to apply an edited rules
   file. `restart` is equally safe now; neither touches the agent or a sandbox.
+  `reload` is refused while the unit is stopped or failed;
+  `reload-or-restart` works in every state.
 - A rules file that does not load is reported by the reload and changes
-  nothing. The one way to end up with no table is to remove it on purpose.
-- At runtime nothing re-checks the table: a ruleset flushed while the agent is
-  running goes unnoticed until the agent next starts, when it refuses to.
+  nothing. What does take the rules away: deleting the table, a `nft flush
+  ruleset` by hand, the distribution's `nftables.service` (its stock config
+  starts with one, and its stop is one), or a rules file that itself begins
+  with `flush ruleset`.
+- At runtime nothing re-checks the rules: a ruleset flushed while the agent is
+  running goes unnoticed, and the node unfenced, until the agent next starts —
+  when its gate loads the host rules again and the agent rebuilds its own.
   Continuous re-assertion is FLU-8.
+- The gate matches the fence by its text. The line `iifname "felucca0" drop`
+  has to stay exactly as generated: a hand edit that rewrites it (adding
+  `counter`, say) loads fine and then stops the agent, and its guests'
+  network, at the next agent start. The generated file and the installer's
+  check on a kept file both say so; nothing checks at `reload` time.
+- One host cannot be given both roles by the installer: there is one rules
+  file and each role's run writes only its own rules. A worker run that finds
+  a control-plane file stops with "no guest fence" (FLU-64).
 - `feluccad.service` has no equivalent check. On the control plane the
-  firewall unit is still advisory (filed separately).
-- `scripts/verify-units.sh` asserts the lines above are present and that
-  `Requires=` on the firewall unit and an `ExecStop=` have not come back.
+  firewall unit is still advisory (FLU-64).
+- `scripts/verify-units.sh` asserts that the settings above are the ones in
+  effect — last assignment, whole `ExecStartPre=`/`StandardInputText=`/
+  `ExecStart=`/`ExecReload=` lists — that `Requires=`/`Requisite=`/`BindsTo=`/
+  `PartOf=` on the firewall unit, `OOMScoreAdjust=` and an `ExecStopPost=` have
+  not come back in any spelling, that the firewall unit's one `ExecStop=` is
+  the shutdown step word for word, and that it rejects 29 deliberately broken
+  copies of the units. `test/installer/allowlist.sh` runs the installer's
+  firewall code against a scratch directory and stand-ins for systemd and the
+  kernel table.

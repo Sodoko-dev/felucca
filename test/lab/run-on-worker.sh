@@ -2,7 +2,10 @@
 # Run one worker-side lab gate (test/lab/<gate>.sh) inside a lab worker VM,
 # from the macOS host.
 #
-#   bash test/lab/run-on-worker.sh <restart|oom|firewall> [worker-vm] [token] [gate args...]
+#   bash test/lab/run-on-worker.sh <gate> [worker-vm] [token] [gate args...]
+#
+# <gate> is the name of a script in this directory without .sh: restart, oom,
+# firewall, break, repro-flu15, repro-flu70.
 #
 # The worker VMs do not mount the repository, so the gate and its helper are
 # copied into the VM first. The gate is started DETACHED in the VM with its
@@ -12,11 +15,12 @@
 # exit, and they only get to exit if they keep running).
 #
 # Exit status: 0 when the gate ends with 0 failures, 1 otherwise, 2 on a setup
-# problem. Environment passed through to the gate when set: INSTALLER_BUNDLE.
+# problem. Environment passed through to the gate when set: INSTALLER_BUNDLE,
+# PREV_AGENT_BIN.
 set -u
 
 GATE="${1:-}"
-case "$GATE" in restart|oom|firewall) ;; *) echo "usage: $0 <restart|oom|firewall> [worker-vm] [token] [gate args...]" >&2; exit 2;; esac
+case "$GATE" in restart|oom|firewall|break|repro-flu15|repro-flu70) ;; *) echo "usage: $0 <restart|oom|firewall|break|repro-flu15|repro-flu70> [worker-vm] [token] [gate args...]" >&2; exit 2;; esac
 WORKER="${2:-${FELUCCA_LAB_WORKER:-kata-lab-0}}"
 
 # The lab token authenticates a root-privileged agent API, so it is never a
@@ -42,6 +46,7 @@ limactl cp "$HERE/$GATE.sh" "$WORKER:$REMOTE/$GATE.sh" >/dev/null || exit 2
 ARGS=""; for a in "$@"; do ARGS="$ARGS $(printf '%q' "$a")"; done
 ENVS="FELUCCA_TOKEN=$(printf '%q' "$TOKEN")"
 [ -n "${INSTALLER_BUNDLE:-}" ] && ENVS="$ENVS INSTALLER_BUNDLE=$(printf '%q' "$INSTALLER_BUNDLE")"
+[ -n "${PREV_AGENT_BIN:-}" ] && ENVS="$ENVS PREV_AGENT_BIN=$(printf '%q' "$PREV_AGENT_BIN")"
 
 echo "== $GATE gate on $WORKER (log in the VM: $OUT) =="
 limactl shell "$WORKER" -- bash -c ": > $OUT; ( $ENVS setsid nohup bash $REMOTE/$GATE.sh$ARGS >> $OUT 2>&1 < /dev/null; echo \"GATE-EXIT \$?\" >> $OUT ) >/dev/null 2>&1 &" || exit 2

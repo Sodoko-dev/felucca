@@ -100,9 +100,17 @@ fn run_nft_file_once(ruleset: &str, use_sudo: bool) -> bool {
     child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
-/// Idempotently bring up the bridge with the CIDR's gateway address, enable
+/// Idempotently create the bridge with the CIDR's gateway address, enable
 /// IPv4 forwarding, and install an nftables masquerade rule for egress.
 /// Returns false if the bridge could not be configured (networking unusable).
+///
+/// This does NOT bring the bridge up — `raise_bridge` does, and the caller
+/// runs it only once `netfilter_ready` holds. On an ordinary restart the
+/// bridge is up already and stays up, so guests notice nothing. But a bridge
+/// that a previous start took down because the fences could not be loaded
+/// (`quarantine_bridge`) has to stay down until they are: raising it here put
+/// every guest back on an unfenced network for the length of each start-up
+/// attempt, once every restart interval.
 pub fn ensure_bridge(cidr: Cidr) -> bool {
     let gw = crate::ipalloc::fmt_ip(cidr.gateway());
     let gw_cidr = format!("{}/{}", gw, cidr.prefix);
@@ -112,9 +120,9 @@ pub fn ensure_bridge(cidr: Cidr) -> bool {
         cidr.prefix
     ));
 
-    // Create the bridge (ignore "exists"); bring it up + assign gateway IP.
+    // Create the bridge (ignore "exists") and assign the gateway IP.
     run(&["ip", "link", "add", BRIDGE_NAME, "type", "bridge"]);
-    if !run(&["ip", "link", "set", BRIDGE_NAME, "up"]) { return false; }
+    if !run(&["ip", "link", "show", "dev", BRIDGE_NAME]) { return false; }
     // addr add is idempotent-ish: errors if already present, which is fine.
     run(&["ip", "addr", "add", &gw_cidr, "dev", BRIDGE_NAME]);
 
@@ -367,10 +375,17 @@ pub fn set_link_down(dev: &str) {
     run(&["ip", "link", "set", dev, "down"]);
 }
 
+/// Bring the guest bridge up. Only ever called once the fences around it are
+/// in force (`netfilter_ready`); see `ensure_bridge`. A no-op on a bridge that
+/// is up already.
+pub fn raise_bridge() -> bool {
+    run(&["ip", "link", "set", BRIDGE_NAME, "up"])
+}
+
 /// Stop all guest traffic on this node, reversibly: take the guest bridge
 /// down. A down bridge forwards nothing between its ports and answers nothing
-/// on the gateway address; `ensure_bridge` brings it back up at the next agent
-/// start.
+/// on the gateway address; `raise_bridge` brings it back up at the first agent
+/// start that gets the fences loaded.
 ///
 /// This is what "refusing to serve tenants" has to do now that Firecrackers
 /// outlive the agent (ADR-0011). When the agent exits because isolation is not
@@ -1091,5 +1106,27 @@ mod tests {
         assert!(ingress_rule_parts(20000, "evil.example.com", 80).is_none());
         assert!(ingress_rule_parts(20000, "", 80).is_none());
         assert!(ingress_rule_parts(20000, "fe80::1", 80).is_none());
+    }
+
+    #[test]
+    fn test_the_bridge_is_only_raised_once_the_fences_are_checked() {
+        // A bridge that an earlier start took down because the fences could
+        // not be loaded has to stay down until they are. `ensure_bridge` runs
+        // before any of that is known, on every start-up attempt.
+        let src = include_str!("net.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let start = prod.find("pub fn ensure_bridge(").expect("ensure_bridge");
+        let end = start + prod[start..].find("\n}\n").expect("end of ensure_bridge");
+        assert!(
+            !prod[start..end].contains("\"up\""),
+            "ensure_bridge must not bring the bridge up"
+        );
+        // The one place that does comes after the check, in main.
+        let main = include_str!("main.rs");
+        let check = main.find("!net::netfilter_ready()").expect("the fence check in main");
+        let raise = main.find("net::raise_bridge()").expect("the raise_bridge call in main");
+        assert!(raise > check, "main raises the bridge before it has checked the fences");
+        assert_eq!(main.matches("net::raise_bridge()").count(), 1);
+        assert_eq!(prod.matches("BRIDGE_NAME, \"up\"").count(), 1, "one place raises the bridge: raise_bridge");
     }
 }

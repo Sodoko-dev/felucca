@@ -30,9 +30,15 @@ pub async fn pool_loop(mgr: Arc<Manager>) {
 /// FC liveness sweep every 5 seconds. In-process reapers already catch child
 /// exits; this covers FCs adopted after an agent restart (reparented to init,
 /// no reaper task exists for them). Runs regardless of pool size.
+///
+/// The same tick finishes two things start-up or an operation could not:
+/// settling the run state of adopted VMs whose Firecracker did not answer
+/// yet, and writing records whose last meta.json write did not land.
 pub async fn liveness_loop(mgr: Arc<Manager>) {
     loop {
         mgr.sweep_dead().await;
+        mgr.settle_unanswered().await;
+        mgr.flush_unwritten_meta().await;
         sleep(Duration::from_secs(5)).await;
     }
 }

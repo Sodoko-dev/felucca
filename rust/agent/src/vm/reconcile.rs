@@ -33,11 +33,13 @@ pub struct Reconciled {
     /// this is a create, fork or pool prewarm that never completed — no caller
     /// was ever told the VM exists.
     pub metaless: Vec<String>,
-    /// Ids of records that were `pooled` on disk and have lost their VMM (a
-    /// host reboot, or the Firecracker died while the agent was down). They
-    /// are in `vms` as `stopped`. A pool VM without its VMM is of no use to
-    /// anyone and was never handed to a tenant: the caller removes it, or it
-    /// keeps its slot, its tap and a rootfs copy forever.
+    /// Ids of pool VMs that were never claimed and have no VMM: `pooled` on
+    /// disk with the Firecracker gone (a host reboot, or it died while the
+    /// agent was down — these are in `vms` as `stopped`), or already `error`
+    /// or `stopped` on disk (it died under an agent that did not get to
+    /// remove it). A pool VM without its VMM is of no use to anyone and was
+    /// never handed to a tenant: the caller removes it, or it keeps its slot,
+    /// its tap and a rootfs copy forever.
     pub dead_pool: Vec<String>,
 }
 
@@ -101,9 +103,21 @@ fn reconcile_one(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Loaded::Metaless,
         Err(_) => return Loaded::Unreadable,
     };
+    // A record that is not adopted may still belong to a VM that is running
+    // (it is left alone, see `Reconciled::unreadable`). Its network slot must
+    // not be handed to the next create: that one would be given a tap the
+    // running guest holds.
+    let keep_slot = |alloc: Option<&mut Allocator>, slot: Option<u32>| {
+        if let (Some(alloc), Some(s)) = (alloc, slot) {
+            alloc.reserve(s);
+        }
+    };
     let meta: Meta = match serde_json::from_str(&data) {
         Ok(m) => m,
-        Err(_) => return Loaded::Unreadable,
+        Err(_) => {
+            keep_slot(alloc, lenient_slot(&data));
+            return Loaded::Unreadable;
+        }
     };
 
     let id = meta.id.clone();
@@ -114,6 +128,7 @@ fn reconcile_one(
     // write for this VM derives its path from these two strings.
     if !valid_vm_id(&id) || !valid_vm_id(&dir_id) {
         warn!(dir = %dir_name, "reconcile: skipped (id or dir_id is not a valid path component)");
+        keep_slot(alloc, meta.slot);
         return Loaded::Unreadable;
     }
     // The directory a record was read from is the one it lives in. A dir_id
@@ -121,6 +136,7 @@ fn reconcile_one(
     // liveness check below, at another instance's files.
     if dir_id != dir_name {
         warn!(dir = %dir_name, dir_id = %dir_id, "reconcile: skipped (dir_id does not name the directory the record is in)");
+        keep_slot(alloc, meta.slot);
         return Loaded::Unreadable;
     }
     let vcpus = meta.vcpus;
@@ -168,12 +184,15 @@ fn reconcile_one(
                 state = VmState::Stopped;
             }
         }
+    } else if matches!(state, VmState::Error | VmState::Stopped) && never_claimed_pool_vm(&meta) {
+        // A pool VM that died while an agent was watching (`error`), or one
+        // that agent was in the middle of removing (`stopped`). It is as much
+        // use as one that was still `pooled` when its VMM went: none.
+        dead_pool = true;
     }
 
     // Reserve the slot so it is not handed to a new VM.
-    if let (Some(alloc), Some(s)) = (alloc, slot) {
-        alloc.reserve(s);
-    }
+    keep_slot(alloc, slot);
 
     let vm = Vm {
         id,
@@ -194,6 +213,25 @@ fn reconcile_one(
         disk_gb: meta.disk_gb.unwrap_or(0),
     };
     Loaded::Vm(vm, dead_pool)
+}
+
+/// The `slot` of a record that does not load as a `Meta`, when its text still
+/// says — a record written by a newer agent, say, with a field or a state this
+/// one does not know.
+fn lenient_slot(data: &str) -> Option<u32> {
+    let slot = serde_json::from_str::<serde_json::Value>(data).ok()?.get("slot")?.as_u64()?;
+    u32::try_from(slot).ok()
+}
+
+/// Is this the record of a pool VM that was never handed to anyone? A claim
+/// gives the record the caller's id, name and tenant and leaves only `dir_id`
+/// naming the pool — so a record that still carries all of the pool's own
+/// marks was never claimed.
+fn never_claimed_pool_vm(meta: &Meta) -> bool {
+    meta.id == meta.dir_id
+        && meta.id.starts_with("pool-")
+        && meta.name == "pool"
+        && meta.tenant_id.is_none()
 }
 
 /// Does *some* process have this pid (kill(pid, 0))? Says nothing about what
@@ -554,5 +592,67 @@ mod tests {
         let vm = vms.iter().find(|v| v.id == "vm-pre").expect("vm-pre");
         assert_eq!(vm.image, "ubuntu-base", "absent image must default to ubuntu-base");
         assert_eq!(vm.disk_gb, 0, "absent disk_gb must default to 0");
+    }
+
+    #[test]
+    fn test_a_record_that_does_not_load_still_keeps_its_slot() {
+        // The VM behind such a record may well be running (it is left alone).
+        // The next create must not be handed the tap that guest holds.
+        let tmp = make_temp_dir();
+        let data_dir = tmp.path().to_str().unwrap();
+        let instances_dir = tmp.path().join("instances");
+        fs::create_dir_all(&instances_dir).unwrap();
+        // Written by a newer agent: a state this one does not know.
+        write_meta(
+            &instances_dir,
+            "vm-new",
+            r#"{"id":"vm-new","name":"vm-new","dir_id":"vm-new","vcpus":1,"mem_mib":256,"pid":7,"slot":0,"ip":"10.231.0.2","state":"hibernating"}"#,
+        );
+        // A record that names another directory.
+        write_meta(
+            &instances_dir,
+            "vm-moved",
+            r#"{"id":"vm-moved","name":"vm-moved","dir_id":"vm-elsewhere","vcpus":1,"mem_mib":256,"pid":null,"slot":1,"ip":"10.231.0.3","state":"running"}"#,
+        );
+        // Cut off in the middle: nothing to go on.
+        write_meta(&instances_dir, "vm-cut", r#"{"id":"vm-cut","na"#);
+
+        let mut alloc = Allocator::new(Cidr::parse("10.231.0.0/24").unwrap());
+        let rec = reconcile(data_dir, Some(&mut alloc), &ProcTable::for_data_dir(data_dir));
+        assert!(rec.vms.is_empty());
+        assert_eq!(rec.unreadable.len(), 3, "{:?}", rec.unreadable);
+        assert_eq!(alloc.claim(), Some(2), "slots 0 and 1 belong to VMs that may be running");
+    }
+
+    #[test]
+    fn test_a_never_claimed_pool_vm_without_a_vmm_is_reported_dead_in_any_state() {
+        let tmp = make_temp_dir();
+        let data_dir = tmp.path().to_str().unwrap();
+        let instances_dir = tmp.path().join("instances");
+        fs::create_dir_all(&instances_dir).unwrap();
+        let record = |id: &str, name: &str, dir_id: &str, state: &str, tenant: &str| {
+            format!(
+                r#"{{"id":"{id}","name":"{name}","dir_id":"{dir_id}","vcpus":1,"mem_mib":256,"pid":null,"slot":null,"ip":null,"state":"{state}"{tenant}}}"#
+            )
+        };
+        // Died under an agent that marked it and did not get to remove it.
+        write_meta(&instances_dir, "pool-err", &record("pool-err", "pool", "pool-err", "error", ""));
+        // That agent was in the middle of removing it.
+        write_meta(&instances_dir, "pool-stop", &record("pool-stop", "pool", "pool-stop", "stopped", ""));
+        // Claimed from a pool: a tenant's sandbox living in a pool directory.
+        write_meta(
+            &instances_dir,
+            "pool-claimed",
+            &record("sb-1", "web", "pool-claimed", "error", r#","tenant_id":"tn-a""#),
+        );
+        // A sandbox that merely has a pool-like id.
+        write_meta(&instances_dir, "pool-mine", &record("pool-mine", "mine", "pool-mine", "stopped", ""));
+
+        let rec = reconcile(data_dir, None, &ProcTable::for_data_dir(data_dir));
+        let mut dead = rec.dead_pool.clone();
+        dead.sort();
+        assert_eq!(dead, vec!["pool-err".to_string(), "pool-stop".to_string()]);
+        // Reported, not dropped: the caller removes them, slot and directory too.
+        assert_eq!(rec.vms.len(), 4);
     }
 }

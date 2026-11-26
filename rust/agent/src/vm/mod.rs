@@ -135,6 +135,19 @@ fn spec_key(s: &PoolSpec) -> String {
     format!("{}|{}|{}|{}|{}", s.image, s.image_sha256, s.vcpus, s.mem_mib, s.disk_gb)
 }
 
+/// The backoff-map key of the pool a pooled VM record belongs to — the same
+/// key `spec_key` gives the spec it was prewarmed from.
+fn pool_spec_key_of(v: &Vm) -> String {
+    spec_key(&PoolSpec {
+        image: v.image.clone(),
+        image_sha256: v.image_sha256.clone().unwrap_or_default(),
+        vcpus: v.vcpus,
+        mem_mib: v.mem_mib,
+        disk_gb: v.disk_gb,
+        count: 0,
+    })
+}
+
 /// Per-spec refill backoff: true when `key` may not be retried at `now`.
 /// Expired entries are removed (the map only ever holds failing specs).
 fn backoff_active(map: &mut std::collections::HashMap<String, Instant>, key: &str, now: Instant) -> bool {
@@ -311,6 +324,10 @@ const KILL_WAIT: Duration = Duration::from_secs(10);
 enum SweepStep {
     /// Kill a Firecracker that belongs to no committed VM.
     Kill { pid: i32, dir_name: String },
+    /// A Firecracker in the directory of a record that holds none and says the
+    /// VM is asleep or stopped: ask it. A guest that is running is adopted, any
+    /// other answer (or none) is a `Kill`. See `Manager::adopt_running_vmm`.
+    Probe { pid: i32, dir_name: String },
     /// Remove an instance directory that never got a `meta.json`.
     RemoveDir { dir_name: String },
     /// A Firecracker next to a record that does not load: leave it running.
@@ -322,6 +339,9 @@ enum SweepStep {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SweepOutcome {
     killed: usize,
+    /// VMMs of a wake or start that had worked but was never written down:
+    /// the guest was running, so the record was brought up to it.
+    rolled_forward: usize,
     dirs_removed: usize,
     /// Pool VMs removed because their VMM was gone (`remove_dead_pool_vms`).
     pool_removed: usize,
@@ -335,6 +355,9 @@ struct SweepOutcome {
 /// * `found` — Firecrackers whose API socket is in `instances/<dir>/`.
 /// * `owned` — pids that records adopted. Never touched.
 /// * `record_dirs` — directories that loaded as a record.
+/// * `adoptable` — of those, the ones whose record holds no VMM and says the
+///   VM is asleep, stopped or in error: where a wake or start that the previous
+///   agent did not finish writing down leaves its Firecracker.
 /// * `unreadable` — directories whose `meta.json` exists and does not load.
 /// * `metaless` — directories with no `meta.json`.
 /// * `mine` — is this pid in the agent's own cgroup?
@@ -342,11 +365,15 @@ struct SweepOutcome {
 /// The rule that matters most: a process is killed only when it is certain
 /// that no caller was ever told its VM exists, or that the record that does
 /// exist has moved on without it. A VMM beside a damaged record is very likely
-/// a healthy tenant VM, and is left alone.
+/// a healthy tenant VM, and is left alone. And a VMM beside a record that says
+/// "asleep" may be a guest that is already awake and writing to its disk —
+/// killing that one would leave the record pointing at a snapshot the disk has
+/// since outrun — so it is asked first (`SweepStep::Probe`).
 fn plan_sweep(
     found: &[FcProc],
     owned: &std::collections::HashSet<i32>,
     record_dirs: &std::collections::HashSet<String>,
+    adoptable: &std::collections::HashSet<String>,
     unreadable: &[String],
     metaless: &[String],
     mine: impl Fn(i32) -> bool,
@@ -364,11 +391,15 @@ fn plan_sweep(
         } else if !mine(p.pid) {
             occupied.insert(dir);
             steps.push(SweepStep::LeaveForeign { pid: p.pid, dir_name: p.dir_name.clone() });
-        } else if metaless.iter().any(|d| d == dir) || record_dirs.contains(dir) {
-            // No meta.json: the create never completed. Or a record that did
-            // not adopt this pid: a wake or start that never completed (the
-            // record still says sleeping/stopped), or a second VMM on a
-            // directory whose record adopted another one.
+        } else if metaless.iter().any(|d| d == dir) {
+            // No meta.json: the create never completed.
+            steps.push(SweepStep::Kill { pid: p.pid, dir_name: p.dir_name.clone() });
+        } else if adoptable.contains(dir) {
+            // The record holds no VMM and says the VM is not running: a wake
+            // or start the previous agent did not finish writing down.
+            steps.push(SweepStep::Probe { pid: p.pid, dir_name: p.dir_name.clone() });
+        } else if record_dirs.contains(dir) {
+            // A second VMM on a directory whose record adopted another one.
             steps.push(SweepStep::Kill { pid: p.pid, dir_name: p.dir_name.clone() });
         }
         // Anything else is in a directory this agent does not manage at all.
@@ -387,7 +418,103 @@ struct Settled {
     resumed: usize,
     paused: usize,
     failed: usize,
+    /// VMMs that did not answer. They are asked again from the liveness loop
+    /// (`Manager::settle_unanswered`) until they do.
     unreachable: usize,
+}
+
+/// What became of one adopted VM when its Firecracker was asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettleResult {
+    /// The VMM agrees with the record (or the record has moved on).
+    AsRecorded,
+    Resumed,
+    Paused,
+    Failed,
+}
+
+/// One Firecracker's answer to "what is your guest doing?".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Probe {
+    /// `GET /` returned this state.
+    Says(String),
+    /// No answer in time, or the socket refused.
+    Silent,
+    /// The record's directory id does not make a path (never asked).
+    NoSocketPath,
+}
+
+/// A VM whose Firecracker did not answer when start-up asked what its guest is
+/// doing — typically one that is still writing the snapshot of a sleep or fork
+/// the previous agent started. Its record may say `running` over a guest that
+/// is paused, so until the VMM has answered once:
+///
+/// * the liveness loop keeps asking (`Manager::settle_unanswered`), and
+/// * `pause` / `resume` do not trust the record enough to answer "already so".
+///
+/// The two never talk to the same VMM at once: a lifecycle operation takes a
+/// `Pending` entry away before it starts (and then establishes the truth
+/// itself), and waits out a `Settling` one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unsettled {
+    /// Nobody is looking at it. The pid is the VMM that was asked.
+    Pending(i32),
+    /// `settle_unanswered` is talking to its VMM right now.
+    Settling,
+}
+
+/// A std mutex that is only ever held for a few instructions and never across
+/// an await. A panic while holding one leaves data that is still valid here
+/// (a set of ids), so poisoning is not a reason to stop.
+fn lock_std<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Ask a Firecracker what its guest is doing. `None` when it does not answer
+/// within `ADOPT_API_TIMEOUT` — its API serves one request at a time, so one
+/// that is busy writing a multi-GiB snapshot answers when that is done.
+async fn probe_vmm(sock: &str) -> Option<String> {
+    match tokio::time::timeout(ADOPT_API_TIMEOUT, fc::get_instance_state(sock)).await {
+        Ok(Ok(state)) => Some(state),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+/// Puts an id on the "meta.json is owed" list when it is dropped while still
+/// armed: a `write_meta` that failed, or one whose caller went away in the
+/// middle of it. See `Manager::flush_unwritten_meta`.
+struct OwedMeta<'a> {
+    owed: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+    id: &'a str,
+    armed: bool,
+}
+
+impl Drop for OwedMeta<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            lock_std(self.owed).insert(self.id.to_string());
+        }
+    }
+}
+
+/// Write `bytes` to `dst` so that a crash at any point leaves either the old
+/// file or the new one, and so that the new one is really on disk when this
+/// returns: temp file, fsync, rename, fsync of the directory.
+///
+/// The fsyncs are what make an acknowledged operation survive a power cut.
+/// Without them a `meta.json` written seconds before can come back empty or
+/// not at all, and start-up treats a directory without one as a create that
+/// never finished and removes it.
+fn replace_file_durably(dir: &str, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = format!("{}/{}.tmp", dir, name);
+    let dst = format!("{}/{}", dir, name);
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, &dst)?;
+    std::fs::File::open(dir)?.sync_all()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -540,6 +667,12 @@ pub struct Manager {
     // held (through this open file) for the life of the process. `None` once
     // tried and refused.
     data_dir_lock: std::sync::OnceLock<Option<std::fs::File>>,
+    // VMs whose Firecracker has not yet said what its guest is doing (see
+    // `Unsettled`). Keyed by VM id.
+    unsettled: std::sync::Mutex<std::collections::HashMap<String, Unsettled>>,
+    // Ids whose meta.json is behind the in-memory record: a write failed or was
+    // interrupted. The liveness loop writes them (`flush_unwritten_meta`).
+    meta_owed: std::sync::Mutex<std::collections::HashSet<String>>,
     // procfs root — always /proc outside unit tests.
     proc_root: std::path::PathBuf,
 }
@@ -585,6 +718,8 @@ impl Manager {
             pool_backoff: Mutex::new(std::collections::HashMap::new()),
             meta_write_lock: Mutex::new(()),
             data_dir_lock: std::sync::OnceLock::new(),
+            unsettled: std::sync::Mutex::new(std::collections::HashMap::new()),
+            meta_owed: std::sync::Mutex::new(std::collections::HashSet::new()),
             proc_root,
         })
     }
@@ -615,9 +750,11 @@ impl Manager {
     ///
     /// 1. Load the records. A record keeps its VMM only if the recorded pid is
     ///    positively that instance's Firecracker (`procscan`).
-    /// 2. Sweep what belongs to no committed VM: the Firecracker of a create,
-    ///    wake or start that never finished, directories that never got a
-    ///    `meta.json`, and pool VMs whose VMM is gone.
+    /// 2. Sweep what belongs to no committed VM: the Firecracker of a create
+    ///    that never finished, directories that never got a `meta.json`, and
+    ///    pool VMs whose VMM is gone. The Firecracker of a wake or start that
+    ///    was never written down is asked first: a guest that is already
+    ///    running is adopted, anything else is killed.
     /// 3. Re-pin the tap of every adopted guest. The pin is host state, not VM
     ///    state: the netdev chains are gone after a host reboot, and an agent
     ///    upgraded in place adopts guests that were started before the pin
@@ -648,8 +785,10 @@ impl Manager {
             (rec.unreadable, rec.metaless, rec.dead_pool, adopted)
         };
 
-        let mut swept = self.sweep_orphans(&procs, &unreadable, &metaless).await;
+        let mut swept = self.sweep_orphans(&procs, &unreadable, &metaless, &dead_pool).await;
         swept.pool_removed = self.remove_dead_pool_vms(&procs, &dead_pool).await;
+        // Counted after the sweep: it may have adopted a VMM itself.
+        let adopted = adopted + swept.rolled_forward;
 
         let mut taps_down = 0usize;
         if self.net_on {
@@ -693,6 +832,7 @@ impl Manager {
             paused = settled.paused,
             failed = settled.failed,
             unreachable = settled.unreachable,
+            rolled_forward = swept.rolled_forward,
             orphans_killed = swept.killed,
             dirs_removed = swept.dirs_removed,
             dead_pool_removed = swept.pool_removed,
@@ -705,14 +845,24 @@ impl Manager {
 
     /// Take the exclusive lock on `{data_dir}/agent.lock` (once; it is then
     /// held for the life of the process). Whoever holds it is the one agent
-    /// allowed to decide that a Firecracker under this data dir belongs to
-    /// nobody. A second agent started by hand against the same data dir would
-    /// otherwise reconcile, find the first agent's in-flight creates — which
-    /// have no `meta.json` yet — and kill them, before failing to bind.
-    fn hold_data_dir_lock(&self) -> bool {
+    /// that manages this data dir.
+    ///
+    /// `main` takes it before anything else at start-up and exits without it.
+    /// A second agent started by hand against the same data dir would
+    /// otherwise run the whole of start-up against the first agent's live
+    /// VMs, from records that are already stale by the time it acts on them:
+    /// kill its in-flight creates (they have no `meta.json` yet), pause a pool
+    /// VM it handed to a tenant a moment ago, rebuild the isolation and
+    /// ingress rules without the VMs created since — and only then fail to
+    /// bind. The sweep and the pool clean-up check it again on their own, so
+    /// nothing that kills or removes runs without it.
+    pub fn hold_data_dir_lock(&self) -> bool {
         self.data_dir_lock
             .get_or_init(|| {
                 use std::os::unix::io::AsRawFd;
+                // A data dir that does not exist yet is created by the first
+                // VM; the lock file must not be what fails on a fresh node.
+                let _ = std::fs::create_dir_all(&self.data_dir);
                 let path = format!("{}/agent.lock", self.data_dir);
                 // std opens with O_CLOEXEC, so no Firecracker inherits the
                 // descriptor: the lock dies with the agent and nothing else.
@@ -756,6 +906,7 @@ impl Manager {
         procs: &ProcTable,
         unreadable: &[String],
         metaless: &[String],
+        dead_pool: &[String],
     ) -> SweepOutcome {
         let mut out = SweepOutcome::default();
         if !self.hold_data_dir_lock() {
@@ -766,15 +917,23 @@ impl Manager {
             );
             return out;
         }
-        let (owned, record_dirs) = {
+        let (owned, record_dirs, adoptable) = {
             let g = self.inner.lock().await;
             let owned: std::collections::HashSet<i32> = g.vms.iter().filter_map(|v| v.pid).collect();
             let dirs: std::collections::HashSet<String> =
                 g.vms.iter().map(|v| v.dir_id.clone()).collect();
-            (owned, dirs)
+            // Pool VMs that lost their VMM are on their way out
+            // (`remove_dead_pool_vms`); nothing is brought back for them.
+            let adoptable: std::collections::HashSet<String> = g
+                .vms
+                .iter()
+                .filter(|v| Self::may_adopt_running_vmm(v) && !dead_pool.contains(&v.id))
+                .map(|v| v.dir_id.clone())
+                .collect();
+            (owned, dirs, adoptable)
         };
         let found = procs.scan();
-        let plan = plan_sweep(&found, &owned, &record_dirs, unreadable, metaless, |pid| {
+        let plan = plan_sweep(&found, &owned, &record_dirs, &adoptable, unreadable, metaless, |pid| {
             procs.in_my_cgroup(pid)
         });
         for step in plan {
@@ -784,10 +943,24 @@ impl Manager {
                         pid,
                         dir = %dir_name,
                         "reconcile: killing a Firecracker that belongs to no committed VM \
-                         (a create, wake or start the previous agent did not finish, or a duplicate)"
+                         (a create the previous agent did not finish, or a second VMM in a VM's directory)"
                     );
                     self.kill_fc_and_wait(pid, &dir_name).await;
                     out.killed += 1;
+                }
+                SweepStep::Probe { pid, dir_name } => {
+                    if self.adopt_running_vmm(pid, &dir_name).await {
+                        out.rolled_forward += 1;
+                    } else {
+                        warn!(
+                            pid,
+                            dir = %dir_name,
+                            "reconcile: killing the Firecracker of a wake or start the previous agent \
+                             did not finish (its guest is not running, so the state on disk is still current)"
+                        );
+                        self.kill_fc_and_wait(pid, &dir_name).await;
+                        out.killed += 1;
+                    }
                 }
                 SweepStep::RemoveDir { dir_name } => {
                     let Some(path) = instance_path(&self.data_dir, &dir_name) else {
@@ -824,6 +997,60 @@ impl Manager {
             }
         }
         out
+    }
+
+    /// Is this a record that a wake or a start may have run ahead of — it
+    /// holds no VMM, and says the VM is asleep, stopped or in error?
+    fn may_adopt_running_vmm(v: &Vm) -> bool {
+        v.pid.is_none() && matches!(v.state, VmState::Sleeping | VmState::Stopped | VmState::Error)
+    }
+
+    /// A Firecracker is running in the directory of a record that holds none
+    /// and says the VM is asleep, stopped or in error. The previous agent woke
+    /// or started that VM and went away (or failed to write) before the record
+    /// said so. Returns true when the VMM was adopted.
+    ///
+    /// If the guest is RUNNING, the record is what is behind: the guest has
+    /// been writing to its disk since, and killing it would leave a `sleeping`
+    /// record on top of a snapshot the disk has outrun — waking that restores
+    /// old memory over a newer filesystem. So the VMM is adopted and the
+    /// record brought up to it.
+    ///
+    /// Anything else — never started, still paused after a snapshot was
+    /// loaded or written, or no answer — means the guest has not run since
+    /// the state on disk was taken. Killing that VMM loses nothing, and the
+    /// caller does.
+    async fn adopt_running_vmm(&self, pid: i32, dir_name: &str) -> bool {
+        let Some(dir) = instance_path(&self.data_dir, dir_name) else {
+            return false;
+        };
+        let sock = format!("{}/{}", dir, procscan::SOCK_NAME);
+        if probe_vmm(&sock).await.as_deref() != Some("Running") {
+            return false;
+        }
+        let (id, was) = {
+            let mut g = self.inner.lock().await;
+            match g.vms.iter_mut().find(|v| v.dir_id == dir_name) {
+                Some(v) if Self::may_adopt_running_vmm(v) => {
+                    let was = v.state.clone();
+                    v.pid = Some(pid);
+                    v.state = VmState::Running;
+                    (v.id.clone(), was)
+                }
+                _ => return false,
+            }
+        };
+        warn!(
+            vm = %id,
+            pid,
+            recorded = %was,
+            "reconcile: this VM's guest is running although its record said otherwise (a wake or \
+             start that the previous agent did not finish writing down); adopted as running"
+        );
+        if let Err(e) = self.write_meta(&id).await {
+            warn!(vm = %id, err = %e, "reconcile: could not write the adopted VM's record yet");
+        }
+        true
     }
 
     /// Remove pool VMs that reconcile found without their VMM. Returns how
@@ -872,97 +1099,230 @@ impl Manager {
     /// The record is what the last completed operation left; anything else is
     /// an operation that was cut short and that nobody was told had worked, so
     /// the VMM is brought back to the record, not the other way round.
+    ///
+    /// All of them are asked at once, so start-up waits `ADOPT_API_TIMEOUT`
+    /// in total for the ones that do not answer, not that long for each. A VMM
+    /// that does not answer is not given up on: it goes on the `unsettled`
+    /// list and is asked again every few seconds (`settle_unanswered`).
     async fn settle_adopted_run_states(&self) -> Settled {
-        let adopted: Vec<(String, String, VmState, i32)> = {
+        let adopted: Vec<(String, String, i32)> = {
             let g = self.inner.lock().await;
             g.vms
                 .iter()
-                .filter_map(|v| v.pid.map(|p| (v.id.clone(), v.dir_id.clone(), v.state.clone(), p)))
+                .filter_map(|v| v.pid.map(|p| (v.id.clone(), v.dir_id.clone(), p)))
                 .collect()
         };
+        let answers = self.probe_all(&adopted).await;
         let mut out = Settled::default();
-        for (id, dir_id, state, pid) in adopted {
-            let Some(dir) = instance_path(&self.data_dir, &dir_id) else {
-                continue;
-            };
-            let sock = format!("{}/{}", dir, procscan::SOCK_NAME);
-            let vmm = match tokio::time::timeout(ADOPT_API_TIMEOUT, fc::get_instance_state(&sock)).await {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
-                    warn!(vm = %id, pid, err = %e, "adopted VM's Firecracker did not answer on its API socket; keeping the record as it is");
+        for ((id, dir_id, pid), answer) in adopted.into_iter().zip(answers) {
+            match answer {
+                Probe::NoSocketPath => {}
+                Probe::Silent => {
+                    warn!(
+                        vm = %id,
+                        pid,
+                        "adopted VM's Firecracker did not answer on its API socket (busy writing a \
+                         snapshot, or stuck); its record is kept as it is and it will be asked again"
+                    );
+                    lock_std(&self.unsettled).insert(id, Unsettled::Pending(pid));
                     out.unreachable += 1;
-                    continue;
                 }
-                Err(_) => {
-                    warn!(vm = %id, pid, "adopted VM's Firecracker did not answer on its API socket in time; keeping the record as it is");
-                    out.unreachable += 1;
-                    continue;
-                }
-            };
-            match settle_action(&state, &vmm) {
-                SettleAction::None => {}
-                SettleAction::Resume => {
-                    let done = tokio::time::timeout(ADOPT_API_TIMEOUT, fc::patch_vm_state(&sock, "Resumed")).await;
-                    if matches!(done, Ok(Ok(()))) {
-                        warn!(vm = %id, pid, "adopted VM was paused inside Firecracker under a record that says running (the previous agent stopped in the middle of a sleep, fork or pause); resumed");
-                        out.resumed += 1;
-                    } else {
-                        // Could not resume it. Record what is true instead, so
-                        // that `resume` is a real request and not a no-op on a
-                        // VM that is listed as running and frozen.
-                        error!(vm = %id, pid, "adopted VM is paused inside Firecracker and could not be resumed; recording it as paused");
-                        self.set_state(&id, VmState::Paused).await;
-                        let _ = self.write_meta(&id).await;
-                        out.failed += 1;
-                    }
-                }
-                SettleAction::Pause => {
-                    let done = tokio::time::timeout(ADOPT_API_TIMEOUT, fc::patch_vm_state(&sock, "Paused")).await;
-                    if matches!(done, Ok(Ok(()))) {
-                        warn!(vm = %id, pid, state = %state, "adopted VM was running inside Firecracker under a record that says it is not (the previous agent stopped in the middle of a resume or a pool claim); paused again");
-                        out.paused += 1;
-                    } else if state == VmState::Paused {
-                        error!(vm = %id, pid, "adopted VM is running inside Firecracker and could not be paused; recording it as running");
-                        self.set_state(&id, VmState::Running).await;
-                        let _ = self.write_meta(&id).await;
-                        out.failed += 1;
-                    } else {
-                        // A pooled VM that would not pause is still claimable:
-                        // the claim's resume is a no-op on a running guest.
-                        error!(vm = %id, pid, "adopted pool VM is running inside Firecracker and could not be paused");
-                        out.failed += 1;
-                    }
-                }
-                SettleAction::Discard => {
-                    error!(vm = %id, pid, "adopted Firecracker never started its guest; killing it");
-                    self.kill_fc_and_wait(pid, &dir_id).await;
-                    {
-                        let mut g = self.inner.lock().await;
-                        if let Some(v) = g.vms.iter_mut().find(|v| v.id == id) {
-                            if v.pid == Some(pid) {
-                                v.state = VmState::Error;
-                                v.pid = None;
-                            }
-                        }
-                    }
-                    let _ = self.write_meta(&id).await;
-                    out.failed += 1;
-                }
+                Probe::Says(vmm) => match self.apply_settle(&id, &dir_id, pid, &vmm).await {
+                    SettleResult::AsRecorded => {}
+                    SettleResult::Resumed => out.resumed += 1,
+                    SettleResult::Paused => out.paused += 1,
+                    SettleResult::Failed => out.failed += 1,
+                },
             }
         }
         out
     }
 
-    /// SIGKILL an instance's Firecracker and wait until the process is gone.
+    /// Ask every listed VMM (id, dir_id, pid) what its guest is doing, all at
+    /// the same time. Answers come back in the order of `vms`.
+    async fn probe_all(&self, vms: &[(String, String, i32)]) -> Vec<Probe> {
+        let mut answers: Vec<Probe> = vms.iter().map(|_| Probe::NoSocketPath).collect();
+        let mut asking = tokio::task::JoinSet::new();
+        for (i, (_, dir_id, _)) in vms.iter().enumerate() {
+            let Some(dir) = instance_path(&self.data_dir, dir_id) else {
+                continue;
+            };
+            let sock = format!("{}/{}", dir, procscan::SOCK_NAME);
+            answers[i] = Probe::Silent;
+            asking.spawn(async move { (i, probe_vmm(&sock).await) });
+        }
+        while let Some(done) = asking.join_next().await {
+            if let Ok((i, Some(state))) = done {
+                answers[i] = Probe::Says(state);
+            }
+        }
+        answers
+    }
+
+    /// Bring one adopted VM's Firecracker, which reports `vmm`, in line with
+    /// its record — the record as it is NOW: the answer may have been a while
+    /// in coming. Does nothing when the record no longer holds `pid`.
+    async fn apply_settle(&self, id: &str, dir_id: &str, pid: i32, vmm: &str) -> SettleResult {
+        let state = {
+            let g = self.inner.lock().await;
+            match g.vms.iter().find(|v| v.id == id) {
+                Some(v) if v.pid == Some(pid) => v.state.clone(),
+                _ => return SettleResult::AsRecorded,
+            }
+        };
+        let Some(dir) = instance_path(&self.data_dir, dir_id) else {
+            return SettleResult::AsRecorded;
+        };
+        let sock = format!("{}/{}", dir, procscan::SOCK_NAME);
+        match settle_action(&state, vmm) {
+            SettleAction::None => SettleResult::AsRecorded,
+            SettleAction::Resume => {
+                let done = tokio::time::timeout(ADOPT_API_TIMEOUT, fc::patch_vm_state(&sock, "Resumed")).await;
+                if matches!(done, Ok(Ok(()))) {
+                    warn!(vm = %id, pid, "adopted VM was paused inside Firecracker under a record that says running (the previous agent stopped in the middle of a sleep, fork or pause); resumed");
+                    SettleResult::Resumed
+                } else {
+                    // Could not resume it. Record what is true instead, so
+                    // that `resume` is a real request and not a no-op on a
+                    // VM that is listed as running and frozen.
+                    error!(vm = %id, pid, "adopted VM is paused inside Firecracker and could not be resumed; recording it as paused");
+                    self.set_state(id, VmState::Paused).await;
+                    let _ = self.write_meta(id).await;
+                    SettleResult::Failed
+                }
+            }
+            SettleAction::Pause => {
+                let done = tokio::time::timeout(ADOPT_API_TIMEOUT, fc::patch_vm_state(&sock, "Paused")).await;
+                if matches!(done, Ok(Ok(()))) {
+                    warn!(vm = %id, pid, state = %state, "adopted VM was running inside Firecracker under a record that says it is not (the previous agent stopped in the middle of a resume or a pool claim); paused again");
+                    SettleResult::Paused
+                } else if state == VmState::Paused {
+                    error!(vm = %id, pid, "adopted VM is running inside Firecracker and could not be paused; recording it as running");
+                    self.set_state(id, VmState::Running).await;
+                    let _ = self.write_meta(id).await;
+                    SettleResult::Failed
+                } else {
+                    // A pooled VM that would not pause is still claimable:
+                    // the claim's resume is a no-op on a running guest.
+                    error!(vm = %id, pid, "adopted pool VM is running inside Firecracker and could not be paused");
+                    SettleResult::Failed
+                }
+            }
+            SettleAction::Discard => {
+                error!(vm = %id, pid, "adopted Firecracker never started its guest; killing it");
+                self.kill_fc_and_wait(pid, dir_id).await;
+                {
+                    let mut g = self.inner.lock().await;
+                    if let Some(v) = g.vms.iter_mut().find(|v| v.id == id) {
+                        if v.pid == Some(pid) {
+                            v.state = VmState::Error;
+                            v.pid = None;
+                        }
+                    }
+                }
+                let _ = self.write_meta(id).await;
+                SettleResult::Failed
+            }
+        }
+    }
+
+    /// Ask the Firecrackers that did not answer at start-up again (liveness
+    /// loop, every 5 s), and settle the ones that answer now.
     ///
-    /// The identity check comes first and is repeated while waiting: the pid
-    /// is only signalled while it is positively (or, on a failed read,
-    /// possibly) this instance's VMM, never merely because a process has that
-    /// number. Waiting matters for VMMs this agent did not spawn — `waitpid`
-    /// returns at once for a process that is not a child, and a caller that
-    /// went on to respawn (sleep → wake) would find the tap and the sockets
-    /// still held by the dying one.
-    async fn kill_fc_and_wait(&self, pid: i32, dir_id: &str) {
+    /// The case this exists for: the agent is restarted while a guest with
+    /// several GiB of memory is being put to sleep or forked. Firecracker
+    /// finishes writing the snapshot on its own — for seconds to minutes,
+    /// during which its API answers nothing — and leaves the guest PAUSED,
+    /// under a record that says `running`. Start-up cannot wait that long.
+    pub async fn settle_unanswered(&self) {
+        // Mark the whole batch as being looked at: a lifecycle operation that
+        // arrives for one of these VMs now waits for this pass to finish.
+        let batch: Vec<(String, i32)> = {
+            let mut list = lock_std(&self.unsettled);
+            let pending: Vec<(String, i32)> = list
+                .iter()
+                .filter_map(|(id, u)| match u {
+                    Unsettled::Pending(pid) => Some((id.clone(), *pid)),
+                    Unsettled::Settling => None,
+                })
+                .collect();
+            for (id, _) in &pending {
+                list.insert(id.clone(), Unsettled::Settling);
+            }
+            pending
+        };
+        if batch.is_empty() {
+            return;
+        }
+        // Only VMs that still hold the VMM that was asked.
+        let mut current: Vec<(String, String, i32)> = Vec::new();
+        {
+            let g = self.inner.lock().await;
+            for (id, pid) in &batch {
+                match g.vms.iter().find(|v| &v.id == id && v.pid == Some(*pid)) {
+                    Some(v) => current.push((id.clone(), v.dir_id.clone(), *pid)),
+                    None => {
+                        // Stopped, slept, deleted or dead since: settled.
+                        lock_std(&self.unsettled).remove(id);
+                    }
+                }
+            }
+        }
+        let answers = self.probe_all(&current).await;
+        for ((id, dir_id, pid), answer) in current.into_iter().zip(answers) {
+            match answer {
+                Probe::Says(vmm) => {
+                    let result = self.apply_settle(&id, &dir_id, pid, &vmm).await;
+                    info!(vm = %id, pid, vmm = %vmm, result = ?result, "adopted VM's Firecracker answers now; its run state is settled");
+                    lock_std(&self.unsettled).remove(&id);
+                }
+                Probe::Silent => {
+                    lock_std(&self.unsettled).insert(id, Unsettled::Pending(pid));
+                }
+                Probe::NoSocketPath => {
+                    lock_std(&self.unsettled).remove(&id);
+                }
+            }
+        }
+    }
+
+    /// Called by every operation that is about to change a VM's run state,
+    /// before it talks to the VMM. Returns true when start-up never heard from
+    /// this VM's Firecracker, i.e. when the run state on its record is not
+    /// known to be true (see `Unsettled`).
+    ///
+    /// Either way the VM is off the list afterwards: the caller is about to
+    /// establish what its guest is doing, which is all the list is for.
+    async fn claim_unsettled(&self, id: &str) -> bool {
+        loop {
+            {
+                let mut list = lock_std(&self.unsettled);
+                match list.get(id) {
+                    None => return false,
+                    Some(Unsettled::Pending(_)) => {
+                        list.remove(id);
+                        return true;
+                    }
+                    // `settle_unanswered` is talking to this VMM; it is done
+                    // within two API timeouts.
+                    Some(Unsettled::Settling) => {}
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// SIGKILL an instance's Firecracker. Returns whether there is a dying
+    /// process worth waiting for (`wait_fc_gone`).
+    ///
+    /// There is no await in here on purpose: a caller can change the record
+    /// and send the signal as one step that nothing — not even its own
+    /// request being dropped — can come between.
+    ///
+    /// The identity check comes first: the pid is only signalled while it is
+    /// positively (or, on a failed read, possibly) this instance's VMM, never
+    /// merely because a process has that number.
+    fn kill_fc(&self, pid: i32, dir_id: &str) -> bool {
         use nix::sys::signal::{kill, Signal};
         use nix::unistd::Pid;
         let procs = self.procs();
@@ -970,15 +1330,23 @@ impl Manager {
             // Not this instance's VMM (any more). If that is because it is
             // already on its way out, give it the moment it needs to let go
             // of the tap; a stranger with a recycled pid is not waited for.
-            if !procs.exiting(pid) {
-                return;
-            }
-        } else {
-            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+            return procs.exiting(pid);
         }
-        // "Exited" means every thread is gone, which is when the memory, the
-        // tap and the sockets are released — not merely that the process no
-        // longer looks like a Firecracker (see `ProcTable::exited`).
+        let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+        true
+    }
+
+    /// Wait until a killed Firecracker is gone, for at most `KILL_WAIT`.
+    ///
+    /// Waiting matters for VMMs this agent did not spawn — `waitpid` returns
+    /// at once for a process that is not a child, and a caller that went on
+    /// to respawn (sleep → wake) would find the tap and the sockets still
+    /// held by the dying one. "Gone" means every thread has exited, which is
+    /// when the memory, the tap and the sockets are released — not merely
+    /// that the process no longer looks like a Firecracker (see
+    /// `ProcTable::exited`).
+    async fn wait_fc_gone(&self, pid: i32, dir_id: &str) {
+        let procs = self.procs();
         let deadline = Instant::now() + KILL_WAIT;
         while !procs.exited(pid) {
             if Instant::now() >= deadline {
@@ -986,6 +1354,13 @@ impl Manager {
                 break;
             }
             sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// SIGKILL an instance's Firecracker and wait until the process is gone.
+    async fn kill_fc_and_wait(&self, pid: i32, dir_id: &str) {
+        if self.kill_fc(pid, dir_id) {
+            self.wait_fc_gone(pid, dir_id).await;
         }
     }
 
@@ -1707,12 +2082,16 @@ impl Manager {
     // ---- pause / resume ----
 
     pub async fn pause(&self, id: &str) -> Result<(), String> {
+        // A VM whose Firecracker never answered at start-up may be running
+        // under a record that says paused. Then "already paused" is not an
+        // answer: the request has to reach the VMM.
+        let unsettled = self.claim_unsettled(id).await;
         {
             let g = self.inner.lock().await;
             let v = g.vms.iter().find(|v| v.id == id).ok_or("NotFound")?;
             match v.state {
-                VmState::Paused => return Ok(()), // idempotent
-                VmState::Running => {}
+                VmState::Paused if !unsettled => return Ok(()), // idempotent
+                VmState::Paused | VmState::Running => {}
                 _ => return Err(format!("InvalidState: {}", v.state.as_str())),
             }
         }
@@ -1723,12 +2102,17 @@ impl Manager {
     }
 
     pub async fn resume(&self, id: &str) -> Result<(), String> {
+        // As in `pause`. The usual case: a guest left paused by a sleep or a
+        // fork the previous agent did not finish, under a record that still
+        // says running — where answering "already running" would leave it
+        // frozen.
+        let unsettled = self.claim_unsettled(id).await;
         {
             let g = self.inner.lock().await;
             let v = g.vms.iter().find(|v| v.id == id).ok_or("NotFound")?;
             match v.state {
-                VmState::Running => return Ok(()), // idempotent
-                VmState::Paused => {}
+                VmState::Running if !unsettled => return Ok(()), // idempotent
+                VmState::Running | VmState::Paused => {}
                 _ => return Err(format!("InvalidState: {}", v.state.as_str())),
             }
         }
@@ -1741,12 +2125,12 @@ impl Manager {
     // ---- sleep / wake ----
 
     pub async fn sleep_vm(&self, id: &str) -> Result<(), String> {
-        let (pid, dir_id) = {
+        self.claim_unsettled(id).await;
+        {
             let g = self.inner.lock().await;
             let v = g.vms.iter().find(|v| v.id == id).ok_or("NotFound")?;
             if v.state == VmState::Sleeping { return Ok(()); }
-            (v.pid, v.dir_id.clone())
-        };
+        }
 
         let sock = self.sock_path(id).await.ok_or("InvalidId")?;
         let dir_path = self.instance_dir(id).await.ok_or("InvalidId")?;
@@ -1758,18 +2142,29 @@ impl Manager {
         fc::put_snapshot_create(&sock, &vmstate, &mem).await
             .map_err(|e| e.to_string())?;
 
-        // Clear the pid BEFORE killing so the exit reaper sees a pid mismatch
-        // and treats this as a deliberate kill (no error transition).
-        self.set_pid(id, None).await;
-        if let Some(p) = pid {
+        // The guest's state is on disk: from here the VM is asleep. The record
+        // says so, loses its pid and the VMM is told to go in ONE step with no
+        // await in it, so nothing can be left half-way by a caller that hangs
+        // up — a record that still said `running` with no pid was a dead VM
+        // listed as running, which no later request could move. Clearing the
+        // pid before the kill also makes the exit reaper see a pid mismatch
+        // and treat this as a deliberate kill (no error transition).
+        let (pid, dir_id) = {
+            let mut g = self.inner.lock().await;
+            let v = g.vms.iter_mut().find(|v| v.id == id).ok_or("NotFound")?;
+            v.state = VmState::Sleeping;
+            (v.pid.take(), v.dir_id.clone())
+        };
+        let dying = pid.filter(|p| self.kill_fc(*p, &dir_id));
+
+        let persisted = self.write_meta(id).await;
+        if let Some(p) = dying {
             // Waits for the process to be gone even when it is not this
             // agent's child (a VMM adopted at start-up): the wake that follows
             // needs the tap and the sockets it holds.
-            self.kill_fc_and_wait(p, &dir_id).await;
+            self.wait_fc_gone(p, &dir_id).await;
         }
-
-        self.set_state(id, VmState::Sleeping).await;
-        self.write_meta(id).await
+        persisted
     }
 
     /// Spawn firecracker → snapshot/load. Returns wake latency in ms.
@@ -1854,6 +2249,8 @@ impl Manager {
         if !valid_vm_id(child_id) {
             return Err("InvalidId".into());
         }
+        // Fork pauses, snapshots and resumes the parent itself.
+        self.claim_unsettled(parent_id).await;
         let (parent_was_running, parent_vcpus, parent_mem_mib, parent_vsock, parent_tenant_id, parent_image, parent_image_sha256, parent_disk_gb) = {
             let g = self.inner.lock().await;
             let p = g.vms.iter().find(|v| v.id == parent_id).ok_or("NotFound")?;
@@ -2293,22 +2690,23 @@ impl Manager {
 
         let sock = self.sock_path(id).await.ok_or("InvalidId")?;
         if let Err(e) = fc::patch_vm_state(&sock, "Resumed").await {
-            // Pool VM is unusable (FC likely dead). Retag the record back,
-            // mark it error, and let the caller fall through to a cold boot.
-            warn!(pool_vm = %pooled_id, vm = %id, err = %e, "pool claim failed");
-            let dead_pid = {
+            // Pool VM is unusable (its Firecracker is gone, or does not
+            // answer). Give the record its pool id back, remove it — it was
+            // never handed to anyone and cannot be now — and let the caller
+            // fall through to a cold boot.
+            warn!(pool_vm = %pooled_id, vm = %id, err = %e, "pool claim failed; removing the pool vm");
+            let spec = {
                 let mut g = self.inner.lock().await;
-                if let Some(v) = g.vms.iter_mut().find(|v| v.id == id) {
+                g.vms.iter_mut().find(|v| v.id == id).map(|v| {
                     v.id = pooled_id.clone();
                     v.name = "pool".to_string();
                     v.tenant_id = None;
-                    v.pid
-                } else {
-                    None
-                }
+                    v.state = VmState::Error;
+                    pool_spec_key_of(v)
+                })
             };
-            if let Some(p) = dead_pid {
-                self.on_fc_exit(&pooled_id, p).await;
+            if let Some(key) = spec {
+                self.remove_dead_pool_vm(&pooled_id, key).await;
             }
             return Ok(false);
         }
@@ -2320,6 +2718,9 @@ impl Manager {
     // ---- stop / start / delete ----
 
     pub async fn stop(&self, id: &str) -> Result<(), String> {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        self.claim_unsettled(id).await;
         // Read the pid and clear the record in ONE critical section: the exit
         // reaper then sees a pid mismatch and treats this as a deliberate kill
         // (no error transition), and nothing can change the record between
@@ -2332,23 +2733,35 @@ impl Manager {
             v.pid = None;
             out
         };
+        // The signal follows with no await in between: a stop is never left
+        // as "the record says stopped and nobody told the VMM".
+        let procs = self.procs();
+        let mut wait_for: Option<i32> = None;
+        let mut signal_err: Option<String> = None;
         if let Some(p) = pid {
-            use nix::sys::signal::{kill, Signal};
-            use nix::unistd::Pid;
             // Signal the pid only while it is still this instance's VMM. A
             // Firecracker adopted at start-up is not this agent's child, so
             // once it has exited its number is free for any other process.
-            let procs = self.procs();
             if procs.identify(p, &dir_id) != Identity::Mismatch {
                 match kill(Pid::from_raw(p), Signal::SIGTERM) {
-                    Ok(_) | Err(nix::errno::Errno::ESRCH) => {}
-                    Err(e) => return Err(e.to_string()),
+                    Ok(_) | Err(nix::errno::Errno::ESRCH) => wait_for = Some(p),
+                    Err(e) => signal_err = Some(e.to_string()),
                 }
-            } else if !procs.exiting(p) {
-                // Gone long ago, or a stranger now has the number: there is
-                // nothing of ours to wait for.
-                return Ok(());
+            } else if procs.exiting(p) {
+                wait_for = Some(p);
             }
+            // Otherwise it is gone long ago, or a stranger now has the number:
+            // there is nothing of ours to wait for.
+        }
+        // On disk straight away. A stop that was never written down reads as
+        // `running` with a dead pid at the next agent start — and from there
+        // as `sleeping` whenever an old snapshot is still lying in the
+        // directory, a state `start` refuses.
+        let persisted = self.write_meta(id).await;
+        if let Some(e) = signal_err {
+            return Err(e);
+        }
+        if let Some(p) = wait_for {
             // Wait for the FC process to actually exit: "stopped" gates the
             // rootfs capture endpoint, and a dying FC may still be flushing
             // rootfs.ext4. Escalate to SIGKILL at 5s, give up at 10s (the
@@ -2375,7 +2788,7 @@ impl Manager {
                 sleep(Duration::from_millis(100)).await;
             }
         }
-        Ok(())
+        persisted
     }
 
     pub async fn start(self: &Arc<Self>, id: &str) -> Result<(), String> {
@@ -2436,19 +2849,33 @@ impl Manager {
     }
 
     pub async fn delete(&self, id: &str) -> Result<(), String> {
-        // Capture slot before removal.
-        let (slot, lives_there) = {
-            let g = self.inner.lock().await;
-            let slot = g.vms.iter().find(|v| v.id == id).and_then(|v| v.slot);
-            // No record has this id, yet a VM lives in the directory of that
-            // name: a pool VM that was claimed keeps its pool directory under
-            // its new id.
-            let lives_there = if g.vms.iter().any(|v| v.id == id) {
-                None
-            } else {
-                g.vms.iter().find(|v| v.dir_id == id).map(|v| v.id.clone())
-            };
-            (slot, lives_there)
+        self.claim_unsettled(id).await;
+        // One critical section decides what this delete is about.
+        let (slot, dir_id, lives_there) = {
+            let mut g = self.inner.lock().await;
+            match g.vms.iter_mut().find(|v| v.id == id) {
+                Some(v) => {
+                    // A pool VM leaves the claimable set here, under the lock
+                    // a claim retags under. Either the claim got there first —
+                    // then no record has this id any more and the branch
+                    // below refuses — or no claim can match it from now on.
+                    // Without this, a delete of a pooled id that raced a
+                    // create removed the tap, the slot and the directory of
+                    // the sandbox that had just been claimed from it.
+                    if v.state == VmState::Pooled {
+                        v.state = VmState::Stopped;
+                    }
+                    (v.slot, v.dir_id.clone(), None)
+                }
+                // No record has this id, yet a VM may live in the directory
+                // of that name: a pool VM that was claimed keeps its pool
+                // directory under its new id.
+                None => (
+                    None,
+                    id.to_string(),
+                    g.vms.iter().find(|v| v.dir_id == id).map(|v| v.id.clone()),
+                ),
+            }
         };
         // delete does not require the VM to exist, and for an unknown id the
         // directory it removes is the one named after the id. That must never
@@ -2462,6 +2889,40 @@ impl Manager {
 
         // stop is best-effort (idempotent delete).
         let _ = self.stop(id).await;
+
+        // Nothing may be left running out of the directory this is about to
+        // remove. stop() dealt with the VMM the record holds; what can remain
+        // is one no record holds — a VM whose meta.json did not load at
+        // start-up is left running and unmanaged (`SweepStep::LeaveUnreadable`),
+        // and the control plane still knows its id. Removing the directory
+        // under it would leave a Firecracker with its memory, its tap and its
+        // egress that no later start can even find: the scan locates VMMs by
+        // their socket's directory.
+        if valid_vm_id(&dir_id) {
+            let procs = self.procs();
+            let strays: Vec<FcProc> =
+                procs.scan().into_iter().filter(|p| p.dir_name == dir_id).collect();
+            if !strays.is_empty() && !self.hold_data_dir_lock() {
+                return Err("InvalidState: a Firecracker is running in this VM's directory and this agent does not hold the data-dir lock".into());
+            }
+            for p in strays {
+                if !procs.in_my_cgroup(p.pid) {
+                    warn!(vm = %id, pid = p.pid, "delete: a Firecracker this unit did not start is running in the VM's directory; nothing removed");
+                    return Err(format!(
+                        "InvalidState: firecracker {} in this VM's directory was not started by this agent",
+                        p.pid
+                    ));
+                }
+                warn!(vm = %id, pid = p.pid, "delete: killing the Firecracker still running in the VM's directory");
+                self.kill_fc_and_wait(p.pid, &dir_id).await;
+                if !procs.exited(p.pid) {
+                    return Err(format!(
+                        "InvalidState: firecracker {} is still running in this VM's directory",
+                        p.pid
+                    ));
+                }
+            }
+        }
 
         if self.net_on {
             if let Some(s) = slot {
@@ -2478,10 +2939,12 @@ impl Manager {
         // An id that is not a plain path component never reaches remove_dir_all:
         // delete does not require the VM to exist, so this is the one call in
         // the manager that would recursively delete an attacker-chosen path.
-        match self.instance_dir(id).await {
+        match instance_path(&self.data_dir, &dir_id) {
             Some(dir_path) => {
                 if let Err(e) = std::fs::remove_dir_all(&dir_path) {
-                    warn!(path = %dir_path, err = %e, "remove_dir_all failed");
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        warn!(path = %dir_path, err = %e, "remove_dir_all failed");
+                    }
                 }
             }
             None => warn!(vm = %id, "delete: rejected id that is not a valid path component"),
@@ -2493,6 +2956,8 @@ impl Manager {
                 g.vms.remove(pos);
             }
         }
+        // The record is gone, and with it anything still owed to its file.
+        lock_std(&self.meta_owed).remove(id);
         // Teardown does not fail on a broken ruleset: the VM is already gone,
         // and returning an error here would only make delete non-idempotent.
         if !self.refresh_isolation().await {
@@ -2524,8 +2989,14 @@ impl Manager {
     /// when `pid` is still the recorded pid and the state implies a live
     /// process; deliberate kills (sleep/stop/delete) clear the pid under the
     /// lock before signalling, so they no-op here.
+    ///
+    /// A sandbox goes to `error` and stays for its owner to see. A pool VM
+    /// nobody claimed is removed instead: it cannot be claimed any more, and
+    /// as an `error` record it would keep a slot, a tap and a rootfs copy that
+    /// nothing ever deletes — neither the drain (it looks at `pooled` VMs) nor
+    /// a tenant (there is none).
     async fn on_fc_exit(&self, id: &str, pid: i32) {
-        let transitioned = {
+        let (transitioned, dead_pool) = {
             let mut g = self.inner.lock().await;
             // A dead pool VM leaves the claimable set by this very transition:
             // claims match on state == Pooled, and Error is not claimable.
@@ -2533,17 +3004,40 @@ impl Manager {
                 Some(v) if v.pid == Some(pid)
                     && matches!(v.state, VmState::Creating | VmState::Running | VmState::Paused | VmState::Pooled) =>
                 {
+                    let dead_pool = (v.state == VmState::Pooled).then(|| pool_spec_key_of(v));
                     v.state = VmState::Error;
                     v.pid = None;
-                    true
+                    (true, dead_pool)
                 }
-                _ => false,
+                _ => (false, None),
             }
         };
-        if transitioned {
-            warn!(vm = %id, pid = pid, "firecracker exited unexpectedly; state -> error");
-            // Best-effort: the instance dir may be mid-delete.
-            let _ = self.write_meta(id).await;
+        if !transitioned {
+            return;
+        }
+        match dead_pool {
+            Some(key) => {
+                warn!(vm = %id, pid = pid, "a pool vm's firecracker exited; removing the pool vm");
+                self.remove_dead_pool_vm(id, key).await;
+            }
+            None => {
+                warn!(vm = %id, pid = pid, "firecracker exited unexpectedly; state -> error");
+                // Best-effort: the instance dir may be mid-delete.
+                let _ = self.write_meta(id).await;
+            }
+        }
+    }
+
+    /// Remove a pool VM whose Firecracker is gone or unusable, and give its
+    /// pool a rest: whatever killed it (most likely the node running out of
+    /// memory) is not helped by prewarming a replacement five seconds later.
+    async fn remove_dead_pool_vm(&self, id: &str, spec_key: String) {
+        {
+            let mut bo = self.pool_backoff.lock().await;
+            bo.insert(spec_key, Instant::now() + REFILL_BACKOFF);
+        }
+        if let Err(e) = self.delete(id).await {
+            warn!(vm = %id, err = %e, "could not remove a dead pool vm");
         }
     }
 
@@ -2574,10 +3068,33 @@ impl Manager {
 
     /// Write the current in-memory record for `id` to its meta.json.
     ///
-    /// The file is replaced, never rewritten in place: an agent killed
-    /// mid-write used to leave a truncated meta.json, and a VM whose record
-    /// does not load is a VM start-up can no longer manage.
+    /// The file is replaced, never rewritten in place, and is on disk when
+    /// this returns (`replace_file_durably`): an agent killed mid-write used
+    /// to leave a truncated meta.json, and a VM whose record does not load is
+    /// a VM start-up can no longer manage.
+    ///
+    /// A write that fails, or whose caller goes away in the middle of it, is
+    /// not forgotten: the id stays on the `meta_owed` list and the liveness
+    /// loop writes it (`flush_unwritten_meta`). Without that, a wake that hit
+    /// a full disk left `sleeping` on disk under a running VM for good — the
+    /// retried request is answered "already running" from memory and never
+    /// writes again.
     async fn write_meta(&self, id: &str) -> Result<(), String> {
+        let mut owed = OwedMeta { owed: &self.meta_owed, id, armed: true };
+        let res = self.write_meta_now(id).await;
+        let settled = match &res {
+            Ok(()) => true,
+            // No such record (any more): there is nothing left to write.
+            Err(e) => e == "NotFound" || e == "InvalidId",
+        };
+        if settled {
+            owed.armed = false;
+            lock_std(&self.meta_owed).remove(id);
+        }
+        res
+    }
+
+    async fn write_meta_now(&self, id: &str) -> Result<(), String> {
         // Held across the snapshot AND the replace, so the newest snapshot is
         // always the one that lands (see the field's comment).
         let _writing = self.meta_write_lock.lock().await;
@@ -2605,14 +3122,21 @@ impl Manager {
         };
 
         let dir_path = instance_path(&self.data_dir, &meta.dir_id).ok_or("InvalidId")?;
-        let meta_path = format!("{}/meta.json", dir_path);
-        let tmp_path = format!("{}/meta.json.tmp", dir_path);
-        let json = meta.to_json();
-        std::fs::write(&tmp_path, json.as_bytes())
-            .map_err(|e| format!("write meta {}: {}", tmp_path, e))?;
-        std::fs::rename(&tmp_path, &meta_path)
-            .map_err(|e| format!("replace meta {}: {}", meta_path, e))?;
-        Ok(())
+        replace_file_durably(&dir_path, "meta.json", meta.to_json().as_bytes())
+            .map_err(|e| format!("write meta {}/meta.json: {}", dir_path, e))
+    }
+
+    /// Write the records whose last write did not land (liveness loop, every
+    /// 5 s). See `write_meta`.
+    pub async fn flush_unwritten_meta(&self) {
+        let owed: Vec<String> = lock_std(&self.meta_owed).iter().cloned().collect();
+        for id in owed {
+            match self.write_meta(&id).await {
+                Ok(()) => info!(vm = %id, "meta.json written (an earlier write had failed or was interrupted)"),
+                Err(e) if e == "NotFound" || e == "InvalidId" => {}
+                Err(e) => warn!(vm = %id, err = %e, "meta.json still cannot be written; the record on disk is behind this VM's real state"),
+            }
+        }
     }
 }
 
@@ -3542,7 +4066,7 @@ mod tests {
     fn test_plan_sweep_never_touches_an_adopted_vmm() {
         let found = vec![fcp(10, "vm-a"), fcp(11, "pool-1")];
         let owned: HashSet<i32> = [10, 11].into_iter().collect();
-        let plan = plan_sweep(&found, &owned, &name_set(&["vm-a", "pool-1"]), &[], &[], |_| true);
+        let plan = plan_sweep(&found, &owned, &name_set(&["vm-a", "pool-1"]), &HashSet::new(), &[], &[], |_| true);
         assert!(plan.is_empty(), "{plan:?}");
     }
 
@@ -3552,13 +4076,14 @@ mod tests {
             fcp(10, "vm-a"),     // adopted
             fcp(12, "vm-a"),     // a second VMM on the same directory
             fcp(20, "vm-half"),  // create that never wrote meta.json
-            fcp(30, "vm-sleep"), // wake that never committed: the record still says sleeping
+            fcp(30, "vm-sleep"), // wake that was never written down: the record still says sleeping
         ];
         let owned: HashSet<i32> = [10].into_iter().collect();
         let plan = plan_sweep(
             &found,
             &owned,
             &name_set(&["vm-a", "vm-sleep"]),
+            &name_set(&["vm-sleep"]),
             &[],
             &names(&["vm-half", "vm-empty"]),
             |_| true,
@@ -3568,7 +4093,8 @@ mod tests {
             vec![
                 kill(12, "vm-a"),
                 kill(20, "vm-half"),
-                kill(30, "vm-sleep"),
+                // Not killed outright: its guest may be awake and writing.
+                SweepStep::Probe { pid: 30, dir_name: "vm-sleep".into() },
                 // Kills come first: a directory is removed after its VMM is gone.
                 rmdir("vm-half"),
                 rmdir("vm-empty"),
@@ -3583,6 +4109,7 @@ mod tests {
         let found = vec![fcp(40, "vm-damaged")];
         let plan = plan_sweep(
             &found,
+            &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
             &names(&["vm-damaged"]),
@@ -3600,6 +4127,7 @@ mod tests {
         let plan = plan_sweep(
             &found,
             &HashSet::new(),
+            &name_set(&["vm-sleep"]),
             &name_set(&["vm-sleep"]),
             &[],
             &names(&["vm-half", "vm-empty"]),
@@ -3620,7 +4148,7 @@ mod tests {
         // Not a record, not unreadable, not unfinished: reconcile never looked
         // at this directory (its name is not a valid instance id).
         let found = vec![fcp(60, "lost+found")];
-        let plan = plan_sweep(&found, &HashSet::new(), &HashSet::new(), &[], &[], |_| true);
+        let plan = plan_sweep(&found, &HashSet::new(), &HashSet::new(), &HashSet::new(), &[], &[], |_| true);
         assert!(plan.is_empty(), "{plan:?}");
     }
 
@@ -4014,19 +4542,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().to_str().unwrap().to_string();
         std::fs::create_dir_all(format!("{}/instances/vm-1", data_dir)).unwrap();
-        let mut bystander = std::process::Command::new("sleep").arg("300").spawn().expect("spawn sleep");
+        // Killed and reaped when the test ends, however it ends.
+        struct Reaped(std::process::Child);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut bystander = Reaped(std::process::Command::new("sleep").arg("300").spawn().expect("spawn sleep"));
         // Past exec, so it is positively "some other program" — which is what
         // a recycled pid looks like in practice.
-        wait_for_argv0(bystander.id(), "sleep");
+        wait_for_argv0(bystander.0.id(), "sleep");
 
         let mgr = mgr_for(data_dir);
-        mgr.inner.lock().await.vms.push(running_vm("vm-1", bystander.id() as i32));
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", bystander.0.id() as i32));
         mgr.stop("vm-1").await.unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let survived = bystander.try_wait().unwrap().is_none();
-        let _ = bystander.kill();
-        let _ = bystander.wait();
+        let survived = bystander.0.try_wait().unwrap().is_none();
         assert!(survived, "stop() signalled a process that is not this instance's Firecracker");
         let g = mgr.inner.lock().await;
         assert_eq!((g.vms[0].state.clone(), g.vms[0].pid), (VmState::Stopped, None));
@@ -4039,10 +4573,16 @@ mod tests {
         std::fs::create_dir_all(format!("{}/instances/vm-1", data_dir)).unwrap();
         let mut vmm = FakeVmm::spawn(&data_dir, "vm-1");
 
-        let mgr = mgr_for(data_dir);
+        let mgr = mgr_for(data_dir.clone());
         mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
         mgr.stop("vm-1").await.unwrap();
         assert!(!vmm.alive(), "stop() must still terminate the instance's own Firecracker");
+        // And the record on disk says so. An unwritten stop reads as `running`
+        // with a dead pid at the next start, and from there as `sleeping`
+        // whenever an old snapshot is lying in the directory.
+        let written = std::fs::read_to_string(format!("{}/instances/vm-1/meta.json", data_dir)).unwrap();
+        let meta: Meta = serde_json::from_str(&written).expect("meta.json must parse");
+        assert_eq!((meta.state, meta.pid), (VmState::Stopped, None));
     }
 
     #[tokio::test]
@@ -4063,5 +4603,359 @@ mod tests {
         let meta: Meta = serde_json::from_str(&written).expect("meta.json must parse");
         assert_eq!((meta.id.as_str(), meta.state, meta.pid), ("vm-1", VmState::Running, Some(4242)));
         assert!(!Path::new(&format!("{}/meta.json.tmp", dir)).exists());
+    }
+
+    /// Stands in for a Firecracker's API socket. Every request is answered 200
+    /// with an `InstanceInfo` carrying the current state; `PATCH /vm` changes
+    /// that state the way a VMM would. The request lines are kept.
+    struct FakeApi {
+        state: Arc<std::sync::Mutex<String>>,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl FakeApi {
+        fn serve(sock: &str, state: &str) -> Self {
+            let listener = tokio::net::UnixListener::bind(sock).expect("bind the fake api socket");
+            let state = Arc::new(std::sync::Mutex::new(state.to_string()));
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (st, sn) = (Arc::clone(&state), Arc::clone(&seen));
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut conn, _)) = listener.accept().await else { return };
+                    let (st, sn) = (Arc::clone(&st), Arc::clone(&sn));
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        // Headers, then as many body bytes as they announce.
+                        let mut buf: Vec<u8> = Vec::new();
+                        let mut chunk = [0u8; 2048];
+                        let request = loop {
+                            let text = String::from_utf8_lossy(&buf).to_string();
+                            if let Some(end) = text.find("\r\n\r\n") {
+                                let want = text[..end]
+                                    .lines()
+                                    .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                                    .unwrap_or(0);
+                                if buf.len() >= end + 4 + want {
+                                    break text;
+                                }
+                            }
+                            match conn.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break text,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        let line = request.lines().next().unwrap_or("").to_string();
+                        if line.starts_with("PATCH /vm") {
+                            if request.contains("Resumed") {
+                                *st.lock().unwrap() = "Running".into();
+                            } else if request.contains("Paused") {
+                                *st.lock().unwrap() = "Paused".into();
+                            }
+                        }
+                        sn.lock().unwrap().push(line);
+                        let body = format!(
+                            "{{\"id\":\"t\",\"state\":\"{}\",\"vmm_version\":\"1.16.0\",\"app_name\":\"Firecracker\"}}",
+                            st.lock().unwrap()
+                        );
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = conn.write_all(resp.as_bytes()).await;
+                        let _ = conn.shutdown().await;
+                    });
+                }
+            });
+            FakeApi { state, seen, task }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        fn state(&self) -> String {
+            self.state.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for FakeApi {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn record_of(mgr: &Manager, id: &str) -> Option<(VmState, Option<i32>)> {
+        let g = mgr.inner.lock().await;
+        g.vms.iter().find(|v| v.id == id).map(|v| (v.state.clone(), v.pid))
+    }
+
+    fn meta_on_disk(data_dir: &str, dir: &str) -> Meta {
+        let written = std::fs::read_to_string(format!("{}/instances/{}/meta.json", data_dir, dir)).unwrap();
+        serde_json::from_str(&written).expect("meta.json must parse")
+    }
+
+    #[tokio::test]
+    async fn test_a_wake_or_start_nobody_wrote_down_is_adopted_when_its_guest_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let inst = format!("{}/instances", data_dir);
+        for d in ["vm-woke", "vm-loading", "vm-started"] {
+            std::fs::create_dir_all(format!("{}/{}", inst, d)).unwrap();
+        }
+        // Three records that hold no VMM, each with a Firecracker in its
+        // directory: what an agent leaves that was woken or started a VM and
+        // went away before it wrote the record.
+        let mut woke = FakeVmm::spawn(&data_dir, "vm-woke");
+        let mut loading = FakeVmm::spawn(&data_dir, "vm-loading");
+        let mut started = FakeVmm::spawn(&data_dir, "vm-started");
+        std::fs::write(format!("{}/vm-woke/meta.json", inst), meta_line("vm-woke", None, "sleeping")).unwrap();
+        std::fs::write(format!("{}/vm-loading/meta.json", inst), meta_line("vm-loading", None, "sleeping")).unwrap();
+        std::fs::write(format!("{}/vm-started/meta.json", inst), meta_line("vm-started", None, "stopped")).unwrap();
+        let _woke_api = FakeApi::serve(&format!("{}/vm-woke/fc.sock", inst), "Running");
+        let _loading_api = FakeApi::serve(&format!("{}/vm-loading/fc.sock", inst), "Paused");
+        let _started_api = FakeApi::serve(&format!("{}/vm-started/fc.sock", inst), "Running");
+
+        let mgr = mgr_for(data_dir.clone());
+        mgr.reconcile().await;
+
+        // A guest that is running has been writing to its disk: killing it
+        // would leave `sleeping` on top of a snapshot the disk has outrun.
+        assert_eq!(record_of(&mgr, "vm-woke").await, Some((VmState::Running, Some(woke.pid()))));
+        assert!(woke.alive(), "a guest that is already awake must not be killed");
+        assert_eq!(record_of(&mgr, "vm-started").await, Some((VmState::Running, Some(started.pid()))));
+        assert!(started.alive());
+        let on_disk = meta_on_disk(&data_dir, "vm-woke");
+        assert_eq!((on_disk.state, on_disk.pid), (VmState::Running, Some(woke.pid())));
+        // Loaded but never resumed: nothing has run since the snapshot, so
+        // the state on disk is still current and the VMM is simply removed.
+        assert_eq!(record_of(&mgr, "vm-loading").await, Some((VmState::Sleeping, None)));
+        assert!(!loading.alive(), "a VMM whose guest never ran must be killed");
+    }
+
+    #[tokio::test]
+    async fn test_a_vmm_that_did_not_answer_at_start_up_is_asked_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-busy", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Adopted as running. Its Firecracker is still writing the snapshot
+        // of a fork the previous agent started, and answers nothing.
+        let mut vmm = FakeVmm::spawn(&data_dir, "vm-busy");
+        std::fs::write(format!("{}/meta.json", dir), meta_line("vm-busy", Some(vmm.pid()), "running")).unwrap();
+
+        let mgr = mgr_for(data_dir.clone());
+        mgr.reconcile().await;
+        assert_eq!(record_of(&mgr, "vm-busy").await, Some((VmState::Running, Some(vmm.pid()))));
+        assert_eq!(lock_std(&mgr.unsettled).get("vm-busy"), Some(&Unsettled::Pending(vmm.pid())));
+
+        // Still silent: nothing is decided, and it stays on the list.
+        mgr.settle_unanswered().await;
+        assert_eq!(lock_std(&mgr.unsettled).get("vm-busy"), Some(&Unsettled::Pending(vmm.pid())));
+
+        // The snapshot is written. Firecracker answers again — and its guest
+        // is paused, under a record that says running.
+        let api = FakeApi::serve(&format!("{}/fc.sock", dir), "Paused");
+        mgr.settle_unanswered().await;
+        assert_eq!(api.state(), "Running", "the guest must be resumed: {:?}", api.requests());
+        assert!(lock_std(&mgr.unsettled).is_empty());
+        assert_eq!(record_of(&mgr, "vm-busy").await, Some((VmState::Running, Some(vmm.pid()))));
+        assert!(vmm.alive());
+    }
+
+    #[tokio::test]
+    async fn test_an_unsettled_vm_that_was_stopped_since_is_dropped_from_the_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        std::fs::create_dir_all(format!("{}/instances/vm-1", data_dir)).unwrap();
+        let vmm = FakeVmm::spawn(&data_dir, "vm-1");
+        let mgr = mgr_for(data_dir);
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
+        lock_std(&mgr.unsettled).insert("vm-1".into(), Unsettled::Pending(vmm.pid()));
+
+        // An operation on the VM takes it off the list before it starts...
+        mgr.stop("vm-1").await.unwrap();
+        assert!(lock_std(&mgr.unsettled).is_empty());
+        // ...and an entry for a VMM the record no longer holds is dropped.
+        lock_std(&mgr.unsettled).insert("vm-1".into(), Unsettled::Pending(vmm.pid()));
+        mgr.settle_unanswered().await;
+        assert!(lock_std(&mgr.unsettled).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resume_reaches_the_vmm_while_its_run_state_is_unsettled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let vmm = FakeVmm::spawn(&data_dir, "vm-1");
+        let api = FakeApi::serve(&format!("{}/fc.sock", dir), "Paused");
+        let mgr = mgr_for(data_dir);
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
+
+        // Settled: "already running" is answered from the record.
+        mgr.resume("vm-1").await.unwrap();
+        assert!(api.requests().is_empty(), "{:?}", api.requests());
+
+        // Start-up never heard from this VMM: the record is not known to be
+        // true, so the request has to reach it.
+        lock_std(&mgr.unsettled).insert("vm-1".into(), Unsettled::Pending(vmm.pid()));
+        mgr.resume("vm-1").await.unwrap();
+        assert_eq!(api.state(), "Running", "{:?}", api.requests());
+        assert!(lock_std(&mgr.unsettled).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sleep_never_leaves_a_running_record_without_a_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut vmm = FakeVmm::spawn(&data_dir, "vm-1");
+        let _api = FakeApi::serve(&format!("{}/fc.sock", dir), "Running");
+        let mgr = mgr_for(data_dir.clone());
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
+
+        // The caller hangs up the moment the record lets go of the pid — the
+        // point at which the request used to be droppable with the record
+        // still saying `running`, which nothing could move afterwards.
+        // `biased`, watcher first: it looks at the record every time the
+        // sleep yields, so it cannot miss that moment.
+        let watcher = Arc::clone(&mgr);
+        tokio::select! {
+            biased;
+            _ = async move {
+                loop {
+                    if watcher.inner.lock().await.vms[0].pid.is_none() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+            r = mgr.sleep_vm("vm-1") => r.unwrap(),
+        }
+        assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Sleeping, None)));
+        // The VMM was told to go in that same step.
+        for _ in 0..300 {
+            if !vmm.alive() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!vmm.alive(), "the Firecracker of a sleeping VM must be gone");
+        // Whatever the dropped request still owed the record's file is written.
+        mgr.flush_unwritten_meta().await;
+        let on_disk = meta_on_disk(&data_dir, "vm-1");
+        assert_eq!((on_disk.state, on_disk.pid), (VmState::Sleeping, None));
+    }
+
+    #[tokio::test]
+    async fn test_delete_does_not_remove_a_directory_from_under_a_running_vmm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-lost", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A healthy VM whose record does not load: start-up leaves it running
+        // and unmanaged. The control plane still knows its id.
+        let mut vmm = FakeVmm::spawn(&data_dir, "vm-lost");
+        std::fs::write(format!("{}/meta.json", dir), "").unwrap();
+
+        let first = mgr_for(data_dir.clone());
+        first.reconcile().await;
+        assert!(vmm.alive());
+        assert!(record_of(&first, "vm-lost").await.is_none());
+
+        // An agent that does not hold the data dir decides nothing about it.
+        let second = mgr_for(data_dir.clone());
+        assert!(second.delete("vm-lost").await.is_err());
+        assert!(vmm.alive() && Path::new(&dir).exists());
+        drop(second);
+
+        // The one that does removes the VM for real: process first, then files.
+        first.delete("vm-lost").await.unwrap();
+        assert!(!vmm.alive(), "delete must not leave a Firecracker running with no directory");
+        assert!(!Path::new(&dir).exists());
+    }
+
+    #[tokio::test]
+    async fn test_a_pool_vm_whose_vmm_dies_is_removed_and_its_pool_rests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/pool-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(format!("{}/rootfs.ext4", dir), "x").unwrap();
+        let vmm = FakeVmm::spawn(&data_dir, "pool-1");
+        let mgr = mgr_for(data_dir);
+        {
+            let mut v = pooled_vm("pool-1", DEFAULT_IMAGE, 1, 256, 0);
+            v.pid = Some(vmm.pid());
+            v.slot = None;
+            v.ip = None;
+            mgr.inner.lock().await.vms.push(v);
+        }
+        // Still alive: nothing happens.
+        mgr.sweep_dead().await;
+        assert_eq!(record_of(&mgr, "pool-1").await.map(|r| r.0), Some(VmState::Pooled));
+
+        drop(vmm); // the Firecracker dies (an OOM kill, say)
+        mgr.sweep_dead().await;
+        // Not an `error` record that keeps a slot and a rootfs copy for ever:
+        assert!(record_of(&mgr, "pool-1").await.is_none(), "a dead pool VM must not linger as a record");
+        assert!(!Path::new(&dir).exists());
+        // and no replacement five seconds later.
+        let key = spec_key(&pool_spec(DEFAULT_IMAGE, 1, 256, 1));
+        assert!(mgr.pool_backoff.lock().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn test_a_meta_write_that_fails_is_owed_and_written_later() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        let mgr = mgr_for(data_dir.clone());
+        // Its directory does not exist: the write cannot land.
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", 4242));
+        assert!(mgr.write_meta("vm-1").await.is_err());
+        assert!(lock_std(&mgr.meta_owed).contains("vm-1"));
+        // Still failing: still owed.
+        mgr.flush_unwritten_meta().await;
+        assert!(lock_std(&mgr.meta_owed).contains("vm-1"));
+        // The disk is back.
+        std::fs::create_dir_all(&dir).unwrap();
+        mgr.flush_unwritten_meta().await;
+        assert!(lock_std(&mgr.meta_owed).is_empty());
+        let on_disk = meta_on_disk(&data_dir, "vm-1");
+        assert_eq!((on_disk.state, on_disk.pid), (VmState::Running, Some(4242)));
+        // A record that does not exist owes nothing.
+        assert!(mgr.write_meta("vm-nope").await.is_err());
+        assert!(lock_std(&mgr.meta_owed).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_meta_write_whose_caller_goes_away_is_owed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        std::fs::create_dir_all(format!("{}/instances/vm-1", data_dir)).unwrap();
+        let mgr = mgr_for(data_dir.clone());
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", 4242));
+
+        // Another write is in progress, so this one has to wait — and its
+        // caller is dropped while it does.
+        let busy = mgr.meta_write_lock.lock().await;
+        {
+            let write = mgr.write_meta("vm-1");
+            tokio::pin!(write);
+            tokio::select! {
+                biased;
+                _ = &mut write => panic!("the write cannot finish while the lock is held"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+        drop(busy);
+        assert!(lock_std(&mgr.meta_owed).contains("vm-1"));
+        mgr.flush_unwritten_meta().await;
+        assert!(lock_std(&mgr.meta_owed).is_empty());
+        assert_eq!(meta_on_disk(&data_dir, "vm-1").state, VmState::Running);
     }
 }
