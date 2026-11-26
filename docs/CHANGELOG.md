@@ -817,6 +817,15 @@ alternatives that lost: [ADR-0011](adr/ADR-0011-worker-restarts.md).
   not load. It may hold a tenant's disk; the agent reports it and leaves it.
   Empty-`meta.json` directories left by older builds need one manual clean-up.
 
+**One place starts a Firecracker (FLU-57, audit F-54)**
+
+- Create/start, wake and fork each carried their own copy of the spawn, and
+  each copy built stdout and stderr from one raw descriptor, so `serial.log`
+  was closed twice per VM — in a multi-threaded runtime the second close can
+  hit a descriptor another thread was just given. `Manager::spawn_firecracker`
+  is now the only spawn site; the two streams each own a descriptor
+  (`try_clone`), and the `unsafe` is gone. A structural test keeps it at one.
+
 **A pool teardown no longer deletes a sandbox it was just handed out (FLU-60, found during this wave)**
 
 - Reproduced on the lab with the previous build: remove a template pool

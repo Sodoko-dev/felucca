@@ -17,7 +17,6 @@ use tracing::{error, info, warn};
 use meta::{ExposeEntry, Meta, VmState};
 use procscan::{FcProc, Identity, ProcTable};
 use serde::Deserialize;
-use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -1538,36 +1537,7 @@ impl Manager {
         // Remove stale socket.
         let _ = std::fs::remove_file(&sock);
 
-        let log_path = format!("{}/serial.log", dir_path);
-        let log_file = open_serial_log(&log_path)
-            .map_err(|e| format!("open serial.log: {}", e))?;
-
-        let log_fd = log_file.into_raw_fd();
-
-        // Spawn firecracker with stdin null, stdout/stderr → serial.log.
-        let child = tokio::process::Command::new("firecracker")
-            .arg("--api-sock").arg(&sock)
-            .stdin(std::process::Stdio::null())
-            .stdout(unsafe { std::process::Stdio::from_raw_fd(log_fd) })
-            .stderr(unsafe { std::process::Stdio::from_raw_fd(log_fd) })
-            .kill_on_drop(false) // ALWAYS false per spec
-            .spawn()
-            .map_err(|e| format!("spawn firecracker: {}", e))?;
-
-        let pid = child.id().ok_or("NoPid")? as i32;
-        // Detached reaper: collects the exit status whenever FC dies (our
-        // SIGKILL on sleep, guest shutdown, crash) so it never zombies, and
-        // flags unexpected exits (pid still recorded) as state=error.
-        // kill_on_drop is false, so dropping after wait never kills anything.
-        {
-            let mgr = Arc::clone(self);
-            let rid = id.to_string();
-            tokio::spawn(async move {
-                let mut child = child;
-                let _ = child.wait().await;
-                mgr.on_fc_exit(&rid, pid).await;
-            });
-        }
+        let pid = self.spawn_firecracker(id, &sock, dir_path)?;
 
         // Poll the API socket up to 3000ms in 50ms steps.
         let deadline = Instant::now() + Duration::from_millis(3000);
@@ -1588,6 +1558,50 @@ impl Manager {
             return Err(e);
         }
         Ok((pid, vsock_on))
+    }
+
+    /// Start the Firecracker of the instance in `dir_path`, console to its
+    /// `serial.log`, and hand its exit to a reaper task. Returns the pid.
+    ///
+    /// THE spawn site: cold boot (create, start), wake and fork all come
+    /// through here, so that everything every VMM must get, it gets — there
+    /// used to be three copies of this, and a fourth would have been the one
+    /// that missed something (`test_there_is_exactly_one_firecracker_spawn_site`).
+    fn spawn_firecracker(self: &Arc<Self>, id: &str, sock: &str, dir_path: &str) -> Result<i32, String> {
+        let log_path = format!("{}/serial.log", dir_path);
+        let log_out = open_serial_log(&log_path)
+            .map_err(|e| format!("open serial.log: {}", e))?;
+        // stdout and stderr each own a descriptor. Both used to be built from
+        // ONE raw fd, so it was closed twice — and in a multi-threaded runtime
+        // the number can be handed to another thread between the two closes,
+        // whose connection or guest socket the second close then takes away.
+        let log_err = log_out
+            .try_clone()
+            .map_err(|e| format!("dup serial.log: {}", e))?;
+
+        // stdin null, stdout/stderr → serial.log.
+        let child = tokio::process::Command::new("firecracker")
+            .arg("--api-sock").arg(sock)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(log_out))
+            .stderr(std::process::Stdio::from(log_err))
+            .kill_on_drop(false) // ALWAYS false per spec
+            .spawn()
+            .map_err(|e| format!("spawn firecracker: {}", e))?;
+
+        let pid = child.id().ok_or("NoPid")? as i32;
+        // Detached reaper: collects the exit status whenever FC dies (our
+        // SIGKILL on sleep, guest shutdown, crash) so it never zombies, and
+        // flags unexpected exits (pid still recorded) as state=error.
+        // kill_on_drop is false, so dropping after wait never kills anything.
+        let mgr = Arc::clone(self);
+        let rid = id.to_string();
+        tokio::spawn(async move {
+            let mut child = child;
+            let _ = child.wait().await;
+            mgr.on_fc_exit(&rid, pid).await;
+        });
+        Ok(pid)
     }
 
     /// True when `{data_dir}/images/.felucca-guest-v1` exists: the rootfs has the
@@ -1758,31 +1772,7 @@ impl Manager {
         // stale file is still there.
         let _ = std::fs::remove_file(format!("{}/v.sock", dir_path));
 
-        let log_path = format!("{}/serial.log", dir_path);
-        let log_file = open_serial_log(&log_path)
-            .map_err(|e| format!("open serial.log: {}", e))?;
-
-        let log_fd = log_file.into_raw_fd();
-
-        let child = tokio::process::Command::new("firecracker")
-            .arg("--api-sock").arg(&sock)
-            .stdin(std::process::Stdio::null())
-            .stdout(unsafe { std::process::Stdio::from_raw_fd(log_fd) })
-            .stderr(unsafe { std::process::Stdio::from_raw_fd(log_fd) })
-            .kill_on_drop(false)
-            .spawn()
-            .map_err(|e| format!("spawn firecracker: {}", e))?;
-
-        let pid = child.id().ok_or("NoPid")? as i32;
-        {
-            let mgr = Arc::clone(self);
-            let rid = id.to_string();
-            tokio::spawn(async move {
-                let mut child = child;
-                let _ = child.wait().await;
-                mgr.on_fc_exit(&rid, pid).await;
-            });
-        }
+        let pid = self.spawn_firecracker(id, &sock, &dir_path)?;
 
         // Poll socket.
         let deadline = Instant::now() + Duration::from_millis(3000);
@@ -1932,31 +1922,7 @@ impl Manager {
         let child_sock = format!("{}/fc.sock", child_dir);
         let _ = std::fs::remove_file(&child_sock);
 
-        let log_path = format!("{}/serial.log", child_dir);
-        let log_file = open_serial_log(&log_path)
-            .map_err(|e| format!("open serial.log: {}", e))?;
-
-        let log_fd = log_file.into_raw_fd();
-
-        let child_proc = tokio::process::Command::new("firecracker")
-            .arg("--api-sock").arg(&child_sock)
-            .stdin(std::process::Stdio::null())
-            .stdout(unsafe { std::process::Stdio::from_raw_fd(log_fd) })
-            .stderr(unsafe { std::process::Stdio::from_raw_fd(log_fd) })
-            .kill_on_drop(false)
-            .spawn()
-            .map_err(|e| format!("spawn child firecracker: {}", e))?;
-
-        let child_pid = child_proc.id().ok_or("NoPid")? as i32;
-        {
-            let mgr = Arc::clone(self);
-            let rid = child_id.to_string();
-            tokio::spawn(async move {
-                let mut child_proc = child_proc;
-                let _ = child_proc.wait().await;
-                mgr.on_fc_exit(&rid, child_pid).await;
-            });
-        }
+        let child_pid = self.spawn_firecracker(child_id, &child_sock, &child_dir)?;
 
         let deadline = Instant::now() + Duration::from_millis(3000);
         loop {
@@ -2957,6 +2923,31 @@ mod tests {
         let slot = 7u32;
         assert_eq!(tap_pin_for_slot(slot).1, net::guest_mac_for_slot(slot));
         assert_ne!(net::guest_mac_for_slot(slot), net::guest_mac_for_slot(slot + 1));
+    }
+
+    #[test]
+    fn test_there_is_exactly_one_firecracker_spawn_site() {
+        // Create/start, wake and fork each used to carry their own copy of
+        // the spawn, and each copy closed the serial.log descriptor twice.
+        // Whatever every VMM must get at birth is only guaranteed while there
+        // is one place that gives it. Structural, like the tap test below.
+        let src = include_str!("mod.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("production half of mod.rs");
+        let code: String = prod
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let needle = ["Command::new(", "\"firecracker\")"].concat();
+        assert_eq!(
+            code.matches(needle.as_str()).count(),
+            1,
+            "every Firecracker must be started by Manager::spawn_firecracker"
+        );
+        // No handle is built from a raw descriptor any more: that is how one
+        // fd came to be owned, and closed, twice.
+        let raw = ["from_raw", "_fd("].concat();
+        assert_eq!(code.matches(raw.as_str()).count(), 0, "a raw fd wrapped in an owning handle");
     }
 
     #[test]
