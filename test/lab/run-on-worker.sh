@@ -5,7 +5,7 @@
 #   bash test/lab/run-on-worker.sh <gate> [worker-vm] [token] [gate args...]
 #
 # <gate> is the name of a script in this directory without .sh: restart, oom,
-# firewall, break, repro-flu15, repro-flu70.
+# firewall, break, reboot-pre, reboot-post, repro-flu15, repro-flu70.
 #
 # The worker VMs do not mount the repository, so the gate and its helper are
 # copied into the VM first. The gate is started DETACHED in the VM with its
@@ -20,7 +20,7 @@
 set -u
 
 GATE="${1:-}"
-case "$GATE" in restart|oom|firewall|break|repro-flu15|repro-flu70) ;; *) echo "usage: $0 <restart|oom|firewall|break|repro-flu15|repro-flu70> [worker-vm] [token] [gate args...]" >&2; exit 2;; esac
+case "$GATE" in restart|oom|firewall|break|reboot-pre|reboot-post|repro-flu15|repro-flu70) ;; *) echo "usage: $0 <restart|oom|firewall|break|reboot-pre|reboot-post|repro-flu15|repro-flu70> [worker-vm] [token] [gate args...]" >&2; exit 2;; esac
 WORKER="${2:-${FELUCCA_LAB_WORKER:-kata-lab-0}}"
 
 # The lab token authenticates a root-privileged agent API, so it is never a

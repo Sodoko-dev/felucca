@@ -952,6 +952,12 @@ alternatives that lost: [ADR-0011](adr/ADR-0011-worker-restarts.md).
   the fence line → agent refuses, bridge down, sandbox alive, recovery with no
   manual step once the file is right.
 
+- Lab gate `scripts/verify-reboot.sh`: a clean reboot of a worker that holds
+  a running, a sleeping and a pool sandbox, with a probe inside one guest that
+  logs what it can reach while the host goes down. With
+  `WITH_DISTRO_NFTABLES=1` the distribution's `nftables.service` is enabled
+  for the run and the shutdown's journal must show the sandboxes ended before
+  the ruleset is flushed (FLU-62).
 
 Known limits, each filed separately: one host cannot get both roles' rules
 from the installer and `feluccad.service` has no start gate (FLU-64); nothing
