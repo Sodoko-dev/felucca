@@ -5,6 +5,26 @@ Everything built, verified, and learned, in order. Companion docs:
 [API-V3-EXEC.md](API-V3-EXEC.md) (contracts), [ARCHITECTURE.md](ARCHITECTURE.md)
 (current system), the ADRs in [adr/](adr/), and [DEPLOYMENT.md](DEPLOYMENT.md).
 
+## Dependency security updates (2026-11-26)
+
+Scanned with `govulncheck`, `cargo audit`, and `npm audit`; every finding
+below is now resolved (all three scanners report clean).
+
+| Component | Change | Fixes |
+|---|---|---|
+| Go toolchain (`go.mod`) | 1.26.6 → **1.26.11** | 15 stdlib advisories, 12 reachable from our code: net/http HTTP/1+2 server crashes/DoS (GO-2026-6859, -6617, -6603, -6611, -6612, -6609), request desync (-6605, -6613), crypto/x509 distrust of compromised intermediates (-6809), crypto/tls ECH (-6607), MIME header limit bypass (-6608), html/template (-6599, -6600) |
+| `golang.org/x/net` | v0.58.0 → v0.63.0 | HTTP/2 + html advisories (GO-2026-6603/6610/6611/6612/6617/6860/6866) |
+| `golang.org/x/crypto` | v0.55.0 → v0.59.0 | ssh channel DoS (GO-2026-6354/6355), openpgp (GO-2026-5932) |
+| `golang.org/x/sys`, `x/text` | v0.47→v0.50, v0.41→v0.44 | kept in step with x/net/x/crypto |
+| `tokio` (agent) | 1.52.3 → 1.54.1 | RUSTSEC-2026-0386 (`AsyncFd` I/O-safety unsoundness) |
+| `rustix` (agent, guest) | 1.1.4 → 1.1.6 | RUSTSEC-2026-0486 (xattr unsoundness) |
+
+TS SDK: `npm audit` clean; only the dev-only majors (TypeScript 7, @types/node 26)
+are pending, deliberately not taken here. Verified in `infra-saas-lab`: go vet +
+go test green, static amd64/arm64 feluccad + felucca-gw builds, cargo test green
+(agent 204/0, guest 36/0 + 5/0), release builds warning-free. Lab conformance
+not re-run: the update is lockfile/toolchain-only with no code changes.
+
 ## Rename: Hearth → Felucca (2026-09-12)
 
 The product, both binaries, on-disk paths, and every public identifier were
