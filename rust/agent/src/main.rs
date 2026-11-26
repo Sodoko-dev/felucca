@@ -227,6 +227,20 @@ async fn main() {
         cfg.token.clone(),
     );
 
+    // One agent per data dir, decided before this one touches anything.
+    // Everything below acts on what it finds — it re-pins taps, pauses and
+    // resumes guests, kills what looks orphaned and rebuilds the node's
+    // rulesets from the records it loaded. Run by a second agent (started by
+    // hand while the unit is up), each of those lands on the first agent's
+    // live sandboxes with records that are already out of date.
+    if !mgr.hold_data_dir_lock() {
+        fatal(&format!(
+            "another felucca-agent holds {}/agent.lock (or the lock file cannot be opened) — \
+             this one has changed nothing and is exiting",
+            cfg.data_dir
+        ));
+    }
+
     // Host networking + IP allocator. The port goes in first: the guest→host
     // fence installed during bridge setup names it in its drop rule.
     net::set_agent_port(cfg.port);
@@ -242,10 +256,32 @@ async fn main() {
     // with no isolation at all. Run `--net off` to serve unnetworked guests
     // deliberately instead.
     if cfg.net && !net::netfilter_ready() {
+        // Exiting no longer takes the guests down with it: Firecrackers
+        // outlive the agent (ADR-0011), so every VM that was running a moment
+        // ago still is. "Refusing to serve" has to cover them too — take the
+        // guest bridge down. Nothing is destroyed: the VMs keep their state,
+        // and the next start that gets the fences up brings the bridge back
+        // (and only that one: nothing before this point raises it).
+        let guests = mgr.live_count().await;
+        net::quarantine_bridge();
+        if guests > 0 {
+            tracing::error!(
+                guests,
+                "the guest bridge has been taken down: these sandboxes keep running but have no \
+                 network until an agent start gets the isolation rules loaded"
+            );
+        }
         fatal(
             "cross-tenant isolation is not in force on this node (see the errors above) — \
              refusing to serve tenants",
         );
+    }
+    // The fences are in force: now, and not before, the guest bridge may be
+    // up. It already is on an ordinary restart; this is what ends a
+    // quarantine, whether an earlier start of the agent imposed it or the
+    // unit's own pre-start check did.
+    if cfg.net && !net::raise_bridge() {
+        warn!("the guest bridge could not be brought up; guests have no network");
     }
     // Ingress DNAT rules don't survive a host reboot either; rebuild them
     // from the exposes persisted in meta.json.

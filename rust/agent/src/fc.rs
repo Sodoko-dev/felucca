@@ -65,6 +65,30 @@ async fn patch(sock: &str, path: &str, body: &str) -> Result<()> {
     Ok(())
 }
 
+/// The `state` field of a `GET /` response body.
+pub fn parse_instance_state(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("state")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// GET / — what the VMM says its guest is doing: "Not started", "Running" or
+/// "Paused" (Firecracker's `InstanceInfo.state`).
+///
+/// The agent's own record says what the last completed operation left. This is
+/// the other half: an agent that takes over a Firecracker it did not start
+/// (ADR-0011) has no other way to learn that a sleep or a fork was cut short
+/// after it had paused the guest.
+pub async fn get_instance_state(sock: &str) -> Result<String> {
+    let (status, body) = request_uds(sock, Method::GET, "/", "").await?;
+    if status != 200 {
+        return Err(FcError(format!("GET / -> {}: {}", status, body)));
+    }
+    parse_instance_state(&body).ok_or_else(|| FcError(format!("GET /: no state in {}", body)))
+}
+
 /// PUT /boot-source — kernel path + boot args.
 /// When net_on and ip is Some, injects `ip=<ip>::<gw>:<mask>::eth0:off` boot arg.
 pub async fn put_boot_source(

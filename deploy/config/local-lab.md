@@ -65,9 +65,10 @@ honours the host part of `bind` now, and two things in this lab need the port
 off-loopback: Lima's automatic forward (which does not pick up a
 guest-loopback-only listener) and the worker VMs, which reach the control plane
 at `192.168.104.3:8080`. Production is the opposite — `127.0.0.1:8080` behind
-Caddy, or the overlay address on a wg fleet (DEPLOYMENT.md §6.3). The lab runs
-no systemd units, so it has no `felucca-firewall` rules either: the L2-isolated
-Lima network is the whole boundary. Do not expose a lab VM.
+Caddy, or the overlay address on a wg fleet (DEPLOYMENT.md §6.3). The lab
+control plane runs `feluccad.service` but no `felucca-firewall` unit, so there
+are no host rules on that VM: the L2-isolated Lima network is the whole
+boundary. Do not expose a lab VM.
 
 ## felucca-agent — Lima lab (`/etc/felucca/felucca-agent.json` inside `kata-lab-0`)
 
@@ -88,10 +89,13 @@ For `kata-lab-1` change `bind` and `advertise_addr` to `192.168.104.4`.
 
 `bind` is the VM's user-v2 address rather than `0.0.0.0` on purpose: `0.0.0.0`
 includes the bridge gateway `10.231.0.1`, which every guest has as its default
-route, so the agent's root API would answer sandboxes directly. The lab does not
-run the systemd units, so it does not get the `felucca-firewall` rules that block
-that path on a production worker (see DEPLOYMENT.md §8) — the bind address is
-the whole defence here. Do not expose a lab VM beyond the host.
+route, so the agent's root API would answer sandboxes directly. The lab workers
+run the installed units — `felucca-agent.service` and
+`felucca-firewall.service`, as in production — so the rules that block that path
+(the guest fence and the port-9090 allow-list, DEPLOYMENT.md §8) are loaded
+there too, and the agent's start gate applies: an agent on a lab worker does
+not start without the fence either. The bind address is the second defence,
+not the only one. Do not expose a lab VM beyond the host.
 
 `advertise_addr` can be omitted if the agent can auto-detect the correct source
 IP toward the control plane (API-V2.md §6). In the Lima user-v2 network the
@@ -109,7 +113,7 @@ explicitly.
 | TLS | none (plain HTTP, L2-isolated) | Caddy reverse proxy terminates TLS |
 | `pool_size` | `0` (single-VM lab) | `2`–`5` per node |
 | `data_dir` | `/srv/felucca` | `/srv/felucca` (same) |
-| host firewall | not installed (no systemd in the lab) | `felucca-firewall.service`, required by `felucca-agent.service` |
+| host firewall | workers: `felucca-firewall.service`, as in production; control plane: none | `felucca-firewall.service` on both roles; `felucca-agent.service` looks for its guest fence in the kernel before every start (it `Wants=` the unit, it does not `Require=` it) |
 
 The binary paths, systemd units, config file locations, and all API semantics
 are identical between lab and production.

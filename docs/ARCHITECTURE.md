@@ -429,7 +429,11 @@ sequenceDiagram
 The scheduler reads `vm_count` from heartbeats, so placement freshness is bounded by the 5s
 heartbeat interval (known wart: rapid back-to-back creates can land on one node). Registration
 and heartbeats carry the bearer token — always, since there is no auth-off mode to fall into.
-Sleeping VMs survive agent restarts: the agent reconciles instance dirs and `meta.json` on startup.
+Every VM survives an agent restart — running, paused, sleeping and warm-pool alike. The agent unit
+runs with `KillMode=process`, so Firecrackers outlive the agent; on startup the agent reconciles
+instance dirs and `meta.json`, adopts each VM whose recorded pid is verifiably that instance's
+Firecracker, sweeps what no completed operation owns, and settles each adopted VMM's run state
+against its record ([ADR-0011](adr/ADR-0011-worker-restarts.md)).
 
 **The per-node credential (v4 hardening).** A node's `addr` is caller-supplied, so every outbound
 dial is a decision about where to deliver a secret; sending the cluster admin token made "point
@@ -617,6 +621,5 @@ Remaining beyond v4:
 | Postgres / HA state | behind the `Store` interface (SQLite done in v4 P0) |
 | Reschedule across nodes | snapshot → ship → restore (needs node-decoupled storage) |
 | OIDC / multi-user auth | token-exchange resolving to the same tenant entities as API keys |
-| Pool-orphan reclaim | a paused pool FC orphaned by an agent restart is reconciled to `stopped` but its process is not reaped (1:1 with v2 behavior) |
 | uffd lazy restore / CoW fork | in-process userfaultfd in the Rust agent (the reason the agent is Rust — rust-vmm territory) |
 | Terraform provider | Go provider against the feluccad API (the reason the control plane is Go) |

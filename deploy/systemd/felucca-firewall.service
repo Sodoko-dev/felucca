@@ -1,11 +1,10 @@
 [Unit]
 Description=Felucca host firewall rules
 Documentation=https://github.com/alpham/infra-saas/docs/DEPLOYMENT.md
-# This unit is the enforcement point for DEPLOYMENT.md §8, not a convenience:
-# felucca-agent.service has Requires=felucca-firewall.service, so a worker whose
-# rules are missing refuses to serve its API at all. The agent listens on the
-# bridge gateway that every guest routes through, and guest->host packets hit
-# the INPUT hook, which the agent's own forward-chain isolation never sees —
+
+# This unit loads the rules DEPLOYMENT.md §8 depends on. The agent listens on
+# the bridge gateway that every guest routes through, and guest->host packets
+# hit the INPUT hook, which the agent's own forward-chain isolation never sees —
 # without the felucca0 drop a tenant with root in their own sandbox reaches the
 # node's root control API.
 #
@@ -14,18 +13,86 @@ Documentation=https://github.com/alpham/infra-saas/docs/DEPLOYMENT.md
 # control plane; control plane: restrict 8080). They live in their own
 # `inet felucca_host` table so they never collide with the agent's `ip felucca`
 # table or with whatever else the host runs.
+#
+# What keeps an unfiltered worker from serving is felucca-agent.service's
+# ExecStartPre=, which looks for the felucca0 drop in the kernel every time the
+# agent starts — and, when it is not there, asks systemd to run this unit
+# again (reload-or-restart) before it gives up on that start. It is
+# deliberately NOT Requires=: that only attests that this unit ran once,
+# restarts the agent whenever this unit is restarted, and leaves the agent down
+# with no retry when this unit fails to start (ADR-0011).
 Before=felucca-agent.service feluccad.service
+# The distribution's own ruleset loader commonly begins with `flush ruleset`.
+# Ordering after it means that at boot it cannot wipe this table once loaded.
+# (Ordering only: nothing is pulled in, and a host without that unit is fine.)
+After=nftables.service
 
 [Service]
-# oneshot + RemainAfterExit so the ruleset is applied once at boot and the unit
-# then counts as active for the Requires= above. A failure here is meant to
-# keep felucca-agent down rather than let it serve unfiltered.
+# oneshot + RemainAfterExit: applied once at boot, then the unit counts as
+# active so `systemctl reload` works.
 Type=oneshot
 RemainAfterExit=true
-# install.sh rewrites this path when nft lives somewhere other than /usr/sbin.
-ExecStart=/usr/sbin/nft -f /etc/felucca/firewall.nft
-# Leading '-' so a stop with the table already gone is not a unit failure.
-ExecStop=-/usr/sbin/nft delete table inet felucca_host
+
+# The script nft runs. It is one transaction: create the table if it is not
+# there (so the delete cannot fail on a first load), delete it, load the rules
+# file, then require that the file really defined the input chain. If the file
+# does not parse, is empty, or defines no input chain, nothing is committed and
+# the rules that were loaded before stay in force — there is never a moment
+# with no rules, and loading twice does not duplicate them. Keeping these four
+# lines here rather than in the rules file means any rules file gets the same
+# treatment, including one written by hand.
+#
+# The transaction covers what the file does, not only this table: the file is
+# included verbatim, so one that begins with `flush ruleset` wipes every other
+# table on the node — the agent's own included — and the load still succeeds.
+# The generated file never does that; do not add it by hand.
+#
+# install.sh rewrites the two paths below when nft or the rules file live
+# somewhere else.
+#
+# StandardInput=data is what makes systemd hand the StandardInputText= lines to
+# nft: systemd.exec(5) says they have no effect without it. systemd 255 sets it
+# by itself when such lines are present, but an nft that was given /dev/null
+# instead would exit 0 with nothing loaded, so the unit does not rely on that.
+StandardInput=data
+StandardInputText=table inet felucca_host
+StandardInputText=delete table inet felucca_host
+StandardInputText=include "/etc/felucca/firewall.nft"
+StandardInputText=list chain inet felucca_host input
+ExecStart=/usr/sbin/nft -f -
+# Second look, from outside the transaction: an nft too old to see its own
+# pending changes passes the in-script check on a stale view. This cannot undo
+# anything, but it fails the unit loudly instead of leaving it green.
+ExecStartPost=/usr/sbin/nft list chain inet felucca_host input
+
+# Applying an edited rules file: `systemctl reload felucca-firewall`. Same
+# transaction as a start, nothing else on the node is touched.
+ExecReload=/usr/sbin/nft -f -
+ExecReload=/usr/sbin/nft list chain inet felucca_host input
+
+# Stopping this unit leaves the rules loaded: VMs keep running when their
+# agent is stopped, so a stop that removed the fence would expose the host to
+# every guest still up. To remove the rules on purpose:
+#   nft delete table inet felucca_host
+#
+# The ExecStop= below does nothing at all unless the HOST is shutting down.
+# Then it ends the sandboxes. felucca-agent.service runs with
+# KillMode=process, so stopping it — which is all a shutdown does to it —
+# leaves every Firecracker running until systemd's very last step, and other
+# units unload rules before that: Ubuntu's nftables.service runs
+# `nft flush ruleset` when it stops. For that time the guests would be running
+# with no fence and no tenant isolation (measured on an idle lab worker: rules
+# flushed 0.2 s before the last Firecracker was killed; longer wherever more
+# is left to stop).
+#
+# It is here, and not on the agent's unit, because of where this unit stands:
+# After= the distribution's loader and Before= the agent, so at shutdown it is
+# stopped after the agent and before the rules can go — and it is active
+# whether or not the agent happens to be running at that moment.
+# `systemctl stop` or `restart` of this unit on a system that is not shutting
+# down ends nothing. Do not turn the test into a default: the same command
+# without it is "kill every sandbox on this worker".
+ExecStop=-/bin/sh -c 'test "$$(systemctl is-system-running 2>/dev/null)" = stopping || exit 0; exec systemctl kill --kill-whom=all --signal=SIGKILL felucca-agent.service'
 
 [Install]
 WantedBy=multi-user.target

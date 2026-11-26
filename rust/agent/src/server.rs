@@ -216,6 +216,26 @@ async fn create_vm(State(state): State<AppState>, req: Request) -> Response {
     }
 }
 
+/// Run a lifecycle operation on its own task and wait for it.
+///
+/// A handler future is dropped when its client hangs up (feluccad gives up
+/// after 30 s, or restarts), wherever it happens to be — and these operations
+/// are sequences: pause, snapshot, kill, record. Cut in the middle, one leaves
+/// a guest paused under a record that says running, or a Firecracker killed
+/// under a record that still names it. On its own task the operation always
+/// runs to its end; only the answer is lost. `create_vm` and `fork_vm` have
+/// done this from the start.
+async fn detached<T, F>(op: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::spawn(op).await {
+        Ok(result) => result,
+        Err(e) => Err(format!("operation task: {}", e)),
+    }
+}
+
 async fn sleep_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -227,7 +247,8 @@ async fn sleep_vm(
     if let Some(resp) = reject_bad_id(&id) {
         return resp;
     }
-    match state.mgr.sleep_vm(&id).await {
+    let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
+    match detached(async move { mgr.sleep_vm(&vm).await }).await {
         Ok(_) => json_response(StatusCode::OK, "{\"ok\":true}"),
         Err(e) => {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
@@ -246,7 +267,8 @@ async fn wake_vm(
     if let Some(resp) = reject_bad_id(&id) {
         return resp;
     }
-    match state.mgr.wake_vm(&id).await {
+    let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
+    match detached(async move { mgr.wake_vm(&vm).await }).await {
         Ok(ms) => {
             let body = format!("{{\"ok\":true,\"wake_ms\":{}}}", ms);
             json_response(StatusCode::OK, &body)
@@ -508,7 +530,8 @@ async fn vm_pause(
     if let Some(resp) = reject_bad_id(&id) {
         return resp;
     }
-    match state.mgr.pause(&id).await {
+    let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
+    match detached(async move { mgr.pause(&vm).await }).await {
         Ok(_) => empty_response(StatusCode::OK),
         Err(e) if e.starts_with("InvalidState") => {
             error_response(StatusCode::CONFLICT, &e)
@@ -530,7 +553,8 @@ async fn vm_resume(
     if let Some(resp) = reject_bad_id(&id) {
         return resp;
     }
-    match state.mgr.resume(&id).await {
+    let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
+    match detached(async move { mgr.resume(&vm).await }).await {
         Ok(_) => empty_response(StatusCode::OK),
         Err(e) if e.starts_with("InvalidState") => {
             error_response(StatusCode::CONFLICT, &e)
@@ -552,7 +576,8 @@ async fn vm_stop(
     if let Some(resp) = reject_bad_id(&id) {
         return resp;
     }
-    match state.mgr.stop(&id).await {
+    let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
+    match detached(async move { mgr.stop(&vm).await }).await {
         Ok(_) => empty_response(StatusCode::OK),
         Err(e) => {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
@@ -571,7 +596,8 @@ async fn vm_start(
     if let Some(resp) = reject_bad_id(&id) {
         return resp;
     }
-    match state.mgr.start(&id).await {
+    let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
+    match detached(async move { mgr.start(&vm).await }).await {
         Ok(_) => empty_response(StatusCode::OK),
         // Wrong lifecycle state (e.g. start on a paused VM) → 409, matching
         // the exec contract's 409 "not running" convention.
@@ -597,9 +623,16 @@ async fn delete_vm(
     if let Some(resp) = reject_bad_id(&id) {
         return resp;
     }
-    // delete is idempotent — unknown id also 204.
-    let _ = state.mgr.delete(&id).await;
-    empty_response(StatusCode::NO_CONTENT)
+    // delete is idempotent — unknown id also 204. What it does report is a
+    // Firecracker it could not get out of the VM's directory: answering 204
+    // there would make feluccad drop its record of a VM that is still running
+    // on this node (feluccad keeps the record on any other status).
+    let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
+    match detached(async move { mgr.delete(&vm).await }).await {
+        Ok(()) => empty_response(StatusCode::NO_CONTENT),
+        Err(e) if e.starts_with("InvalidState") => error_response(StatusCode::CONFLICT, &e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    }
 }
 
 /// GET /v1/vms/:id/rootfs (v4 P4): stream the instance's rootfs.ext4 for
