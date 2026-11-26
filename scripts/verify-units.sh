@@ -116,6 +116,10 @@ REQUIRED=(
     'felucca-agent.service|KillMode=process'
     'felucca-agent.service|Restart=always'
     'felucca-agent.service|StartLimitIntervalSec=0'
+    # FLU-2: one OOM-killed Firecracker must not stop the unit (and with it
+    # the agent), and systemd-oomd must not kill the whole cgroup.
+    'felucca-agent.service|OOMPolicy=continue'
+    'felucca-agent.service|ManagedOOMPreference=omit'
     # FLU-3: the agent must not start while the host firewall table is absent,
     # and must not be restarted (or left down) by the unit that loads it.
     'felucca-agent.service|Wants=felucca-firewall.service'
@@ -131,6 +135,9 @@ REQUIRED=(
 )
 # Lines that must NOT come back: "<unit>|<extended regex>".
 FORBIDDEN=(
+    # FLU-2: a unit-level OOM score is inherited by every Firecracker, and an
+    # unprivileged VMM may lower itself back to it.
+    'felucca-agent.service|^OOMScoreAdjust='
     # FLU-3: Requires= restarts the agent with the firewall unit and leaves it
     # down, with no retry, when that unit fails to start.
     'felucca-agent.service|^(Requires|BindsTo|PartOf)=.*felucca-firewall'

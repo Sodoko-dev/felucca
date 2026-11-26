@@ -804,6 +804,20 @@ alternatives that lost: [ADR-0011](adr/ADR-0011-worker-restarts.md).
 - Removed from the backlog: "pool-orphan reclaim".
 - New lab gate: `scripts/verify-restart.sh`.
 
+**One OOM kill takes one sandbox (FLU-2, audit F-19)**
+
+- `felucca-agent.service`: `OOMPolicy=continue` (the default `stop` stopped the
+  unit, and with it every sandbox, when the kernel OOM-killed any one
+  Firecracker) and `ManagedOOMPreference=omit` (systemd-oomd kills whole
+  cgroups).
+- The agent sets `oom_score_adj` 300 on every Firecracker it spawns or adopts
+  and stays at 0 itself, so the process the kernel takes is a VMM — one
+  sandbox — and not the agent or a host daemon. No `OOMScoreAdjust=` on the
+  unit, on purpose (ADR-0011); `scripts/verify-units.sh` refuses one.
+- New lab gate: `scripts/verify-oom.sh` (runs the unit's cgroup out of memory
+  with a `MemoryMax=` drop-in; the same script against the previous unit
+  reproduces the outage).
+
 **Warm-pool VMs no longer pile up across restarts (FLU-29, audit F-26)**
 
 - Was: every agent restart left the previous pool VM behind as a `stopped`

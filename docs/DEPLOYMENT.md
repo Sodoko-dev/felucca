@@ -1369,6 +1369,42 @@ Limits to know about (each is tracked as its own issue):
 - A long-running sandbox keeps the Firecracker binary it was started with. A
   hypervisor upgrade reaches it only when it is next cold-started.
 
+### When a worker runs out of memory
+
+Nothing stops a worker from being promised more guest memory than it has
+(memory admission is a separate, open issue), so the kernel OOM killer is the
+backstop. What it does now:
+
+- It kills **one process**. The agent unit has `OOMPolicy=continue`, so that
+  kill no longer stops the unit — before ADR-0011 the first OOM kill of any
+  Firecracker stopped the unit, and stopping the unit killed every sandbox on
+  the worker.
+- The process it picks is a Firecracker, in practice the one whose guest has
+  touched the most memory. The agent gives every Firecracker it spawns or
+  adopts `oom_score_adj` 300 and stays at 0 itself, so a VMM is taken before
+  the agent, sshd or journald.
+- The agent sees that one Firecracker exit and marks that one sandbox `error`
+  (`firecracker exited unexpectedly; state -> error` in the journal, next to
+  systemd's `A process of this unit has been killed by the OOM killer.`).
+  Every other sandbox keeps its pid, its uptime and its state. `start` on the
+  `error` sandbox cold-boots it.
+- `ManagedOOMPreference=omit` keeps **systemd-oomd**, where it is enabled, away
+  from the unit's cgroup: oomd does not pick a process, it kills a whole
+  cgroup, and this one holds every sandbox.
+
+Check a node with:
+
+```sh
+systemctl show felucca-agent -p OOMPolicy -p ManagedOOMPreference
+for p in $(pgrep -x firecracker); do echo "$p $(cat /proc/$p/oom_score_adj)"; done   # 300 each
+cat /proc/$(pgrep -x felucca-agent)/oom_score_adj                                    # 0
+grep oom_kill /sys/fs/cgroup/system.slice/felucca-agent.service/memory.events
+```
+
+Do not add `OOMScoreAdjust=` to the unit: it is inherited by every
+Firecracker and sets a floor an unprivileged VMM may lower itself back to.
+`scripts/verify-units.sh` refuses it.
+
 ### Upgrading from a Hearth install
 
 If this deployment predates the Hearth → Felucca rename, do the one-time
@@ -1508,6 +1544,7 @@ ritual: `scripts/bench.sh <endpoint> <token>` and refresh `docs/BENCHMARKS.md`.
 | `POST /sandboxes` returns `503 no ready node` | No workers registered and ready | Fix the worker install and verify it reaches the control plane |
 | Guest networking not working (`ip: null`) | `net` is `off` or agent config missing | Set `"net": "on"` and `"net_cidr"` in agent config; verify `nft` and `ip` are installed |
 | Bridge `felucca0` missing after agent restart | Idempotent setup should recreate it | Agent recreates the bridge at startup; check `journalctl -u felucca-agent` for errors |
+| One sandbox went to `error`; journal has `A process of this unit has been killed by the OOM killer.` | The worker ran out of memory and the kernel took that sandbox's Firecracker (§10). The others were not touched | `start` the sandbox to cold-boot it. If it keeps happening the worker is over-committed: lower what is placed on it |
 | Every sandbox on a worker died when the agent was restarted | The unit in force is not the shipped one: `systemctl show felucca-agent -p KillMode` says `control-group` (an old unit, or a drop-in overriding it) | Install `deploy/systemd/felucca-agent.service`, `systemctl daemon-reload`, confirm `KillMode=process` **before** the next restart (§10) |
 | `systemctl stop felucca-agent` did not stop the sandboxes | Intended since ADR-0011 | `systemctl stop felucca-agent && systemctl kill felucca-agent` powers off every sandbox on the node (§10) |
 | Guests have no network after an agent start; journal has `the guest bridge has been taken down` or `could not be pinned — the port has been taken down` | The agent could not load its nft rules at that start, and takes guest ports down rather than leave them unfenced | Fix `nft` (see the errors just above in the journal) and `systemctl restart felucca-agent`: the next successful start brings the bridge and the taps back up. No sandbox was stopped |

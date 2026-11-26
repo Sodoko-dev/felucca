@@ -79,6 +79,24 @@ ExecStart=/usr/local/bin/felucca-agent --config /etc/felucca/felucca-agent.json
 #   start command): expected, do not alert on them.
 # Not "mixed": that still SIGKILLs the whole cgroup after TimeoutStopSec.
 KillMode=process
+# One out-of-memory kill must cost one sandbox, not all of them.
+#
+# Every Firecracker is in this unit's cgroup, and with systemd's default
+# (OOMPolicy=stop) the kernel OOM-killing ANY process of the unit stops the
+# unit. `continue` leaves the unit running: the agent sees that one VMM exit
+# and marks that one sandbox `error`.
+# (KillMode=process alone already keeps the other VMMs alive through such a
+# stop, but the agent would still be taken down and restarted for nothing.)
+OOMPolicy=continue
+# systemd-oomd, where it is enabled, does not pick a process: it kills a whole
+# cgroup, and this one holds every sandbox on the worker. Keep it out; the
+# kernel OOM killer still acts here, one process at a time.
+ManagedOOMPreference=omit
+# No OOMScoreAdjust= here on purpose. It would be inherited by every
+# Firecracker, and the floor it sets is one an unprivileged process may lower
+# itself back to — a compromised VMM could make itself the last to die.
+# Instead the agent marks each Firecracker as a preferred victim when it
+# spawns or adopts it (oom_score_adj 300), and stays at 0 itself.
 # Restart policy. `always`, not `on-failure`: an agent that was ended by a
 # plain SIGTERM (kill <pid>) exits "cleanly" and on-failure would leave it
 # down, with its sandboxes running unattended. `systemctl stop` is still

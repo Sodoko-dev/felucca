@@ -111,6 +111,32 @@ what makes that safe:
    agent's lifetime an empty list means "not told yet". Only the config
    pool's own excess is drained before the first push.
 
+### One out-of-memory kill takes one sandbox (FLU-2)
+
+**`OOMPolicy=continue`.** With the default (`stop`), the kernel OOM-killing any
+process of the unit stops the unit. `KillMode=process` alone already keeps the
+other Firecrackers alive through such a stop, but the agent would still be
+taken down and restarted for nothing; with `continue` the unit carries on, the
+agent sees one VMM exit, and one sandbox goes to `error`.
+
+**`ManagedOOMPreference=omit`.** systemd-oomd does not choose a process, it
+kills a whole cgroup — and this one holds every sandbox on the worker.
+
+**Every Firecracker gets `oom_score_adj` 300; the agent stays at 0.** The
+guests are what fills a worker's memory, so the process to lose is a VMM — one
+sandbox — rather than the agent, sshd or journald. The agent writes the value
+itself: in the one function that spawns a Firecracker (before the child is
+handed to its reaper, so the pid cannot have been recycled), and again for
+every VMM it adopts at start-up, which is what covers VMMs started by an agent
+that predates this.
+
+There is deliberately **no `OOMScoreAdjust=` on the unit**, although a strongly
+negative one for the agent was the original suggestion. A unit-level value is
+inherited by every Firecracker, and the kernel remembers it as the floor a
+process without CAP_SYS_RESOURCE may lower itself back to. A compromised VMM
+could undo the agent's `300` and make itself the last process on the node to
+die. With the unit at 0, the lowest a VMM can go is level with the agent.
+
 ### The host firewall is checked in the kernel and loaded in one transaction (FLU-3)
 
 **`felucca-agent.service` no longer `Requires=` the firewall unit.** It
@@ -209,6 +235,14 @@ it has been loaded.
 - **Graceful stop** (finish in-flight operations on SIGTERM). Worth having and
   filed separately. It cannot replace the start-up handling, which also has
   to cover a crash.
+- **Different OOM scores for pool VMs and tenant VMs** (pool VMs first: they
+  hold nobody's data). Sensible, but a pool VM that dies is prewarmed again on
+  the next tick with no backoff, and its dead record is not cleaned up until
+  the agent restarts — under sustained pressure that is a boot loop that eats
+  slots. It needs a refill backoff first; filed separately.
+- **A memory limit per VM** (`MemoryMax` on a cgroup of its own) would turn a
+  host-wide OOM into "that guest hit its own limit". It needs the per-VM
+  scopes above.
 - **Keep `Requires=` and add the `ExecStartPre=` check.** This was the plan
   before it was challenged. It keeps the restart propagation (harmless once
   sandboxes survive an agent restart) but also keeps the trap: a firewall unit
@@ -251,6 +285,13 @@ it has been loaded.
   (FLU-4); in-flight operations fail on every restart (no graceful stop); NAT
   and ingress rules are rebuilt non-atomically at each start; helper processes
   (`cp`, `curl`, `e2fsck`) outlive the agent that started them.
+- A worker can still be promised more memory than it has (admission is
+  FLU-24). What changes is the price: the sandbox whose guest grew the most
+  dies, instead of all of them. A badly over-committed worker loses sandboxes
+  one after another until what is left fits.
+- An OOM kill is no longer visible as a failed or restarted unit. The signals
+  are the sandbox going to `error`, the journal line, and `oom_kill` in the
+  unit cgroup's `memory.events`. The control plane is not told (FLU-13).
 - `systemctl reload felucca-firewall` is the way to apply an edited rules
   file. `restart` is equally safe now; neither touches the agent or a sandbox.
 - A rules file that does not load is reported by the reload and changes

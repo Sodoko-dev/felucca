@@ -273,6 +273,30 @@ fn drainable_pooled_ids(
         .collect()
 }
 
+/// `oom_score_adj` of every Firecracker (-1000..=1000; the agent stays at 0).
+///
+/// When a worker runs out of memory the guests are what filled it, and the
+/// process to lose should be a VMM — one sandbox — rather than the agent,
+/// sshd or journald, whose loss costs the whole node. The kernel ranks
+/// victims by resident memory plus this value, in thousandths of RAM: 300
+/// puts any Firecracker ahead of a daemon using less than about a third of
+/// the machine more than it does, while a genuine host-side leak that grows
+/// past that is still the one taken.
+///
+/// Set by the agent per process, not as `OOMScoreAdjust=` on the unit: a
+/// unit-level value is inherited by every VMM, and it is a floor an
+/// unprivileged process may lower itself back to.
+const FC_OOM_SCORE_ADJ: i32 = 300;
+
+/// Mark the process at `pid` as a preferred OOM victim (see
+/// `FC_OOM_SCORE_ADJ`). Raising the value needs no privilege.
+fn set_oom_score_adj(proc_root: &Path, pid: i32) -> std::io::Result<()> {
+    std::fs::write(
+        proc_root.join(pid.to_string()).join("oom_score_adj"),
+        format!("{}\n", FC_OOM_SCORE_ADJ),
+    )
+}
+
 /// How long start-up waits for an adopted Firecracker to answer on its API
 /// socket. It answers in well under a millisecond when healthy; a VMM that
 /// does not is left as recorded rather than held against the whole start.
@@ -645,6 +669,19 @@ impl Manager {
                          (not removed), so this guest has no network until an agent start pins it"
                     );
                 }
+            }
+        }
+
+        // A VMM started by an agent that predates the OOM marking is still
+        // at 0; every adopted one gets it (again). Its identity was checked a
+        // moment ago, when its record adopted it.
+        let adopted_pids: Vec<(String, i32)> = {
+            let g = self.inner.lock().await;
+            g.vms.iter().filter_map(|v| v.pid.map(|p| (v.id.clone(), p))).collect()
+        };
+        for (id, pid) in adopted_pids {
+            if let Err(e) = set_oom_score_adj(&self.proc_root, pid) {
+                warn!(vm = %id, pid, err = %e, "could not set oom_score_adj on an adopted firecracker");
             }
         }
 
@@ -1590,6 +1627,12 @@ impl Manager {
             .map_err(|e| format!("spawn firecracker: {}", e))?;
 
         let pid = child.id().ok_or("NoPid")? as i32;
+        // While `child` is still in this scope the process cannot have been
+        // reaped, so the pid is certain to be this Firecracker's — the write
+        // cannot land on a stranger. A failure costs the preference, not the VM.
+        if let Err(e) = set_oom_score_adj(&self.proc_root, pid) {
+            warn!(vm = %id, pid, err = %e, "could not set oom_score_adj on the new firecracker");
+        }
         // Detached reaper: collects the exit status whenever FC dies (our
         // SIGKILL on sleep, guest shutdown, crash) so it never zombies, and
         // flags unexpected exits (pid still recorded) as state=error.
@@ -3646,6 +3689,65 @@ mod tests {
         // An empty push is a real answer ("no template pools"), not silence.
         mgr.set_pools(Vec::new()).await.unwrap();
         assert!(mgr.inner.lock().await.pools_synced);
+    }
+
+    // ---- FLU-2: every Firecracker is a preferred OOM victim ----
+
+    #[test]
+    fn test_set_oom_score_adj_writes_the_value_for_that_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("4321")).unwrap();
+        set_oom_score_adj(tmp.path(), 4321).unwrap();
+        assert_eq!(std::fs::read_to_string(tmp.path().join("4321").join("oom_score_adj")).unwrap(), "300\n");
+        // A process that is gone is an error for the caller to log, not a panic.
+        assert!(set_oom_score_adj(tmp.path(), 9999).is_err());
+    }
+
+    #[test]
+    fn test_the_oom_score_is_inside_the_range_the_kernel_accepts() {
+        // Above the agent's own 0, so a VMM is taken before the agent; well
+        // below 1000, so "always first" is not what we ask for.
+        assert!((1..1000).contains(&FC_OOM_SCORE_ADJ));
+    }
+
+    #[tokio::test]
+    async fn test_adoption_marks_the_vmm_as_an_oom_victim() {
+        // On the real /proc, against a real process: the kernel has to accept
+        // the write from an unprivileged parent (raising needs no capability),
+        // and a VMM started by an agent that predates the marking sits at 0.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        std::fs::create_dir_all(format!("{}/instances/vm-run", data_dir)).unwrap();
+        let vmm = FakeVmm::spawn(&data_dir, "vm-run");
+        let adj = || std::fs::read_to_string(format!("/proc/{}/oom_score_adj", vmm.pid())).unwrap();
+        let before = adj();
+        std::fs::write(
+            format!("{}/instances/vm-run/meta.json", data_dir),
+            meta_line("vm-run", Some(vmm.pid()), "running"),
+        )
+        .unwrap();
+
+        let mgr = mgr_for(data_dir);
+        mgr.reconcile().await;
+
+        assert_eq!(adj().trim(), "300", "was {:?} before adoption", before.trim());
+    }
+
+    #[test]
+    fn test_every_spawned_firecracker_gets_the_oom_score() {
+        // The mark is applied in the one spawn function, before the child is
+        // handed to its reaper. Structural, because spawning needs a real
+        // Firecracker: the call has to be inside that function, between the
+        // spawn and the reaper.
+        let src = include_str!("mod.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("production half of mod.rs");
+        let start = prod.find("fn spawn_firecracker(").expect("spawn_firecracker");
+        let body = &prod[start..];
+        let body = &body[..body.find("\n    }\n").expect("end of spawn_firecracker")];
+        let spawn = body.find(".spawn()").expect("the spawn");
+        let mark = body.find("set_oom_score_adj(").expect("spawn_firecracker must set the OOM score");
+        let reaper = body.find("tokio::spawn(").expect("the reaper");
+        assert!(spawn < mark && mark < reaper, "the OOM score must be set after the spawn and before the reaper owns the child");
     }
 
     // ---- FLU-60: a pool VM claimed while the drain is running ----
