@@ -1287,9 +1287,85 @@ for the exact values used in each Lima VM.
 
 ## 10. Upgrade procedure
 
-Felucca upgrades are binary-replacement restarts. **Sleeping VMs survive agent
-restarts** (the Firecracker process is already stopped when a VM is sleeping;
-the snapshot on disk is untouched by a restart).
+Felucca upgrades are binary-replacement restarts. **Every sandbox survives an
+agent restart** — running, paused, sleeping and warm-pool VMs alike. That has
+been the claim since v2; since ADR-0011 it is also true under systemd. The
+agent unit runs with `KillMode=process`, so stopping, restarting, upgrading or
+crashing the agent signals the agent alone. The Firecracker processes keep
+running, and the next agent takes them over from
+`{data_dir}/instances/*/meta.json`.
+
+### What an agent restart does
+
+While the agent is down (a restart is a few seconds; a crash is `RestartSec=5s`
+plus start-up) sandboxes keep running and keep their network: guest traffic
+never passed through the agent, and the nft rules that fence the guests live
+in the kernel. What stops is everything the agent does — the node API (create,
+exec, sleep, wake, fork…), the warm-pool refill, the liveness sweep and the
+heartbeat. feluccad lists the node as `down` after 15 s of silence and stops
+placing new sandboxes on it; it does not touch the ones already there.
+
+At start-up the agent, before it serves anything:
+
+1. Loads every record and **adopts** each VM whose recorded pid really is that
+   instance's Firecracker — owned by the agent's user, started as `firecracker
+   --api-sock …/instances/<dir>/fc.sock`, with paths compared after resolving
+   symlinks. A pid that some other process has since been given is not adopted.
+2. Kills Firecrackers that belong to no completed operation (a create, wake or
+   start that was cut short) and removes instance directories that never got a
+   `meta.json`. It only kills processes in its own cgroup, and it holds
+   `{data_dir}/agent.lock` while doing so — a second agent started by hand on
+   the same data dir cannot mistake the first one's in-flight creates for
+   orphans.
+3. Re-pins the tap of every adopted guest, warm-pool VMs included.
+4. Asks each adopted Firecracker what its guest is doing and makes that match
+   the record: a VM that a cut-short sleep or fork left paused is resumed; a
+   VM that a cut-short resume or pool claim left running is paused again.
+
+The journal line `reconcile: took over what the previous agent left` carries
+the counts (`adopted`, `resumed`, `paused`, `orphans_killed`, `dirs_removed`,
+`left_unreadable`, `taps_down`).
+
+Things that follow from VMs outliving the agent:
+
+| You run | What happens |
+|---|---|
+| `systemctl restart felucca-agent` | Agent restarts; every sandbox keeps running. Operations in flight at that moment fail for their caller and are rolled back at start-up. |
+| `systemctl stop felucca-agent` | Agent stops; **sandboxes keep running**, unmanaged until you start it again. The unit shows `inactive` while its cgroup still lists the Firecrackers. |
+| `systemctl kill felucca-agent` | Signals **every** process in the unit: the agent **and every sandbox**. To signal the agent only: `systemctl kill --kill-whom=main felucca-agent` (`--kill-who=` before systemd 252). |
+| `systemctl stop felucca-agent && systemctl kill felucca-agent` | The way to power off every sandbox on a node. |
+| host reboot / shutdown | Sandboxes are not stopped when the agent unit stops; they end in systemd's final kill pass. Keep `{data_dir}` on a local filesystem. |
+
+Each agent restart makes systemd log three warnings **per running sandbox**:
+one `Unit process N (firecracker) remains running after unit stopped.` and two
+`Found left-over process N (firecracker) in control group while starting unit.
+Ignoring.` (one for the pre-start check, one for the agent). That is systemd
+describing exactly the intended state; do not alert on them.
+
+Limits to know about (each is tracked as its own issue):
+
+- A sandbox whose Firecracker **died while the agent was down** is not
+  reported as `error` when the agent returns: it is listed `stopped`, or
+  `sleeping` if an earlier snapshot of it is still on disk — and waking that
+  one restores old memory over a newer disk. The same goes for every sandbox
+  after a host reboot or after the power-off command above. Until FLU-4 is
+  fixed, cold-start (`stop`, `start`) such a sandbox instead of waking it.
+- The agent has no graceful stop: a create, fork, sleep or wake that is in
+  progress when it is restarted fails for the caller.
+- At each start the agent rebuilds its NAT and ingress rules one rule at a
+  time, so new inbound connections to an exposed port can be refused for a
+  moment.
+- A record whose `meta.json` cannot be read is not adopted. If a Firecracker
+  is running there the agent leaves it alone and logs an ERROR
+  (`left_unreadable`); it is your call whether to repair the file or kill the
+  process.
+- If the agent cannot load its isolation rules at start-up it exits (§8.1) and,
+  because the sandboxes no longer die with it, **takes the guest bridge down**
+  first: guests keep their state but have no network until an agent start gets
+  the rules loaded. A single tap that cannot be re-pinned is likewise taken
+  down, not removed.
+- A long-running sandbox keeps the Firecracker binary it was started with. A
+  hypervisor upgrade reaches it only when it is next cold-started.
 
 ### Upgrading from a Hearth install
 
@@ -1319,26 +1395,45 @@ ssh root@cp-host "
 
 ### Worker upgrade
 
+**Units first, then the binary, then the restart.** The unit is what keeps the
+sandboxes alive across the restart, and `systemctl daemon-reload` applies a new
+unit to the running agent at once.
+
 ```sh
 # 1. Build new felucca-agent binary (see §3 — Rust build inside the toolchain VM)
 
-# 2. Copy to worker
+# 2. Copy the units and the binary to the worker
+scp deploy/systemd/felucca-agent.service deploy/systemd/felucca-firewall.service \
+    root@worker-host:/etc/systemd/system/
 scp deploy/release/x86_64/felucca-agent root@worker-host:/usr/local/bin/felucca-agent.new
 
-# 3. Atomic replace + restart
-#    Running VMs are unaffected — Firecracker children are independent processes.
-#    Sleeping VMs are safe — their snapshot is on disk; the agent re-discovers
-#    them from meta.json on restart (this is the contract from API-V2.md §6).
+# 3. Load the units, check, replace the binary, restart
 ssh root@worker-host "
+  systemctl daemon-reload
+  systemctl show felucca-agent -p KillMode -p Restart     # KillMode=process Restart=always
+  systemctl reload felucca-firewall || systemctl start felucca-firewall
   install -m 0755 /usr/local/bin/felucca-agent.new /usr/local/bin/felucca-agent
   systemctl restart felucca-agent
   systemctl status felucca-agent --no-pager
 "
 ```
 
+`deploy/install.sh worker` does steps 2 and 3 up to the restart, which it
+leaves to you (and prints). **If `KillMode` does not say `process` when you
+restart, every sandbox on the worker dies** — that is what the check is for.
+The first restart from an agent that predates ADR-0011 is already safe once
+the new unit is loaded: the Firecrackers the old agent started are adopted by
+the new one.
+
 The worker re-registers with the control plane within ~5 s after restart.
-Running sandboxes remain in the `running` state because their Firecracker
-processes are independent of the agent process.
+
+**Rolling back.** Roll the binary and the unit back together and treat it as a
+node drain: with the old unit loaded, the next agent restart or crash kills
+every sandbox again. Rolling back the binary alone leaves the new unit in
+place, and an agent that predates ADR-0011 does not adopt warm-pool VMs —
+every restart then orphans one live Firecracker per pool VM. Empty the pools
+first (`pool_size: 0`, and `PUT /v1/pools` with `[]`), or clear the leftovers
+with `systemctl kill felucca-agent` once the node is drained.
 
 ### Rolling upgrades (multiple workers)
 
@@ -1349,7 +1444,7 @@ Upgrade workers one at a time. Before restarting an agent, optionally drain it:
 # No built-in drain command in v2 — simply stop the agent,
 # upgrade, restart; in-flight creates will fail with 503 and
 # the client should retry (the control plane will choose another
-# ready worker).
+# ready worker). Sandboxes already on the node keep running throughout.
 ```
 
 ---
@@ -1411,6 +1506,11 @@ ritual: `scripts/bench.sh <endpoint> <token>` and refresh `docs/BENCHMARKS.md`.
 | `POST /sandboxes` returns `503 no ready node` | No workers registered and ready | Fix the worker install and verify it reaches the control plane |
 | Guest networking not working (`ip: null`) | `net` is `off` or agent config missing | Set `"net": "on"` and `"net_cidr"` in agent config; verify `nft` and `ip` are installed |
 | Bridge `felucca0` missing after agent restart | Idempotent setup should recreate it | Agent recreates the bridge at startup; check `journalctl -u felucca-agent` for errors |
+| Every sandbox on a worker died when the agent was restarted | The unit in force is not the shipped one: `systemctl show felucca-agent -p KillMode` says `control-group` (an old unit, or a drop-in overriding it) | Install `deploy/systemd/felucca-agent.service`, `systemctl daemon-reload`, confirm `KillMode=process` **before** the next restart (§10) |
+| `systemctl stop felucca-agent` did not stop the sandboxes | Intended since ADR-0011 | `systemctl stop felucca-agent && systemctl kill felucca-agent` powers off every sandbox on the node (§10) |
+| Guests have no network after an agent start; journal has `the guest bridge has been taken down` or `could not be pinned — the port has been taken down` | The agent could not load its nft rules at that start, and takes guest ports down rather than leave them unfenced | Fix `nft` (see the errors just above in the journal) and `systemctl restart felucca-agent`: the next successful start brings the bridge and the taps back up. No sandbox was stopped |
+| Journal has `a Firecracker is running in an instance directory whose meta.json does not load` | That sandbox's record is damaged; the agent left the VM running and does not manage it | Repair `{data_dir}/instances/<dir>/meta.json` and restart the agent to adopt it, or kill the process to discard the VM |
+| Journal has `could not take the data-dir lock` | Another `felucca-agent` is running on the same `data_dir` | Stop the stray one. Until then this agent does not clean up orphan Firecrackers at start-up |
 | `POST /sandboxes/{id}/wake` is slow (> 500 ms) | No warm pool VMs available | Increase `pool_size` in agent config (requires restart); check `felucca_pool_size` metric |
 | `POST /sandboxes/{id}/fork` returns `501` | Running v1 binary | Upgrade to v2 binary |
 | TLS cert errors | Caddy cannot reach ACME or wrong domain | Check `journalctl -u caddy`; verify DNS and port 80/443 reachability |

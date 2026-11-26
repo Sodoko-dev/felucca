@@ -770,6 +770,40 @@ First wave of the 2026-11 stability audit: the three findings that each took
 down **every sandbox on a worker** in one ordinary event. Decisions and the
 alternatives that lost: [ADR-0011](adr/ADR-0011-worker-restarts.md).
 
+**Sandboxes outlive the agent (FLU-1, audit F-01)**
+
+- `felucca-agent.service`: `KillMode=process`, `Restart=always`,
+  `StartLimitIntervalSec=0`. Restarting, stopping, upgrading or crashing the
+  agent no longer kills the Firecrackers in its cgroup, and the agent always
+  comes back.
+- Start-up takes over what is running instead of assuming nothing is
+  (`vm/procscan.rs`, `vm/reconcile.rs`, `Manager::reconcile`):
+  - a record keeps its VMM only if the recorded pid is positively that
+    instance's Firecracker (owner, argv, canonical socket directory) — not
+    merely alive;
+  - warm-pool VMs are adopted as pooled (they used to be written off as
+    `stopped` with the pid dropped: one leaked Firecracker and tap per pool VM
+    per restart once restarts stopped killing them);
+  - Firecrackers of operations that never completed are killed and their
+    directories removed; a VMM beside a `meta.json` that does not load is left
+    running and reported;
+  - each adopted VMM is asked for its run state (`GET /`) and brought back to
+    its record — a sleep or fork cut short used to leave a VM listed `running`
+    and frozen, with `resume` a no-op;
+  - taps of adopted pool VMs are re-pinned; a tap that cannot be pinned is
+    taken down, not deleted (deleting it cut a live guest's network for good);
+    when isolation cannot be established the guest bridge is taken down before
+    the agent exits.
+- `meta.json` is replaced by rename, never rewritten in place.
+- The liveness sweep, `stop` and `sleep` go by what a pid is, and wait for a
+  killed Firecracker to have fully exited (every thread), which is when its
+  tap is free.
+- Template-pool VMs that survived the restart are not drained before feluccad
+  has pushed the pool specs to the new agent.
+- `{data_dir}/agent.lock`: only the agent holding it sweeps.
+- Removed from the backlog: "pool-orphan reclaim".
+- New lab gate: `scripts/verify-restart.sh`.
+
 **Firewall changes no longer touch the agent (FLU-3, audit F-20)**
 
 - `felucca-agent.service`: `Requires=felucca-firewall.service` →
@@ -795,6 +829,15 @@ alternatives that lost: [ADR-0011](adr/ADR-0011-worker-restarts.md).
 
 **Upgrading an existing worker**
 
+- [ ] **Units before binary, and check before you restart**:
+      `systemctl show felucca-agent -p KillMode` must say `process`. Restart
+      with the old unit still loaded and every sandbox dies one last time.
+- [ ] Never roll the binary back without the unit (or the other way round) on
+      a node with sandboxes — see DEPLOYMENT.md §10 "Rolling back".
+- [ ] `systemctl stop felucca-agent` no longer stops sandboxes. To power a
+      node's sandboxes off: `systemctl stop felucca-agent && systemctl kill
+      felucca-agent`. Update runbooks and anything that alerts on
+      "left-over process" warnings.
 - [ ] Re-run `deploy/install.sh worker` (or copy both units and
       `systemctl daemon-reload`). **Do not pass `FELUCCA_CONTROL_PLANE_IP`
       unless you mean to rewrite the allow-list** — without it the installer
@@ -807,4 +850,4 @@ alternatives that lost: [ADR-0011](adr/ADR-0011-worker-restarts.md).
 
 branch (uffd CoW fork of running VMs) → cross-tenant nftables isolation →
 overlayfs root tier → SQLite state → cross-node reschedule → OIDC →
-pool-orphan reclaim → uffd lazy restore → Terraform provider.
+uffd lazy restore → Terraform provider.

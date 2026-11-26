@@ -242,6 +242,20 @@ async fn main() {
     // with no isolation at all. Run `--net off` to serve unnetworked guests
     // deliberately instead.
     if cfg.net && !net::netfilter_ready() {
+        // Exiting no longer takes the guests down with it: Firecrackers
+        // outlive the agent (ADR-0011), so every VM that was running a moment
+        // ago still is. "Refusing to serve" has to cover them too — take the
+        // guest bridge down. Nothing is destroyed: the VMs keep their state,
+        // and the next start that gets the fences up brings the bridge back.
+        let guests = mgr.live_count().await;
+        net::quarantine_bridge();
+        if guests > 0 {
+            tracing::error!(
+                guests,
+                "the guest bridge has been taken down: these sandboxes keep running but have no \
+                 network until an agent start gets the isolation rules loaded"
+            );
+        }
         fatal(
             "cross-tenant isolation is not in force on this node (see the errors above) — \
              refusing to serve tenants",

@@ -111,6 +111,11 @@ echo "verify-units: OK — all units parse, all dependencies resolve, no unknown
 # Lines that must be present verbatim: "<unit>|<exact line>".
 # Each one is here because removing it brings back an outage (ADR-0011):
 REQUIRED=(
+    # FLU-1: stopping, restarting or crashing the agent must not kill the
+    # Firecrackers in its cgroup, and the agent must always come back.
+    'felucca-agent.service|KillMode=process'
+    'felucca-agent.service|Restart=always'
+    'felucca-agent.service|StartLimitIntervalSec=0'
     # FLU-3: the agent must not start while the host firewall table is absent,
     # and must not be restarted (or left down) by the unit that loads it.
     'felucca-agent.service|Wants=felucca-firewall.service'

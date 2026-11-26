@@ -360,6 +360,27 @@ pub fn delete_tap(tap: &str) {
     run(&["ip", "link", "del", tap]);
 }
 
+/// Take a link down without removing it (best effort). A down port forwards
+/// nothing, and — unlike a deleted one — whatever holds it open keeps a device
+/// that `ip link set <dev> up` makes work again.
+pub fn set_link_down(dev: &str) {
+    run(&["ip", "link", "set", dev, "down"]);
+}
+
+/// Stop all guest traffic on this node, reversibly: take the guest bridge
+/// down. A down bridge forwards nothing between its ports and answers nothing
+/// on the gateway address; `ensure_bridge` brings it back up at the next agent
+/// start.
+///
+/// This is what "refusing to serve tenants" has to do now that Firecrackers
+/// outlive the agent (ADR-0011). When the agent exits because isolation is not
+/// in force, the guests that were already running keep running; before, the
+/// same exit killed them. They must not stay on a network the agent could not
+/// fence.
+pub fn quarantine_bridge() {
+    set_link_down(BRIDGE_NAME);
+}
+
 // ---- per-tap anti-spoofing ----
 
 /// A guest's L2 identity: six hex octets, lowercased, never empty.

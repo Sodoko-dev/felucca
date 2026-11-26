@@ -1,24 +1,56 @@
 //! Startup reconciliation: rescan instances/*/meta.json and rebuild in-memory state.
 //!
 //! Port of Manager.reconcile / Manager.reconcileOne in backend/src/agent/vm.zig,
-//! branch-for-branch.
+//! with two deliberate departures (ADR-0011). Firecrackers now outlive the
+//! agent, so adopting them is the normal path at every start rather than a
+//! rarity:
+//!
+//! * whether a record still has its VMM is decided by what the recorded pid
+//!   *is* (see `procscan`), not by whether some process has that number;
+//! * a pooled VM whose VMM is alive is adopted as pooled. It used to be
+//!   written off as `stopped` with its pid dropped, which was harmless while
+//!   every restart killed it anyway and leaks one live Firecracker per restart
+//!   once it does not.
 
+use super::procscan::{Identity, ProcTable};
 use super::{valid_vm_id, Vm, VmState};
 use crate::ipalloc::Allocator;
 use crate::vm::meta::Meta;
 use std::path::Path;
-use tracing::warn;
+use tracing::{error, warn};
 
-/// Scan data_dir/instances/ and return a Vec of reconciled Vm records.
+/// What start-up found under `instances/`.
+#[derive(Debug, Default)]
+pub struct Reconciled {
+    pub vms: Vec<Vm>,
+    /// Directories that have a `meta.json` which did not yield a record (it
+    /// does not parse, or names an id/dir this agent refuses). Nothing in them
+    /// is touched: if a Firecracker is running there it is most likely a
+    /// healthy tenant VM whose record got damaged, and that is not a reason to
+    /// kill it.
+    pub unreadable: Vec<String>,
+    /// Directories with no `meta.json` at all. `meta.json` is written last, so
+    /// this is a create, fork or pool prewarm that never completed — no caller
+    /// was ever told the VM exists.
+    pub metaless: Vec<String>,
+}
+
+enum Loaded {
+    Vm(Vm),
+    Unreadable,
+    Metaless,
+}
+
+/// Scan data_dir/instances/ and return what is there.
 /// Also calls `alloc.reserve(slot)` for every record that has a slot set.
-pub fn reconcile(data_dir: &str, mut alloc: Option<&mut Allocator>) -> Vec<Vm> {
+pub fn reconcile(data_dir: &str, mut alloc: Option<&mut Allocator>, procs: &ProcTable) -> Reconciled {
+    let mut out = Reconciled::default();
     let instances_path = format!("{}/instances", data_dir);
     let dir = match std::fs::read_dir(&instances_path) {
         Ok(d) => d,
-        Err(_) => return Vec::new(),
+        Err(_) => return out,
     };
 
-    let mut vms = Vec::new();
     for entry in dir.flatten() {
         let ft = match entry.file_type() {
             Ok(t) => t,
@@ -27,31 +59,57 @@ pub fn reconcile(data_dir: &str, mut alloc: Option<&mut Allocator>) -> Vec<Vm> {
         if !ft.is_dir() { continue; }
         let name = entry.file_name();
         let dir_name = name.to_string_lossy();
-        match reconcile_one(data_dir, &dir_name, alloc.as_deref_mut()) {
-            Some(vm) => vms.push(vm),
-            None => {
-                warn!(dir = %dir_name, "reconcile: skipped (no valid meta.json)");
+        // Only directories this agent could have created are its business:
+        // a `lost+found`, or anything else that is not a valid instance id,
+        // is neither loaded nor cleaned up.
+        if !valid_vm_id(&dir_name) {
+            continue;
+        }
+        match reconcile_one(data_dir, &dir_name, alloc.as_deref_mut(), procs) {
+            Loaded::Vm(vm) => out.vms.push(vm),
+            Loaded::Unreadable => {
+                warn!(dir = %dir_name, "reconcile: skipped (meta.json does not load)");
+                out.unreadable.push(dir_name.into_owned());
             }
+            Loaded::Metaless => out.metaless.push(dir_name.into_owned()),
         }
     }
-    vms
+    out
 }
 
-fn reconcile_one(data_dir: &str, dir_name: &str, alloc: Option<&mut Allocator>) -> Option<Vm> {
+fn reconcile_one(
+    data_dir: &str,
+    dir_name: &str,
+    alloc: Option<&mut Allocator>,
+    procs: &ProcTable,
+) -> Loaded {
     let meta_path = format!("{}/instances/{}/meta.json", data_dir, dir_name);
-    let data = std::fs::read_to_string(&meta_path).ok()?;
-    let meta: Meta = serde_json::from_str(&data).ok()?;
+    let data = match std::fs::read_to_string(&meta_path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Loaded::Metaless,
+        Err(_) => return Loaded::Unreadable,
+    };
+    let meta: Meta = match serde_json::from_str(&data) {
+        Ok(m) => m,
+        Err(_) => return Loaded::Unreadable,
+    };
 
     let id = meta.id.clone();
     let vm_name = meta.name.clone();
-    // The on-disk dir name is authoritative for dir_id.
     let dir_id = meta.dir_id.clone();
     // Adopting a record whose id or dir_id is not a plain path component would
     // re-introduce the traversal the create path now rejects: every later
     // write for this VM derives its path from these two strings.
     if !valid_vm_id(&id) || !valid_vm_id(&dir_id) {
         warn!(dir = %dir_name, "reconcile: skipped (id or dir_id is not a valid path component)");
-        return None;
+        return Loaded::Unreadable;
+    }
+    // The directory a record was read from is the one it lives in. A dir_id
+    // that names a different one would point every later write, and the
+    // liveness check below, at another instance's files.
+    if dir_id != dir_name {
+        warn!(dir = %dir_name, dir_id = %dir_id, "reconcile: skipped (dir_id does not name the directory the record is in)");
+        return Loaded::Unreadable;
     }
     let vcpus = meta.vcpus;
     let mem_mib = meta.mem_mib;
@@ -64,16 +122,29 @@ fn reconcile_one(data_dir: &str, dir_name: &str, alloc: Option<&mut Allocator>) 
     let mut state: VmState = meta.state.clone();
     let mut pid: Option<i32> = None;
 
-    // Pool VMs from a previous run are not reclaimed; treat them as stopped orphans.
-    if state == VmState::Pooled {
-        state = VmState::Stopped;
-    }
-
-    // Is the recorded pid still a live firecracker?
-    if (state == VmState::Running || state == VmState::Paused) && meta_pid.is_some() {
-        let mpid = meta_pid.unwrap();
-        if pid_alive(mpid) {
-            pid = Some(mpid);
+    // A state that implies a running VMM: is the recorded pid still it?
+    if matches!(state, VmState::Running | VmState::Paused | VmState::Pooled) {
+        let adopted = match meta_pid {
+            None => false,
+            Some(mpid) => match procs.identify(mpid, dir_name) {
+                Identity::Match => true,
+                Identity::Mismatch => false,
+                // The process could not be inspected. Declaring a VM dead on a
+                // failed read would orphan its VMM, so fall back to the only
+                // thing left to go on — the question the agent used to ask.
+                Identity::Unknown => {
+                    let alive = pid_alive(mpid);
+                    error!(vm = %id, pid = mpid, alive,
+                        "reconcile: could not inspect the recorded pid; going by whether a process has it");
+                    alive
+                }
+            },
+        };
+        if adopted {
+            pid = meta_pid;
+        } else if state == VmState::Pooled {
+            // A pool VM without its VMM is of no use to anyone.
+            state = VmState::Stopped;
         } else {
             // Process gone. If a snapshot exists → sleeping; else stopped.
             let vmstate_path = format!("{}/instances/{}/vmstate.bin", data_dir, dir_name);
@@ -90,7 +161,7 @@ fn reconcile_one(data_dir: &str, dir_name: &str, alloc: Option<&mut Allocator>) 
         alloc.reserve(s);
     }
 
-    Some(Vm {
+    Loaded::Vm(Vm {
         id,
         name: vm_name,
         dir_id,
@@ -110,7 +181,8 @@ fn reconcile_one(data_dir: &str, dir_name: &str, alloc: Option<&mut Allocator>) 
     })
 }
 
-/// Check if a pid is alive (kill(pid, 0)).
+/// Does *some* process have this pid (kill(pid, 0))? Says nothing about what
+/// that process is — use `ProcTable::identify` for that.
 pub fn pid_alive(pid: i32) -> bool {
     use nix::unistd::Pid;
     // Signal 0 probes existence without delivering a signal.
@@ -139,6 +211,139 @@ mod tests {
         fs::write(dir.join("vmstate.bin"), b"fake").unwrap();
     }
 
+    /// Reconcile against the real /proc: none of the pids these tests record
+    /// is a Firecracker serving a temp dir, so no record is ever adopted.
+    fn load(data_dir: &str, alloc: Option<&mut Allocator>) -> Vec<Vm> {
+        reconcile(data_dir, alloc, &ProcTable::for_data_dir(data_dir)).vms
+    }
+
+    /// A procfs-shaped tree in which `pid` is a Firecracker serving
+    /// `<data_dir>/instances/<dir_name>`.
+    fn fake_proc_with_vmm(proc_root: &Path, data_dir: &str, pid: i32, dir_name: &str) {
+        let p = proc_root.join(pid.to_string());
+        fs::create_dir_all(&p).unwrap();
+        let sock = format!("{}/instances/{}/fc.sock", data_dir, dir_name);
+        let mut cmdline = Vec::new();
+        for a in ["firecracker", "--api-sock", sock.as_str()] {
+            cmdline.extend_from_slice(a.as_bytes());
+            cmdline.push(0);
+        }
+        fs::write(p.join("cmdline"), cmdline).unwrap();
+    }
+
+    fn meta_json(id: &str, dir_id: &str, pid: Option<i32>, state: &str) -> String {
+        let pid = pid.map(|p| p.to_string()).unwrap_or_else(|| "null".into());
+        format!(
+            r#"{{"id":"{id}","name":"{id}","dir_id":"{dir_id}","vcpus":1,"mem_mib":256,"pid":{pid},"slot":3,"ip":"10.231.0.5","state":"{state}"}}"#
+        )
+    }
+
+    #[test]
+    fn test_live_vmm_is_adopted_in_every_live_state() {
+        // The path that became normal with KillMode=process: the agent is new,
+        // the Firecrackers are not.
+        let tmp = make_temp_dir();
+        let data_dir = tmp.path().join("data");
+        let instances_dir = data_dir.join("instances");
+        let proc_root = tmp.path().join("proc");
+        fs::create_dir_all(&instances_dir).unwrap();
+        let data_dir = data_dir.to_str().unwrap();
+
+        for (i, state) in ["running", "paused", "pooled"].iter().enumerate() {
+            let name = format!("vm-{}", state);
+            let pid = 4000 + i as i32;
+            write_meta(&instances_dir, &name, &meta_json(&name, &name, Some(pid), state));
+            fake_proc_with_vmm(&proc_root, data_dir, pid, &name);
+        }
+
+        let rec = reconcile(data_dir, None, &ProcTable::at(&proc_root, data_dir));
+        assert!(rec.unreadable.is_empty() && rec.metaless.is_empty());
+        let by_id = |id: &str| rec.vms.iter().find(|v| v.id == id).unwrap_or_else(|| panic!("{id} not loaded"));
+        assert_eq!((by_id("vm-running").state.clone(), by_id("vm-running").pid), (VmState::Running, Some(4000)));
+        assert_eq!((by_id("vm-paused").state.clone(), by_id("vm-paused").pid), (VmState::Paused, Some(4001)));
+        // Was: pooled → stopped with the pid dropped, i.e. one live Firecracker
+        // and one tap leaked on every agent restart.
+        assert_eq!((by_id("vm-pooled").state.clone(), by_id("vm-pooled").pid), (VmState::Pooled, Some(4002)));
+    }
+
+    #[test]
+    fn test_recycled_pid_is_not_adopted() {
+        // The recorded pid is alive, but it is not this instance's VMM: it is
+        // another instance's, or not a Firecracker at all. `kill(pid, 0)`
+        // adopted both.
+        let tmp = make_temp_dir();
+        let data_dir = tmp.path().join("data");
+        let instances_dir = data_dir.join("instances");
+        let proc_root = tmp.path().join("proc");
+        fs::create_dir_all(&instances_dir).unwrap();
+        let data_dir = data_dir.to_str().unwrap();
+
+        write_meta(&instances_dir, "vm-a", &meta_json("vm-a", "vm-a", Some(5000), "running"));
+        write_meta(&instances_dir, "vm-b", &meta_json("vm-b", "vm-b", Some(5001), "running"));
+        write_vmstate(&instances_dir, "vm-b");
+        write_meta(&instances_dir, "vm-c", &meta_json("vm-c", "vm-c", Some(5002), "pooled"));
+        // 5000 serves vm-OTHER; 5001 is an unrelated program; 5002 does not exist.
+        fs::create_dir_all(instances_dir.join("vm-other")).unwrap();
+        fake_proc_with_vmm(&proc_root, data_dir, 5000, "vm-other");
+        fs::create_dir_all(proc_root.join("5001")).unwrap();
+        fs::write(proc_root.join("5001").join("cmdline"), b"sleep\0600\0").unwrap();
+
+        let rec = reconcile(data_dir, None, &ProcTable::at(&proc_root, data_dir));
+        let by_id = |id: &str| rec.vms.iter().find(|v| v.id == id).unwrap_or_else(|| panic!("{id} not loaded"));
+        assert_eq!((by_id("vm-a").state.clone(), by_id("vm-a").pid), (VmState::Stopped, None));
+        assert_eq!((by_id("vm-b").state.clone(), by_id("vm-b").pid), (VmState::Sleeping, None));
+        assert_eq!((by_id("vm-c").state.clone(), by_id("vm-c").pid), (VmState::Stopped, None));
+    }
+
+    #[test]
+    fn test_live_state_without_a_pid_falls_back() {
+        let tmp = make_temp_dir();
+        let data_dir = tmp.path().to_str().unwrap();
+        let instances_dir = tmp.path().join("instances");
+        fs::create_dir_all(&instances_dir).unwrap();
+        write_meta(&instances_dir, "vm-np", &meta_json("vm-np", "vm-np", None, "running"));
+
+        let vms = load(data_dir, None);
+        let vm = vms.iter().find(|v| v.id == "vm-np").expect("vm-np");
+        // "running" with no VMM to speak of is not a state anything could leave.
+        assert_eq!((vm.state.clone(), vm.pid), (VmState::Stopped, None));
+    }
+
+    #[test]
+    fn test_directories_without_a_usable_record_are_reported_not_dropped() {
+        // What start-up does with a directory depends on WHY it has no record:
+        // one with no meta.json never became a VM and can be cleaned up; one
+        // whose meta.json is damaged may well hold a healthy tenant VM.
+        let tmp = make_temp_dir();
+        let data_dir = tmp.path().to_str().unwrap();
+        let instances_dir = tmp.path().join("instances");
+        fs::create_dir_all(&instances_dir).unwrap();
+
+        write_meta(&instances_dir, "vm-ok", &meta_json("vm-ok", "vm-ok", None, "stopped"));
+        // Never completed: rootfs copied, meta.json not written yet.
+        fs::create_dir_all(instances_dir.join("vm-half")).unwrap();
+        fs::write(instances_dir.join("vm-half").join("rootfs.ext4"), b"x").unwrap();
+        // Only the temp file of an atomic write: the rename never happened.
+        fs::create_dir_all(instances_dir.join("vm-tmp")).unwrap();
+        fs::write(instances_dir.join("vm-tmp").join("meta.json.tmp"), b"{}").unwrap();
+        // Damaged records.
+        write_meta(&instances_dir, "vm-empty", "");
+        write_meta(&instances_dir, "vm-junk", "{\"id\":\"vm-junk\",\"na");
+        write_meta(&instances_dir, "vm-newer", &meta_json("vm-newer", "vm-newer", None, "hibernating"));
+        // A record that says it lives somewhere else.
+        write_meta(&instances_dir, "vm-moved", &meta_json("vm-moved", "vm-ok", None, "stopped"));
+        // Not an instance directory at all: left completely alone.
+        fs::create_dir_all(instances_dir.join("lost+found")).unwrap();
+        fs::write(instances_dir.join("stray-file"), b"x").unwrap();
+
+        let mut rec = reconcile(data_dir, None, &ProcTable::for_data_dir(data_dir));
+        rec.unreadable.sort();
+        rec.metaless.sort();
+        assert_eq!(rec.vms.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(), vec!["vm-ok"]);
+        assert_eq!(rec.metaless, vec!["vm-half", "vm-tmp"]);
+        assert_eq!(rec.unreadable, vec!["vm-empty", "vm-junk", "vm-moved", "vm-newer"]);
+    }
+
     #[test]
     fn test_dead_pid_with_vmstate_becomes_sleeping() {
         let tmp = make_temp_dir();
@@ -152,7 +357,7 @@ mod tests {
         // Write vmstate.bin so it maps to sleeping.
         write_vmstate(&instances_dir, "vm-1");
 
-        let vms = reconcile(data_dir, None);
+        let vms = load(data_dir, None);
         let vm = vms.iter().find(|v| v.id == "vm-1").expect("vm-1");
         // pid 999999 is almost certainly dead → sleeping (vmstate.bin present).
         assert_eq!(vm.state, VmState::Sleeping, "should be sleeping with vmstate.bin");
@@ -171,7 +376,7 @@ mod tests {
         write_meta(&instances_dir, "vm-2", meta);
         // No vmstate.bin → stopped.
 
-        let vms = reconcile(data_dir, None);
+        let vms = load(data_dir, None);
         let vm = vms.iter().find(|v| v.id == "vm-2").expect("vm-2");
         assert_eq!(vm.state, VmState::Stopped);
         assert_eq!(vm.pid, None);
@@ -188,7 +393,7 @@ mod tests {
         let meta = r#"{"id":"pool-abc","name":"pool-abc","dir_id":"pool-abc","vcpus":1,"mem_mib":256,"pid":12345,"slot":2,"ip":"10.231.0.4","state":"pooled"}"#;
         write_meta(&instances_dir, "pool-abc", meta);
 
-        let vms = reconcile(data_dir, None);
+        let vms = load(data_dir, None);
         let vm = vms.iter().find(|v| v.id == "pool-abc").expect("pool-abc");
         assert_eq!(vm.state, VmState::Stopped, "pooled → stopped on startup");
     }
@@ -205,7 +410,7 @@ mod tests {
 
         let cidr = Cidr::parse("10.231.0.0/24").unwrap();
         let mut alloc = Allocator::new(cidr);
-        let vms = reconcile(data_dir, Some(&mut alloc));
+        let vms = load(data_dir, Some(&mut alloc));
 
         // Slot 2 should be reserved — next claim should skip it.
         let claimed = alloc.claim().unwrap();
@@ -223,7 +428,7 @@ mod tests {
         let meta = r#"{"id":"vm-sl","name":"vm-sl","dir_id":"vm-sl","vcpus":1,"mem_mib":256,"pid":null,"slot":1,"ip":"10.231.0.3","state":"sleeping"}"#;
         write_meta(&instances_dir, "vm-sl", meta);
 
-        let vms = reconcile(data_dir, None);
+        let vms = load(data_dir, None);
         let vm = vms.iter().find(|v| v.id == "vm-sl").expect("vm-sl");
         assert_eq!(vm.state, VmState::Sleeping);
         assert_eq!(vm.pid, None);
@@ -243,7 +448,7 @@ mod tests {
         let bad_id = r#"{"id":"../../etc/felucca","name":"x","dir_id":"vm-evil2","vcpus":1,"mem_mib":256,"pid":null,"slot":null,"ip":null,"state":"stopped"}"#;
         write_meta(&instances_dir, "vm-evil2", bad_id);
 
-        let vms = reconcile(data_dir, None);
+        let vms = load(data_dir, None);
         assert!(vms.is_empty(), "traversal ids must not be adopted: {:?}", vms);
     }
 
@@ -260,7 +465,7 @@ mod tests {
         write_meta(&instances_dir, "pool-xyz", meta);
         write_vmstate(&instances_dir, "pool-xyz");
 
-        let vms = reconcile(data_dir, None);
+        let vms = load(data_dir, None);
         let vm = vms.iter().find(|v| v.id == "sb-real-id").expect("sb-real-id");
         assert_eq!(vm.dir_id, "pool-xyz");
     }
@@ -276,7 +481,7 @@ mod tests {
         let meta = r#"{"id":"vm-t","name":"vm-t","dir_id":"vm-t","vcpus":1,"mem_mib":256,"pid":null,"slot":1,"ip":"10.231.0.3","state":"sleeping","vsock":false,"tenant_id":"acme"}"#;
         write_meta(&instances_dir, "vm-t", meta);
 
-        let vms = reconcile(data_dir, None);
+        let vms = load(data_dir, None);
         let vm = vms.iter().find(|v| v.id == "vm-t").expect("vm-t");
         assert_eq!(vm.tenant_id, Some("acme".to_string()), "tenant_id must be carried through reconcile");
     }
@@ -292,7 +497,7 @@ mod tests {
         let meta = r#"{"id":"vm-old","name":"vm-old","dir_id":"vm-old","vcpus":1,"mem_mib":256,"pid":null,"slot":1,"ip":"10.231.0.3","state":"sleeping","vsock":true}"#;
         write_meta(&instances_dir, "vm-old", meta);
 
-        let vms = reconcile(data_dir, None);
+        let vms = load(data_dir, None);
         let vm = vms.iter().find(|v| v.id == "vm-old").expect("vm-old");
         assert_eq!(vm.tenant_id, None, "absent tenant_id must default to None");
     }
@@ -308,7 +513,7 @@ mod tests {
         let meta = r#"{"id":"vm-img","name":"vm-img","dir_id":"vm-img","vcpus":2,"mem_mib":2048,"pid":null,"slot":1,"ip":"10.231.0.3","state":"sleeping","vsock":true,"image":"odoo-v18","disk_gb":8}"#;
         write_meta(&instances_dir, "vm-img", meta);
 
-        let vms = reconcile(data_dir, None);
+        let vms = load(data_dir, None);
         let vm = vms.iter().find(|v| v.id == "vm-img").expect("vm-img");
         assert_eq!(vm.image, "odoo-v18");
         assert_eq!(vm.disk_gb, 8);
@@ -325,7 +530,7 @@ mod tests {
         let meta = r#"{"id":"vm-pre","name":"vm-pre","dir_id":"vm-pre","vcpus":1,"mem_mib":256,"pid":null,"slot":1,"ip":"10.231.0.3","state":"sleeping","vsock":true}"#;
         write_meta(&instances_dir, "vm-pre", meta);
 
-        let vms = reconcile(data_dir, None);
+        let vms = load(data_dir, None);
         let vm = vms.iter().find(|v| v.id == "vm-pre").expect("vm-pre");
         assert_eq!(vm.image, "ubuntu-base", "absent image must default to ubuntu-base");
         assert_eq!(vm.disk_gb, 0, "absent disk_gb must default to 0");

@@ -24,6 +24,12 @@ Wants=felucca-firewall.service
 After=felucca-firewall.service
 # Firecracker must be present before the agent starts.
 ConditionPathExists=/usr/local/bin/firecracker
+# Never give up on starting the agent. Sandboxes keep running while it is down
+# (KillMode=process below), but nothing watches them, refills the pool or
+# answers the control plane — so "tried five times in ten seconds, staying
+# failed" is the wrong end state for this unit. With the default limit, a
+# handful of quick manual restarts is enough to reach it.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -49,8 +55,35 @@ EnvironmentFile=-/etc/felucca/agent.env
 ExecStartPre=/usr/sbin/nft list chain inet felucca_host input
 ExecStart=/usr/local/bin/felucca-agent --config /etc/felucca/felucca-agent.json
 
-# Restart policy
-Restart=on-failure
+# Stopping, restarting or losing the agent must not touch the sandboxes.
+#
+# Every Firecracker is a child of the agent and lives in this unit's cgroup.
+# With systemd's default (KillMode=control-group) stopping the unit — a
+# restart, an upgrade, a crash followed by Restart= — kills the whole cgroup,
+# i.e. every sandbox on the worker. KillMode=process signals the agent alone.
+# The Firecrackers keep running; the next agent adopts them from
+# {data_dir}/instances/*/meta.json, after checking that each recorded pid
+# really is that instance's Firecracker (ADR-0011).
+#
+# What follows from it:
+#   systemctl stop felucca-agent      leaves every sandbox running (unmanaged
+#                                     until the agent is started again)
+#   systemctl kill felucca-agent      signals EVERY process in the unit, so
+#                                     every sandbox — use --kill-whom=main to
+#                                     signal the agent only
+#   power off all sandboxes on a node:
+#       systemctl stop felucca-agent && systemctl kill felucca-agent
+#   each restart logs, per running sandbox, one "Unit process N (firecracker)
+#   remains running after unit stopped." and two "Found left-over process N
+#   (firecracker) in control group while starting unit. Ignoring." (one per
+#   start command): expected, do not alert on them.
+# Not "mixed": that still SIGKILLs the whole cgroup after TimeoutStopSec.
+KillMode=process
+# Restart policy. `always`, not `on-failure`: an agent that was ended by a
+# plain SIGTERM (kill <pid>) exits "cleanly" and on-failure would leave it
+# down, with its sandboxes running unattended. `systemctl stop` is still
+# honoured.
+Restart=always
 RestartSec=5s
 TimeoutStartSec=60s
 TimeoutStopSec=60s
