@@ -1312,8 +1312,10 @@ At start-up the agent, before it serves anything:
    --api-sock …/instances/<dir>/fc.sock`, with paths compared after resolving
    symlinks. A pid that some other process has since been given is not adopted.
 2. Kills Firecrackers that belong to no completed operation (a create, wake or
-   start that was cut short) and removes instance directories that never got a
-   `meta.json`. It only kills processes in its own cgroup, and it holds
+   start that was cut short), removes instance directories that never got a
+   `meta.json`, and removes warm-pool VMs whose Firecracker is gone (after a
+   host reboot, say — they were never handed to anyone and cannot be claimed
+   any more). It only kills processes in its own cgroup, and it holds
    `{data_dir}/agent.lock` while doing so — a second agent started by hand on
    the same data dir cannot mistake the first one's in-flight creates for
    orphans.
@@ -1324,7 +1326,7 @@ At start-up the agent, before it serves anything:
 
 The journal line `reconcile: took over what the previous agent left` carries
 the counts (`adopted`, `resumed`, `paused`, `orphans_killed`, `dirs_removed`,
-`left_unreadable`, `taps_down`).
+`dead_pool_removed`, `left_unreadable`, `taps_down`).
 
 Things that follow from VMs outliving the agent:
 

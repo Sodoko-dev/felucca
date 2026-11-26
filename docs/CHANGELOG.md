@@ -804,6 +804,19 @@ alternatives that lost: [ADR-0011](adr/ADR-0011-worker-restarts.md).
 - Removed from the backlog: "pool-orphan reclaim".
 - New lab gate: `scripts/verify-restart.sh`.
 
+**Warm-pool VMs no longer pile up across restarts (FLU-29, audit F-26)**
+
+- Was: every agent restart left the previous pool VM behind as a `stopped`
+  record nothing deletes, and prewarmed a new one. With the changes above a
+  pool VM whose Firecracker survived is adopted; one whose Firecracker is
+  gone (host reboot) is now removed at start-up — record, slot, tap and
+  rootfs copy.
+- Directories that never got a `meta.json` are removed at start-up, and
+  `meta.json` is written by rename, so new empty ones cannot appear.
+- Deliberately **not** removed: a directory whose `meta.json` exists and does
+  not load. It may hold a tenant's disk; the agent reports it and leaves it.
+  Empty-`meta.json` directories left by older builds need one manual clean-up.
+
 **A pool teardown no longer deletes a sandbox it was just handed out (FLU-60, found during this wave)**
 
 - Reproduced on the lab with the previous build: remove a template pool

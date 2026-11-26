@@ -300,6 +300,8 @@ enum SweepStep {
 struct SweepOutcome {
     killed: usize,
     dirs_removed: usize,
+    /// Pool VMs removed because their VMM was gone (`remove_dead_pool_vms`).
+    pool_removed: usize,
     left_unreadable: usize,
     left_foreign: usize,
 }
@@ -591,8 +593,8 @@ impl Manager {
     /// 1. Load the records. A record keeps its VMM only if the recorded pid is
     ///    positively that instance's Firecracker (`procscan`).
     /// 2. Sweep what belongs to no committed VM: the Firecracker of a create,
-    ///    wake or start that never finished, and directories that never got a
-    ///    `meta.json`.
+    ///    wake or start that never finished, directories that never got a
+    ///    `meta.json`, and pool VMs whose VMM is gone.
     /// 3. Re-pin the tap of every adopted guest. The pin is host state, not VM
     ///    state: the netdev chains are gone after a host reboot, and an agent
     ///    upgraded in place adopts guests that were started before the pin
@@ -615,15 +617,16 @@ impl Manager {
     /// start brings the port up again as soon as the pin holds.
     pub async fn reconcile(&self) {
         let procs = self.procs();
-        let (unreadable, metaless, adopted) = {
+        let (unreadable, metaless, dead_pool, adopted) = {
             let mut g = self.inner.lock().await;
             let rec = reconcile::reconcile(&self.data_dir, g.allocator.as_mut(), &procs);
             g.vms = rec.vms;
             let adopted = g.vms.iter().filter(|v| v.pid.is_some()).count();
-            (rec.unreadable, rec.metaless, adopted)
+            (rec.unreadable, rec.metaless, rec.dead_pool, adopted)
         };
 
-        let swept = self.sweep_orphans(&procs, &unreadable, &metaless).await;
+        let mut swept = self.sweep_orphans(&procs, &unreadable, &metaless).await;
+        swept.pool_removed = self.remove_dead_pool_vms(&procs, &dead_pool).await;
 
         let mut taps_down = 0usize;
         if self.net_on {
@@ -656,6 +659,7 @@ impl Manager {
             unreachable = settled.unreachable,
             orphans_killed = swept.killed,
             dirs_removed = swept.dirs_removed,
+            dead_pool_removed = swept.pool_removed,
             left_unreadable = swept.left_unreadable,
             left_foreign = swept.left_foreign,
             taps_down,
@@ -784,6 +788,46 @@ impl Manager {
             }
         }
         out
+    }
+
+    /// Remove pool VMs that reconcile found without their VMM. Returns how
+    /// many were removed.
+    ///
+    /// They were prewarmed, never handed to a tenant, and cannot be claimed
+    /// any more; left alone each one keeps a slot, a tap and a full rootfs
+    /// copy as a `stopped` record nothing ever deletes — one per pool VM after
+    /// every host reboot. Same conditions as the sweep: only the agent holding
+    /// the data-dir lock does it, and a directory that a Firecracker is still
+    /// running out of (one this unit did not start, which the sweep left
+    /// alone) is not touched.
+    async fn remove_dead_pool_vms(&self, procs: &ProcTable, dead_pool: &[String]) -> usize {
+        if dead_pool.is_empty() || !self.hold_data_dir_lock() {
+            return 0;
+        }
+        let occupied: std::collections::HashSet<String> =
+            procs.scan().into_iter().map(|p| p.dir_name).collect();
+        let mut removed = 0;
+        for id in dead_pool {
+            let dir_id = {
+                let g = self.inner.lock().await;
+                match g.vms.iter().find(|v| &v.id == id) {
+                    Some(v) => v.dir_id.clone(),
+                    None => continue,
+                }
+            };
+            if occupied.contains(&dir_id) {
+                warn!(vm = %id, "reconcile: a Firecracker is still running in a dead pool VM's directory; leaving it");
+                continue;
+            }
+            match self.delete(id).await {
+                Ok(()) => {
+                    info!(vm = %id, "reconcile: removed a pool VM whose Firecracker is gone");
+                    removed += 1;
+                }
+                Err(e) => warn!(vm = %id, err = %e, "reconcile: could not remove a dead pool VM"),
+            }
+        }
+        removed
     }
 
     /// Step 4 of `reconcile`: ask each adopted Firecracker what its guest is
@@ -3748,6 +3792,10 @@ mod tests {
         let mut damaged = FakeVmm::spawn(&data_dir, "vm-damaged"); // healthy VM, record truncated
         let mut woke = FakeVmm::spawn(&data_dir, "vm-sleep"); // wake that never committed
 
+        // A pool VM from before a host reboot: recorded pid long gone.
+        std::fs::create_dir_all(format!("{}/pool-dead", inst)).unwrap();
+        std::fs::write(format!("{}/pool-dead/meta.json", inst), meta_line("pool-dead", Some(999_999), "pooled")).unwrap();
+        std::fs::write(format!("{}/pool-dead/rootfs.ext4", inst), "x").unwrap();
         std::fs::write(format!("{}/vm-run/meta.json", inst), meta_line("vm-run", Some(run.pid()), "running")).unwrap();
         std::fs::write(format!("{}/pool-1/meta.json", inst), meta_line("pool-1", Some(pool.pid()), "pooled")).unwrap();
         std::fs::write(format!("{}/vm-sleep/meta.json", inst), meta_line("vm-sleep", None, "sleeping")).unwrap();
@@ -3777,6 +3825,10 @@ mod tests {
         // The record moved on without this process: killed, record kept.
         assert!(!woke.alive(), "the VMM of an uncommitted wake must be killed");
         assert_eq!(recs.get("vm-sleep"), Some(&(VmState::Sleeping, None)));
+        // A pool VM without its VMM is removed, record and directory (F-26:
+        // it used to stay behind as a `stopped` record after every restart).
+        assert!(!recs.contains_key("pool-dead"), "a dead pool VM must not linger as a record");
+        assert!(!Path::new(&format!("{}/pool-dead", inst)).exists());
     }
 
     #[tokio::test]

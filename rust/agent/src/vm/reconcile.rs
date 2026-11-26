@@ -33,10 +33,17 @@ pub struct Reconciled {
     /// this is a create, fork or pool prewarm that never completed — no caller
     /// was ever told the VM exists.
     pub metaless: Vec<String>,
+    /// Ids of records that were `pooled` on disk and have lost their VMM (a
+    /// host reboot, or the Firecracker died while the agent was down). They
+    /// are in `vms` as `stopped`. A pool VM without its VMM is of no use to
+    /// anyone and was never handed to a tenant: the caller removes it, or it
+    /// keeps its slot, its tap and a rootfs copy forever.
+    pub dead_pool: Vec<String>,
 }
 
 enum Loaded {
-    Vm(Vm),
+    /// A record, and whether it is a pool VM that lost its VMM.
+    Vm(Vm, bool),
     Unreadable,
     Metaless,
 }
@@ -66,7 +73,12 @@ pub fn reconcile(data_dir: &str, mut alloc: Option<&mut Allocator>, procs: &Proc
             continue;
         }
         match reconcile_one(data_dir, &dir_name, alloc.as_deref_mut(), procs) {
-            Loaded::Vm(vm) => out.vms.push(vm),
+            Loaded::Vm(vm, dead_pool) => {
+                if dead_pool {
+                    out.dead_pool.push(vm.id.clone());
+                }
+                out.vms.push(vm);
+            }
             Loaded::Unreadable => {
                 warn!(dir = %dir_name, "reconcile: skipped (meta.json does not load)");
                 out.unreadable.push(dir_name.into_owned());
@@ -121,6 +133,7 @@ fn reconcile_one(
 
     let mut state: VmState = meta.state.clone();
     let mut pid: Option<i32> = None;
+    let mut dead_pool = false;
 
     // A state that implies a running VMM: is the recorded pid still it?
     if matches!(state, VmState::Running | VmState::Paused | VmState::Pooled) {
@@ -145,6 +158,7 @@ fn reconcile_one(
         } else if state == VmState::Pooled {
             // A pool VM without its VMM is of no use to anyone.
             state = VmState::Stopped;
+            dead_pool = true;
         } else {
             // Process gone. If a snapshot exists → sleeping; else stopped.
             let vmstate_path = format!("{}/instances/{}/vmstate.bin", data_dir, dir_name);
@@ -161,7 +175,7 @@ fn reconcile_one(
         alloc.reserve(s);
     }
 
-    Loaded::Vm(Vm {
+    let vm = Vm {
         id,
         name: vm_name,
         dir_id,
@@ -178,7 +192,8 @@ fn reconcile_one(
         image: meta.image.clone().unwrap_or_else(|| super::DEFAULT_IMAGE.to_string()),
         image_sha256: meta.image_sha256.clone(),
         disk_gb: meta.disk_gb.unwrap_or(0),
-    })
+    };
+    Loaded::Vm(vm, dead_pool)
 }
 
 /// Does *some* process have this pid (kill(pid, 0))? Says nothing about what
@@ -258,6 +273,8 @@ mod tests {
 
         let rec = reconcile(data_dir, None, &ProcTable::at(&proc_root, data_dir));
         assert!(rec.unreadable.is_empty() && rec.metaless.is_empty());
+        // A pool VM whose VMM is alive is adopted, not written off.
+        assert!(rec.dead_pool.is_empty());
         let by_id = |id: &str| rec.vms.iter().find(|v| v.id == id).unwrap_or_else(|| panic!("{id} not loaded"));
         assert_eq!((by_id("vm-running").state.clone(), by_id("vm-running").pid), (VmState::Running, Some(4000)));
         assert_eq!((by_id("vm-paused").state.clone(), by_id("vm-paused").pid), (VmState::Paused, Some(4001)));
@@ -393,9 +410,12 @@ mod tests {
         let meta = r#"{"id":"pool-abc","name":"pool-abc","dir_id":"pool-abc","vcpus":1,"mem_mib":256,"pid":12345,"slot":2,"ip":"10.231.0.4","state":"pooled"}"#;
         write_meta(&instances_dir, "pool-abc", meta);
 
-        let vms = load(data_dir, None);
-        let vm = vms.iter().find(|v| v.id == "pool-abc").expect("pool-abc");
-        assert_eq!(vm.state, VmState::Stopped, "pooled → stopped on startup");
+        let rec = reconcile(data_dir, None, &ProcTable::for_data_dir(data_dir));
+        let vm = rec.vms.iter().find(|v| v.id == "pool-abc").expect("pool-abc");
+        assert_eq!(vm.state, VmState::Stopped, "a pool VM whose VMM is gone is not claimable");
+        // ... and it is handed back as one to remove (F-26: it used to stay a
+        // `stopped` record for good, one more after every restart).
+        assert_eq!(rec.dead_pool, vec!["pool-abc"]);
     }
 
     #[test]

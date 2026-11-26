@@ -61,7 +61,10 @@ what makes that safe:
    Firecracker and tap per restart once it does not (measured: five orphans
    after nine restarts). Their taps are re-pinned with everyone else's; the
    claim path pins nothing, so start-up is the only place it happens before a
-   pool VM is handed to a tenant.
+   pool VM is handed to a tenant. A pooled record whose VMM is gone (a host
+   reboot) is removed at start-up, record, tap and directory: it was never
+   handed to anyone, cannot be claimed, and used to stay behind as a `stopped`
+   record for good (FLU-29).
 
 3. **The record is the truth; the VMM is brought back to it.** Sleep and fork
    pause the guest before they write anything, so an agent that stops in the
