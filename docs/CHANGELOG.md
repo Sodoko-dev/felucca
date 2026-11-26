@@ -804,6 +804,20 @@ alternatives that lost: [ADR-0011](adr/ADR-0011-worker-restarts.md).
 - Removed from the backlog: "pool-orphan reclaim".
 - New lab gate: `scripts/verify-restart.sh`.
 
+**A pool teardown no longer deletes a sandbox it was just handed out (FLU-60, found during this wave)**
+
+- Reproduced on the lab with the previous build: remove a template pool
+  (`PUT /v1/pools []`) while creates of that shape arrive, and 6 of 6 creates
+  came back `201`, listed `running`, with `rootfs.ext4`, `meta.json` and both
+  sockets deleted. The drain deleted pool VMs by ids it had listed a moment
+  earlier; a VM claimed in between answers to a new id but keeps its pool
+  directory, and `delete` of an id nobody has removed the directory of that
+  name.
+- The drain now confirms under the state lock that a VM is still pooled, and
+  makes it unclaimable in the same step, before deleting it. `delete` of an
+  id no record has refuses to remove a directory another VM lives in — which
+  also covers `DELETE /v1/vms/pool-…` for an id that was claimed earlier.
+
 **Firewall changes no longer touch the agent (FLU-3, audit F-20)**
 
 - `felucca-agent.service`: `Requires=felucca-firewall.service` →

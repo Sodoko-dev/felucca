@@ -2142,6 +2142,13 @@ impl Manager {
             drainable_pooled_ids(&g.vms, &specs, self.legacy_pool_spec().as_ref(), g.pools_synced)
         };
         for sid in surplus {
+            // The list above is a moment old, and every delete below takes a
+            // few hundred milliseconds. A create may have claimed this VM in
+            // between — it then answers to the caller's id, in the SAME
+            // directory. Only a VM that is still pooled is drained.
+            if !self.retire_pooled(&sid).await {
+                continue;
+            }
             info!(vm = %sid, "draining surplus pool vm");
             if let Err(e) = self.delete(&sid).await {
                 warn!(vm = %sid, err = %e, "pool drain failed");
@@ -2188,6 +2195,24 @@ impl Manager {
                     break;
                 }
             }
+        }
+    }
+
+    /// Take a pool VM out of the claimable set — if it is still in it.
+    ///
+    /// One critical section, the same lock `claim_from_pool` retags under:
+    /// either the claim got there first (no record has this id any more, or
+    /// it is no longer `Pooled`) and this returns false, or the VM stops being
+    /// `Pooled` here and no claim can match it from now on. `delete` then
+    /// tears it down like any stopped VM.
+    async fn retire_pooled(&self, id: &str) -> bool {
+        let mut g = self.inner.lock().await;
+        match g.vms.iter_mut().find(|v| v.id == id) {
+            Some(v) if v.state == VmState::Pooled => {
+                v.state = VmState::Stopped;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -2359,10 +2384,28 @@ impl Manager {
 
     pub async fn delete(&self, id: &str) -> Result<(), String> {
         // Capture slot before removal.
-        let slot = {
+        let (slot, lives_there) = {
             let g = self.inner.lock().await;
-            g.vms.iter().find(|v| v.id == id).and_then(|v| v.slot)
+            let slot = g.vms.iter().find(|v| v.id == id).and_then(|v| v.slot);
+            // No record has this id, yet a VM lives in the directory of that
+            // name: a pool VM that was claimed keeps its pool directory under
+            // its new id.
+            let lives_there = if g.vms.iter().any(|v| v.id == id) {
+                None
+            } else {
+                g.vms.iter().find(|v| v.dir_id == id).map(|v| v.id.clone())
+            };
+            (slot, lives_there)
         };
+        // delete does not require the VM to exist, and for an unknown id the
+        // directory it removes is the one named after the id. That must never
+        // be a directory some other VM is running out of: deleting a stale
+        // pool id used to remove the rootfs, meta.json and sockets of the
+        // sandbox that had been claimed from it.
+        if let Some(owner) = lives_there {
+            warn!(vm = %id, owner = %owner, "delete: no VM has this id and its directory belongs to another VM; nothing removed");
+            return Ok(());
+        }
 
         // stop is best-effort (idempotent delete).
         let _ = self.stop(id).await;
@@ -3568,6 +3611,62 @@ mod tests {
         // An empty push is a real answer ("no template pools"), not silence.
         mgr.set_pools(Vec::new()).await.unwrap();
         assert!(mgr.inner.lock().await.pools_synced);
+    }
+
+    // ---- FLU-60: a pool VM claimed while the drain is running ----
+
+    #[tokio::test]
+    async fn test_drain_skips_a_pool_vm_that_was_claimed_since_the_list_was_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = mgr_for(dir.path().to_str().unwrap().to_string());
+        {
+            let mut g = mgr.inner.lock().await;
+            g.vms.push(pooled_vm("pool-1", DEFAULT_IMAGE, 1, 256, 0));
+            g.vms.push(pooled_vm("pool-2", DEFAULT_IMAGE, 1, 256, 0));
+            // What claim_from_pool does to pool-1 between the drain taking
+            // its list and reaching this entry: new id, same directory.
+            let v = &mut g.vms[0];
+            v.id = "sb-tenant".into();
+            v.state = VmState::Running;
+        }
+        // The drain still holds the id "pool-1".
+        assert!(!mgr.retire_pooled("pool-1").await, "a claimed VM must not be drained");
+        // An untouched pool VM is retired, and from then on cannot be claimed.
+        assert!(mgr.retire_pooled("pool-2").await);
+        assert!(!mgr.retire_pooled("pool-2").await);
+        let g = mgr.inner.lock().await;
+        assert_eq!(find_pooled_match(&g.vms, DEFAULT_IMAGE, None, 1, 256, 0), None);
+        assert_eq!(g.vms[0].state, VmState::Running);
+    }
+
+    #[tokio::test]
+    async fn test_delete_of_a_stale_pool_id_leaves_the_claimed_vms_directory_alone() {
+        // Was: 6 of 6 sandboxes claimed during a pool teardown came back 201
+        // and `running` with rootfs.ext4, meta.json and both sockets deleted.
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let inst = format!("{}/instances/pool-1", data_dir);
+        std::fs::create_dir_all(&inst).unwrap();
+        std::fs::write(format!("{}/rootfs.ext4", inst), b"tenant data").unwrap();
+
+        let mgr = mgr_for(data_dir);
+        {
+            let mut claimed = pooled_vm("sb-tenant", DEFAULT_IMAGE, 1, 256, 0);
+            claimed.dir_id = "pool-1".into();
+            claimed.state = VmState::Running;
+            claimed.pid = None;
+            mgr.inner.lock().await.vms.push(claimed);
+        }
+
+        // The id the VM had while it was in the pool.
+        mgr.delete("pool-1").await.unwrap();
+        assert!(Path::new(&format!("{}/rootfs.ext4", inst)).exists(), "a running VM's directory was removed");
+        assert_eq!(mgr.inner.lock().await.vms.len(), 1);
+
+        // Deleting the VM by the id it has now still works.
+        mgr.delete("sb-tenant").await.unwrap();
+        assert!(!Path::new(&inst).exists());
+        assert!(mgr.inner.lock().await.vms.is_empty());
     }
 
     /// Block until `/proc/<pid>/cmdline` starts with `argv0`. `spawn()` returns
