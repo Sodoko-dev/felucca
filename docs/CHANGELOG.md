@@ -938,7 +938,11 @@ alternatives that lost: [ADR-0011](adr/ADR-0011-worker-restarts.md).
   and that `Requires=`/`Requisite=`/`BindsTo=`/`PartOf=`, `OOMScoreAdjust=` and
   `ExecStopPost=` stay gone however they are spelled. It then breaks copies of
   the units in 29 ways and requires its own assertions to reject each one. It
-  stubs every `Exec*=` path, not just `ExecStart`.
+  stubs every `Exec*=` path, not just `ExecStart`. In its staged root it now
+  drops system units that are symlinks leaving the unit directory (Ubuntu
+  26.04 ships dracut's that way): `systemd-analyze` reported each of them, and
+  the CI units job had failed on every pull request since GitHub's
+  `ubuntu-latest` became 26.04 (FLU-71).
 - `test/installer/allowlist.sh` (CI, under `sudo`): 112 checks, with the
   installer's functions running under the installer's own shell options — 35
   on the address-list parser (injection strings, prefixes, values that name
@@ -951,7 +955,6 @@ alternatives that lost: [ADR-0011](adr/ADR-0011-worker-restarts.md).
   sandbox and brought back by an agent restart; rules file broken, or without
   the fence line → agent refuses, bridge down, sandbox alive, recovery with no
   manual step once the file is right.
-
 - Lab gate `scripts/verify-reboot.sh`: a clean reboot of a worker that holds
   a running, a sleeping and a pool sandbox, with a probe inside one guest that
   logs what it can reach while the host goes down. With

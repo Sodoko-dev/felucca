@@ -49,10 +49,15 @@ command -v systemd-analyze >/dev/null 2>&1 || {
 
 # Where the distribution keeps its own units; needed or every unit fails with
 # "Unit sysinit.target not found" once --root cuts off the real search path.
-SYS_UNIT_DIR=""
-for d in /usr/lib/systemd/system /lib/systemd/system; do
-    [ -d "$d" ] && { SYS_UNIT_DIR="$d"; break; }
-done
+# (VERIFY_UNITS_SYS_UNIT_DIR names another directory to take them from; it is
+# there so that this script can be tested against another distribution's layout.)
+SYS_UNIT_DIR="${VERIFY_UNITS_SYS_UNIT_DIR:-}"
+[ -z "${SYS_UNIT_DIR}" ] || [ -d "${SYS_UNIT_DIR}" ] || { echo "verify-units: VERIFY_UNITS_SYS_UNIT_DIR=${SYS_UNIT_DIR} is not a directory." >&2; exit 2; }
+if [ -z "${SYS_UNIT_DIR}" ]; then
+    for d in /usr/lib/systemd/system /lib/systemd/system; do
+        [ -d "$d" ] && { SYS_UNIT_DIR="$d"; break; }
+    done
+fi
 [ -n "${SYS_UNIT_DIR}" ] || { echo "verify-units: no system unit directory found." >&2; exit 2; }
 
 ROOT="$(mktemp -d)"
@@ -62,6 +67,31 @@ mkdir -p "${ROOT}/usr/lib/systemd" "${ROOT}/etc/systemd/system" \
          "${ROOT}/usr/local/bin" "${ROOT}/usr/sbin" "${ROOT}/etc/felucca" \
          "${ROOT}/srv/felucca"
 cp -a "${SYS_UNIT_DIR}" "${ROOT}/usr/lib/systemd/system"
+
+# A distribution may ship units as symlinks that leave the unit directory.
+# Ubuntu 26.04 does: dracut-*.service point into /usr/lib/dracut/modules.d and
+# are wanted by sysinit.target and initrd.target. Their targets are not in the
+# staged root, so systemd-analyze reports every one it comes across
+# ("dracut-shutdown.service: Failed to open ...: No such file or directory")
+# although none of them is a unit under test. A link that cannot be followed
+# inside the staged root is not a unit this root has: drop it, then the
+# .wants/.requires links that pointed at it, until nothing dangles. Links to
+# /dev/null are masks and stay.
+while :; do
+    pruned=0
+    while IFS= read -r -d '' link; do
+        target="$(readlink "$link")"
+        case "$target" in
+            /dev/null) continue ;;
+            /*) [ -e "${ROOT}${target}" ] && continue ;;
+            *)  [ -e "$link" ] && continue ;;
+        esac
+        rm -f "$link"
+        pruned=$((pruned + 1))
+    done < <(find "${ROOT}/usr/lib/systemd/system" -type l -print0)
+    [ "$pruned" -gt 0 ] || break
+done
+
 cp "${UNIT_DIR}"/*.service "${ROOT}/etc/systemd/system/"
 
 # Stubs at exactly the paths the shipped Exec*/ConditionPathExists lines name.
