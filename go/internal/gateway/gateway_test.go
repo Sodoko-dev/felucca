@@ -17,7 +17,7 @@ import (
 type testEnv struct {
 	gw       *Gateway
 	backend  *httptest.Server
-	feluccad  *httptest.Server
+	feluccad *httptest.Server
 	routes   atomic.Value // []Route
 	ensure   func(sandboxID string, port uint16) int
 	backends atomic.Int64
@@ -64,7 +64,7 @@ func newTestEnv(t *testing.T, limits map[string]TenantLimit) *testEnv {
 
 	env.gw = New(Config{
 		Domain:       "sb.lab.test",
-		FeluccadURL:   env.feluccad.URL,
+		FeluccadURL:  env.feluccad.URL,
 		Token:        "admin-tok",
 		Refresh:      time.Hour, // tests refresh explicitly
 		TenantLimits: limits,
@@ -125,12 +125,12 @@ func TestUnknownHostAndLabelShapes(t *testing.T) {
 	env.setRoutes(env.backendRoute("odoo--sb-1", "sb-1", "t-1", "running"))
 
 	for _, host := range []string{
-		"odoo--sb-2.sb.lab.test",      // unknown sandbox
-		"web--sb-1.sb.lab.test",       // unknown name
-		"odoo--sb-1.other.test",       // wrong domain
-		"x.odoo--sb-1.sb.lab.test",    // nested label
-		"sb.lab.test",                 // bare domain
-		"odoosb-1.sb.lab.test",        // no separator
+		"odoo--sb-2.sb.lab.test",   // unknown sandbox
+		"web--sb-1.sb.lab.test",    // unknown name
+		"odoo--sb-1.other.test",    // wrong domain
+		"x.odoo--sb-1.sb.lab.test", // nested label
+		"sb.lab.test",              // bare domain
+		"odoosb-1.sb.lab.test",     // no separator
 	} {
 		if w := doHost(t, env.gw, host, "/"); w.Code != 404 {
 			t.Errorf("%s: got %d, want 404", host, w.Code)

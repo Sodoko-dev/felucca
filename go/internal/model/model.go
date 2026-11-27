@@ -107,15 +107,15 @@ type Expose struct {
 // Node is the in-memory representation of an agent node.
 // Status is computed at marshal time via a view struct.
 type Node struct {
-	ID           string `json:"id"`
-	Hostname     string `json:"hostname"`
-	Addr         string `json:"addr"`
-	CPUs         uint32 `json:"cpus"`
-	MemTotalMiB  uint64 `json:"mem_total_mib"`
-	MemFreeMiB   uint64 `json:"mem_free_mib"`
-	VMCount      uint32 `json:"vm_count"`
-	PoolSize     uint32 `json:"pool_size"`
-	LastHB       int64  `json:"last_heartbeat"`
+	ID          string `json:"id"`
+	Hostname    string `json:"hostname"`
+	Addr        string `json:"addr"`
+	CPUs        uint32 `json:"cpus"`
+	MemTotalMiB uint64 `json:"mem_total_mib"`
+	MemFreeMiB  uint64 `json:"mem_free_mib"`
+	VMCount     uint32 `json:"vm_count"`
+	PoolSize    uint32 `json:"pool_size"`
+	LastHB      int64  `json:"last_heartbeat"`
 }
 
 // NodeStatus computes whether the node is ready based on the supplied now (unix secs).

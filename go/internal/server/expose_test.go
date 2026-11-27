@@ -134,7 +134,9 @@ func TestExposeHappyPath(t *testing.T) {
 	// The sandbox JSON now carries the expose.
 	w4 := doRequest(h, "GET", "/api/v1/sandboxes/"+id, "", adminAuth)
 	var sb struct {
-		Exposes []struct{ Name string `json:"name"` } `json:"exposes"`
+		Exposes []struct {
+			Name string `json:"name"`
+		} `json:"exposes"`
 	}
 	_ = json.Unmarshal(w4.Body.Bytes(), &sb)
 	if len(sb.Exposes) != 1 || sb.Exposes[0].Name != "odoo" {
@@ -146,14 +148,14 @@ func TestExposeValidation(t *testing.T) {
 	srv, _, id := newExposeTestServer(t)
 	h := srv.Handler()
 	bad := []string{
-		`{"name":"Odoo","port":1}`,            // uppercase
-		`{"name":"-a","port":1}`,              // leading dash
-		`{"name":"a-","port":1}`,              // trailing dash
-		`{"name":"a--b","port":1}`,            // double dash (separator)
-		`{"name":"8069","port":1}`,            // all digits (dynamic namespace)
-		`{"name":"","port":1}`,                // empty
+		`{"name":"Odoo","port":1}`, // uppercase
+		`{"name":"-a","port":1}`,   // leading dash
+		`{"name":"a-","port":1}`,   // trailing dash
+		`{"name":"a--b","port":1}`, // double dash (separator)
+		`{"name":"8069","port":1}`, // all digits (dynamic namespace)
+		`{"name":"","port":1}`,     // empty
 		`{"name":"` + string(make([]byte, 0)) + `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","port":1}`, // 33 chars
-		`{"name":"ok","port":0}`,              // port 0
+		`{"name":"ok","port":0}`, // port 0
 		`not json`,
 	}
 	for _, body := range bad {

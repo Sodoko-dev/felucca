@@ -32,11 +32,11 @@ func TestValidPolicy(t *testing.T) {
 		v    int64
 		want bool
 	}{
-		{0, true},                 // inherit
-		{-1, true},                // explicitly disabled
-		{minIdleSleepS, true},     // lower bound
+		{0, true},             // inherit
+		{-1, true},            // explicitly disabled
+		{minIdleSleepS, true}, // lower bound
 		{minIdleSleepS - 1, false},
-		{maxPolicyS, true},        // upper bound (one year)
+		{maxPolicyS, true}, // upper bound (one year)
 		{maxPolicyS + 1, false},
 		{-2, false}, // only -1 is a valid negative
 	}

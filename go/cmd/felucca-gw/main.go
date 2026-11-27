@@ -97,7 +97,7 @@ func main() {
 
 	gw := gateway.New(gateway.Config{
 		Domain:       *domain,
-		FeluccadURL:   *feluccad,
+		FeluccadURL:  *feluccad,
 		Token:        *token,
 		Refresh:      time.Duration(*refresh) * time.Second,
 		TenantLimits: limits,

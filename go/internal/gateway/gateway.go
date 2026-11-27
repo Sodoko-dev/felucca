@@ -47,7 +47,7 @@ type TenantLimit struct {
 // Config is the gateway's runtime configuration.
 type Config struct {
 	Domain       string // wildcard zone, e.g. "sb.example.com"
-	FeluccadURL   string // e.g. "http://127.0.0.1:8080"
+	FeluccadURL  string // e.g. "http://127.0.0.1:8080"
 	Token        string // feluccad admin token (routes are admin-only)
 	Refresh      time.Duration
 	TenantLimits map[string]TenantLimit
