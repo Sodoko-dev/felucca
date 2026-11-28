@@ -3,44 +3,115 @@ package gateway
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// testEnv wires a fake feluccad (route table + ensure) and a fake backend
-// (echoing which Host/path it saw) behind a Gateway.
+// testEnv wires a fake feluccad (route table + ensure + wake) and two fake
+// backends (echoing which backend, Host and path they saw) behind a Gateway.
 type testEnv struct {
 	gw       *Gateway
-	backend  *httptest.Server
+	backend  *httptest.Server // echoes be=1
+	backend2 *httptest.Server // echoes be=2
 	feluccad *httptest.Server
 	routes   atomic.Value // []Route
 	ensure   func(sandboxID string, port uint16) int
 	backends atomic.Int64
+	conns    atomic.Int64 // connections accepted by backend (not backend2)
+	fetches  atomic.Int64 // GET /api/v1/routes served
+	wakes    atomic.Int64 // POST .../wake served
+
+	hmu     sync.Mutex
+	onFetch func(n int64)                        // runs after the table is read, before it is sent
+	onWake  func(w http.ResponseWriter, n int64) // answers the wake; nil = 404
+}
+
+func (env *testEnv) setOnFetch(f func(n int64)) {
+	env.hmu.Lock()
+	env.onFetch = f
+	env.hmu.Unlock()
+}
+
+func (env *testEnv) setOnWake(f func(w http.ResponseWriter, n int64)) {
+	env.hmu.Lock()
+	env.onWake = f
+	env.hmu.Unlock()
+}
+
+// newEchoBackend answers with its id and what it saw; an "Upgrade: echo-test"
+// request is switched to a raw connection that echoes one line.
+func newEchoBackend(t *testing.T, env *testEnv, id string, conns *atomic.Int64) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		env.backends.Add(1)
+		if strings.EqualFold(r.Header.Get("Upgrade"), "echo-test") {
+			conn, brw, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: echo-test\r\nConnection: Upgrade\r\n\r\n")
+			brw.Flush()
+			line, _ := brw.ReadString('\n')
+			brw.WriteString("echo:" + line)
+			brw.Flush()
+			return
+		}
+		fmt.Fprintf(w, "be=%s backend saw host=%s path=%s xfp=%s", id, r.Host, r.URL.Path, r.Header.Get("X-Forwarded-Proto"))
+	}))
+	if conns != nil {
+		srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+			if s == http.StateNew {
+				conns.Add(1)
+			}
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+	return srv
 }
 
 func newTestEnv(t *testing.T, limits map[string]TenantLimit) *testEnv {
 	t.Helper()
 	env := &testEnv{}
 
-	env.backend = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		env.backends.Add(1)
-		fmt.Fprintf(w, "backend saw host=%s path=%s xfp=%s", r.Host, r.URL.Path, r.Header.Get("X-Forwarded-Proto"))
-	}))
-	t.Cleanup(env.backend.Close)
+	env.backend = newEchoBackend(t, env, "1", &env.conns)
+	env.backend2 = newEchoBackend(t, env, "2", nil)
 
 	env.feluccad = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer admin-tok" {
 			w.WriteHeader(404)
 			return
 		}
+		if strings.HasPrefix(r.URL.Path, "/api/v1/sandboxes/") && strings.HasSuffix(r.URL.Path, "/wake") && r.Method == http.MethodPost {
+			n := env.wakes.Add(1)
+			env.hmu.Lock()
+			f := env.onWake
+			env.hmu.Unlock()
+			if f == nil {
+				w.WriteHeader(404)
+				return
+			}
+			f(w, n)
+			return
+		}
 		switch r.URL.Path {
 		case "/api/v1/routes":
+			n := env.fetches.Add(1)
 			routes, _ := env.routes.Load().([]Route)
+			env.hmu.Lock()
+			f := env.onFetch
+			env.hmu.Unlock()
+			if f != nil {
+				f(n)
+			}
 			_ = json.NewEncoder(w).Encode(struct {
 				Routes []Route `json:"routes"`
 			}{routes})
@@ -72,9 +143,14 @@ func newTestEnv(t *testing.T, limits map[string]TenantLimit) *testEnv {
 	return env
 }
 
-// backendHostPort splits the httptest backend URL into host + port for routes.
+// backendRoute builds a route to the first echo backend.
 func (env *testEnv) backendRoute(label, sandboxID, tenant, state string) Route {
-	u, _ := url.Parse(env.backend.URL)
+	return routeTo(env.backend, label, sandboxID, tenant, state)
+}
+
+// routeTo splits an httptest backend URL into host + port for a route.
+func routeTo(srv *httptest.Server, label, sandboxID, tenant, state string) Route {
+	u, _ := url.Parse(srv.URL)
 	host := u.Hostname()
 	var port uint16
 	fmt.Sscanf(u.Port(), "%d", &port)
@@ -244,6 +320,280 @@ func TestRefreshSurvivesFeluccadOutage(t *testing.T) {
 	env.gw.refresh()
 	if w := doHost(t, env.gw, "odoo--sb-1.sb.lab.test", "/"); w.Code != 200 {
 		t.Errorf("after outage: got %d, want 200 from cached route", w.Code)
+	}
+}
+
+// ---- FLU-7: each wake waiter resolves its own route ----
+
+// sleepingPair is one sandbox with two services on two different backends.
+// They differ in guest port, as two exposes of one sandbox always do: the
+// node port is per (sandbox, guest port).
+func (env *testEnv) sleepingPair(state string) []Route {
+	b := routeTo(env.backend2, "b--sb-w", "sb-w", "t-1", state)
+	b.GuestPort = 3000
+	return []Route{routeTo(env.backend, "a--sb-w", "sb-w", "t-1", state), b}
+}
+
+// TestWakeEachWaiterGetsItsOwnRoute: two hostnames of one sleeping sandbox
+// requested at the same moment each reach their OWN backend.
+func TestWakeEachWaiterGetsItsOwnRoute(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.gw.cfg.AutoWake = true
+	env.setOnWake(func(w http.ResponseWriter, _ int64) {
+		time.Sleep(50 * time.Millisecond) // long enough for the second request to join
+		env.routes.Store(env.sleepingPair("running"))
+		w.WriteHeader(200)
+	})
+	const rounds = 20
+	for round := 0; round < rounds; round++ {
+		env.setRoutes(env.sleepingPair("sleeping")...)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		got := make([]*httptest.ResponseRecorder, 2)
+		for i, host := range []string{"a--sb-w.sb.lab.test", "b--sb-w.sb.lab.test"} {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				got[i] = doHost(t, env.gw, host, "/")
+			}()
+		}
+		close(start)
+		wg.Wait()
+		for i, want := range []string{"be=1 backend saw host=a--sb-w", "be=2 backend saw host=b--sb-w"} {
+			if got[i].Code != 200 || !strings.Contains(got[i].Body.String(), want) {
+				t.Errorf("round %d label %d: got %d %q, want %q", round, i, got[i].Code, got[i].Body.String(), want)
+			}
+		}
+	}
+	wakes := env.wakes.Load()
+	t.Logf("%d wakes for %d rounds of two requests", wakes, rounds)
+	if wakes >= 2*rounds {
+		t.Errorf("%d wakes: no round shared a wake, so the waiter path was not exercised", wakes)
+	}
+}
+
+// wakeOne requests label once with auto-wake on and reports the response, the
+// table fetches made after the (first) wake call, and the elapsed time.
+func (env *testEnv) wakeOne(t *testing.T, host string) (*httptest.ResponseRecorder, int64, time.Duration) {
+	t.Helper()
+	var atWake atomic.Int64
+	atWake.Store(-1)
+	env.hmu.Lock()
+	inner := env.onWake
+	env.onWake = func(w http.ResponseWriter, n int64) {
+		if n == 1 {
+			atWake.Store(env.fetches.Load())
+		}
+		inner(w, n)
+	}
+	env.hmu.Unlock()
+	began := time.Now()
+	w := doHost(t, env.gw, host, "/")
+	el := time.Since(began)
+	if atWake.Load() < 0 {
+		t.Fatal("the wake was never called")
+	}
+	return w, env.fetches.Load() - atWake.Load(), el
+}
+
+func TestWakeAccepted2xxThenRunning(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.gw.cfg.AutoWake = true
+	env.setRoutes(env.sleepingPair("sleeping")...)
+	env.setOnWake(func(w http.ResponseWriter, _ int64) {
+		env.routes.Store(env.sleepingPair("running"))
+		w.WriteHeader(202)
+	})
+	w, fetches, _ := env.wakeOne(t, "b--sb-w.sb.lab.test")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "be=2") {
+		t.Errorf("got %d %q, want 200 from backend 2", w.Code, w.Body.String())
+	}
+	if fetches != 1 || env.wakes.Load() != 1 {
+		t.Errorf("fetches after wake %d, wakes %d; want 1 and 1", fetches, env.wakes.Load())
+	}
+}
+
+// The poll ends as soon as ANY route of the sandbox shows running, not only
+// the requested label; the request then resolves its own label (still
+// sleeping in this table) and gets the page, with no second wake.
+func TestWake2xxAnotherLabelRunningFirst(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.gw.cfg.AutoWake = true
+	env.setRoutes(env.sleepingPair("sleeping")...)
+	env.setOnWake(func(w http.ResponseWriter, _ int64) {
+		rs := env.sleepingPair("sleeping")
+		rs[1].State = "running"
+		env.routes.Store(rs)
+		w.WriteHeader(200)
+	})
+	w, fetches, el := env.wakeOne(t, "a--sb-w.sb.lab.test")
+	if fetches != 1 {
+		t.Errorf("fetches after wake %d, want 1 (b--sb-w running ends the poll)", fetches)
+	}
+	if env.wakes.Load() != 1 {
+		t.Errorf("wakes %d, want 1", env.wakes.Load())
+	}
+	if w.Code != 503 || !strings.Contains(w.Body.String(), "asleep") || el > 900*time.Millisecond {
+		t.Errorf("got %d %q after %v, want the sleeping page without polling", w.Code, w.Body.String(), el)
+	}
+}
+
+func TestWake503RetryAfterThen2xx(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.gw.cfg.AutoWake = true
+	env.setRoutes(env.sleepingPair("sleeping")...)
+	env.setOnWake(func(w http.ResponseWriter, n int64) {
+		if n == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(503)
+			return
+		}
+		env.routes.Store(env.sleepingPair("running"))
+		w.WriteHeader(200)
+	})
+	w, _, el := env.wakeOne(t, "a--sb-w.sb.lab.test")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "be=1") {
+		t.Errorf("got %d %q, want 200 from backend 1", w.Code, w.Body.String())
+	}
+	if env.wakes.Load() != 2 {
+		t.Errorf("wakes %d, want 2 (resent after Retry-After)", env.wakes.Load())
+	}
+	if el < time.Second {
+		t.Errorf("resent after %v, want after the 1s Retry-After", el)
+	}
+}
+
+// feluccad answers 503 + Retry-After also when the wake was applied but not
+// saved; its table already shows running, so one look is enough: no resend,
+// no wait for the Retry-After.
+func TestWake503AppliedButNotSavedSeesRunning(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.gw.cfg.AutoWake = true
+	env.setRoutes(env.sleepingPair("sleeping")...)
+	env.setOnWake(func(w http.ResponseWriter, _ int64) {
+		env.routes.Store(env.sleepingPair("running"))
+		w.Header().Set("Retry-After", "5")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		fmt.Fprint(w, `{"error":"applied but not saved","applied":true}`)
+	})
+	w, _, el := env.wakeOne(t, "a--sb-w.sb.lab.test")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "be=1") {
+		t.Errorf("got %d %q, want 200 from backend 1", w.Code, w.Body.String())
+	}
+	if env.wakes.Load() != 1 {
+		t.Errorf("wakes %d, want exactly 1", env.wakes.Load())
+	}
+	if el >= 3*time.Second {
+		t.Errorf("took %v, want well under 3s", el)
+	}
+}
+
+func TestWake409NoPolling(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.gw.cfg.AutoWake = true
+	env.setRoutes(env.sleepingPair("sleeping")...)
+	env.setOnWake(func(w http.ResponseWriter, _ int64) { w.WriteHeader(409) })
+	w, fetches, el := env.wakeOne(t, "a--sb-w.sb.lab.test")
+	if fetches != 1 {
+		t.Errorf("fetches after wake %d, want exactly 1", fetches)
+	}
+	if w.Code != 503 || !strings.Contains(w.Body.String(), "asleep") || el > 900*time.Millisecond {
+		t.Errorf("got %d %q after %v, want the sleeping page quickly", w.Code, w.Body.String(), el)
+	}
+}
+
+func TestWake404ResolvesAgainstNewTable(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.gw.cfg.AutoWake = true
+	env.setRoutes(env.sleepingPair("sleeping")...)
+	env.setOnWake(func(w http.ResponseWriter, _ int64) {
+		env.routes.Store([]Route{}) // the sandbox is gone
+		w.WriteHeader(404)
+	})
+	w, fetches, el := env.wakeOne(t, "a--sb-w.sb.lab.test")
+	if fetches != 1 {
+		t.Errorf("fetches after wake %d, want exactly 1", fetches)
+	}
+	if w.Code != 404 || !strings.Contains(w.Body.String(), "no such service") || el > 900*time.Millisecond {
+		t.Errorf("got %d %q after %v, want 404 no such service quickly", w.Code, w.Body.String(), el)
+	}
+}
+
+// A wake whose answer never arrives (transport error) is followed by the poll,
+// as before: someone else may have woken the sandbox.
+func TestWakeTransportErrorPolls(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.gw.cfg.AutoWake = true
+	env.setRoutes(env.sleepingPair("sleeping")...)
+	var wakeFetch atomic.Int64
+	env.setOnWake(func(w http.ResponseWriter, _ int64) {
+		wakeFetch.Store(env.fetches.Load())
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			conn.Close()
+		}
+	})
+	env.setOnFetch(func(n int64) {
+		// The first poll has already read the table and answers "asleep";
+		// the second sees it up.
+		if w := wakeFetch.Load(); w > 0 && n == w+1 {
+			env.routes.Store(env.sleepingPair("running"))
+		}
+	})
+	w, fetches, _ := env.wakeOne(t, "a--sb-w.sb.lab.test")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "be=1") {
+		t.Errorf("got %d %q, want 200 from backend 1", w.Code, w.Body.String())
+	}
+	if fetches != 2 || env.wakes.Load() != 1 {
+		t.Errorf("fetches after wake %d, wakes %d; want 2 and 1", fetches, env.wakes.Load())
+	}
+}
+
+// TestWakePanicDoesNotParkLaterRequests (FLU-7 W3).
+func TestWakePanicDoesNotParkLaterRequests(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.gw.cfg.AutoWake = true
+	env.setRoutes(env.sleepingPair("sleeping")...)
+	env.gw.wake = func(string) { panic("wake path blew up") }
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("the wake seam did not panic")
+			}
+		}()
+		doHost(t, env.gw, "a--sb-w.sb.lab.test", "/")
+	}()
+
+	env.gw.wake = func(string) {}
+	done := make(chan int, 1)
+	go func() { done <- doHost(t, env.gw, "b--sb-w.sb.lab.test", "/").Code }()
+	select {
+	case code := <-done:
+		if code != 503 {
+			t.Errorf("after the panic: got %d, want the sleeping page", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a request after the panicked wake is parked")
+	}
+	env.gw.wmu.Lock()
+	n := len(env.gw.waking)
+	env.gw.wmu.Unlock()
+	if n != 0 {
+		t.Errorf("%d wake entries left behind", n)
+	}
+}
+
+// TestEnsure503IsRetryable (FLU-7 W4): feluccad refusing an ensure with 503
+// is a retryable 503 for the client, not a 404.
+func TestEnsure503IsRetryable(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.setRoutes()
+	env.ensure = func(string, uint16) int { return 503 }
+	w := doHost(t, env.gw, "8069--sb-dyn.sb.lab.test", "/")
+	if w.Code != 503 || w.Header().Get("Retry-After") != "5" {
+		t.Errorf("got %d Retry-After=%q %q, want 503 with Retry-After: 5", w.Code, w.Header().Get("Retry-After"), w.Body.String())
 	}
 }
 
