@@ -27,6 +27,23 @@ metaless_dirs() { sudo sh -c "for d in $D/*/; do [ -e \"\$d\" ] || continue; [ -
 took_over() { journal_since "$1" | grep 'reconcile: took over' | tail -1 | sed 's/\x1b\[[0-9;]*m//g; s/.*took over what the previous agent left *//'; }
 no_garbage() { eq "$1: no Firecracker without a record" "$(orphans | wc -l | tr -d ' ')" 0; eq "$1: no directory without meta.json" "$(metaless_dirs)" ""; }
 mk() { api -o /dev/null -w '%{http_code}' -m 180 -X POST -d "{\"id\":\"$1\",\"name\":\"bk\",\"vcpus\":1,\"mem_mib\":${2:-256}${3:+,\"tenant_id\":\"$3\"}}" "$A/v1/vms"; }
+# The same create, keeping what the agent answered: appends "<id> <code> <secs> <body>"
+# to <file>. For the sections that create in bulk: a create that fails must
+# never be silent (the agent logs nothing for a failed create; its answer is
+# the only account of what went wrong).
+mkr() { # <id> <mem> <file>
+  local out tail body
+  out="$(api -w '\n%{http_code} %{time_total}' -m 180 -X POST -d "{\"id\":\"$1\",\"name\":\"bk\",\"vcpus\":1,\"mem_mib\":${2:-256}}" "$A/v1/vms")"
+  tail="${out##*$'\n'}"; body="${out%$'\n'*}"; [ "$tail" = "$out" ] && body=""
+  printf '%s %s %s %s\n' "$1" "${tail%% *}" "${tail#* }" "$(printf '%s' "$body" | tr '\n' ' ' | cut -c1-400)" >> "$3"
+}
+# <file> — print every create that did not answer 201, with its body
+report_creates() {
+  local n; n="$(awk '$2!="201"' "$1" | wc -l | tr -d ' ')"
+  say "  creates: $(awk '{print $2}' "$1" | sort | uniq -c | awk '{printf "%sx%s ", $1, $2}')"
+  [ "$n" -gt 0 ] && awk '$2!="201" {id=$1; c=$2; t=$3; $1=$2=$3=""; sub(/^ +/, ""); printf "  create %s answered %s after %ss: %s\n", id, c, t, ($0==""?"(no body)":$0)}' "$1"
+  return 0
+}
 gping() { guest "$1" "ping -c2 -W1 $2 >/dev/null 2>&1 && echo yes || echo no" | tr -d '\n'; }
 cleanup_prefix bk-
 
@@ -54,13 +71,14 @@ fi
 
 if want B2; then
 say "== B2. agent killed every 3 s while sandboxes are being created =="
-rm -f /tmp/felucca-lab-bk-create.out
-( for i in $(seq 1 12); do c=$(mk bk-s$i 256); echo "$i $c" >> /tmp/felucca-lab-bk-create.out; sleep 0.5; done ) &
+rm -f /tmp/felucca-lab-bk-create.out /tmp/felucca-lab-bk-create.body
+( for i in $(seq 1 12); do mkr bk-s$i 256 /tmp/felucca-lab-bk-create.body; c="$(tail -1 /tmp/felucca-lab-bk-create.body | cut -d' ' -f2)"; echo "$i $c" >> /tmp/felucca-lab-bk-create.out; sleep 0.5; done ) &
 CRE=$!
 # MainPID is 0 between two starts, and `kill -9 0` would be this script's own process group.
 for _ in 1 2 3 4 5 6; do sleep 3; AP="$(agent_pid)"; [ "${AP:-0}" -gt 1 ] && sudo kill -9 "$AP" 2>/dev/null; done
 wait $CRE; wait_up; sleep 8
 OKS=$(grep -c ' 201$' /tmp/felucca-lab-bk-create.out); say "  creates: $(sort -n /tmp/felucca-lab-bk-create.out | awk '{printf "%s ", $2}')"
+report_creates /tmp/felucca-lab-bk-create.body   # 000 is expected here: the agent was killed under the request
 DEAD=0
 for i in $(sort -n /tmp/felucca-lab-bk-create.out | awk '$2==201{print $1}'); do
   if [ "$(vm_state bk-s$i)" = running ] && wait_exec bk-s$i 150; then :; else DEAD=$((DEAD+1)); say "  bk-s$i: 201 but state=$(vm_state bk-s$i)"; fi
@@ -69,13 +87,16 @@ done
 eq "sandboxes that answered 201 and are not running and answering" "$DEAD" 0
 no_garbage "kill storm"
 say "  records now: $(vms | jq -c '[.vms[]|select(.id|startswith("bk-s"))|.state]|group_by(.)|map({(.[0]):length})|add')"
-cleanup_prefix bk-; rm -f /tmp/felucca-lab-bk-create.out
+cleanup_prefix bk-; rm -f /tmp/felucca-lab-bk-create.out /tmp/felucca-lab-bk-create.body
 fi
 
 if want B3; then
 say "== B3. 15 sandboxes: how long a restart takes, and a double restart =="
-for i in $(seq 1 15); do mk bk-m$i 256 >/dev/null & [ $((i % 5)) -eq 0 ] && wait; done; wait
-for i in $(seq 1 15); do wait_exec bk-m$i 240 || bad "bk-m$i not exec-ready"; done
+rm -f /tmp/felucca-lab-bk-m.body
+for i in $(seq 1 15); do mkr bk-m$i 256 /tmp/felucca-lab-bk-m.body & [ $((i % 5)) -eq 0 ] && wait; done; wait
+report_creates /tmp/felucca-lab-bk-m.body
+for i in $(seq 1 15); do wait_exec bk-m$i 240 || bad "bk-m$i not exec-ready (create answered: $(awk -v i=bk-m$i '$1==i {$1=""; print}' /tmp/felucca-lab-bk-m.body | cut -c2-200); record: $(vms | jq -c --arg i bk-m$i '.vms[]|select(.id==$i)|{state,pid}'))"; done
+rm -f /tmp/felucca-lab-bk-m.body
 FC0="$(fcs)"; N0=$(fc_count)
 T0=$(date '+%Y-%m-%d %H:%M:%S'); S=$(date +%s.%N); sudo systemctl restart $UNIT; wait_up; E=$(date +%s.%N)
 say "  restart -> /healthz with $N0 Firecrackers: $(echo "$E - $S" | bc | cut -c1-5) s; start-up: $(took_over "$T0")"

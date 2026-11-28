@@ -7,11 +7,19 @@
 # conformance suite (plain HTTP from another VM) can do. `scripts/verify-*.sh`
 # on the macOS host ship them into the VM and run them.
 #
-# Needs: FELUCCA_TOKEN (the lab token). Optional: AGENT_API, AGENT_DATA_DIR.
+# Needs: FELUCCA_AUTH_FILE (a file, readable only by the user running the gate,
+# holding the line `Authorization: Bearer <lab token>`; curl reads it with
+# `-H @file`, so the token is on no command line and in no process listing),
+# or else FELUCCA_TOKEN (the token itself: then $H puts it on every curl
+# command line). Optional: AGENT_API, AGENT_DATA_DIR.
 
 A="${AGENT_API:-http://127.0.0.1:9090}"
-: "${FELUCCA_TOKEN:?FELUCCA_TOKEN is not set}"
-H="Authorization: Bearer ${FELUCCA_TOKEN}"
+if [ -n "${FELUCCA_AUTH_FILE:-}" ] && [ -r "${FELUCCA_AUTH_FILE}" ]; then
+  H="@${FELUCCA_AUTH_FILE}"
+else
+  : "${FELUCCA_TOKEN:?neither FELUCCA_AUTH_FILE nor FELUCCA_TOKEN is set}"
+  H="Authorization: Bearer ${FELUCCA_TOKEN}"
+fi
 DATA_DIR="${AGENT_DATA_DIR:-$(sudo sed -n 's/.*"data_dir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/felucca/felucca-agent.json 2>/dev/null | head -1)}"
 DATA_DIR="${DATA_DIR:-/srv/felucca}"
 D="${DATA_DIR%/}/instances"
