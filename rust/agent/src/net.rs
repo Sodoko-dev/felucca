@@ -49,8 +49,13 @@ pub(crate) const COMMAND_LIMIT: Duration = Duration::from_secs(10);
 pub(crate) enum Ran {
     /// It exited by itself within the limit.
     Done { ok: bool, stdout: String, stderr: String },
-    /// It could not be started, or it outran the limit and was killed.
+    /// It could not be started.
     Failed,
+    /// It outran the limit and was killed. Kept apart from `Failed`: a
+    /// command that hung is not tried a second time (`run`, `run_nft_file`) —
+    /// as root the `sudo -n` attempt is the same command, and it would hold
+    /// the rule lock for a second limit.
+    TimedOut,
 }
 
 /// Run `argv` (with `stdin` fed to it, if any) and give it `limit` to exit.
@@ -106,7 +111,7 @@ pub(crate) fn run_limited(argv: &[&str], stdin: Option<&str>, limit: Duration) -
         let _ = child.kill();
         let _ = child.wait();
         warn!(cmd = %argv.join(" "), limit_ms = limit.as_millis() as u64, "command outran its time limit and was killed");
-        return Ran::Failed;
+        return Ran::TimedOut;
     };
     let wrote = writer.map(|w| w.join().unwrap_or(false)).unwrap_or(true);
     let stdout = out.and_then(|t| t.join().ok()).unwrap_or_default();
@@ -124,13 +129,23 @@ fn with_sudo<'a>(argv: &[&'a str], use_sudo: bool) -> Vec<&'a str> {
 /// Run `argv`, trying unprivileged first, then `sudo -n` fallback.
 /// Returns true if exit code 0. Shared with wg.rs (same shell-out idiom).
 pub(crate) fn run(argv: &[&str]) -> bool {
-    if run_once(argv, false) { return true; }
-    run_once(argv, true)
+    run_escalating(argv, None, COMMAND_LIMIT)
 }
 
-fn run_once(argv: &[&str], use_sudo: bool) -> bool {
+/// `argv` bare, then with `sudo -n` — unless the bare run succeeded or
+/// outran `limit`: a hung command is not run again (see `Ran::TimedOut`).
+fn run_escalating(argv: &[&str], stdin: Option<&str>, limit: Duration) -> bool {
     if argv.is_empty() { return false; }
-    matches!(run_limited(&with_sudo(argv, use_sudo), None, COMMAND_LIMIT), Ran::Done { ok: true, .. })
+    match run_limited(argv, stdin, limit) {
+        Ran::Done { ok: true, .. } => true,
+        Ran::TimedOut => false,
+        _ => matches!(run_limited(&with_sudo(argv, true), stdin, limit), Ran::Done { ok: true, .. }),
+    }
+}
+
+fn run_once(argv: &[&str], use_sudo: bool) -> Ran {
+    if argv.is_empty() { return Ran::Failed; }
+    run_limited(&with_sudo(argv, use_sudo), None, COMMAND_LIMIT)
 }
 
 /// Feed a whole ruleset to `nft -f -`. nft applies a file as ONE netlink
@@ -138,15 +153,7 @@ fn run_once(argv: &[&str], use_sudo: bool) -> bool {
 /// sees a chain that has been flushed but not yet repopulated. `run` cannot do
 /// this because it has no stdin; the bare-then-`sudo -n` fallback is the same.
 fn run_nft_file(ruleset: &str) -> bool {
-    if run_nft_file_once(ruleset, false) { return true; }
-    run_nft_file_once(ruleset, true)
-}
-
-fn run_nft_file_once(ruleset: &str, use_sudo: bool) -> bool {
-    matches!(
-        run_limited(&with_sudo(&["nft", "-f", "-"], use_sudo), Some(ruleset), COMMAND_LIMIT),
-        Ran::Done { ok: true, .. }
-    )
+    run_escalating(&["nft", "-f", "-"], Some(ruleset), COMMAND_LIMIT)
 }
 
 // ---- FLU-8: markers, and what the watch looks at ----
@@ -381,11 +388,11 @@ pub(crate) struct HostKernel;
 
 impl HostKernel {
     /// Run bare, then with `sudo -n` unless the bare run gave a definite
-    /// answer (`definite` decides from stderr).
+    /// answer (`definite` decides from stderr) or timed out.
     fn ask(argv: &[&str], definite: impl Fn(&str) -> bool) -> Ran {
         let bare = run_limited(argv, None, COMMAND_LIMIT);
         match &bare {
-            Ran::Done { ok: true, .. } => return bare,
+            Ran::Done { ok: true, .. } | Ran::TimedOut => return bare,
             Ran::Done { ok: false, stderr, .. } if definite(stderr) => return bare,
             _ => {}
         }
@@ -673,9 +680,10 @@ fn set_sysctl_verified(key: &str, proc_path: &str) -> bool {
     };
     if confirmed() { return true; }
     let arg = format!("{}=1", key);
-    run_once(&["sysctl", "-w", &arg], false);
+    // A hung sysctl is not run again (`Ran::TimedOut`).
+    if run_once(&["sysctl", "-w", &arg], false) == Ran::TimedOut { return confirmed(); }
     if confirmed() { return true; }
-    run_once(&["sysctl", "-w", &arg], true);
+    if run_once(&["sysctl", "-w", &arg], true) == Ran::TimedOut { return confirmed(); }
     if confirmed() { return true; }
     // Last resort for units with no sysctl binary; sh -c so one sudo covers
     // the redirect.
@@ -1717,6 +1725,7 @@ mod tests {
         assert_eq!(listing_of(done(false, "", missing)), Listing::Missing);
         // Timed out, could not be started, or any other failure.
         assert_eq!(listing_of(Ran::Failed), Listing::Unknown);
+        assert_eq!(listing_of(Ran::TimedOut), Listing::Unknown);
         assert_eq!(listing_of(done(false, "", "Error: Operation not permitted")), Listing::Unknown);
         assert_eq!(listing_of(done(false, "", "")), Listing::Unknown);
     }
@@ -1727,7 +1736,7 @@ mod tests {
         let pidfile = dir.path().join("pid");
         let script = format!("echo $$ > {}; exec sleep 30", pidfile.display());
         let t = Instant::now();
-        assert_eq!(run_limited(&["sh", "-c", &script], None, Duration::from_millis(300)), Ran::Failed);
+        assert_eq!(run_limited(&["sh", "-c", &script], None, Duration::from_millis(300)), Ran::TimedOut);
         assert!(t.elapsed() < Duration::from_secs(5), "took {:?}", t.elapsed());
         let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
         // Killed and reaped: nothing answers to the pid any more.
@@ -1739,6 +1748,24 @@ mod tests {
         );
         assert!(matches!(run_limited(&["false"], None, Duration::from_secs(5)), Ran::Done { ok: false, .. }));
         assert_eq!(run_limited(&["/nonexistent/felucca-test"], None, Duration::from_secs(5)), Ran::Failed);
+    }
+
+    #[test]
+    fn test_a_command_that_timed_out_is_not_tried_again_with_sudo() {
+        // Was: any failure, a time-out included, ran the command a second
+        // time with `sudo -n` — as root the same command, so a hung `nft`
+        // held the rule lock for two limits. (On the build VM `sudo -n`
+        // works, so the second attempt would really hang a second time.)
+        let limit = Duration::from_secs(1);
+        let t = Instant::now();
+        assert!(!run_escalating(&["sh", "-c", "sleep 30"], None, limit));
+        assert!(t.elapsed() < limit + limit / 2, "took {:?}: tried twice", t.elapsed());
+        let t = Instant::now();
+        assert!(!run_escalating(&["sh", "-c", "sleep 30"], Some("x"), limit));
+        assert!(t.elapsed() < limit + limit / 2, "took {:?}: tried twice", t.elapsed());
+        // A plain failure still escalates (and fails here too), quickly.
+        assert!(!run_escalating(&["false"], None, limit));
+        assert!(run_escalating(&["true"], None, limit));
     }
 
     #[test]

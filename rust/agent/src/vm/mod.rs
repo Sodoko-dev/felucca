@@ -579,6 +579,17 @@ impl From<&str> for OpError {
 /// plain string, use it too.
 pub const BUSY: &str = "busy";
 
+/// The refusal of a fork whose parent was itself forked before this release
+/// (FLU-72 K5), running, paused or sleeping. No path, no other sandbox: the
+/// control plane relays it to the tenant word for word; the log has both.
+pub const FORK_REFUSED_FORKED_BEFORE: &str = "InvalidState: this sandbox was forked before this release and runs on \
+    its parent's disk image, not on its own; it cannot be forked";
+
+/// The refusal of a wake of such a sandbox whose parent's image moved on
+/// (FLU-72 K6). Same reasoning.
+pub const WAKE_REFUSED_FORKED_BEFORE: &str = "InvalidState: this sandbox was forked before this release and runs on \
+    its parent's disk image, which has changed since it slept; it cannot be woken and is now stopped (use start)";
+
 /// What stop and delete answer when the operation they pre-empted has not
 /// let go within `CLOSE_WAIT` (409, with `"state":"stopped"`: stop has
 /// written that record). The caller retries.
@@ -2243,6 +2254,11 @@ impl Manager {
     pub async fn refresh_ingress(&self) -> bool {
         if !self.rules_on() { return true; }
         let _guard = self.ruleset_lock.lock().await;
+        self.rebuild_ingress_locked().await
+    }
+
+    /// `refresh_ingress` for a caller that holds the rule lock already.
+    async fn rebuild_ingress_locked(&self) -> bool {
         let members = Self::ingress_members(&*self.inner.lock().await);
         let ok = self.rules.rebuild_ingress(&members);
         lock_std(&self.watch).built(net::Chain::Ingress, ok.then(|| net::marker_of(&net::ingress_ruleset(&members))).flatten());
@@ -2266,6 +2282,14 @@ impl Manager {
     /// `avoid` (`pick_node_port`). The answer is success only once the DNAT
     /// rule is in the kernel: a rebuild that fails takes the mapping back out
     /// of the record and answers `RuleFailed`.
+    ///
+    /// The whole of it — the mapping into the record, the rebuild, and on a
+    /// failure the mapping out again and a second rebuild — runs under the
+    /// rule lock, and `meta.json` is written only once the rule is in. The
+    /// mapping used to be written first: a roll-back write that did not land
+    /// before a restart brought it back, possibly beside the sandbox that had
+    /// got the port since; and a rebuild for another sandbox, run between the
+    /// push and the failure, installed the doomed rule for good.
     pub async fn expose(
         &self,
         id: &str,
@@ -2273,6 +2297,18 @@ impl Manager {
         avoid: &std::collections::HashSet<u16>,
         prefer: Option<u16>,
     ) -> Result<u16, ExposeError> {
+        // The answers that need no rule change, without waiting for the rule
+        // lock (a delete in progress holds it while the record has no ip).
+        {
+            let g = self.inner.lock().await;
+            let v = g.vms.iter().find(|v| v.id == id).ok_or(ExposeError::NotFound)?;
+            if v.ip.is_none() { return Err(ExposeError::NoIp); }
+            if let Some(e) = v.exposes.iter().find(|e| e.guest_port == guest_port) {
+                return Ok(e.node_port);
+            }
+        }
+        let rules = self.ruleset_lock.lock().await;
+        // Looked at again below: anything may have changed while waiting.
         let node_port = {
             let mut g = self.inner.lock().await;
             // node ports are unique across ALL VMs — collect before the
@@ -2293,14 +2329,14 @@ impl Manager {
             g.node_port_cursor = next;
             np
         };
-        // Persist + rebuild outside the state lock (write_meta re-locks).
-        // Persist is best-effort like other meta writes off the happy path:
-        // the in-memory entry is authoritative and a failed write is owed
-        // (`meta_owed`).
-        if let Err(e) = self.write_meta(id).await {
-            warn!(vm = %id, err = %e, "expose persist failed");
-        }
-        if self.refresh_ingress().await {
+        if self.rebuild_ingress_locked().await {
+            drop(rules);
+            // Persisted only now that the rule is in. Best-effort like other
+            // meta writes off the happy path: the in-memory entry is
+            // authoritative and a failed write is owed (`meta_owed`).
+            if let Err(e) = self.write_meta(id).await {
+                warn!(vm = %id, err = %e, "expose persist failed");
+            }
             return Ok(node_port);
         }
         // The rule is not there. Answering with the port would send the
@@ -2316,9 +2352,14 @@ impl Manager {
                 v.exposes.retain(|e| !(e.guest_port == guest_port && e.node_port == node_port));
             }
         }
-        if let Err(e) = self.write_meta(id).await {
-            warn!(vm = %id, err = %e, "expose roll-back persist failed");
+        // Again without it: a rebuild that "failed" by outrunning its time
+        // limit may have committed all the same, and no rule for a mapping
+        // nobody was told about may stay. Nothing was written to meta.json.
+        if !self.rebuild_ingress_locked().await {
+            error!(vm = %id, node_port, "expose: the rebuild without the failed mapping failed as well; \
+                   the watch retries the ingress chain");
         }
+        drop(rules);
         error!(vm = %id, guest_port, node_port, "expose: the ingress rule could not be installed; mapping removed");
         Err(ExposeError::RuleFailed)
     }
@@ -3429,12 +3470,12 @@ impl Manager {
                      release); that image has not been written since the snapshot, so it is woken on it"
                 ),
                 Ok(true) => {
-                    let reason = format!(
-                        "InvalidState: the VM runs on the image {} (it was forked before this release), and that \
-                         image was written after the snapshot; the VM is stopped (use start)",
-                        drive
-                    );
-                    return Err(self.stop_stale_wake(id, pid0, Some(pid), reason).await);
+                    // The path goes to the log only: the control plane
+                    // relays the answer to the tenant word for word.
+                    warn!(vm = %id, image = %drive,
+                        "wake refused: this sandbox runs on another image than its own rootfs.ext4 (it was forked \
+                         before this release), and that image was written after the snapshot; it is stopped");
+                    return Err(self.stop_stale_wake(id, pid0, Some(pid), WAKE_REFUSED_FORKED_BEFORE.into()).await);
                 }
                 Err(e) => {
                     kill_and_reap(pid); // never ran
@@ -3602,7 +3643,51 @@ impl Manager {
     /// parent's guest-internal IP (v2 documented caveat; fixed in v3).
     /// `Err("AlreadyExists")` (→ 409) when the child id or its directory is
     /// taken, before anything is written.
+    ///
+    /// The plain-text form the unit tests use; the handler takes
+    /// `fork_answer`. (Not `cfg(test)`: the structural tests read this
+    /// file's production half up to its first test-only attribute.)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn fork(self: &Arc<Self>, parent_id: &str, child_id: &str, child_name: &str) -> Result<Option<String>, String> {
+        self.fork_inner(parent_id, child_id, child_name, &mut None).await
+    }
+
+    /// `fork`, answered the way sleep, wake, stop and start answer: `Busy`;
+    /// a refusal for the parent's state as `InvalidState` carrying the state
+    /// the agent holds for the parent when the refusal is built (the control
+    /// plane records it); everything else `Other`, verbatim.
+    pub async fn fork_answer(
+        self: &Arc<Self>,
+        parent_id: &str,
+        child_id: &str,
+        child_name: &str,
+    ) -> Result<Option<String>, OpError> {
+        let mut refused = None;
+        match self.fork_inner(parent_id, child_id, child_name, &mut refused).await {
+            Ok(ip) => Ok(ip),
+            Err(e) if e == BUSY => Err(OpError::Busy),
+            Err(e) => Err(match refused {
+                Some(state) => OpError::InvalidState { msg: e, state },
+                None => OpError::Other(e),
+            }),
+        }
+    }
+
+    /// The parent's state as the record says now, or `fallback`.
+    async fn state_now(&self, id: &str, fallback: &VmState) -> VmState {
+        let g = self.inner.lock().await;
+        g.vms.iter().find(|v| v.id == id).map(|v| v.state.clone()).unwrap_or_else(|| fallback.clone())
+    }
+
+    /// The body of `fork`. A refusal for the parent's state also sets
+    /// `refused` to that state.
+    async fn fork_inner(
+        self: &Arc<Self>,
+        parent_id: &str,
+        child_id: &str,
+        child_name: &str,
+        refused: &mut Option<VmState>,
+    ) -> Result<Option<String>, String> {
         if !valid_vm_id(child_id) {
             return Err("InvalidId".into());
         }
@@ -3630,6 +3715,7 @@ impl Manager {
             // `creating` parent whose VMM is alive used to be snapshotted
             // too. Refused before anything is reserved.
             if !matches!(p.state, VmState::Running | VmState::Paused | VmState::Sleeping) {
+                *refused = Some(p.state.clone());
                 return Err(format!(
                     "InvalidState: {} (only a running, paused or sleeping VM can be forked)",
                     p.state.as_str()
@@ -3762,12 +3848,14 @@ impl Manager {
             match fc::get_root_drive_path(&parent_sock).await {
                 Ok(p) if same_file(&p, &parent_rootfs).unwrap_or(false) => {}
                 Ok(p) => {
+                    // The path and the ids go to the log only: the control
+                    // plane relays the answer to the tenant word for word.
+                    warn!(vm = %parent_id, child = %child_id, image = %p,
+                        "fork refused: the parent runs on another image than its own rootfs.ext4 (it was forked \
+                         before this release)");
                     self.drop_unborn_child(child_id, Some(&child_dir), child_slot).await;
-                    return Err(format!(
-                        "InvalidState: {} runs on the image {}, not on its own rootfs.ext4 (it was forked before \
-                         this release) and cannot be forked",
-                        parent_id, p
-                    ));
+                    *refused = Some(self.state_now(parent_id, &parent_state).await);
+                    return Err(FORK_REFUSED_FORKED_BEFORE.into());
                 }
                 Err(e) => {
                     self.drop_unborn_child(child_id, Some(&child_dir), child_slot).await;
@@ -3882,12 +3970,14 @@ impl Manager {
         match fc::get_root_drive_path(&child_sock).await {
             Ok(p) if same_file(&p, &parent_rootfs).unwrap_or(false) => {}
             Ok(p) => {
-                let e = format!(
-                    "fork: {} ran on the image {} when it was snapshotted, not on its own rootfs.ext4 (it was \
-                     forked before this release); the child is not started",
-                    parent_id, p
-                );
-                return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e).await);
+                // A refusal like the running parent's (409, not 500: the
+                // request can never succeed); the path and the ids are logged.
+                warn!(vm = %parent_id, child = %child_id, image = %p,
+                    "fork refused: the parent ran on another image than its own rootfs.ext4 when it was \
+                     snapshotted (it was forked before this release); the child is not started");
+                let e = self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, FORK_REFUSED_FORKED_BEFORE.into()).await;
+                *refused = Some(self.state_now(parent_id, &parent_state).await);
+                return Err(e);
             }
             Err(e) => return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e.to_string()).await),
         }
@@ -4587,7 +4677,7 @@ impl Manager {
         let _closing = self.begin_close(id);
         self.claim_unsettled(id).await;
         // One critical section decides what this delete is about.
-        let (slot, dir_id, lives_there) = {
+        let (dir_id, lives_there) = {
             let mut g = self.inner.lock().await;
             match g.vms.iter_mut().find(|v| v.id == id) {
                 Some(v) => {
@@ -4601,13 +4691,12 @@ impl Manager {
                     if v.state == VmState::Pooled {
                         v.state = VmState::Stopped;
                     }
-                    (v.slot, v.dir_id.clone(), None)
+                    (v.dir_id.clone(), None)
                 }
                 // No record has this id, yet a VM may live in the directory
                 // of that name: a pool VM that was claimed keeps its pool
                 // directory under its new id.
                 None => (
-                    None,
                     id.to_string(),
                     g.vms.iter().find(|v| v.dir_id == id).map(|v| v.id.clone()),
                 ),
@@ -4681,13 +4770,24 @@ impl Manager {
         // ip". Address and exposes go in the same section, so nothing reads
         // the one without the other. (A listing taken meanwhile shows the
         // record with `ip` null.)
-        {
+        //
+        // The slot is taken OFF the record here, in the same section, and
+        // only this value is used below: of two overlapping deletes of one
+        // sandbox exactly one gets it, and the other frees, holds and
+        // un-taps nothing. Both used to read it at entry, so the second freed
+        // it again after a create had claimed it — removing the NEW
+        // sandbox's tap and pin, and handing its address to the next one.
+        let slot = {
             let mut g = self.inner.lock().await;
-            if let Some(v) = g.vms.iter_mut().find(|v| v.id == id) {
-                v.ip = None;
-                v.exposes.clear();
+            match g.vms.iter_mut().find(|v| v.id == id) {
+                Some(v) => {
+                    v.ip = None;
+                    v.exposes.clear();
+                    v.slot.take()
+                }
+                None => None,
             }
-        }
+        };
         // (2) Both rebuilds, each reporting whether it was applied.
         let isolation_ok = self.refresh_isolation().await;
         if !isolation_ok {
@@ -7970,7 +8070,9 @@ mod tests {
             );
             assert!(load < config, "{lines:?}");
             if later {
-                assert!(matches!(&r, Err(OpError::InvalidState { state: VmState::Stopped, msg }) if msg.contains(&image)), "{r:?}");
+                // Changed on purpose (fix list item 6): no path in the
+                // answer; the image is in the log.
+                assert!(matches!(&r, Err(OpError::InvalidState { state: VmState::Stopped, msg }) if msg == WAKE_REFUSED_FORKED_BEFORE), "{r:?}");
                 assert!(gone_soon(pid).await);
                 assert!(!api.bodies().iter().any(|b| b.contains("Resumed")), "never resumed: {lines:?}");
                 assert_eq!(meta_on_disk(&data_dir, "vm-1").state, VmState::Stopped);
@@ -8612,9 +8714,14 @@ mod tests {
         std::fs::write(&image, b"x").unwrap();
         let image = image.to_str().unwrap().to_string();
         let f = forking(VmState::Running, Behavior { drive: Some(image.clone()), ..Default::default() }, Behavior::default(), &fake_fc_bin()).await;
-        let r = f.mgr.fork("vm-1", "vm-2", "c").await;
+        let r = f.mgr.fork_answer("vm-1", "vm-2", "c").await;
         let _ = std::fs::remove_file(&image);
-        assert!(matches!(&r, Err(e) if e.starts_with("InvalidState") && e.contains(&image)), "{r:?}");
+        // Changed on purpose (fix list item 6): the answer reaches the tenant
+        // word for word, so it names no path; the log has the image.
+        assert_eq!(
+            r,
+            Err(OpError::InvalidState { msg: FORK_REFUSED_FORKED_BEFORE.into(), state: VmState::Running })
+        );
         let api = f.parent_api.as_ref().unwrap();
         assert!(!api.requests().iter().any(|l| l.starts_with("PATCH /vm") || l.starts_with("PUT /snapshot")), "{:?}", api.requests());
         assert!(record_of(&f.mgr, "vm-2").await.is_none());
@@ -8636,8 +8743,15 @@ mod tests {
                     FakeApi::serve_with(&format!("{}.fake.sock", f.child_dir), "Not started", Behavior { drive: Some(image.clone()), ..Default::default() })
                 },
             ));
-            let r = f.mgr.fork("vm-1", "vm-2", "c").await;
-            assert!(matches!(&r, Err(e) if e.contains(&image)), "{state}: {r:?}");
+            let r = f.mgr.fork_answer("vm-1", "vm-2", "c").await;
+            // Changed on purpose (items 6, 7): a 409 refusal with the
+            // parent's state for every parent state — the sleeping parent's
+            // used to be a 500 — and no path in it.
+            assert_eq!(
+                r,
+                Err(OpError::InvalidState { msg: FORK_REFUSED_FORKED_BEFORE.into(), state: state.clone() }),
+                "{state}"
+            );
             let lines = f.child_api.requests();
             assert!(!lines.iter().any(|l| l.starts_with("PATCH")), "{state}: neither re-pointed nor resumed: {lines:?}");
             let pid = spawned_pid(&f.child_dir).await;
@@ -9313,6 +9427,13 @@ pub(crate) mod rule_fake {
         pub(crate) unlocked_tap_removals: std::sync::atomic::AtomicUsize,
         /// `fences_ready` answers false.
         pub(crate) fences_down: AtomicBool,
+        /// The outcomes of the next ingress rebuilds, in order (true =
+        /// fail); once empty, `fail_ingress` decides.
+        pub(crate) ingress_script: std::sync::Mutex<std::collections::VecDeque<bool>>,
+        /// Run once, inside the SECOND `remove_tap` call, before it removes
+        /// anything (two overlapping deletes).
+        #[allow(clippy::type_complexity)]
+        pub(crate) on_second_remove_tap: std::sync::Mutex<Option<Box<dyn FnOnce(&FakeRules, &Manager) + Send>>>,
     }
 
     /// One chain: its spec, its rules as `nft list` prints them.
@@ -9463,6 +9584,16 @@ pub(crate) mod rule_fake {
         /// The free guest slots, read off the manager's allocator. The
         /// manager makes these calls with `inner` released; one made while
         /// holding it panics here.
+        ///
+        /// CONSTRAINT: `try_lock`, not a wait — it is called from inside the
+        /// (synchronous) rule calls, where awaiting is impossible and a
+        /// blocking wait would deadlock the one runtime thread. It therefore
+        /// also panics when ANOTHER task holds `inner` at that moment, which
+        /// cannot happen on the current-thread runtime `#[tokio::test]` uses
+        /// (the caller is the only task running), but can on a multi-thread
+        /// one. Tests that use this fake must stay on the current-thread
+        /// runtime; a test that needs another task holding `inner` must not
+        /// make rule calls meanwhile.
         pub(crate) fn free_slots(&self) -> Vec<u32> {
             let Some(mgr) = self.mgr.get().and_then(|w| w.upgrade()) else { return Vec::new() };
             let mut g = mgr.inner.try_lock().expect("a rule call was made while holding `inner`");
@@ -9494,13 +9625,21 @@ pub(crate) mod rule_fake {
             sorted.sort();
             let free_slots = self.free_slots();
             lock_std(&self.calls).push(RuleCall::Ingress { members: sorted, free_slots });
-            !self.fail_ingress.load(Ordering::SeqCst) && net::Kernel::apply(self, &net::ingress_ruleset(members))
+            let fail = lock_std(&self.ingress_script).pop_front().unwrap_or(self.fail_ingress.load(Ordering::SeqCst));
+            !fail && net::Kernel::apply(self, &net::ingress_ruleset(members))
         }
         fn remove_tap(&self, tap: &str) {
             let free_slots = self.free_slots();
+            let earlier = lock_std(&self.calls).iter().filter(|c| matches!(c, RuleCall::RemoveTap { .. })).count();
             if let Some(mgr) = self.mgr.get().and_then(|w| w.upgrade()) {
                 if mgr.ruleset_lock.try_lock().is_ok() {
                     self.unlocked_tap_removals.fetch_add(1, Ordering::SeqCst);
+                }
+                if earlier == 1 {
+                    let hook = lock_std(&self.on_second_remove_tap).take();
+                    if let Some(hook) = hook {
+                        hook(self, &mgr);
+                    }
                 }
             }
             lock_std(&self.calls).push(RuleCall::RemoveTap { tap: tap.to_string(), free_slots });
@@ -9907,6 +10046,162 @@ mod rule_tests {
             assert!(calls.iter().all(|c| !matches!(c, RuleCall::RemoveTap { .. })), "{which}: {calls:?}");
             assert!(!rules.free_slots().contains(&0), "{which}: slot 0 was freed by the second delete");
         }
+    }
+
+    /// A sandbox `id` in slot `slot`, as `add_vm` makes one, put straight
+    /// into the manager from inside a (synchronous) rule call, with its tap
+    /// held by a VMM and pinned.
+    fn create_inside_rule_call(rules: &FakeRules, mgr: &Manager, id: &str, slot: u32) {
+        let ip = crate::ipalloc::fmt_ip(mgr.cidr.host_at(slot));
+        {
+            let mut g = mgr.inner.try_lock().expect("inner is free inside a rule call");
+            assert!(Manager::claim_slot(&mut g) == Ok(slot), "slot {slot} must be the lowest free one by now");
+            g.vms.push(Vm {
+                id: id.into(),
+                name: id.into(),
+                dir_id: id.into(),
+                vcpus: 1,
+                mem_mib: 256,
+                state: VmState::Running,
+                pid: None,
+                slot: Some(slot),
+                ip: Some(ip.clone()),
+                vsock: false,
+                tenant_id: Some("t9".into()),
+                exposes: Vec::new(),
+                image: DEFAULT_IMAGE.into(),
+                image_sha256: None,
+                disk_gb: 0,
+                snapshot_valid: false,
+            });
+        }
+        let (tap, mac) = tap_pin_for_slot(slot);
+        rules.k().links.insert(tap.clone(), super::rule_fake::FakeLink { up: true, held: true, port: true });
+        assert!(net::Kernel::apply(rules, &net::antispoof_ruleset(&tap, &ip, &mac).unwrap()));
+    }
+
+    #[tokio::test]
+    async fn test_two_overlapping_deletes_free_the_slot_once() {
+        // RQ-1: both deletes read the slot at entry. The second one to finish
+        // removed the tap and pin of a sandbox created in between (it had got
+        // the slot, the lowest free) and freed its slot again.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, rules) = mgr_with_rules(tmp.path().to_str().unwrap());
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        // Slot 0 must be the lowest free one once vm-a's goes.
+        rules.clear();
+        // If a second tap removal happens, a create gets in just before it.
+        *lock_std(&rules.on_second_remove_tap) = Some(Box::new(|r: &FakeRules, m: &Manager| {
+            create_inside_rule_call(r, m, "vm-new", 0)
+        }));
+        let held = hold_rule_lock(&mgr).await;
+        let d1 = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.delete("vm-a").await })
+        };
+        let d2 = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.delete("vm-a").await })
+        };
+        // Both past their first step, parked at the rule lock.
+        sleep(Duration::from_millis(50)).await;
+        drop(held);
+        d1.await.unwrap().unwrap();
+        d2.await.unwrap().unwrap();
+        let removals: Vec<RuleCall> =
+            rules.calls().into_iter().filter(|c| matches!(c, RuleCall::RemoveTap { .. })).collect();
+        assert_eq!(removals.len(), 1, "the tap was removed twice: {removals:?}");
+        // The sandbox created afterwards (or in between) keeps its slot,
+        // its tap and its chain.
+        if mgr.inner.lock().await.vms.iter().all(|v| v.id != "vm-new") {
+            create_inside_rule_call(&rules, &mgr, "vm-new", 0);
+        }
+        assert!(!rules.free_slots().contains(&0), "vm-new's slot was freed");
+        assert!(rules.k().links.contains_key("hth-0"), "vm-new lost its tap");
+        assert!(matches!(rules.marker("netdev", "felucca", "as_hth_0"), Some(Some(_))), "vm-new lost its pin");
+        assert!(mgr.inner.lock().await.held_slots.is_empty());
+
+        // The same with the rebuilds failing: held exactly once, freed once.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, rules) = mgr_with_rules(tmp.path().to_str().unwrap());
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        rules.fail_isolation.store(true, Ordering::SeqCst);
+        let held = hold_rule_lock(&mgr).await;
+        let (m1, m2) = (Arc::clone(&mgr), Arc::clone(&mgr));
+        let d1 = tokio::spawn(async move { m1.delete("vm-a").await });
+        let d2 = tokio::spawn(async move { m2.delete("vm-a").await });
+        sleep(Duration::from_millis(50)).await;
+        drop(held);
+        d1.await.unwrap().unwrap();
+        d2.await.unwrap().unwrap();
+        assert_eq!(mgr.inner.lock().await.held_slots.iter().copied().collect::<Vec<_>>(), vec![0]);
+        rules.fail_isolation.store(false, Ordering::SeqCst);
+        assert!(mgr.refresh_isolation().await);
+        assert!(rules.free_slots().contains(&0));
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_expose_writes_nothing_and_leaves_no_rule() {
+        // RQ-13: the mapping was written to meta.json before the rule was
+        // known to be in; a roll-back write that did not land before a
+        // restart brought it back.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let (mgr, rules) = mgr_with_rules(&data_dir);
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        let p1 = mgr.expose("vm-a", 80, &none(), None).await.unwrap();
+        let meta = format!("{}/instances/vm-a/meta.json", data_dir);
+        let before = std::fs::read(&meta).unwrap();
+        rules.fail_ingress.store(true, Ordering::SeqCst);
+        set_cursor(&mgr, 21000).await;
+        assert_eq!(mgr.expose("vm-a", 81, &none(), None).await, Err(ExposeError::RuleFailed));
+        // Nothing written: what a restart reads is what was there before.
+        assert_eq!(std::fs::read(&meta).unwrap(), before, "meta.json was written for a failed expose");
+        assert_eq!(exposes_on_disk(&data_dir, "vm-a"), vec![(80, p1)]);
+        assert_eq!(exposes_of(&mgr, "vm-a").await, vec![(80, p1)]);
+        // And no rule for it.
+        rules.fail_ingress.store(false, Ordering::SeqCst);
+        let ingress = rules.k().listing("ip", "felucca").unwrap();
+        assert!(!ingress.contains("dport 21000"), "{ingress}");
+        // The rebuild without it ran after the failure.
+        let last_two: Vec<RuleCall> = rules.calls().into_iter().rev().take(2).collect();
+        assert!(matches!(&last_two[0], RuleCall::Ingress { members, .. } if members.iter().all(|m| m.0 != 21000)), "{last_two:?}");
+    }
+
+    #[tokio::test]
+    async fn test_a_concurrent_rebuild_cannot_install_a_failing_exposes_rule() {
+        // RQ-13: another sandbox's rebuild, run between the push of the new
+        // mapping and its own failed rebuild, installed the doomed rule.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, rules) = mgr_with_rules(tmp.path().to_str().unwrap());
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        add_vm(&mgr, "vm-b", 1, "t2").await;
+        set_cursor(&mgr, 22000).await;
+        // The other sandbox's rebuild succeeds; this expose's fails.
+        lock_std(&rules.ingress_script).extend([false, true]);
+        let held = hold_rule_lock(&mgr).await;
+        let other = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.refresh_ingress().await })
+        };
+        sleep(Duration::from_millis(20)).await;
+        let doomed = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.expose("vm-a", 80, &HashSet::new(), None).await })
+        };
+        sleep(Duration::from_millis(20)).await;
+        drop(held);
+        assert!(other.await.unwrap());
+        assert_eq!(doomed.await.unwrap(), Err(ExposeError::RuleFailed));
+        let ingress = rules.k().listing("ip", "felucca").unwrap();
+        assert!(!ingress.contains("dport 22000"), "the doomed rule is in the kernel: {ingress}");
+        // Not even for a moment: only the expose's own rebuild saw it.
+        let saw: Vec<RuleCall> = rules
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, RuleCall::Ingress { members, .. } if members.iter().any(|m| m.0 == 22000)))
+            .collect();
+        assert_eq!(saw.len(), 1, "another rebuild carried the doomed mapping: {saw:?}");
     }
 
     #[tokio::test]

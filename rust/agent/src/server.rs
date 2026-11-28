@@ -17,7 +17,7 @@ use crate::config::authorized_either;
 use crate::registration::NodeToken;
 use crate::vm::{
     image, valid_vm_id, CreateSpec, ExecOutcome, ExecStreamOutcome, ExposeError, Manager,
-    OpError, PoolSpec, RootfsError, BUSY, DEFAULT_IMAGE, STOP_GAVE_UP,
+    OpError, PoolSpec, RootfsError, DEFAULT_IMAGE, STOP_GAVE_UP,
 };
 use tracing::warn;
 
@@ -343,25 +343,29 @@ async fn fork_vm(
     // abandon a half-built child record.
     let mgr = Arc::clone(&state.mgr);
     let (pid2, cid2, cname2) = (parent_id.clone(), child_id.clone(), child_name.clone());
-    let result = match tokio::spawn(async move { mgr.fork(&pid2, &cid2, &cname2).await }).await {
+    let result = match tokio::spawn(async move { mgr.fork_answer(&pid2, &cid2, &cname2).await }).await {
         Ok(r) => r,
-        Err(e) => Err(format!("fork task: {}", e)),
+        Err(e) => Err(OpError::Other(format!("fork task: {}", e))),
     };
+    fork_response(result)
+}
+
+/// The answer to a fork. A refusal for the parent's state carries that
+/// state under `state`, as sleep, wake, stop and start do (the control plane
+/// records it); `busy` and `AlreadyExists` carry none.
+fn fork_response(result: Result<Option<String>, OpError>) -> Response {
     match result {
         Ok(ip) => {
             let body = serde_json::json!({ "ok": true, "ip": ip }).to_string();
             json_response(StatusCode::CREATED, &body)
         }
-        // The parent is held by another lifecycle operation.
-        Err(e) if e == BUSY => busy_response(),
+        // The parent is held by another lifecycle operation; or the parent
+        // is in a state that cannot be forked.
+        Err(e @ (OpError::Busy | OpError::InvalidState { .. })) => op_error_response(&e),
         // The child id, or a directory of that name, is taken; nothing was
         // written.
-        Err(e) if e == "AlreadyExists" => error_response(StatusCode::CONFLICT, &e),
-        // The parent is in a state that cannot be forked (the text names it).
-        Err(e) if e.starts_with("InvalidState") => error_response(StatusCode::CONFLICT, &e),
-        Err(e) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
-        }
+        Err(OpError::Other(e)) if e == "AlreadyExists" => error_response(StatusCode::CONFLICT, &e),
+        Err(OpError::Other(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
 }
 
@@ -1044,6 +1048,55 @@ mod tests {
         w.rules.reject.lock().unwrap().push("ip felucca forward".into());
         w.mgr.watch_tick(IsolationWatch::Enforce).await.unwrap();
         check(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_every_fork_refusal_answers_its_status_and_the_parents_state() {
+        // Fix list items 6 and 7: each fork refusal for the parent's state is
+        // a 409 carrying `state`, like sleep, wake, stop and start; `busy` and
+        // `AlreadyExists` carry none; and no answer names a path.
+        use crate::vm::meta::VmState;
+        use crate::vm::{FORK_REFUSED_FORKED_BEFORE, WAKE_REFUSED_FORKED_BEFORE};
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let mgr = Manager::new(data_dir.clone(), false, crate::ipalloc::Cidr { base: 0x0AE7_0000, prefix: 24 }, 0, "http://cp".into(), "tok".into());
+        // A parent in a state that cannot be forked, refused by the manager.
+        crate::vm::rule_fake::add_vm(&mgr, "vm-1", 0, "t1").await;
+        let refused = mgr.fork_answer("vm-1", "vm-2", "c").await;
+        let cases: Vec<(Result<Option<String>, OpError>, StatusCode, serde_json::Value)> = vec![
+            (
+                refused,
+                StatusCode::CONFLICT,
+                serde_json::json!({"error": "InvalidState: stopped (only a running, paused or sleeping VM can be forked)", "state": "stopped"}),
+            ),
+            (
+                Err(OpError::InvalidState { msg: FORK_REFUSED_FORKED_BEFORE.into(), state: VmState::Sleeping }),
+                StatusCode::CONFLICT,
+                serde_json::json!({"error": FORK_REFUSED_FORKED_BEFORE, "state": "sleeping"}),
+            ),
+            (
+                Err(OpError::InvalidState { msg: FORK_REFUSED_FORKED_BEFORE.into(), state: VmState::Running }),
+                StatusCode::CONFLICT,
+                serde_json::json!({"error": FORK_REFUSED_FORKED_BEFORE, "state": "running"}),
+            ),
+            (Err(OpError::Busy), StatusCode::CONFLICT, serde_json::json!({"error": "busy"})),
+            (Err(OpError::Other("AlreadyExists".into())), StatusCode::CONFLICT, serde_json::json!({"error": "AlreadyExists"})),
+        ];
+        for (result, status, body) in cases {
+            let resp = fork_response(result);
+            assert_eq!(resp.status(), status, "{body}");
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap().to_string();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap(), body);
+            assert!(!text.contains('/') && !text.contains(&data_dir), "a path in the answer: {text}");
+        }
+        // The wake refusal of the same kind names no path either.
+        let resp = op_error_response(&OpError::InvalidState { msg: WAKE_REFUSED_FORKED_BEFORE.into(), state: VmState::Stopped });
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(!text.contains('/'), "{text}");
+        assert!(text.contains("\"state\":\"stopped\""), "{text}");
     }
 
     // ---- inbound credentials ----
