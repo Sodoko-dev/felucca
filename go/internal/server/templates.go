@@ -226,7 +226,9 @@ func (srv *Server) createTemplate(w http.ResponseWriter, r *http.Request, tenant
 	if req.Tenant != "" {
 		owner, err := srv.db.GetTenant(req.Tenant)
 		if err != nil {
-			writeJSON(w, 500, []byte(`{"error":"store error"}`))
+			// Read errors are 503 (store unavailable), as everywhere else.
+			slog.Error("create template: tenant read failed", "tenant", req.Tenant, "err", err)
+			refuseStoreUnavailable(w)
 			return
 		}
 		if owner == nil {
@@ -261,7 +263,8 @@ func (srv *Server) createTemplate(w http.ResponseWriter, r *http.Request, tenant
 	}
 
 	if existing, err := srv.db.GetTemplateByName(t.Name); err != nil {
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
+		slog.Error("create template: template read failed", "template", t.Name, "err", err)
+		refuseStoreUnavailable(w)
 		return
 	} else if existing != nil {
 		writeJSON(w, 409, []byte(`{"error":"template exists"}`))
@@ -362,7 +365,8 @@ func (srv *Server) deleteTemplate(w http.ResponseWriter, name, tenant string) {
 	}
 	t, err := srv.db.GetTemplateByName(name)
 	if err != nil {
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
+		slog.Error("delete template: template read failed", "template", name, "err", err)
+		refuseStoreUnavailable(w)
 		return
 	}
 	if t == nil {

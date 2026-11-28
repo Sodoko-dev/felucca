@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -55,19 +56,40 @@ func (s *State) Now() int64 {
 	return time.Now().Unix()
 }
 
-// quarantineS is ingress.PortQuarantine in the unit the entries carry.
-var quarantineS = int64(ingress.PortQuarantine / time.Second)
+// quarantineS is ingress.PortQuarantine in the unit the entries carry;
+// keepS is how long an entry is kept at all (see SnapshotLocked).
+var (
+	quarantineS = int64(ingress.PortQuarantine / time.Second)
+	keepS       = int64((ingress.PortQuarantine + ingress.Margin) / time.Second)
+)
+
+// The quarantine runs on the wall clock, which can step.
+//
+//   - Backward: an entry whose release time is in the future is set to "now"
+//     in the working set, under the lock, the first time it is looked at
+//     (QuarantineLocked, SnapshotLocked). Its quarantine then ends
+//     PortQuarantine after the step, not PortQuarantine after the clock has
+//     caught up with the old release time. QuarantineExpiresIn clamps as well,
+//     for an entry seen before that.
+//   - Forward: shortens every quarantine; nothing can tell that from time
+//     passing. Entries are dropped for good only once PortQuarantine + Margin
+//     old, so a step within the margin that is corrected before then loses
+//     nothing.
+
+// QuarantineExpiresIn is the number of seconds until q's quarantine ends
+// (<= 0: ended), at most PortQuarantine.
+func QuarantineExpiresIn(q model.ReleasedPort, now int64) int64 {
+	left := q.ReleasedAt + quarantineS - now
+	if left > quarantineS {
+		left = quarantineS
+	}
+	return left
+}
 
 // QuarantineActive reports whether an entry is still within its quarantine
 // at now.
 func QuarantineActive(q model.ReleasedPort, now int64) bool {
-	return now-q.ReleasedAt < quarantineS
-}
-
-// QuarantineExpiresIn is the number of seconds until q's quarantine ends
-// (<= 0: ended).
-func QuarantineExpiresIn(q model.ReleasedPort, now int64) int64 {
-	return q.ReleasedAt + quarantineS - now
+	return QuarantineExpiresIn(q, now) > 0
 }
 
 // New creates an empty State.
@@ -222,7 +244,9 @@ func (s *State) RegisterNodeGuarded(hostname, addr string, cpus uint32, memTotal
 	}
 
 	if n := s.findNodeByHostname(hostname); n != nil {
-		// Update mutable fields, keep id.
+		// Update mutable fields, keep id. A new address moves the node's
+		// quarantined ports with it, in this critical section.
+		s.rehostQuarantineLocked(n, addr)
 		n.Addr = addr
 		n.CPUs = cpus
 		n.MemTotalMiB = memTotal
@@ -252,6 +276,47 @@ func (s *State) RegisterNodeGuarded(hostname, addr string, cpus uint32, memTotal
 	}
 	s.Nodes = append(s.Nodes, n)
 	return NodeRegistration{ID: id, Reclaimed: reclaimed}
+}
+
+// rehostQuarantineLocked is the quarantine's half of a node's address change:
+// the entries are keyed on the worker host (what route rows carry), so a
+// re-registration under a new host would orphan them while gateways still
+// route the old host to this worker's ports. They are rewritten to the new
+// host; when another node record still has the old host (two records, one
+// worker), they are copied instead, so both keys stay protected.
+//
+// The key is the host STRING: two spellings of one IPv6 address (or a name
+// and its address) are two keys, and nothing here joins them.
+// Caller holds the lock.
+func (s *State) rehostQuarantineLocked(n *model.Node, addr string) {
+	oldHost, _ := agentclient.SplitHostPort(n.Addr)
+	newHost, _ := agentclient.SplitHostPort(addr)
+	if oldHost == newHost {
+		return
+	}
+	shared := false
+	for _, o := range s.Nodes {
+		if o != n {
+			if h, _ := agentclient.SplitHostPort(o.Addr); h == oldHost {
+				shared = true
+				break
+			}
+		}
+	}
+	var copies []model.ReleasedPort
+	for i := range s.Quarantine {
+		if s.Quarantine[i].Host != oldHost {
+			continue
+		}
+		if shared {
+			c := s.Quarantine[i]
+			c.Host = newHost
+			copies = append(copies, c)
+		} else {
+			s.Quarantine[i].Host = newHost
+		}
+	}
+	s.Quarantine = append(s.Quarantine, copies...)
 }
 
 // reclaimStaleNodesLocked drops node records that are PROVABLY dead, to make
@@ -443,12 +508,43 @@ func (s *State) RemoveSandboxLocked(id string) {
 	}
 }
 
+// Two questions about removing a row, with two answers, because the worker
+// and the quarantine key on different things:
+//
+//   - GuestPortShared: may the worker's mapping be removed? The worker keeps
+//     one mapping per (VM, guest port) and removes BY GUEST PORT, so the call
+//     is skipped while another row of the sandbox has the same guest port —
+//     whatever node port that row names. Rows written before this release can
+//     hold one guest port on two node ports (a stale one and the live one);
+//     removing the stale name must not take the live mapping with it.
+//   - NodePortNamed: is the node port released? Only when no remaining row of
+//     the sandbox names it; then it is quarantined.
+
+// GuestPortShared reports whether another row of sb (another name) has e's
+// guest port: the worker's mapping for that guest port is still needed.
+func GuestPortShared(sb *model.Sandbox, e model.Expose) bool {
+	for _, o := range sb.Exposes {
+		if o.Name != e.Name && o.GuestPort == e.GuestPort {
+			return true
+		}
+	}
+	return false
+}
+
+// NodePortNamed reports whether a row of sb other than the one named except
+// names nodePort.
+func NodePortNamed(sb *model.Sandbox, nodePort uint16, except string) bool {
+	for _, o := range sb.Exposes {
+		if o.Name != except && o.NodePort == nodePort {
+			return true
+		}
+	}
+	return false
+}
+
 // RemoveExposeLocked removes the route row name of sandbox id and reports
-// whether there was one. Its node port is quarantined when no other row of
-// the sandbox maps the same guest port or node port: the worker keeps one
-// DNAT rule per guest port, and the unexpose paths leave it in place while
-// another name uses it, so removing one of two such names releases nothing.
-// Caller holds the lock.
+// whether there was one. Its node port is quarantined when no remaining row
+// of the sandbox names it (NodePortNamed). Caller holds the lock.
 func (s *State) RemoveExposeLocked(id, name string) bool {
 	sb := s.FindSandbox(id)
 	if sb == nil {
@@ -468,14 +564,7 @@ func (s *State) RemoveExposeLocked(id, name string) bool {
 		return false
 	}
 	sb.Exposes = kept
-	shared := false
-	for _, e := range sb.Exposes {
-		if e.GuestPort == gone.GuestPort || e.NodePort == gone.NodePort {
-			shared = true
-			break
-		}
-	}
-	if !shared {
+	if !NodePortNamed(sb, gone.NodePort, gone.Name) {
 		s.releaseLocked(sb, *gone)
 	}
 	if len(sb.Exposes) == 0 {
@@ -517,6 +606,125 @@ func (s *State) RemoveExposesOnPortLocked(id string, nodePort uint16) int {
 	return n
 }
 
+// RepointGuestPortLocked moves every row of sandbox id on guestPort to
+// nodePort and quarantines each node port they held before (once per port).
+// It is for a worker that answered an expose of that guest port with a
+// different port than the rows name: the worker is the authority, its old
+// mapping is gone, and a port left in a row it no longer has would otherwise
+// leave the rows later without being quarantined. Returns the old ports.
+// Caller holds the lock.
+func (s *State) RepointGuestPortLocked(id string, guestPort, nodePort uint16) []uint16 {
+	sb := s.FindSandbox(id)
+	if sb == nil {
+		return nil
+	}
+	var old []uint16
+	seen := map[uint16]bool{}
+	for i := range sb.Exposes {
+		e := &sb.Exposes[i]
+		if e.GuestPort != guestPort || e.NodePort == nodePort {
+			continue
+		}
+		if !seen[e.NodePort] {
+			seen[e.NodePort] = true
+			old = append(old, e.NodePort)
+			s.releaseLocked(sb, *e)
+		}
+		e.NodePort = nodePort
+	}
+	return old
+}
+
+// DoubleBooking is one worker host's node port that route rows of more than
+// one sandbox name.
+type DoubleBooking struct {
+	Host       string
+	Port       uint16
+	SandboxIDs []string
+}
+
+// DoubleBookedLocked lists the (host, node port) pairs that rows of two or
+// more different sandboxes name: rows written before FLU-6, when a delete
+// that timed out in feluccad left a row whose port the worker then gave to
+// another sandbox. Sorted by host, then port. Caller holds the lock.
+func (s *State) DoubleBookedLocked() []DoubleBooking {
+	type key struct {
+		host string
+		port uint16
+	}
+	owners := map[key][]string{}
+	var keys []key
+	for _, sb := range s.Sandboxes {
+		host, ok := s.NodeHostLocked(sb)
+		if !ok {
+			continue
+		}
+		for _, e := range sb.Exposes {
+			k := key{host, e.NodePort}
+			ids := owners[k]
+			if len(ids) == 0 {
+				keys = append(keys, k)
+			}
+			if len(ids) == 0 || ids[len(ids)-1] != sb.ID {
+				owners[k] = append(ids, sb.ID)
+			}
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].host != keys[j].host {
+			return keys[i].host < keys[j].host
+		}
+		return keys[i].port < keys[j].port
+	})
+	var out []DoubleBooking
+	for _, k := range keys {
+		if ids := owners[k]; len(ids) > 1 {
+			out = append(out, DoubleBooking{Host: k.host, Port: k.port, SandboxIDs: ids})
+		}
+	}
+	return out
+}
+
+// SplitGuestPort is one guest port of a sandbox that its rows map to more
+// than one node port.
+type SplitGuestPort struct {
+	SandboxID string
+	GuestPort uint16
+	NodePorts []uint16
+}
+
+// SplitGuestPortsLocked lists the guest ports that rows of one sandbox map to
+// two or more node ports: rows written before this release (an unexpose that
+// timed out in feluccad, then a fresh mapping). The worker holds one mapping
+// per guest port, so all but one of those ports are stale. Ordered as the
+// sandboxes and their rows are. Caller holds the lock.
+func (s *State) SplitGuestPortsLocked() []SplitGuestPort {
+	var out []SplitGuestPort
+	for _, sb := range s.Sandboxes {
+		var order []uint16
+		ports := map[uint16][]uint16{}
+		for _, e := range sb.Exposes {
+			ps := ports[e.GuestPort]
+			if len(ps) == 0 {
+				order = append(order, e.GuestPort)
+			}
+			dup := false
+			for _, p := range ps {
+				dup = dup || p == e.NodePort
+			}
+			if !dup {
+				ports[e.GuestPort] = append(ps, e.NodePort)
+			}
+		}
+		for _, g := range order {
+			if len(ports[g]) > 1 {
+				out = append(out, SplitGuestPort{SandboxID: sb.ID, GuestPort: g, NodePorts: ports[g]})
+			}
+		}
+	}
+	return out
+}
+
 // NodeHostLocked is the worker host of a sandbox: the host part of its node's
 // agent address, as route rows carry it. ok is false when the sandbox has no
 // node record (a port there is not reachable through any route). Caller holds
@@ -546,9 +754,21 @@ func (s *State) releaseLocked(sb *model.Sandbox, e model.Expose) {
 	})
 }
 
+// clampFutureLocked sets the release time of every entry released "in the
+// future" (the clock stepped back) to now; see the clock note above
+// QuarantineExpiresIn. Caller holds the lock.
+func (s *State) clampFutureLocked(now int64) {
+	for i := range s.Quarantine {
+		if s.Quarantine[i].ReleasedAt > now {
+			s.Quarantine[i].ReleasedAt = now
+		}
+	}
+}
+
 // QuarantineLocked returns copies of the entries still in quarantine at now.
 // Caller holds the lock.
 func (s *State) QuarantineLocked(now int64) []model.ReleasedPort {
+	s.clampFutureLocked(now)
 	var out []model.ReleasedPort
 	for _, q := range s.Quarantine {
 		if QuarantineActive(q, now) {
@@ -619,15 +839,17 @@ type Snapshot struct {
 	Quarantine []model.ReleasedPort
 }
 
-// SnapshotLocked deep-copies the persisted part of the working set. Expired
-// quarantine entries are dropped from the working set here: this is the one
-// place that runs after every change, and an expired entry protects nothing.
-// Caller must hold the lock.
+// SnapshotLocked deep-copies the persisted part of the working set. Quarantine
+// entries older than PortQuarantine + Margin are dropped from the working set
+// here: this is the one place that runs after every change. The margin keeps
+// an entry a forward clock step expired early until the step can have been
+// corrected (see QuarantineExpiresIn). Caller must hold the lock.
 func (s *State) SnapshotLocked() *Snapshot {
 	now := s.Now()
+	s.clampFutureLocked(now)
 	kept := s.Quarantine[:0]
 	for _, q := range s.Quarantine {
-		if QuarantineActive(q, now) {
+		if now-q.ReleasedAt < keepS {
 			kept = append(kept, q)
 		}
 	}

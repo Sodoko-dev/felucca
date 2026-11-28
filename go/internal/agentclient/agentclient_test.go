@@ -42,6 +42,24 @@ func TestRequestReadsAtMostMaxBody(t *testing.T) {
 	}
 }
 
+// RequestWithin ends a call at its own limit, well before the client's 30 s.
+func TestRequestWithinEndsAtItsLimit(t *testing.T) {
+	release := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	t.Cleanup(func() { close(release); ts.Close() })
+	host, port := SplitHostPort(ts.URL)
+	start := time.Now()
+	_, err := RequestWithin(host, port, http.MethodDelete, "/v1/vms/x/expose", []byte(`{}`), "", "", 300*time.Millisecond)
+	if err == nil {
+		t.Fatal("a call to a worker that never answers succeeded")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("the call took %v, want about 300 ms", d)
+	}
+}
+
 func TestExecReadsAtMostMaxExecBody(t *testing.T) {
 	host, port := serveBytes(t, MaxExecBody)
 	resp, err := ExecVM(host, port, "sb-1", []byte(`{}`), "", 10*time.Second, "")

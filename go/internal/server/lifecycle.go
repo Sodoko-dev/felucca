@@ -13,6 +13,7 @@ import (
 
 	"github.com/alpham/infra-saas/felucca/internal/ingress"
 	"github.com/alpham/infra-saas/felucca/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/state"
 	"github.com/alpham/infra-saas/felucca/internal/store"
 )
 
@@ -26,7 +27,19 @@ const (
 	// lifecycleInterval is the sweep cadence: policies are second-granular
 	// but enforcement within ~15s of the deadline is plenty.
 	lifecycleInterval = 15 * time.Second
+
+	// The sweep's drop of dynamic exposes holds the global exposeMu across
+	// each worker call, so its calls are bounded much tighter than the
+	// client's 30 s: dropCallTimeout per call, and dropPassBudget of worker
+	// time per pass — once a pass's drops have spent it, the rest wait for
+	// the next pass. A pass's drops therefore hold exposeMu for at most
+	// dropPassBudget + dropCallTimeout, well inside lifecycleInterval.
+	dropCallTimeout = 5 * time.Second
+	dropPassBudget  = 5 * time.Second
 )
+
+// dropBudget is the worker time one pass's drops may still spend.
+type dropBudget struct{ left time.Duration }
 
 // validPolicy reports whether a wire policy value is acceptable:
 // 0 (inherit), -1 (disabled), or [min, maxPolicyS] seconds.
@@ -163,7 +176,7 @@ func (srv *Server) lifecycleSweep(now int64) {
 				ttl := effectivePolicy(sb.AsleepDeleteS, lookup(sb.TenantID), true)
 				if ttl > 0 && now-sb.SleptAt >= ttl {
 					acts = append(acts, action{sb.ID, sb.TenantID, false, false})
-				} else if now-sb.SleptAt >= int64(ingress.PortQuarantine/time.Second) && hasDynamicExpose(sb) {
+				} else if longAsleepLocked(sb, now) && hasDynamicExpose(sb) && srv.dropDialableLocked(sb, now) {
 					// Not before: a sandbox that wakes within the quarantine
 					// keeps its rows and ports (FLU-6 R12).
 					acts = append(acts, action{sb.ID, sb.TenantID, false, true})
@@ -233,11 +246,25 @@ func (srv *Server) lifecycleSweep(now int64) {
 			srv.autoDelete(a.id, a.tenant, unreachable)
 		}
 	}
+	budget := &dropBudget{left: dropPassBudget}
 	for i := range acts {
 		if a := acts[(i+off)%len(acts)]; a.drop {
-			srv.dropDynamicExposes(a.id, a.tenant, unreachable)
+			srv.dropDynamicExposes(a.id, a.tenant, now, unreachable, budget)
 		}
 	}
+}
+
+// dropDialableLocked reports whether the drop may be scheduled for sb: its
+// node is ready by its heartbeat, so a silent worker is never dialed by the
+// drop (it holds exposeMu across the call). A sandbox whose node record is
+// gone is scheduled too: its drop makes no worker call at all, it only
+// removes rows. Caller holds the state lock.
+func (srv *Server) dropDialableLocked(sb *model.Sandbox, now int64) bool {
+	if sb.NodeID == nil {
+		return true
+	}
+	n := srv.st.FindNode(*sb.NodeID)
+	return n == nil || n.NodeStatus(now) == "ready"
 }
 
 // hasDynamicExpose reports whether sb has a dynamic (all-digit) expose.
@@ -429,7 +456,14 @@ func (srv *Server) autoDelete(id, tenant string, unreachable map[nodeTenant]bool
 // not attempted while the store is failing (an earlier action of this sweep
 // may have failed it), saved, a failed save logged — memory keeps what the
 // worker did and the recovery loop writes it.
-func (srv *Server) dropDynamicExposes(id, tenant string, unreachable map[nodeTenant]bool) {
+//
+// Bounded like autoDelete: a transport failure enters the sweep's unreachable
+// set for (node, tenant) and ends this action, and the set is consulted
+// before every dial. Each dial holds exposeMu (every expose in the fleet
+// waits behind it), so a worker that is down costs this action at most ONE
+// call per tenant per pass, and none at all when another action of the pass
+// already found it unreachable.
+func (srv *Server) dropDynamicExposes(id, tenant string, now int64, unreachable map[nodeTenant]bool, budget *dropBudget) {
 	if srv.storeFailing() {
 		return
 	}
@@ -458,8 +492,27 @@ func (srv *Server) dropDynamicExposes(id, tenant string, unreachable map[nodeTen
 	sweepID := newTraceID("sweep")
 	dropped := 0
 	for _, e := range dynamic {
-		if err := srv.dropExpose(id, e, sweepID); err != nil {
-			break // the rest are retried by the next sweep
+		// A save that failed since this action began (another request's)
+		// will refuse this one's too: stop unexposing.
+		if srv.storeFailing() {
+			break
+		}
+		if agentAddr != "" && unreachable[nodeTenant{agentAddr, tenant}] {
+			break
+		}
+		if budget.left <= 0 {
+			break // this pass's worker time is spent; the next pass goes on
+		}
+		ok, err := srv.dropExpose(id, e, sweepID, now, budget)
+		if err != nil {
+			// Only a transport failure marks the node unreachable; an answer
+			// refusing the unexpose is about this sandbox. Either way the
+			// rest are retried by the next sweep.
+			nodeUnreachable(unreachable, agentAddr, tenant, transportErr(err))
+			break
+		}
+		if !ok {
+			break // woke (or was deleted): it keeps the rest of its rows
 		}
 		dropped++
 	}
@@ -472,46 +525,92 @@ func (srv *Server) dropDynamicExposes(id, tenant string, unreachable map[nodeTen
 	slog.Info("lifecycle: dropped dynamic exposes of a long-sleeping sandbox", "sandbox", id, "count", dropped, "request_id", sweepID)
 }
 
-// dropExpose removes one expose row and its agent DNAT rule, preserving the
-// shared-guest-port rule like the unexpose handler. On agent failure the row
-// stays (the rule is still live) and the error is returned: the sweep retries.
-// It does not save; the caller does.
-func (srv *Server) dropExpose(id string, e model.Expose, reqID string) error {
+// longAsleepLocked reports whether sb is asleep and has been for at least the
+// port quarantine at now: the condition under which the sweep drops its
+// dynamic rows. Caller holds the state lock.
+func longAsleepLocked(sb *model.Sandbox, now int64) bool {
+	return sb != nil && sb.State == model.StateSleeping && sb.SleptAt > 0 &&
+		now-sb.SleptAt >= int64(ingress.PortQuarantine/time.Second)
+}
+
+// dropExpose removes one dynamic expose row of a long-sleeping sandbox and its
+// agent DNAT rule, leaving the worker's mapping in place while another row
+// has the same guest port (state.GuestPortShared), like the unexpose handler.
+// ok is false when nothing was done because the sandbox is no longer long
+// asleep (or the row is gone). The worker call is limited to dropCallTimeout
+// and its duration is charged to budget. On agent failure the
+// row stays (the rule is still live) and the error is returned: the sweep
+// retries. A 404 from the worker is the mapping being gone (agentUnexpose):
+// the row goes. It does not save; the caller does.
+func (srv *Server) dropExpose(id string, e model.Expose, reqID string, now int64, budget *dropBudget) (ok bool, err error) {
 	srv.exposeMu.Lock()
 	defer srv.exposeMu.Unlock()
 
+	// Re-checked right before the worker call, in the critical section that
+	// reads what to call: a wake that completed since the sweep's decision
+	// keeps the DNAT rule of what is now a running sandbox.
 	var agentAddr string
+	var row model.Expose
 	shared := false
-	func() {
+	if !func() bool {
 		srv.st.Lock()
 		defer srv.st.Unlock()
-		if sb := srv.st.FindSandbox(id); sb != nil {
-			if sb.NodeID != nil {
-				if node := srv.st.FindNode(*sb.NodeID); node != nil {
-					agentAddr = node.Addr
-				}
-			}
-			for _, other := range sb.Exposes {
-				if other.Name != e.Name && other.GuestPort == e.GuestPort {
-					shared = true
-					break
-				}
+		sb := srv.st.FindSandbox(id)
+		if !longAsleepLocked(sb, now) {
+			return false
+		}
+		found := false
+		for _, o := range sb.Exposes {
+			if o.Name == e.Name {
+				row, found = o, true
+				break
 			}
 		}
-	}()
+		if !found {
+			return false
+		}
+		if sb.NodeID != nil {
+			if node := srv.st.FindNode(*sb.NodeID); node != nil {
+				agentAddr = node.Addr
+			}
+		}
+		shared = state.GuestPortShared(sb, row)
+		return true
+	}() {
+		return false, nil
+	}
 
 	if agentAddr != "" && !shared {
-		if err := srv.agentUnexpose(agentAddr, id, e.GuestPort, reqID); err != nil {
+		// exposeMu stays held across the call (releasing it would reopen the
+		// race with a concurrent routes/ensure); the call's own limit and the
+		// pass's budget are what bound it.
+		start := time.Now()
+		err := srv.agentUnexposeWithin(agentAddr, id, row.GuestPort, reqID, dropCallTimeout)
+		budget.left -= time.Since(start)
+		if err != nil {
 			slog.Warn("lifecycle: drop expose failed", "sandbox", id, "expose", e.Name, "err", err)
-			return err
+			return false, err
 		}
 	}
+	woke := false
 	func() {
 		srv.st.Lock()
 		defer srv.st.Unlock()
+		// And again before the row goes. A sandbox that woke DURING the call
+		// has lost the rule on the worker already; its row goes too (a row
+		// naming a port with no rule would answer the gateway's next request
+		// from a dead port, while without it the gateway re-ensures the
+		// route), and the loss is logged — after the lock.
+		if sb := srv.st.FindSandbox(id); sb != nil && !longAsleepLocked(sb, now) {
+			woke = true
+		}
 		srv.st.RemoveExposeLocked(id, e.Name)
 	}()
-	return nil
+	if woke {
+		slog.Warn("lifecycle: the sandbox woke while its dynamic expose was being dropped; the route is re-created on its next request",
+			"sandbox", id, "expose", e.Name, "request_id", reqID)
+	}
+	return true, nil
 }
 
 // agentAddrAndState returns the sandbox's current state and its node's agent

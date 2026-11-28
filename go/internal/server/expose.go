@@ -5,6 +5,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/alpham/infra-saas/felucca/internal/agentclient"
 	"github.com/alpham/infra-saas/felucca/internal/model"
@@ -182,10 +184,15 @@ type portLists struct {
 	own map[uint16]bool
 	// others: node port -> the other sandboxes on this host whose rows hold it.
 	others map[uint16][]string
-	// ownOther: ports this sandbox holds for its other guest ports.
-	ownOther map[uint16]bool
+	// ownOther: ports this sandbox holds for its other guest ports, with a
+	// row that holds each.
+	ownOther map[uint16]model.Expose
 	// quarantined: node port -> its newest entry still in quarantine on this host.
 	quarantined map[uint16]model.ReleasedPort
+	// strangers: quarantined ports on this host that another (sandbox, guest
+	// port) released. A quarantined port that is not one is this sandbox's
+	// own, released for this same guest port.
+	strangers map[uint16]bool
 	// prefer: the quarantined port this sandbox last held for this guest port
 	// (0: none).
 	prefer uint16
@@ -195,14 +202,14 @@ type portLists struct {
 // the state lock.
 func (srv *Server) portListsLocked(host string, sb *model.Sandbox, guestPort uint16, now int64) portLists {
 	pl := portLists{
-		own: map[uint16]bool{}, others: map[uint16][]string{}, ownOther: map[uint16]bool{},
-		quarantined: map[uint16]model.ReleasedPort{},
+		own: map[uint16]bool{}, others: map[uint16][]string{}, ownOther: map[uint16]model.Expose{},
+		quarantined: map[uint16]model.ReleasedPort{}, strangers: map[uint16]bool{},
 	}
 	for _, e := range sb.Exposes {
 		if e.GuestPort == guestPort {
 			pl.own[e.NodePort] = true
-		} else {
-			pl.ownOther[e.NodePort] = true
+		} else if _, seen := pl.ownOther[e.NodePort]; !seen {
+			pl.ownOther[e.NodePort] = e
 		}
 	}
 	for _, other := range srv.st.Sandboxes {
@@ -221,7 +228,7 @@ func (srv *Server) portListsLocked(host string, sb *model.Sandbox, guestPort uin
 	// strangers: ports another (sandbox, guest port) released on this host.
 	// Handing such a port back to this sandbox would let that other hostname
 	// reach it, so it is never preferred.
-	strangers := map[uint16]bool{}
+	strangers := pl.strangers
 	var mine *model.ReleasedPort
 	for _, q := range srv.st.QuarantineLocked(now) {
 		if q.Host != host {
@@ -239,9 +246,12 @@ func (srv *Server) portListsLocked(host string, sb *model.Sandbox, guestPort uin
 			strangers[q.Port] = true
 		}
 	}
-	if mine != nil && len(pl.own) == 0 && !strangers[mine.Port] &&
-		len(pl.others[mine.Port]) == 0 && !pl.ownOther[mine.Port] {
-		pl.prefer = mine.Port
+	if mine != nil {
+		_, heldForAnotherGuestPort := pl.ownOther[mine.Port]
+		if len(pl.own) == 0 && !strangers[mine.Port] &&
+			len(pl.others[mine.Port]) == 0 && !heldForAnotherGuestPort {
+			pl.prefer = mine.Port
+		}
 	}
 	return pl
 }
@@ -272,9 +282,17 @@ func (pl portLists) avoid() []uint16 {
 
 // churnRefusalLocked is the R6' cap check for a request that needs a fresh
 // port: nil, or the 429 to answer. Caller holds the state lock.
+//
+// The per-sandbox cap counts distinct (node port, guest port) pairs on the
+// host the request is for: after two nodes swapped addresses every entry
+// exists under both hosts (state.rehostQuarantineLocked copies them), and two
+// copies of one release are one port taken. A pair counts until its last copy
+// expires.
 func (srv *Server) churnRefusalLocked(host string, sb *model.Sandbox, now int64) *nodePortRefusal {
-	var tenantN, sandboxN int
-	var tenantNext, sandboxNext int64 = -1, -1
+	var tenantN int
+	var tenantNext int64 = -1
+	type pair struct{ port, guest uint16 }
+	sandboxPairs := map[pair]int64{} // pair -> seconds until its last copy expires
 	for _, q := range srv.st.QuarantineLocked(now) {
 		left := state.QuarantineExpiresIn(q, now)
 		if sb.TenantID != adminTenant && q.Host == host && q.TenantID == sb.TenantID {
@@ -283,11 +301,18 @@ func (srv *Server) churnRefusalLocked(host string, sb *model.Sandbox, now int64)
 				tenantNext = left
 			}
 		}
-		if q.SandboxID == sb.ID {
-			sandboxN++
-			if sandboxNext < 0 || left < sandboxNext {
-				sandboxNext = left
+		if q.SandboxID == sb.ID && q.Host == host {
+			k := pair{q.Port, q.GuestPort}
+			if left > sandboxPairs[k] {
+				sandboxPairs[k] = left
 			}
+		}
+	}
+	sandboxN := len(sandboxPairs)
+	var sandboxNext int64 = -1
+	for _, left := range sandboxPairs {
+		if sandboxNext < 0 || left < sandboxNext {
+			sandboxNext = left
 		}
 	}
 	refuse := func(next int64) *nodePortRefusal {
@@ -365,6 +390,17 @@ func (srv *Server) acquireNodePort(agentAddr, sbID string, guestPort uint16, req
 
 	port := ans.NodePort
 	undo, staleRemoved := false, false
+	// Log lines are collected under the state lock and written after it: a
+	// slow log sink must not hold every request behind the lock.
+	type logLine struct {
+		level slog.Level
+		msg   string
+		args  []any
+	}
+	var logs []logLine
+	logf := func(level slog.Level, msg string, args ...any) {
+		logs = append(logs, logLine{level, msg, append(args, "request_id", reqID)})
+	}
 	func() {
 		srv.st.Lock()
 		defer srv.st.Unlock()
@@ -377,35 +413,73 @@ func (srv *Server) acquireNodePort(agentAddr, sbID string, guestPort uint16, req
 		}
 		now := srv.st.Now()
 		pl := srv.portListsLocked(host, sb, guestPort, now)
+		// ownReleased: the answer is quarantined only by this sandbox's own
+		// entries for this same guest port (the prefer case, or the worker's
+		// idempotent answer for a mapping whose rows feluccad already
+		// removed): its old hostname reaches the same service again.
+		_, quarantined := pl.quarantined[port]
+		ownReleased := quarantined && !pl.strangers[port]
 		if !pl.own[port] {
 			if others := pl.others[port]; len(others) > 0 {
 				for _, other := range others {
 					srv.st.RemoveExposesOnPortLocked(other, port)
-					slog.Error("expose: the worker handed out a node port another sandbox's route row holds; that row is stale and is removed, its port quarantined",
-						"sandbox", sbID, "stale_sandbox", other, "node_host", host, "node_port", port, "request_id", reqID)
+					logf(slog.LevelError, "expose: the worker handed out a node port another sandbox's route row holds; that row is stale and is removed, its port quarantined",
+						"sandbox", sbID, "stale_sandbox", other, "node_host", host, "node_port", port)
 				}
 				staleRemoved, undo, refused = true, true, refusePortConflict
 				return
 			}
-			if q, ok := pl.quarantined[port]; ok && port != prefer {
+			if holder, ok := pl.ownOther[port]; ok {
+				// Recorded, it would put two guest ports on one node port: the
+				// second name would be served by the first one's service. An
+				// agent that ignores avoid answers this again on every retry;
+				// what ends it is removing the expose that holds the port.
+				msg := fmt.Sprintf("node port conflict: the worker answered node port %d, which this sandbox's expose %q (guest port %d) holds; removing that expose ends it",
+					port, holder.Name, holder.GuestPort)
+				b, _ := json.Marshal(struct {
+					Error string `json:"error"`
+				}{msg})
+				logf(slog.LevelError, "expose: the worker returned a node port this sandbox holds for another guest port; refused until that expose is removed",
+					"sandbox", sbID, "guest_port", guestPort, "node_host", host, "node_port", port,
+					"held_by_expose", holder.Name, "held_for_guest_port", holder.GuestPort)
+				undo = true
+				refused = &nodePortRefusal{status: 503, body: string(b), retryAfter: portConflictRetryAfter}
+				return
+			}
+			if q, ok := pl.quarantined[port]; ok && port != prefer && !ownReleased {
 				if ans.AvoidHonored {
-					slog.Error("expose: the worker returned a quarantined node port it was told to avoid; refused",
-						"sandbox", sbID, "node_host", host, "node_port", port, "released_by", q.SandboxID, "request_id", reqID)
+					logf(slog.LevelError, "expose: the worker returned a quarantined node port it was told to avoid; refused",
+						"sandbox", sbID, "node_host", host, "node_port", port, "released_by", q.SandboxID)
 					undo, refused = true, refusePortConflict
 					return
 				}
-				slog.Warn("expose: an agent that does not honour avoid returned a quarantined node port; accepted (upgrade the agent)",
+				logf(slog.LevelWarn, "expose: an agent that does not honour avoid returned a quarantined node port; accepted (upgrade the agent)",
 					"sandbox", sbID, "node_host", host, "node_port", port, "released_by", q.SandboxID,
-					"released_ago_s", now-q.ReleasedAt, "request_id", reqID)
+					"released_ago_s", now-q.ReleasedAt)
 			}
+		}
+		// The rows of this guest port follow the worker, the authority: when
+		// it mapped a port they do not all name — none of them (its old
+		// mapping is gone: an unexpose that timed out in feluccad after the
+		// worker carried it out), or one of several (rows written before
+		// this release that hold one guest port on two node ports) — every
+		// row of the guest port is re-pointed to the answer and the other
+		// ports are quarantined. Saved with the record.
+		if len(pl.own) > 1 || (len(pl.own) == 1 && !pl.own[port]) {
+			old := srv.st.RepointGuestPortLocked(sbID, guestPort, port)
+			logf(slog.LevelWarn, "expose: the worker mapped this guest port to one node port; the sandbox's rows follow it and the other ports are quarantined",
+				"sandbox", sbID, "guest_port", guestPort, "node_host", host, "node_port", port, "old_ports", fmt.Sprint(old))
 		}
 		if refused = record(sb, port); refused != nil {
 			return
 		}
-		if prefer != 0 && port == prefer {
+		if (prefer != 0 && port == prefer) || ownReleased {
 			srv.st.UnquarantineLocked(host, port, sbID, guestPort)
 		}
 	}()
+	for _, l := range logs {
+		slog.Log(context.Background(), l.level, l.msg, l.args...)
+	}
 	if staleRemoved {
 		if err := srv.saveState(); err != nil {
 			slog.Error("expose: stale route row removed but not saved (the recovery loop will write it)", "sandbox", sbID, "request_id", reqID, "err", err)
@@ -423,16 +497,65 @@ func (srv *Server) acquireNodePort(agentAddr, sbID string, guestPort uint16, req
 }
 
 func (srv *Server) agentUnexpose(agentAddr, sbID string, guestPort uint16, reqID string) error {
+	host, port := agentclient.SplitHostPort(agentAddr)
+	resp, err := srv.agentCall(host, port, http.MethodDelete, "/v1/vms/"+sbID+"/expose", unexposeBody(guestPort), reqID)
+	return unexposeResult(resp, err)
+}
+
+// agentUnexposeWithin is agentUnexpose with a shorter limit than the client's
+// 30 s, for the sweep's drop: it holds exposeMu across the call, and every
+// expose in the fleet waits for it. A time-out is a transport failure.
+func (srv *Server) agentUnexposeWithin(agentAddr, sbID string, guestPort uint16, reqID string, timeout time.Duration) error {
+	resp, err := srv.dialNode(agentAddr).doWithin(timeout, http.MethodDelete, "/v1/vms/"+sbID+"/expose", unexposeBody(guestPort), reqID)
+	return unexposeResult(resp, err)
+}
+
+// doWithin is nodeDial.do with a shorter limit for this one call. It is part
+// of the choke point (TestNoDialPathCanCarryTheAdminToken): the credential is
+// the dial's own.
+func (d nodeDial) doWithin(timeout time.Duration, method, path string, body []byte, reqID string) (*agentclient.Response, error) {
+	return agentclient.RequestWithin(d.host, d.port, method, path, body, d.token, reqID, timeout)
+}
+
+func unexposeBody(guestPort uint16) []byte {
 	body, _ := json.Marshal(struct {
 		GuestPort uint16 `json:"guest_port"`
 	}{guestPort})
-	host, port := agentclient.SplitHostPort(agentAddr)
-	resp, err := srv.agentCall(host, port, http.MethodDelete, "/v1/vms/"+sbID+"/expose", body, reqID)
+	return body
+}
+
+// unexposeResult reads the worker's answer to an unexpose.
+func unexposeResult(resp *agentclient.Response, err error) error {
 	if err != nil {
-		return fmt.Errorf("agent unreachable: %w", err)
+		return &agentUnreachableError{err: err}
+	}
+	// 404: the worker does not know the VM (re-installed under the same
+	// address, or the VM is gone), so it holds no mapping for it either — the
+	// rule is gone, as both delete paths treat a 404. A missing mapping of a
+	// known VM is already a 200.
+	if resp.Status == 404 {
+		return nil
 	}
 	if resp.Status != 200 {
 		return fmt.Errorf("agent unexpose status %d", resp.Status)
+	}
+	return nil
+}
+
+// agentUnreachableError is a worker call that got no answer at all (a
+// transport failure), as opposed to an answer refusing it. Only this kind
+// enters the sweep's per-pass unreachable set (nodeUnreachable).
+type agentUnreachableError struct{ err error }
+
+func (e *agentUnreachableError) Error() string { return "agent unreachable: " + e.err.Error() }
+func (e *agentUnreachableError) Unwrap() error { return e.err }
+
+// transportErr returns err when it is a transport failure, nil otherwise:
+// the argument nodeUnreachable expects.
+func transportErr(err error) error {
+	var u *agentUnreachableError
+	if errors.As(err, &u) {
+		return err
 	}
 	return nil
 }
@@ -601,6 +724,14 @@ func (srv *Server) reExposeFork(agentAddr, childID string, parentExposes []model
 	defer srv.exposeMu.Unlock()
 
 	for _, e := range parentExposes {
+		// Checked once exposeMu is held, and per expose: with the store
+		// failing the fork's last save will be refused, and every port taken
+		// here would only sit in quarantine against the tenant's churn cap
+		// once that fork's clean-up removes the child.
+		if srv.storeFailing() {
+			slog.Warn("fork: re-expose stopped, the store is failing", "sandbox", childID, "request_id", reqID)
+			return
+		}
 		srv.st.Lock()
 		child := srv.st.FindSandbox(childID)
 		if child == nil {
@@ -665,14 +796,15 @@ func (srv *Server) unexposeSandbox(w http.ResponseWriter, r *http.Request, id, n
 		writeJSON(w, 404, []byte(`{"error":"not found"}`))
 		return
 	}
-	var guestPort uint16
+	var row model.Expose
 	found := false
 	for _, e := range sb.Exposes {
 		if e.Name == name {
-			guestPort, found = e.GuestPort, true
+			row, found = e, true
 			break
 		}
 	}
+	guestPort := row.GuestPort
 	if !found {
 		srv.st.Unlock()
 		writeJSON(w, 404, []byte(`{"error":"not found"}`))
@@ -689,20 +821,18 @@ func (srv *Server) unexposeSandbox(w http.ResponseWriter, r *http.Request, id, n
 	// Only skip the agent when there is no node to talk to (e.g. error state
 	// after a node loss) — the row is all that's left then.
 	if agentAddr != "" {
-		// A second expose row may share the guest port under another name; the
-		// DNAT rule must survive in that case.
+		// Another row on the same guest port (under another name, on any node
+		// port) still needs the worker's mapping: the worker removes by guest
+		// port, so the call is skipped (state.GuestPortShared).
 		shared := false
 		srv.st.Lock()
 		if sb := srv.st.FindSandbox(id); sb != nil {
-			for _, e := range sb.Exposes {
-				if e.Name != name && e.GuestPort == guestPort {
-					shared = true
-					break
-				}
-			}
+			shared = state.GuestPortShared(sb, row)
 		}
 		srv.st.Unlock()
 		if !shared {
+			// A 404 is not an error here: the worker does not know the VM, so
+			// the mapping is gone and the row goes (agentUnexpose).
 			if err := srv.agentUnexpose(agentAddr, id, guestPort, reqID(r.Context())); err != nil {
 				slog.Error("unexpose agent failed", "sandbox", id, "expose", name, "err", err, "request_id", reqID(r.Context()))
 				writeJSON(w, 502, []byte(`{"error":"agent unexpose failed"}`))

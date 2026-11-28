@@ -57,6 +57,14 @@ func readBody(body io.Reader, limit int64) ([]byte, error) {
 // token is attached as "Authorization: Bearer <token>" when non-empty.
 // reqID is attached as "X-Felucca-Request-Id" when non-empty.
 func Request(host string, port uint16, method, path string, body []byte, token, reqID string) (*Response, error) {
+	return RequestWithin(host, port, method, path, body, token, reqID, 0)
+}
+
+// RequestWithin is Request with a shorter limit than the client's
+// ingress.WorkerCallTimeout for this one call (0: the client's limit). For a
+// caller that must not wait the full time — the sweep's drop of dynamic
+// exposes holds the global expose lock across its call.
+func RequestWithin(host string, port uint16, method, path string, body []byte, token, reqID string, timeout time.Duration) (*Response, error) {
 	url := fmt.Sprintf("http://%s:%d%s", host, port, path)
 
 	var bodyReader io.Reader
@@ -64,7 +72,13 @@ func Request(host string, port uint16, method, path string, body []byte, token, 
 		bodyReader = bytes.NewReader(body)
 	}
 
-	req, err := http.NewRequest(method, url, bodyReader)
+	ctx := context.Background()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}

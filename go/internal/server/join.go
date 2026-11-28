@@ -199,8 +199,10 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		return srv.db.CheckJoinToken(tokenHash, now)
 	}()
 	if err != nil {
+		// A read error is not a refusal of the token: 503, no throttle, and
+		// the store is not marked failing (nothing failed to be written).
 		slog.Error("check join token", "err", err)
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
+		refuseStoreUnavailable(w)
 		return
 	}
 	if !tokenOK {
@@ -211,7 +213,7 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 	var overlayIP string
 	if existing, err := srv.db.GetWgPeerByPubKey(req.PubKey); err != nil {
 		slog.Error("wg peer lookup", "err", err)
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
+		refuseStoreUnavailable(w)
 		return
 	} else if existing != nil && ipnet.Contains(net.ParseIP(existing.OverlayIP)) {
 		// Re-join keeps its address — but only while it's still inside the
@@ -247,7 +249,7 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		peers, err := srv.db.ListWgPeers()
 		if err != nil {
 			slog.Error("list wg peers", "err", err)
-			writeJSON(w, 500, []byte(`{"error":"store error"}`))
+			refuseStoreUnavailable(w)
 			return
 		}
 		taken := make([]string, 0, len(peers))

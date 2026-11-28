@@ -45,6 +45,14 @@ type portWorker struct {
 	// closed without an answer — feluccad sees a failed call (a delete that
 	// "timed out") while the worker has released the VM's ports.
 	hangUpOnDelete bool
+	// unexposeStatus, when not 0, answers every unexpose with that status
+	// (the mapping is left as it is). hangUpOnUnexpose carries the unexpose
+	// out, then hangs up (an unexpose that "timed out" in feluccad).
+	unexposeStatus   int
+	hangUpOnUnexpose bool
+	// onExpose / onUnexpose / onFork run inside the call, before it is answered.
+	onExpose, onUnexpose, onFork func()
+	deletes                      int // VM deletes seen
 }
 
 type exposeReq struct {
@@ -72,6 +80,9 @@ func (f *portWorker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodPost && strings.HasSuffix(p, "/expose"):
 		f.reqs = append(f.reqs, exposeReq{vm: vm, guest: req.GuestPort, avoid: req.Avoid, prefer: req.Prefer, raw: string(body)})
+		if f.onExpose != nil {
+			f.onExpose()
+		}
 		port, have := f.held[key]
 		if !have {
 			if f.exhausted {
@@ -93,9 +104,29 @@ func (f *portWorker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	case r.Method == http.MethodDelete && strings.HasSuffix(p, "/expose"):
 		f.unexp = append(f.unexp, key)
+		if f.onUnexpose != nil {
+			f.onUnexpose()
+		}
+		if f.unexposeStatus != 0 {
+			w.WriteHeader(f.unexposeStatus)
+			_, _ = w.Write([]byte(`{"error":"injected"}`))
+			return
+		}
 		delete(f.held, key)
+		if f.hangUpOnUnexpose {
+			if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+				conn.Close()
+			}
+			return
+		}
 		ok(`{"ok":true}`)
+	case r.Method == http.MethodPost && strings.HasSuffix(p, "/fork"):
+		if f.onFork != nil {
+			f.onFork()
+		}
+		ok(`{"ip":"10.231.0.10"}`)
 	case r.Method == http.MethodDelete:
+		f.deletes++
 		for k := range f.held {
 			if strings.HasPrefix(k, vm+"/") {
 				delete(f.held, k)
@@ -672,7 +703,7 @@ func TestChurnCaps(t *testing.T) {
 			if i == 3 {
 				at = now - 300 // the oldest: expires in 600 s
 			}
-			return model.ReleasedPort{Host: fmt.Sprintf("10.0.0.%d", i), Port: 21000, SandboxID: s, GuestPort: uint16(1000 + i), ReleasedAt: at}
+			return model.ReleasedPort{Host: fx.host, Port: uint16(21000 + i), SandboxID: s, GuestPort: uint16(1000 + i), ReleasedAt: at}
 		}))
 		wantChurn(t, fx.expose(s, "web", 80), "600", "at the sandbox cap")
 	})
@@ -685,7 +716,7 @@ func TestChurnCaps(t *testing.T) {
 		// One over the cap: the preferred entry leaves quarantine below, and
 		// the sandbox must still be at the cap afterwards.
 		q := fillQuarantine(maxQuarantinedPerSandbox+1, func(i int) model.ReleasedPort {
-			return model.ReleasedPort{Host: fmt.Sprintf("10.0.0.%d", i), Port: 21000, SandboxID: s, GuestPort: uint16(1000 + i), TenantID: qTenant, ReleasedAt: now - 10}
+			return model.ReleasedPort{Host: fx.host, Port: uint16(21000 + i), SandboxID: s, GuestPort: uint16(1000 + i), TenantID: qTenant, ReleasedAt: now - 10}
 		})
 		q[0] = model.ReleasedPort{Host: fx.host, Port: 20900, SandboxID: s, GuestPort: 82, TenantID: qTenant, ReleasedAt: now - 10}
 		fx.setQuarantine(q)
@@ -855,6 +886,7 @@ func TestMetricNodePortsQuarantined(t *testing.T) {
 	now := fx.now.Load()
 	fx.setQuarantine([]model.ReleasedPort{
 		{Host: fx.host, Port: 20001, SandboxID: "sb-a", ReleasedAt: now - 10},
+		{Host: fx.host, Port: 20001, SandboxID: "sb-x", ReleasedAt: now - 20}, // same port: counted once
 		{Host: fx.host, Port: 20002, SandboxID: "sb-b", ReleasedAt: now - 899},
 		{Host: fx.host, Port: 20003, SandboxID: "sb-c", ReleasedAt: now - 900}, // expired
 	})

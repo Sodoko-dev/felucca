@@ -1293,10 +1293,11 @@ func TestNoDialPathCanCarryTheAdminToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("glob package sources: %v", err)
 	}
-	dialFuncs := []string{"Request", "ExecVM", "ExecVMStream"}
+	dialFuncs := []string{"Request", "RequestWithin", "ExecVM", "ExecVMStream"}
 	// The choke point, and nothing else.
 	allowedDial := map[string]bool{
 		"nodeDial.do": true, "nodeDial.exec": true, "nodeDial.execStream": true,
+		"nodeDial.doWithin": true, // do with a shorter limit (expose.go)
 	}
 	allowedToken := map[string]bool{
 		// The inbound check, and the grandfathered legacy-node fallback inside

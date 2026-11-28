@@ -171,7 +171,43 @@ func New(cfg *config.Config, st *state.State, db store.Store) *Server {
 	}
 	srv.seedLegacyNodeCreds()
 	srv.loadNodeTokenIndex()
+	srv.reportDoubleBookedPorts()
 	return srv
+}
+
+// reportDoubleBookedPorts logs, once at start-up (New runs right after the
+// state is loaded), one ERROR per worker host and node port that route rows of
+// two different sandboxes name. Rows written before FLU-6 can be like that: a
+// delete that timed out in feluccad kept A's row, and the worker then gave the
+// port to B. Nothing is repaired automatically: which row is stale is not
+// known here, so the operator resolves it.
+func (srv *Server) reportDoubleBookedPorts() {
+	var dups []state.DoubleBooking
+	var splits []state.SplitGuestPort
+	func() {
+		srv.st.Lock()
+		defer srv.st.Unlock()
+		dups = srv.st.DoubleBookedLocked()
+		splits = srv.st.SplitGuestPortsLocked()
+	}()
+	for _, d := range dups {
+		slog.Error("start-up: route rows of different sandboxes name the same node port; one of them is stale (its hostname may reach the other sandbox): delete or unexpose the stale one",
+			"node_host", d.Host, "node_port", d.Port, "sandboxes", strings.Join(d.SandboxIDs, ","))
+	}
+	// One guest port of one sandbox on two node ports: the worker holds one
+	// mapping per guest port, so the other rows name a dead port. The next
+	// expose that reaches the worker for that guest port (a new name on it)
+	// re-points them all to the worker's port (acquireNodePort). A repeat of
+	// an existing name does not reach the worker, and the gateway does not
+	// re-ensure a route it has a row for, so neither repairs it.
+	for _, s := range splits {
+		ports := make([]string, len(s.NodePorts))
+		for i, p := range s.NodePorts {
+			ports[i] = strconv.Itoa(int(p))
+		}
+		slog.Error("start-up: route rows of one sandbox map one guest port to several node ports; all but one are stale. The next expose of a new name on that guest port repairs it (or unexpose the stale name)",
+			"sandbox", s.SandboxID, "guest_port", s.GuestPort, "node_ports", strings.Join(ports, ","))
+	}
 }
 
 // loadNodeTokenIndex builds the inbound node-token index from the store, once,
@@ -1836,7 +1872,10 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 	if req.Template != "" {
 		tpl, err := srv.db.GetTemplateByName(req.Template)
 		if err != nil {
-			writeJSON(w, 500, []byte(`{"error":"store error"}`))
+			// A read error: 503 like every other read, the store not marked
+			// failing (nothing failed to be written).
+			slog.Error("create: template read failed", "template", req.Template, "err", err)
+			refuseStoreUnavailable(w)
 			return
 		}
 		if tpl == nil {
@@ -2065,7 +2104,11 @@ const maxRefusalBody = 64 << 10
 //
 // from is the state the record held when the request started. The worker's
 // answer describes that moment, so it is recorded only over that same state:
-// a record that changed meanwhile carries newer news. The state, its clocks
+// a record that changed meanwhile carries newer news. "Same state" compares
+// the state value, not a version: a record that left that state and came
+// back to it within the one round trip is overwritten. That is deliberate
+// (review RQ-14): the window is one worker call, and a version counter would
+// buy nothing the next request does not correct. The state, its clocks
 // and its usage event change in one critical section; then a save, whose
 // failure is logged (the save marks the store failing and the recovery loop
 // writes what memory holds) and does not change the answer.
@@ -2886,7 +2929,17 @@ func (srv *Server) serveMetrics(w http.ResponseWriter) {
 	func() {
 		srv.st.Lock()
 		defer srv.st.Unlock()
-		quarantined = len(srv.st.QuarantineLocked(srv.st.Now()))
+		// Distinct (worker host, node port) pairs: two sandboxes that released
+		// one port within the quarantine are two entries but one port.
+		type hostPort struct {
+			host string
+			port uint16
+		}
+		seen := map[hostPort]bool{}
+		for _, q := range srv.st.QuarantineLocked(srv.st.Now()) {
+			seen[hostPort{q.Host, q.Port}] = true
+		}
+		quarantined = len(seen)
 		for _, n := range srv.st.Nodes {
 			if n.NodeStatus(now) == "ready" {
 				readyCount++
@@ -2909,7 +2962,7 @@ func (srv *Server) serveMetrics(w http.ResponseWriter) {
 
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "# HELP felucca_nodes_ready Number of ready nodes\n# TYPE felucca_nodes_ready gauge\nfelucca_nodes_ready %d\n", readyCount)
-	fmt.Fprintf(&buf, "# HELP felucca_nodes_unfenced Ready nodes whose last heartbeat reported isolation_ok false\n# TYPE felucca_nodes_unfenced gauge\nfelucca_nodes_unfenced %d\n", unfencedCount)
+	fmt.Fprintf(&buf, "# HELP felucca_nodes_unfenced Ready nodes whose last heartbeat reported isolation_ok false (a node that goes silent while unfenced leaves this count although its VMs may keep running)\n# TYPE felucca_nodes_unfenced gauge\nfelucca_nodes_unfenced %d\n", unfencedCount)
 	buf.WriteString("# HELP felucca_sandboxes_total Sandboxes by state\n# TYPE felucca_sandboxes_total gauge\n")
 	for _, st := range model.AllStates {
 		fmt.Fprintf(&buf, "felucca_sandboxes_total{state=%q} %d\n", string(st), counts[st])
@@ -2920,7 +2973,7 @@ func (srv *Server) serveMetrics(w http.ResponseWriter) {
 	fmt.Fprintf(&buf, "# HELP felucca_wake_ms_sum Sum of wake latencies (ms)\n# TYPE felucca_wake_ms_sum counter\nfelucca_wake_ms_sum %d\n", wakeMsSum)
 	fmt.Fprintf(&buf, "# HELP felucca_forks_total Total forks\n# TYPE felucca_forks_total counter\nfelucca_forks_total %d\n", forksTotal)
 	fmt.Fprintf(&buf, "# HELP felucca_execs_total Total exec attempts\n# TYPE felucca_execs_total counter\nfelucca_execs_total %d\n", execsTotal)
-	fmt.Fprintf(&buf, "# HELP felucca_node_ports_quarantined Released node ports still kept away from other sandboxes\n# TYPE felucca_node_ports_quarantined gauge\nfelucca_node_ports_quarantined %d\n", quarantined)
+	fmt.Fprintf(&buf, "# HELP felucca_node_ports_quarantined Released node ports still kept away from other sandboxes (distinct worker host and port pairs)\n# TYPE felucca_node_ports_quarantined gauge\nfelucca_node_ports_quarantined %d\n", quarantined)
 	buf.WriteString("# HELP felucca_pool_size Warm-pool depth per node\n# TYPE felucca_pool_size gauge\n")
 	for _, p := range pools {
 		fmt.Fprintf(&buf, "felucca_pool_size{node=%q} %d\n", p.hostname, p.size)
