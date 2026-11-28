@@ -354,6 +354,9 @@ async fn fork_vm(
         }
         // The parent is held by another lifecycle operation.
         Err(e) if e == BUSY => busy_response(),
+        // The child id, or a directory of that name, is taken; nothing was
+        // written.
+        Err(e) if e == "AlreadyExists" => error_response(StatusCode::CONFLICT, &e),
         Err(e) => {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
         }
@@ -1154,5 +1157,23 @@ mod tests {
         // Sleeping already: still a success.
         let resp = sleep_vm(State(state.clone()), id("vm-asleep"), authed()).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ---- FLU-70: a fork onto a taken id ----
+
+    #[tokio::test]
+    async fn test_fork_onto_a_taken_id_or_directory_answers_409() {
+        let (dir, state) = state_with(&[("vm-asleep", "sleeping"), ("vm-other", "stopped")]).await;
+        // A directory no record owns (its meta.json did not load).
+        std::fs::create_dir_all(dir.path().join("instances").join("vm-stray")).unwrap();
+        for child in ["vm-other", "vm-stray"] {
+            let req = Request::builder()
+                .header("authorization", "Bearer t")
+                .body(Body::from(format!(r#"{{"id":"{child}"}}"#)))
+                .unwrap();
+            let resp = fork_vm(State(state.clone()), Path("vm-asleep".to_string()), req).await;
+            assert_eq!(resp.status(), StatusCode::CONFLICT, "{child}");
+            assert_eq!(body_of(resp).await, serde_json::json!({ "error": "AlreadyExists" }), "{child}");
+        }
     }
 }
