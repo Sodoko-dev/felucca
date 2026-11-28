@@ -68,7 +68,11 @@ while :; do
     seen="$total"
   fi
   rc="$(limactl shell "$WORKER" -- bash -c "sed -n 's/^GATE-EXIT //p' $OUT | tail -1" 2>/dev/null | tr -d ' \r\n')"
-  [ -n "$rc" ] && break
+  if [ -n "$rc" ]; then
+    # the gate may have ended between the line count and this look: read what came after the last count
+    limactl shell "$WORKER" -- bash -c "sed -n '$((seen+1)),\$p' $OUT" 2>/dev/null | grep -v '^GATE-EXIT '
+    break
+  fi
   sleep 5
 done
 [ "$rc" = 0 ]

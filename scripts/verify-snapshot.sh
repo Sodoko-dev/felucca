@@ -57,7 +57,11 @@ part() {
       vsh bash -c "sed -n '$((seen+1)),${total}p' $out" 2>/dev/null | grep -v '^GATE-EXIT ' | tee -a "$LOCAL_OUT"; seen="$total"
     fi
     rc="$(vsh bash -c "sed -n 's/^GATE-EXIT //p' $out | tail -1" 2>/dev/null | tr -d ' \r\n')"
-    [ -n "$rc" ] && break
+    if [ -n "$rc" ]; then
+      # the part may have ended between the line count and this look: read what came after the last count
+      vsh bash -c "sed -n '$((seen+1)),\$p' $out" 2>/dev/null | grep -v '^GATE-EXIT ' | tee -a "$LOCAL_OUT"
+      break
+    fi
     sleep 5
   done
   tally "$name"
