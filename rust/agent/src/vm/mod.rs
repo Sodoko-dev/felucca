@@ -3063,10 +3063,16 @@ impl Manager {
             // The state file under its temporary name, renamed once
             // Firecracker said the whole snapshot was written: a failed
             // create leaves a complete-looking state file behind.
+            //
+            // The disk is copied while the parent is still paused (FLU-72),
+            // so that it is the disk of the same instant as the memory. Copied
+            // after the resume, as it used to be, it held writes the child's
+            // memory knows nothing of — a disk and a page cache that disagree.
             let child_vmstate_tmp = format!("{}/{}", child_dir, VMSTATE_TMP);
             let made = match fc::put_snapshot_create(&parent_sock, &child_vmstate_tmp, &child_mem_file).await {
                 Ok(()) => std::fs::rename(&child_vmstate_tmp, &child_vmstate)
-                    .map_err(|e| format!("rename {} -> {}: {}", child_vmstate_tmp, child_vmstate, e)),
+                    .map_err(|e| format!("rename {} -> {}: {}", child_vmstate_tmp, child_vmstate, e))
+                    .and_then(|()| copy_rootfs(&parent_rootfs, &child_rootfs)),
                 Err(e) => Err(e.to_string()),
             };
             // The parent is given back first, the child's files removed
@@ -3082,10 +3088,6 @@ impl Manager {
             if !resumed {
                 self.drop_unborn_child(child_id, Some(&child_dir)).await;
                 return Err(format!("fork: {} could not be resumed after its snapshot and stays paused", parent_id));
-            }
-            if let Err(e) = copy_rootfs(&parent_rootfs, &child_rootfs) {
-                self.drop_unborn_child(child_id, Some(&child_dir)).await;
-                return Err(e);
             }
         }
         // Everything from here is the child's.
@@ -3156,14 +3158,31 @@ impl Manager {
         } else {
             None
         };
-        if let Err(e) = fc::put_snapshot_load(&child_sock, &child_vmstate, &child_mem_file, self.net_on, child_slot, vsock_override, true).await {
+        // Loaded paused: the snapshot names the PARENT's disk image (it
+        // records the drive's absolute path, and the load has no override
+        // for it), so the child must not run before its drive is its own.
+        if let Err(e) = fc::put_snapshot_load(&child_sock, &child_vmstate, &child_mem_file, self.net_on, child_slot, vsock_override, false).await {
             // Don't leak the child FC that failed to restore.
             return Err(self.fail_child(child_id, Some(child_pid), e.to_string()).await);
         }
-        // The child runs: its state file describes a past it has left (S11:
-        // `vmstate.bin` only beside a `sleeping` record). mem.bin stays — the
-        // child runs on a private mapping of it.
+        // Loaded: its state file is used up and describes nothing the child
+        // will be (S11: `vmstate.bin` only beside a `sleeping` record).
+        // mem.bin stays — the child runs on a private mapping of it.
         remove_if_present(child_id, &child_vmstate);
+
+        // Its own disk (FLU-72), and checked: a child resumed on its parent's
+        // image writes over the parent's filesystem from a second kernel.
+        if let Err(e) = fc::patch_drive_rootfs(&child_sock, &child_rootfs).await {
+            return Err(self.fail_child(child_id, Some(child_pid), e.to_string()).await);
+        }
+        match fc::get_root_drive_path(&child_sock).await {
+            Ok(p) if p == child_rootfs => {}
+            Ok(p) => {
+                let e = format!("fork: the child's drive is {} after the PATCH, not {}", p, child_rootfs);
+                return Err(self.fail_child(child_id, Some(child_pid), e).await);
+            }
+            Err(e) => return Err(self.fail_child(child_id, Some(child_pid), e.to_string()).await),
+        }
 
         {
             let mut g = self.inner.lock().await;
@@ -3185,6 +3204,12 @@ impl Manager {
         }
         if let Err(e) = self.write_meta(child_id).await {
             return Err(self.fail_child(child_id, Some(child_pid), e).await);
+        }
+        // Only now does the child run: its record says `running` on disk, and
+        // a start-up that finds this VMM still paused resumes it — on its own
+        // drive by then.
+        if let Err(e) = fc::patch_vm_state(&child_sock, "Resumed").await {
+            return Err(self.fail_child(child_id, Some(child_pid), e.to_string()).await);
         }
 
         // Fork re-IP: the child restored with the parent's guest-internal IP.
@@ -5537,6 +5562,11 @@ mod tests {
         write_snapshot: bool,
         /// Read this meta.json at every request and keep (request line, contents).
         watch_meta: Option<String>,
+        /// The root drive's `path_on_host` that `GET /vm/config` answers
+        /// (what a loaded snapshot names). `PATCH /drives/rootfs` changes it,
+        /// as Firecracker does, unless `keep_drive`.
+        drive: Option<String>,
+        keep_drive: bool,
     }
 
     /// Has `pid` exited (gone, or a zombie nobody has reaped yet)?
@@ -5558,12 +5588,13 @@ mod tests {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
             let meta_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let drive = Arc::new(std::sync::Mutex::new(behavior.drive.clone().unwrap_or_default()));
             let (st, sn, bd, ms) = (Arc::clone(&state), Arc::clone(&seen), Arc::clone(&bodies), Arc::clone(&meta_seen));
             let task = tokio::spawn(async move {
                 loop {
                     let Ok((mut conn, _)) = listener.accept().await else { return };
-                    let (st, sn, bd, ms, behavior) =
-                        (Arc::clone(&st), Arc::clone(&sn), Arc::clone(&bd), Arc::clone(&ms), behavior.clone());
+                    let (st, sn, bd, ms, behavior, dr) =
+                        (Arc::clone(&st), Arc::clone(&sn), Arc::clone(&bd), Arc::clone(&ms), behavior.clone(), Arc::clone(&drive));
                     tokio::spawn(async move {
                         use tokio::io::{AsyncReadExt, AsyncWriteExt};
                         // Headers, then as many body bytes as they announce.
@@ -5626,9 +5657,19 @@ mod tests {
                                 std::fs::write(v["snapshot_path"].as_str().unwrap(), b"device state").unwrap();
                                 std::fs::write(v["mem_file_path"].as_str().unwrap(), b"guest memory").unwrap();
                             }
+                            if line.starts_with("PATCH /drives/rootfs") && !behavior.keep_drive {
+                                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                                *dr.lock().unwrap() = v["path_on_host"].as_str().unwrap().to_string();
+                            }
                         }
                         let (status, body) = if failed {
                             ("400 Bad Request", "{\"fault_message\":\"refused by the test\"}".to_string())
+                        } else if line.starts_with("GET /vm/config") {
+                            let drive = dr.lock().unwrap().clone();
+                            let drives = serde_json::json!([
+                                { "drive_id": "rootfs", "path_on_host": drive, "is_root_device": true, "is_read_only": false }
+                            ]);
+                            ("200 OK", serde_json::json!({ "drives": drives }).to_string())
                         } else {
                             (
                                 "200 OK",
@@ -6741,12 +6782,25 @@ mod tests {
     }
 
     async fn forking(state: VmState, parent: Behavior, child: Behavior, fc_bin: &str) -> Forking {
+        forking_with(state, |_, _| (parent, child), fc_bin).await
+    }
+
+    /// `forking`, with the parent's and the child's behaviours made from the
+    /// parent's and the child's directories.
+    async fn forking_with(
+        state: VmState,
+        behaviors: impl FnOnce(&str, &str) -> (Behavior, Behavior),
+        fc_bin: &str,
+    ) -> Forking {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().to_str().unwrap().to_string();
         let parent_dir = format!("{}/instances/vm-1", data_dir);
         let child_dir = format!("{}/instances/vm-2", data_dir);
+        let (parent, child) = behaviors(&parent_dir, &child_dir);
         std::fs::create_dir_all(&parent_dir).unwrap();
         disk_image(&parent_dir);
+        // A loaded snapshot names the parent's disk image (FLU-72).
+        let child = Behavior { drive: child.drive.clone().or_else(|| Some(format!("{}/rootfs.ext4", parent_dir))), ..child };
         let child_api = FakeApi::serve_with(&format!("{}.fake.sock", child_dir), "Not started", child);
         let mgr = mgr_with_fc(data_dir.clone(), fc_bin);
         let (vmm, parent_api) = if state == VmState::Sleeping {
@@ -6981,6 +7035,119 @@ mod tests {
         let child_pid = spawned_pid(&f.child_dir).await;
         f.mgr.stop("vm-2").await.unwrap();
         assert!(gone_soon(child_pid).await);
+    }
+
+    // -- fork: the child's own disk (FLU-72) --
+
+    #[tokio::test]
+    async fn test_a_fork_copies_the_disk_while_the_parent_is_paused() {
+        // `watch_meta` reads any file: here the child's disk image, at every
+        // request the parent's API receives.
+        let f = forking_with(
+            VmState::Running,
+            |_, child_dir| {
+                let watch = Behavior { watch_meta: Some(format!("{}/rootfs.ext4", child_dir)), ..Default::default() };
+                (watch, Behavior::default())
+            },
+            &fake_fc_bin(),
+        )
+        .await;
+        f.mgr.fork("vm-1", "vm-2", "c").await.unwrap();
+        let api = f.parent_api.as_ref().unwrap();
+        let seen = api.meta_seen();
+        let at = |what: &str| {
+            seen.iter()
+                .position(|(l, _)| l.starts_with(what))
+                .unwrap_or_else(|| panic!("no {what}: {:?}", api.requests()))
+        };
+        let (pause, create) = (at("PATCH /vm"), at("PUT /snapshot/create"));
+        let resume = seen.iter().rposition(|(l, _)| l.starts_with("PATCH /vm")).unwrap();
+        assert!(pause < create && create < resume, "{:?}", api.requests());
+        assert!(api.bodies()[pause].contains("Paused") && api.bodies()[resume].contains("Resumed"));
+        assert_eq!(seen[create].1, "", "not copied before the snapshot");
+        assert_eq!(seen[resume].1, "parent disk", "the child's disk must be there when the parent's resume arrives");
+        let child_pid = spawned_pid(&f.child_dir).await;
+        f.mgr.stop("vm-2").await.unwrap();
+        assert!(gone_soon(child_pid).await);
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_child_gets_its_own_disk_before_it_runs() {
+        for state in [VmState::Running, VmState::Sleeping] {
+            let f = forking_with(
+                state.clone(),
+                |_, child_dir| {
+                    let watch = Behavior { watch_meta: Some(format!("{}/meta.json", child_dir)), ..Default::default() };
+                    (Behavior::default(), watch)
+                },
+                &fake_fc_bin(),
+            )
+            .await;
+            f.mgr.fork("vm-1", "vm-2", "c").await.unwrap_or_else(|e| panic!("{state}: {e}"));
+            let child_pid = spawned_pid(&f.child_dir).await;
+            let child_rootfs = format!("{}/rootfs.ext4", f.child_dir);
+
+            // Exactly this, in this order.
+            let lines = f.child_api.requests();
+            let kinds: Vec<&str> = lines.iter().map(|l| l.rsplit_once(' ').map(|(a, _)| a).unwrap_or(l)).collect();
+            assert_eq!(
+                kinds,
+                ["PUT /snapshot/load", "PATCH /drives/rootfs", "GET /vm/config", "PATCH /vm"],
+                "{state}: {lines:?}"
+            );
+            let bodies = f.child_api.bodies();
+            assert!(bodies[0].contains("\"resume_vm\":false"), "{state}: loaded paused: {}", bodies[0]);
+            assert_eq!(bodies[1], fc::build_drive_rootfs_patch(&child_rootfs), "{state}");
+            assert!(bodies[3].contains("Resumed"), "{state}");
+            // When the resume reached the child, its record said `running`
+            // with its VMM, on disk.
+            let (_, at_resume) = f.child_api.meta_seen().into_iter().find(|(l, _)| l.starts_with("PATCH /vm")).unwrap();
+            let at_resume: Meta = serde_json::from_str(&at_resume).expect("meta.json at the resume");
+            assert_eq!((at_resume.state, at_resume.pid), (VmState::Running, Some(child_pid)), "{state}");
+            assert_eq!(record_of(&f.mgr, "vm-2").await, Some((VmState::Running, Some(child_pid))), "{state}");
+            f.mgr.stop("vm-2").await.unwrap();
+            assert!(gone_soon(child_pid).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_child_whose_start_fails_is_never_resumed_on_any_disk() {
+        for case in ["load", "drive patch", "drive check", "child resume"] {
+            let child = match case {
+                "load" => Behavior { fail: vec!["PUT /snapshot/load"], ..Default::default() },
+                "drive patch" => Behavior { fail: vec!["PATCH /drives/rootfs"], ..Default::default() },
+                // The PATCH is answered, but the drive still names the
+                // parent's image.
+                "drive check" => Behavior { keep_drive: true, ..Default::default() },
+                _ => Behavior { fail_body: vec!["Resumed"], ..Default::default() },
+            };
+            let f = forking(VmState::Running, Behavior::default(), child, &fake_fc_bin()).await;
+
+            let r = f.mgr.fork("vm-1", "vm-2", "c").await;
+            assert!(r.is_err(), "{case}: {r:?}");
+            if case == "drive check" {
+                let e = r.unwrap_err();
+                assert!(e.contains(&format!("{}/rootfs.ext4", f.parent_dir)), "{case}: names the foreign drive: {e}");
+            }
+            // Never resumed — refused, in the last case.
+            let resumes = f.child_api.bodies().iter().filter(|b| b.contains("Resumed")).count();
+            assert_eq!(resumes, usize::from(case == "child resume"), "{case}: {:?}", f.child_api.requests());
+            let pid = spawned_pid(&f.child_dir).await;
+            assert!(gone_soon(pid).await, "{case}: the child's VMM must be gone");
+            assert_eq!(record_of(&f.mgr, "vm-2").await, Some((VmState::Error, None)), "{case}");
+            for name in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
+                assert!(!exists(&format!("{}/{}", f.child_dir, name)), "{case}: {name}");
+            }
+            if case == "child resume" {
+                // Its record had been written as `running`: it is written again.
+                let disk = meta_on_disk(&f.data_dir, "vm-2");
+                assert_eq!((disk.state, disk.pid), (VmState::Error, None), "{case}");
+            }
+            // The parent is not affected.
+            assert_eq!(f.parent_api.as_ref().unwrap().state(), "Running", "{case}");
+            assert_eq!(record_of(&f.mgr, "vm-1").await.unwrap().0, VmState::Running, "{case}");
+            assert!(lock_std(&f.mgr.busy).is_empty(), "{case}");
+        }
     }
 
     // -- clean-up of snapshot files --
