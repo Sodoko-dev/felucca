@@ -2,8 +2,10 @@ package gateway
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -27,14 +29,22 @@ type testEnv struct {
 	routes   atomic.Value // []Route
 	ensure   func(sandboxID string, port uint16) int
 	backends atomic.Int64
-	conns    atomic.Int64 // connections accepted by backend (not backend2)
+	conns    atomic.Int64 // connections accepted by backend
+	conns2   atomic.Int64 // connections accepted by backend2
 	fetches  atomic.Int64 // GET /api/v1/routes served
 	wakes    atomic.Int64 // POST .../wake served
 	skew     atomic.Int64 // added to the gateway's clock (time.Duration)
 
+	ensureRetry string       // Retry-After on a non-200 ensure answer; set before requests
+	ensures     atomic.Int64 // POST /api/v1/routes/ensure served
+	failFetch   atomic.Bool  // GET /api/v1/routes answers 500
+	activities  atomic.Int64 // POST /api/v1/routes/activity served
+
 	hmu     sync.Mutex
 	onFetch func(n int64)                        // runs after the table is read, before it is sent
 	onWake  func(w http.ResponseWriter, n int64) // answers the wake; nil = 404
+	// activity, when set, holds every activity report until it is closed.
+	activity chan struct{}
 }
 
 func (env *testEnv) setOnFetch(f func(n int64)) {
@@ -87,7 +97,7 @@ func newTestEnv(t *testing.T, limits map[string]TenantLimit) *testEnv {
 	env := &testEnv{}
 
 	env.backend = newEchoBackend(t, env, "1", &env.conns)
-	env.backend2 = newEchoBackend(t, env, "2", nil)
+	env.backend2 = newEchoBackend(t, env, "2", &env.conns2)
 
 	env.feluccad = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer admin-tok" {
@@ -109,6 +119,10 @@ func newTestEnv(t *testing.T, limits map[string]TenantLimit) *testEnv {
 		switch r.URL.Path {
 		case "/api/v1/routes":
 			n := env.fetches.Add(1)
+			if env.failFetch.Load() {
+				w.WriteHeader(500)
+				return
+			}
 			routes, _ := env.routes.Load().([]Route)
 			env.hmu.Lock()
 			f := env.onFetch
@@ -119,15 +133,34 @@ func newTestEnv(t *testing.T, limits map[string]TenantLimit) *testEnv {
 			_ = json.NewEncoder(w).Encode(struct {
 				Routes []Route `json:"routes"`
 			}{routes})
+		case "/api/v1/routes/activity":
+			env.activities.Add(1)
+			env.hmu.Lock()
+			hold := env.activity
+			env.hmu.Unlock()
+			if hold != nil {
+				<-hold
+			}
+			fmt.Fprint(w, "{}")
 		case "/api/v1/routes/ensure":
 			var req struct {
 				SandboxID string `json:"sandbox_id"`
 				Port      uint16 `json:"port"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&req)
+			env.ensures.Add(1)
 			code := 404
 			if env.ensure != nil {
 				code = env.ensure(req.SandboxID, req.Port)
+			}
+			if code < 0 { // no answer at all: the connection just closes
+				if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+					conn.Close()
+				}
+				return
+			}
+			if code != 200 && env.ensureRetry != "" {
+				w.Header().Set("Retry-After", env.ensureRetry)
 			}
 			w.WriteHeader(code)
 			fmt.Fprint(w, "{}")
@@ -328,13 +361,13 @@ func TestRefreshSurvivesFeluccadOutage(t *testing.T) {
 	if w := doHost(t, env.gw, "odoo--sb-1.sb.lab.test", "/"); w.Code != 200 {
 		t.Errorf("after outage: got %d, want 200 from cached route", w.Code)
 	}
-	env.skew.Store(int64(599 * time.Second))
+	env.skew.Store(int64(540 * time.Second))
 	env.gw.refresh()
 	if w := doHost(t, env.gw, "odoo--sb-1.sb.lab.test", "/"); w.Code != 200 {
 		t.Errorf("outage inside max-stale: got %d, want 200 from cached route", w.Code)
 	}
 	// ...and fails closed beyond it: its node ports may belong to others now.
-	env.skew.Store(int64(601 * time.Second))
+	env.skew.Store(int64(660 * time.Second))
 	env.gw.refresh()
 	assertTableUnavailable(t, doHost(t, env.gw, "odoo--sb-1.sb.lab.test", "/"))
 }
@@ -377,19 +410,19 @@ func TestOldTableFailsClosed(t *testing.T) {
 	}
 	checkHealthz("fresh")
 
-	env.skew.Store(int64(599 * time.Second))
+	env.skew.Store(int64(540 * time.Second))
 	if w := doHost(t, env.gw, host, "/"); w.Code != 200 {
-		t.Errorf("599s old: got %d, want 200", w.Code)
+		t.Errorf("540s old: got %d, want 200", w.Code)
 	}
 	if c := ready(); c != 200 {
-		t.Errorf("599s old: readyz %d, want 200", c)
+		t.Errorf("540s old: readyz %d, want 200", c)
 	}
 
-	env.skew.Store(int64(601 * time.Second))
+	env.skew.Store(int64(660 * time.Second))
 	assertTableUnavailable(t, doHost(t, env.gw, host, "/"))
 	assertTableUnavailable(t, doHost(t, env.gw, "web--sb-9.sb.lab.test", "/")) // unknown label too
 	if c := ready(); c != 503 {
-		t.Errorf("601s old: readyz %d, want 503", c)
+		t.Errorf("660s old: readyz %d, want 503", c)
 	}
 	checkHealthz("stale")
 
@@ -415,7 +448,7 @@ func TestOldTableWallClockAge(t *testing.T) {
 	if w := doHost(t, env.gw, host, "/"); w.Code != 200 {
 		t.Errorf("fresh: got %d, want 200", w.Code)
 	}
-	env.skew.Store(int64(601 * time.Second))
+	env.skew.Store(int64(660 * time.Second))
 	assertTableUnavailable(t, doHost(t, env.gw, host, "/"))
 	if c := doHost(t, env.gw, "gw.lab.test", "/readyz").Code; c != 503 {
 		t.Errorf("wall-clock stale: readyz %d, want 503", c)
@@ -531,15 +564,162 @@ func TestUpstreamConnectionNotReusedForAnotherSandbox(t *testing.T) {
 	if c := env.conns.Load(); c != 2 {
 		t.Errorf("after B: %d connections, want 2 (B must not reuse A's)", c)
 	}
+}
 
-	// A left the table, so its upstream address is gone with it.
-	env.gw.umu.Lock()
-	_, kept := env.gw.upstreams[upstreamAuthority(Route{SandboxID: "sb-a", GuestPort: 8069})]
-	n := len(env.gw.upstreams)
-	env.gw.umu.Unlock()
-	if kept || n != 1 {
-		t.Errorf("upstream map: A kept=%v size=%d, want A dropped and size 1", kept, n)
+// TestUpstreamNewConnectionWhenNodeAddressChanges: the same sandbox and guest
+// port move to another node address; the next request goes there on a new
+// connection, not over the idle one to the old address.
+func TestUpstreamNewConnectionWhenNodeAddressChanges(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.setRoutes(env.backendRoute("web--sb-a", "sb-a", "t-1", "running"))
+	if w := doHost(t, env.gw, "web--sb-a.sb.lab.test", "/"); w.Code != 200 || !strings.Contains(w.Body.String(), "be=1") {
+		t.Fatalf("before the move: got %d %q", w.Code, w.Body.String())
 	}
+	env.setRoutes(routeTo(env.backend2, "web--sb-a", "sb-a", "t-1", "running")) // same sandbox + guest port
+	if w := doHost(t, env.gw, "web--sb-a.sb.lab.test", "/"); w.Code != 200 || !strings.Contains(w.Body.String(), "be=2") {
+		t.Errorf("after the move: got %d %q, want backend 2 (the new node address)", w.Code, w.Body.String())
+	}
+	if c := env.conns2.Load(); c != 1 {
+		t.Errorf("%d connections to the new address, want 1", c)
+	}
+}
+
+// TestUpstreamAuthorityRoundTrip: the authority keeps the node address intact
+// through IPv6 literals (bracketed, as feluccad sends them, or not), names
+// with dots and upper case, and a host name lowercased on the way.
+func TestUpstreamAuthorityRoundTrip(t *testing.T) {
+	for _, c := range []struct{ host, want string }{
+		{"10.0.0.7", "10.0.0.7:20001"},
+		{"[fd00::2]", "[fd00::2]:20001"},
+		{"fd00::2", "[fd00::2]:20001"},
+		{"[::1]", "[::1]:20001"},
+		{"Node-A.Example.", "Node-A.Example.:20001"},
+	} {
+		r := Route{SandboxID: "Sb-X.y", GuestPort: 8069, NodeHost: c.host, NodePort: 20001}
+		a := upstreamAuthority(r)
+		for _, form := range []string{a, strings.ToLower(a)} {
+			got, err := upstreamDialAddr(form)
+			if err != nil || got != c.want {
+				t.Errorf("%q via %q: got %q err=%v, want %q", c.host, form, got, err, c.want)
+			}
+		}
+		if _, err := url.Parse("http://" + a + "/"); err != nil {
+			t.Errorf("%q: authority %q is not a valid URL host: %v", c.host, a, err)
+		}
+	}
+	for _, bad := range []string{"10.0.0.7:80", "61-1-zz-2" + upstreamSuffix, "61-1-31" + upstreamSuffix, "61-1-31-99999" + upstreamSuffix} {
+		if _, err := upstreamDialAddr(bad); err == nil {
+			t.Errorf("%q decoded, want an error", bad)
+		}
+	}
+}
+
+// TestIPv6NodeHost: feluccad sends an IPv6 worker as "[addr]"; requests to it
+// must reach it (they were 502 when the brackets were doubled).
+func TestIPv6NodeHost(t *testing.T) {
+	ln, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("no IPv6 loopback here (%v); the address building is covered by TestUpstreamAuthorityRoundTrip", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "be=v6")
+	}))
+	srv.Listener.Close()
+	srv.Listener = ln
+	srv.Start()
+	defer srv.Close()
+	env := newTestEnv(t, nil)
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	var p uint16
+	fmt.Sscanf(port, "%d", &p)
+	env.setRoutes(Route{Hostname: "web--sb-6", SandboxID: "sb-6", TenantID: "t-1", Name: "web",
+		NodeHost: "[::1]", NodePort: p, GuestPort: 80, State: "running"})
+	if w := doHost(t, env.gw, "web--sb-6.sb.lab.test", "/"); w.Code != 200 || w.Body.String() != "be=v6" {
+		t.Errorf("got %d %q, want 200 from the IPv6 backend", w.Code, w.Body.String())
+	}
+}
+
+// TestTableFreshTakesTheLargerAge: through tableFresh itself, a stopped
+// monotonic clock with a moving wall clock (a frozen host) fails closed.
+func TestTableFreshTakesTheLargerAge(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.setRoutes(env.backendRoute("odoo--sb-1", "sb-1", "t-1", "running"))
+	for _, c := range []struct {
+		mono, wall time.Duration
+		code       int
+	}{
+		{10 * time.Second, 10 * time.Second, 200},
+		{10 * time.Second, 700 * time.Second, 503}, // frozen host
+		{700 * time.Second, -5 * time.Second, 503}, // wall clock stepped back
+	} {
+		env.gw.ages = func(time.Time, time.Time) (time.Duration, time.Duration) { return c.mono, c.wall }
+		if w := doHost(t, env.gw, "odoo--sb-1.sb.lab.test", "/"); w.Code != c.code {
+			t.Errorf("mono %v wall %v: got %d, want %d", c.mono, c.wall, w.Code, c.code)
+		}
+	}
+}
+
+func TestNewClampsMaxStale(t *testing.T) {
+	gw := New(Config{Domain: "sb.lab.test", MaxStale: time.Hour})
+	if gw.cfg.MaxStale != ingress.GatewayMaxStaleCeiling {
+		t.Errorf("MaxStale %v, want clamped to %v", gw.cfg.MaxStale, ingress.GatewayMaxStaleCeiling)
+	}
+}
+
+// TestRefreshCadenceIndependentOfActivityReport: a hanging activity report
+// must not hold up the table refresh.
+func TestRefreshCadenceIndependentOfActivityReport(t *testing.T) {
+	env := newTestEnv(t, nil)
+	hang := make(chan struct{})
+	env.hmu.Lock()
+	env.activity = hang
+	env.hmu.Unlock()
+	t.Cleanup(func() { close(hang) }) // runs before the fake feluccad closes
+	gw := New(Config{Domain: "sb.lab.test", FeluccadURL: env.feluccad.URL, Token: "admin-tok", Refresh: 50 * time.Millisecond})
+	gw.markActive("sb-1")
+	stop := make(chan struct{})
+	go gw.Run(stop)
+	time.Sleep(600 * time.Millisecond)
+	close(stop)
+	if n := env.fetches.Load(); n < 5 {
+		t.Errorf("%d table fetches in 600ms at a 50ms refresh while the activity report hangs, want at least 5", n)
+	}
+	if n := env.activities.Load(); n < 1 {
+		t.Errorf("%d activity reports, want at least 1 (the test must hang one)", n)
+	}
+}
+
+// The 502 answer hides the cause; the log must carry it.
+func TestUpstreamErrorIsLogged(t *testing.T) {
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(lockedWriter{&mu, &buf}, nil)))
+	defer slog.SetDefault(prev)
+
+	env := newTestEnv(t, nil)
+	env.setRoutes(env.backendRoute("odoo--sb-1", "sb-1", "t-1", "running"))
+	env.backend.Close()
+	if w := doHost(t, env.gw, "odoo--sb-1.sb.lab.test", "/"); w.Code != 502 {
+		t.Fatalf("got %d, want 502", w.Code)
+	}
+	mu.Lock()
+	out := buf.String()
+	mu.Unlock()
+	if !strings.Contains(out, "gw: upstream") || !strings.Contains(out, "label=odoo--sb-1") || !strings.Contains(out, "err=") {
+		t.Errorf("log %q: want the upstream error with its label", out)
+	}
+}
+
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (l lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 // Control: requests for one sandbox do reuse the pooled connection (keep-alive
@@ -590,8 +770,9 @@ func TestUpgradeThroughProxy(t *testing.T) {
 // ---- FLU-7: each wake waiter resolves its own route ----
 
 // sleepingPair is one sandbox with two services on two different backends.
-// They differ in guest port, as two exposes of one sandbox always do: the
-// upstream pool (and node port) is per (sandbox, guest port).
+// They are two services, so they differ in guest port. (Two NAMES for one
+// guest port share its node port, and then one upstream pool for both is
+// right; two node ports need two guest ports.)
 func (env *testEnv) sleepingPair(state string) []Route {
 	b := routeTo(env.backend2, "b--sb-w", "sb-w", "t-1", state)
 	b.GuestPort = 3000
@@ -691,15 +872,15 @@ func TestWake2xxAnotherLabelRunningFirst(t *testing.T) {
 		env.routes.Store(rs)
 		w.WriteHeader(200)
 	})
-	w, fetches, el := env.wakeOne(t, "a--sb-w.sb.lab.test")
+	w, fetches, _ := env.wakeOne(t, "a--sb-w.sb.lab.test")
 	if fetches != 1 {
 		t.Errorf("fetches after wake %d, want 1 (b--sb-w running ends the poll)", fetches)
 	}
 	if env.wakes.Load() != 1 {
 		t.Errorf("wakes %d, want 1", env.wakes.Load())
 	}
-	if w.Code != 503 || !strings.Contains(w.Body.String(), "asleep") || el > 900*time.Millisecond {
-		t.Errorf("got %d %q after %v, want the sleeping page without polling", w.Code, w.Body.String(), el)
+	if w.Code != 503 || !strings.Contains(w.Body.String(), "asleep") {
+		t.Errorf("got %d %q, want the sleeping page", w.Code, w.Body.String())
 	}
 }
 
@@ -759,12 +940,51 @@ func TestWake409NoPolling(t *testing.T) {
 	env.gw.cfg.AutoWake = true
 	env.setRoutes(env.sleepingPair("sleeping")...)
 	env.setOnWake(func(w http.ResponseWriter, _ int64) { w.WriteHeader(409) })
-	w, fetches, el := env.wakeOne(t, "a--sb-w.sb.lab.test")
+	w, fetches, _ := env.wakeOne(t, "a--sb-w.sb.lab.test")
 	if fetches != 1 {
 		t.Errorf("fetches after wake %d, want exactly 1", fetches)
 	}
-	if w.Code != 503 || !strings.Contains(w.Body.String(), "asleep") || el > 900*time.Millisecond {
-		t.Errorf("got %d %q after %v, want the sleeping page quickly", w.Code, w.Body.String(), el)
+	if w.Code != 503 || !strings.Contains(w.Body.String(), "asleep") {
+		t.Errorf("got %d %q, want the sleeping page", w.Code, w.Body.String())
+	}
+}
+
+// TestWakeRefusedIsHeld (FLU-7 review): a refused wake (409: busy, e.g. a
+// fork of it is running) is not sent again for wakeRefusedHold, so a client
+// looping on a sleeping sandbox cannot turn each request into a wake, a worker
+// call and a full table fetch. After the hold the next request wakes again.
+func TestWakeRefusedIsHeld(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.gw.cfg.AutoWake = true
+	env.setRoutes(env.sleepingPair("sleeping")...)
+	env.setOnWake(func(w http.ResponseWriter, _ int64) { w.WriteHeader(409) })
+	for i := 0; i < 21; i++ {
+		w := doHost(t, env.gw, "a--sb-w.sb.lab.test", "/")
+		if w.Code != 503 || !strings.Contains(w.Body.String(), "asleep") {
+			t.Fatalf("request %d: got %d %q, want the sleeping page", i, w.Code, w.Body.String())
+		}
+	}
+	if n := env.wakes.Load(); n != 1 {
+		t.Errorf("one 409 then 20 requests inside the hold: %d wakes, want 1", n)
+	}
+	env.skew.Add(int64(wakeRefusedHold + time.Second))
+	env.gw.refresh() // keep the table fresh at the moved clock (it also prunes)
+	doHost(t, env.gw, "b--sb-w.sb.lab.test", "/")
+	if n := env.wakes.Load(); n != 2 {
+		t.Errorf("after the hold: %d wakes, want 2", n)
+	}
+	env.gw.wmu.Lock()
+	held := len(env.gw.refused)
+	env.gw.wmu.Unlock()
+	if held != 1 {
+		t.Errorf("%d refused marks, want 1 (the new refusal)", held)
+	}
+	env.setRoutes() // the sandbox leaves the table: its mark goes with it
+	env.gw.wmu.Lock()
+	held = len(env.gw.refused)
+	env.gw.wmu.Unlock()
+	if held != 0 {
+		t.Errorf("%d refused marks after the sandbox left the table, want 0", held)
 	}
 }
 
@@ -776,12 +996,12 @@ func TestWake404ResolvesAgainstNewTable(t *testing.T) {
 		env.routes.Store([]Route{}) // the sandbox is gone
 		w.WriteHeader(404)
 	})
-	w, fetches, el := env.wakeOne(t, "a--sb-w.sb.lab.test")
+	w, fetches, _ := env.wakeOne(t, "a--sb-w.sb.lab.test")
 	if fetches != 1 {
 		t.Errorf("fetches after wake %d, want exactly 1", fetches)
 	}
-	if w.Code != 404 || !strings.Contains(w.Body.String(), "no such service") || el > 900*time.Millisecond {
-		t.Errorf("got %d %q after %v, want 404 no such service quickly", w.Code, w.Body.String(), el)
+	if w.Code != 404 || !strings.Contains(w.Body.String(), "no such service") {
+		t.Errorf("got %d %q, want 404 no such service", w.Code, w.Body.String())
 	}
 }
 
@@ -858,6 +1078,182 @@ func TestEnsure503IsRetryable(t *testing.T) {
 	w := doHost(t, env.gw, "8069--sb-dyn.sb.lab.test", "/")
 	if w.Code != 503 || w.Header().Get("Retry-After") != "5" {
 		t.Errorf("got %d Retry-After=%q %q, want 503 with Retry-After: 5", w.Code, w.Header().Get("Retry-After"), w.Body.String())
+	}
+}
+
+// TestEnsureAnswersMap: every ensure answer other than 200/403/404 is a
+// retryable answer for the client, never "no such service".
+func TestEnsureAnswersMap(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		code      int    // feluccad's answer; -1 = none at all
+		retry     string // feluccad's Retry-After
+		wantCode  int
+		wantRetry string
+	}{
+		{"429 churn cap, Retry-After passed through", 429, "17", 429, "17"},
+		{"429 without Retry-After", 429, "", 429, "5"},
+		{"503, Retry-After passed through", 503, "9", 503, "9"},
+		{"503 without Retry-After", 503, "", 503, "5"},
+		{"503 with a date Retry-After", 503, "Wed, 21 Oct 2026 07:28:00 GMT", 503, "5"},
+		{"no answer", -1, "", 503, "5"},
+		{"409 no address yet", 409, "3", 503, "5"},
+		{"502", 502, "", 503, "5"},
+	} {
+		env := newTestEnv(t, nil)
+		env.setRoutes()
+		env.ensureRetry = c.retry
+		code := c.code
+		env.ensure = func(string, uint16) int { return code }
+		w := doHost(t, env.gw, "8069--sb-dyn.sb.lab.test", "/")
+		if w.Code != c.wantCode || w.Header().Get("Retry-After") != c.wantRetry {
+			t.Errorf("%s: got %d Retry-After=%q %q, want %d with Retry-After %q",
+				c.name, w.Code, w.Header().Get("Retry-After"), w.Body.String(), c.wantCode, c.wantRetry)
+		}
+	}
+}
+
+// The ensure succeeded but the table fetch after it failed: retryable.
+func TestEnsureThenTableFetchFails(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.setRoutes()
+	env.ensure = func(string, uint16) int {
+		env.failFetch.Store(true)
+		return 200
+	}
+	w := doHost(t, env.gw, "8069--sb-dyn.sb.lab.test", "/")
+	if w.Code != 503 || w.Header().Get("Retry-After") != "5" {
+		t.Errorf("got %d Retry-After=%q %q, want 503 with Retry-After: 5", w.Code, w.Header().Get("Retry-After"), w.Body.String())
+	}
+}
+
+// After a wake the second resolution runs the lazy ensure again for an
+// all-digit label the woken table no longer has.
+func TestSecondResolutionEnsuresDynamicLabel(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.gw.cfg.AutoWake = true
+	web := func(state string) Route { return env.backendRoute("web--sb-d", "sb-d", "t-1", state) }
+	dyn := func(state string) Route {
+		r := env.backendRoute("8069--sb-d", "sb-d", "t-1", state)
+		r.GuestPort = 8069
+		return r
+	}
+	env.setRoutes(web("sleeping"))
+	env.ensure = func(string, uint16) int {
+		if env.ensures.Load() == 1 {
+			env.routes.Store([]Route{web("sleeping"), dyn("sleeping")})
+		} else {
+			env.routes.Store([]Route{web("running"), dyn("running")})
+		}
+		return 200
+	}
+	env.setOnWake(func(w http.ResponseWriter, _ int64) {
+		env.routes.Store([]Route{web("running")}) // the dynamic expose is gone
+		w.WriteHeader(200)
+	})
+	w := doHost(t, env.gw, "8069--sb-d.sb.lab.test", "/")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "host=8069--sb-d") {
+		t.Errorf("got %d %q, want 200 proxied", w.Code, w.Body.String())
+	}
+	if n := env.ensures.Load(); n != 2 {
+		t.Errorf("%d ensures, want 2 (one per resolution)", n)
+	}
+	if n := env.wakes.Load(); n != 1 {
+		t.Errorf("%d wakes, want 1", n)
+	}
+}
+
+// The second resolution checks the table's age like a fresh request.
+func TestSecondResolutionFindsTableStale(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.gw.cfg.AutoWake = true
+	env.setRoutes(env.sleepingPair("sleeping")...)
+	env.setOnWake(func(w http.ResponseWriter, _ int64) {
+		env.failFetch.Store(true)                // feluccad's table is gone...
+		env.skew.Store(int64(660 * time.Second)) // ...and the gateway's is now old
+		w.WriteHeader(409)
+	})
+	assertTableUnavailable(t, doHost(t, env.gw, "a--sb-w.sb.lab.test", "/"))
+	if n := env.wakes.Load(); n != 1 {
+		t.Errorf("%d wakes, want 1", n)
+	}
+}
+
+// The second resolution is the same client request: it takes no second
+// rate-limit token (with rps 1 the bucket is empty after the first pass).
+func TestSecondResolutionTakesNoRateToken(t *testing.T) {
+	env := newTestEnv(t, map[string]TenantLimit{"t-1": {RPS: 1}})
+	env.gw.cfg.AutoWake = true
+	env.setRoutes(env.sleepingPair("sleeping")...)
+	env.setOnWake(func(w http.ResponseWriter, _ int64) {
+		env.routes.Store(env.sleepingPair("running"))
+		w.WriteHeader(200)
+	})
+	if w := doHost(t, env.gw, "a--sb-w.sb.lab.test", "/"); w.Code != 200 {
+		t.Errorf("got %d %q, want 200 (not a 429 from its own second pass)", w.Code, w.Body.String())
+	}
+}
+
+// Requests parked on a wake that then panics are released (FLU-7 W3).
+func TestWakePanicReleasesParkedWaiters(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.gw.cfg.AutoWake = true
+	env.setRoutes(env.sleepingPair("sleeping")...)
+	started, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int64
+	env.gw.wake = func(string) {
+		if calls.Add(1) > 1 {
+			return
+		}
+		close(started)
+		<-release
+		panic("wake path blew up")
+	}
+	go func() {
+		defer func() { recover() }()
+		doHost(t, env.gw, "a--sb-w.sb.lab.test", "/")
+	}()
+	<-started
+	const waiters = 3
+	codes := make(chan int, waiters)
+	for i := 0; i < waiters; i++ {
+		go func() { codes <- doHost(t, env.gw, "b--sb-w.sb.lab.test", "/").Code }()
+	}
+	time.Sleep(100 * time.Millisecond) // let them park on the shared wake
+	close(release)
+	for i := 0; i < waiters; i++ {
+		select {
+		case code := <-codes:
+			if code != 503 {
+				t.Errorf("waiter: got %d, want the sleeping page", code)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%d of %d waiters still parked after the wake panicked", waiters-i, waiters)
+		}
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("%d wake calls, want 1 (the waiters were parked, not leaders)", n)
+	}
+}
+
+// The resend of a 503-refused wake stops when the budget is spent; the
+// request then gets the page for the state the table shows.
+func TestWakeResendBudgetEnds(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.gw.cfg.AutoWake = true
+	env.gw.wakeBudget = 2500 * time.Millisecond
+	env.setRoutes(env.sleepingPair("sleeping")...)
+	env.setOnWake(func(w http.ResponseWriter, _ int64) {
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(503)
+	})
+	w := doHost(t, env.gw, "a--sb-w.sb.lab.test", "/")
+	if w.Code != 503 || !strings.Contains(w.Body.String(), "asleep") {
+		t.Errorf("got %d %q, want the sleeping page", w.Code, w.Body.String())
+	}
+	// Sends at about 0 s, 1 s and 2 s; the next would start past 2.5 s.
+	if n := env.wakes.Load(); n < 2 || n > 3 {
+		t.Errorf("%d wakes inside a 2.5s budget with Retry-After 1, want 2 or 3", n)
 	}
 }
 

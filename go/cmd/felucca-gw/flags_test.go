@@ -83,3 +83,27 @@ func TestMaxStaleFromEnvAndBounds(t *testing.T) {
 		}
 	}
 }
+
+// A bare integer is seconds, for the env variable and the flag alike; the help
+// text shows the default as 600s.
+func TestMaxStaleBareSeconds(t *testing.T) {
+	t.Setenv("FELUCCA_GW_MAX_STALE", "600")
+	if o, err := parseWith(t); err != nil || o.maxStale != 600*time.Second {
+		t.Errorf("env 600: max-stale=%v err=%v, want 600s", o.maxStale, err)
+	}
+	t.Setenv("FELUCCA_GW_MAX_STALE", "")
+	if o, err := parseWith(t, "-max-stale", "45"); err != nil || o.maxStale != 45*time.Second {
+		t.Errorf("flag 45: max-stale=%v err=%v, want 45s", o.maxStale, err)
+	}
+	if o, err := parseWith(t, "-max-stale", "2m"); err != nil || o.maxStale != 2*time.Minute {
+		t.Errorf("flag 2m: max-stale=%v err=%v, want 2m", o.maxStale, err)
+	}
+	fs := flag.NewFlagSet("felucca-gw", flag.ContinueOnError)
+	defineFlags(fs)
+	var buf bytes.Buffer
+	fs.SetOutput(&buf)
+	fs.PrintDefaults()
+	if !strings.Contains(buf.String(), "(default 600s)") {
+		t.Errorf("help text does not show the max-stale default as 600s:\n%s", buf.String())
+	}
+}

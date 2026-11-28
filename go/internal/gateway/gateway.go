@@ -10,6 +10,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -76,16 +77,19 @@ type Gateway struct {
 	// now is the clock that stamps and ages the table (a seam for tests).
 	now func() time.Time
 
+	// ages yields the table's monotonic and wall-clock ages (clockAges; a
+	// seam for tests, since a real time cannot carry a stopped monotonic
+	// clock with a moving wall clock).
+	ages func(now, at time.Time) (mono, wall time.Duration)
+
 	// wake runs one auto-wake of a sandbox (doWake; a seam for tests).
 	wake func(sandboxID string)
 
-	// Upstream connections are pooled per (sandbox, guest port), never per
-	// node:port (FLU-6 R9): the proxy targets a synthetic authority naming the
-	// sandbox and guest port, and the transport's dial resolves it to the
-	// node:port through this map.
+	// Upstream connections are pooled per (sandbox, guest port, node host,
+	// node port), never per node:port alone (FLU-6 R9): the proxy targets a
+	// synthetic authority that encodes all four (upstreamAuthority), and the
+	// transport's dial decodes the node address from it.
 	transport *http.Transport
-	umu       sync.Mutex
-	upstreams map[string]string // synthetic "host:80" -> "node:port"
 
 	lmu      sync.Mutex
 	limiters map[string]*bucket
@@ -99,6 +103,13 @@ type Gateway struct {
 	// one sleeping sandbox must produce ONE wake + poll, not one per request.
 	wmu    sync.Mutex
 	waking map[string]*wakeCall
+
+	// refused is when feluccad last refused a wake of a sandbox (404 or 409),
+	// under wmu; see wakeRefusedHold. Pruned with the table.
+	refused map[string]time.Time
+
+	// wakeBudget bounds resending a 503-refused wake (a seam for tests).
+	wakeBudget time.Duration
 }
 
 // wakeCall is a single shared auto-wake operation; concurrent requests for the
@@ -115,16 +126,24 @@ func New(cfg Config) *Gateway {
 	if cfg.MaxStale <= 0 {
 		cfg.MaxStale = ingress.GatewayMaxStaleCeiling
 	}
+	if cfg.MaxStale > ingress.GatewayMaxStaleCeiling {
+		// The port quarantine is sized for the ceiling; a caller that skipped
+		// ValidateTimings must not stretch it.
+		slog.Warn("gw: max-stale above the ceiling, clamped", "max_stale", cfg.MaxStale, "ceiling", ingress.GatewayMaxStaleCeiling)
+		cfg.MaxStale = ingress.GatewayMaxStaleCeiling
+	}
 	g := &Gateway{
 		cfg:        cfg,
 		client:     &http.Client{Timeout: 10 * time.Second},
 		wakeClient: &http.Client{Timeout: 30 * time.Second},
 		routes:     map[string]Route{},
 		now:        time.Now,
-		upstreams:  map[string]string{},
+		ages:       clockAges,
 		limiters:   map[string]*bucket{},
 		active:     map[string]struct{}{},
 		waking:     map[string]*wakeCall{},
+		refused:    map[string]time.Time{},
+		wakeBudget: wakeBudget,
 	}
 	g.wake = g.doWake
 	g.transport = g.newTransport()
@@ -152,15 +171,29 @@ func ValidateTimings(refresh, maxStale time.Duration) error {
 }
 
 // Run blocks, refreshing the route table (and flushing the ingress-activity
-// batch) until stop is closed.
+// batch) until stop is closed. The activity report runs on its own goroutine
+// and ticker: it can take up to the client timeout when feluccad is slow, and
+// the refresh cadence must not wait for it, or max-stale's lower bound
+// (2 x refresh + 20 s) would not hold.
 func (g *Gateway) Run(stop <-chan struct{}) {
+	go func() {
+		t := time.NewTicker(g.cfg.Refresh)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				g.reportActivity()
+			case <-stop:
+				return
+			}
+		}
+	}()
 	t := time.NewTicker(g.cfg.Refresh)
 	defer t.Stop()
 	g.refresh()
 	for {
 		select {
 		case <-t.C:
-			g.reportActivity()
 			g.refresh()
 		case <-stop:
 			return
@@ -234,6 +267,11 @@ func (g *Gateway) autoWakeAllowed(tenantID string) bool {
 // has one route per exposed port, so each caller (the first one too) looks its
 // OWN label up again afterwards (FLU-7 W1).
 func (g *Gateway) wakeAndWait(sandboxID string) {
+	// A wake feluccad just refused is not sent again for a while: the caller
+	// goes straight to its second resolution (and the page).
+	if g.wakeRefused(sandboxID) {
+		return
+	}
 	g.wmu.Lock()
 	if call, ok := g.waking[sandboxID]; ok {
 		g.wmu.Unlock()
@@ -257,49 +295,83 @@ func (g *Gateway) wakeAndWait(sandboxID string) {
 
 // Wake pacing (FLU-7 W2).
 const (
-	wakeBudget   = 15 * time.Second       // resending a refused wake stops here
+	wakeBudget   = 15 * time.Second       // resending a 503-refused wake stops here
 	wakeRetryCap = 2 * time.Second        // longest wait a Retry-After can ask for
 	wakeRetryMin = 250 * time.Millisecond // shortest: "Retry-After: 0" must not spin
 	wakePolls    = 15                     // table fetches after an accepted wake
+	// wakeRefusedHold: after a 404 or 409, requests for that sandbox skip the
+	// wake this long (the sleeping page says Retry-After: 5). Without it every
+	// request would cost feluccad a wake, a worker call and a full table fetch,
+	// in milliseconds, for anyone who can send requests.
+	wakeRefusedHold = 5 * time.Second
 )
 
 // doWake asks feluccad to wake the sandbox and reads the answer:
 //   - 2xx: poll the table until any route of the sandbox shows running;
-//   - 503 with Retry-After: send the wake again after that delay while the
-//     budget lasts (feluccad is busy, e.g. the sandbox is mid-transition);
-//   - 404, 409: nothing to wait for; fetch the table once so the waiters see
-//     the state feluccad now has;
+//   - 503 with Retry-After: feluccad's store is failing (the wake was refused,
+//     or applied on the worker but not saved); look at the table, and send
+//     the wake again after that delay while the budget lasts;
+//   - 404 (no such sandbox) or 409 (busy: another lifecycle operation, e.g. a
+//     fork of it, is running): nothing to wait for; fetch the table once so the
+//     waiters see the state feluccad now has, and hold off further wakes;
 //   - anything else (transport error, 502, other 5xx): poll as before, since a
 //     concurrent caller may have won the race and woken it.
+//
+// A failed table fetch is logged at Warn once per wake and at Debug after
+// that: an outage would otherwise log 15 lines per wake.
 func (g *Gateway) doWake(sandboxID string) {
+	warned := false
+	fetch := func() ([]Route, bool) {
+		routes, err := g.fetchTable()
+		if err != nil {
+			lvl := slog.LevelDebug
+			if !warned {
+				lvl, warned = slog.LevelWarn, true
+			}
+			slog.Log(context.Background(), lvl, "gw: route fetch during wake", "sandbox", sandboxID, "err", err)
+			return nil, false
+		}
+		return routes, true
+	}
 	start := time.Now()
 	for {
 		status, retry := g.sendWake(sandboxID)
 		switch {
 		case status >= 200 && status < 300:
-			g.pollRunning(sandboxID)
+			g.pollRunning(sandboxID, fetch)
 			return
 		case status == 503 && retry >= 0:
-			// feluccad also answers 503 when the wake WAS applied on the
-			// worker but could not be saved ("applied but not saved"); its
-			// table then already shows the sandbox running. Look before
-			// waiting and resending.
-			if routes, ok := g.fetchTable(); ok && sandboxRunning(routes, sandboxID) {
+			// When the wake WAS applied but not saved ("applied but not
+			// saved"), the table already shows the sandbox running. Look
+			// before waiting and resending.
+			if routes, ok := fetch(); ok && sandboxRunning(routes, sandboxID) {
 				return
 			}
 			d := min(max(retry, wakeRetryMin), wakeRetryCap)
-			if time.Since(start)+d >= wakeBudget {
+			if time.Since(start)+d >= g.wakeBudget {
 				return // the table was fetched just above
 			}
 			time.Sleep(d)
 		case status == 404 || status == 409:
-			g.fetchTable()
+			fetch()
+			g.wmu.Lock()
+			g.refused[sandboxID] = g.now()
+			g.wmu.Unlock()
 			return
 		default:
-			g.pollRunning(sandboxID)
+			g.pollRunning(sandboxID, fetch)
 			return
 		}
 	}
+}
+
+// wakeRefused reports whether feluccad refused a wake of the sandbox (404 or
+// 409) less than wakeRefusedHold ago.
+func (g *Gateway) wakeRefused(sandboxID string) bool {
+	g.wmu.Lock()
+	at, ok := g.refused[sandboxID]
+	g.wmu.Unlock()
+	return ok && g.now().Sub(at) < wakeRefusedHold
 }
 
 // sendWake posts one wake. It returns the status (0 on a transport error) and
@@ -327,12 +399,12 @@ func (g *Gateway) sendWake(sandboxID string) (int, time.Duration) {
 // pollRunning fetches the table (at most wakePolls times, 1 s apart) until any
 // route of the sandbox shows running with a node: the sandbox is up, and every
 // waiter's own label is in that same table.
-func (g *Gateway) pollRunning(sandboxID string) {
+func (g *Gateway) pollRunning(sandboxID string, fetch func() ([]Route, bool)) {
 	for i := 0; i < wakePolls; i++ {
 		if i > 0 {
 			time.Sleep(time.Second)
 		}
-		if routes, ok := g.fetchTable(); ok && sandboxRunning(routes, sandboxID) {
+		if routes, ok := fetch(); ok && sandboxRunning(routes, sandboxID) {
 			return
 		}
 	}
@@ -353,34 +425,36 @@ func sandboxRunning(routes []Route, sandboxID string) bool {
 // feluccad blip must not take down working routes) until it is older than
 // MaxStale, when requests fail closed (ServeHTTP).
 func (g *Gateway) refresh() {
-	g.fetchTable()
+	if _, err := g.fetchTable(); err != nil {
+		slog.Warn("gw: route refresh", "err", err)
+	}
 }
 
 // fetchTable fetches the route table and installs it. It returns the fetched
-// routes (even when a newer table was already in place) and whether the fetch
-// succeeded.
-func (g *Gateway) fetchTable() ([]Route, bool) {
+// routes (even when a newer table was already in place); the caller logs a
+// failure at the level its loop can afford.
+func (g *Gateway) fetchTable() ([]Route, error) {
 	started := g.now()
 	routes, err := g.fetchRoutes()
 	if err != nil {
-		slog.Warn("gw: route refresh", "err", err)
-		return nil, false
+		return nil, err
 	}
 	g.installTable(routes, started)
-	return routes, true
+	return routes, nil
 }
 
 // installTable is the one place the table is swapped. started is when its
 // fetch STARTED: a fetch that started earlier than the current table's never
 // replaces it, however late it finishes (the background loop, a wake poll and
 // a dynamic ensure fetch concurrently, and a slow answer is an old answer).
-// Upstream addresses of routes that left the table are dropped with it.
+// Refused-wake marks of sandboxes that left the table, or have expired, are
+// dropped with it.
 func (g *Gateway) installTable(routes []Route, started time.Time) bool {
 	m := make(map[string]Route, len(routes))
-	keep := make(map[string]struct{}, len(routes))
+	sandboxes := make(map[string]struct{}, len(routes))
 	for _, r := range routes {
 		m[r.Hostname] = r
-		keep[upstreamAuthority(r)] = struct{}{}
+		sandboxes[r.SandboxID] = struct{}{}
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -390,13 +464,13 @@ func (g *Gateway) installTable(routes []Route, started time.Time) bool {
 	g.routes = m
 	g.tableAt = started
 	// Under g.mu so that two installs prune in the order they installed.
-	g.umu.Lock()
-	for a := range g.upstreams {
-		if _, ok := keep[a]; !ok {
-			delete(g.upstreams, a)
+	g.wmu.Lock()
+	for id, at := range g.refused {
+		if _, ok := sandboxes[id]; !ok || started.Sub(at) >= wakeRefusedHold {
+			delete(g.refused, id)
 		}
 	}
-	g.umu.Unlock()
+	g.wmu.Unlock()
 	return true
 }
 
@@ -417,8 +491,13 @@ func (g *Gateway) tableFresh() bool {
 	if at.IsZero() {
 		return false
 	}
-	now := g.now()
-	return tableAge(now.Sub(at), now.Round(0).Sub(at.Round(0))) <= g.cfg.MaxStale
+	return tableAge(g.ages(g.now(), at)) <= g.cfg.MaxStale
+}
+
+// clockAges is the monotonic and the wall-clock difference between two
+// times (Round(0) strips the monotonic reading).
+func clockAges(now, at time.Time) (mono, wall time.Duration) {
+	return now.Sub(at), now.Round(0).Sub(at.Round(0))
 }
 
 // tableAge is the age tableFresh judges by: the larger of the monotonic and
@@ -451,41 +530,51 @@ func (g *Gateway) fetchRoutes() ([]Route, error) {
 }
 
 // ensureDynamic asks feluccad to lazily expose a port (the port-in-hostname
-// path); feluccad enforces the per-sandbox opt-in.
-func (g *Gateway) ensureDynamic(sandboxID string, port uint16) (Route, int, error) {
+// path); feluccad enforces the per-sandbox opt-in. It returns feluccad's
+// status (0 when there was no usable answer) and its Retry-After header.
+func (g *Gateway) ensureDynamic(sandboxID string, port uint16) (Route, int, string, error) {
 	payload, _ := json.Marshal(struct {
 		SandboxID string `json:"sandbox_id"`
 		Port      uint16 `json:"port"`
 	}{sandboxID, port})
 	req, err := http.NewRequest(http.MethodPost, g.cfg.FeluccadURL+"/api/v1/routes/ensure", strings.NewReader(string(payload)))
 	if err != nil {
-		return Route{}, 0, err
+		return Route{}, 0, "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+g.cfg.Token)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := g.client.Do(req)
 	if err != nil {
-		return Route{}, 0, err
+		return Route{}, 0, "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return Route{}, resp.StatusCode, fmt.Errorf("ensure status %d", resp.StatusCode)
+		return Route{}, resp.StatusCode, resp.Header.Get("Retry-After"), fmt.Errorf("ensure status %d", resp.StatusCode)
 	}
 	// The ensure response is an expose view; refetch the table for the full
 	// route row (node host etc.) — one extra round-trip on first hit only.
 	// The row is taken from this fetch even when a newer table won the
 	// install: this fetch started after the ensure, so it has the row.
-	routes, ok := g.fetchTable()
-	if !ok {
-		return Route{}, 0, fmt.Errorf("route table fetch after ensure failed")
+	routes, err := g.fetchTable()
+	if err != nil {
+		return Route{}, 0, "", fmt.Errorf("route table fetch after ensure: %w", err)
 	}
 	label := fmt.Sprintf("%d--%s", port, sandboxID)
 	for _, r := range routes {
 		if r.Hostname == label {
-			return r, 200, nil
+			return r, 200, "", nil
 		}
 	}
-	return Route{}, 0, fmt.Errorf("ensured route %s missing from table", label)
+	return Route{}, 0, "", fmt.Errorf("ensured route %s missing from table", label)
+}
+
+// retryAfterOr passes a Retry-After of whole seconds through and falls back
+// to def for anything else (absent, a date, garbage).
+func retryAfterOr(v, def string) string {
+	if s, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && s >= 0 {
+		return strconv.Itoa(s)
+	}
+	return def
 }
 
 // splitLabel extracts the routing label from a Host header: it must be a
@@ -544,7 +633,7 @@ func (g *Gateway) resolve(w http.ResponseWriter, label, name, sandboxID string, 
 		// amplification loop against feluccad).
 		port, err := strconv.ParseUint(name, 10, 16)
 		if err == nil && port > 0 && strconv.FormatUint(port, 10) == name {
-			rt, status, err := g.ensureDynamic(sandboxID, uint16(port))
+			rt, status, retry, err := g.ensureDynamic(sandboxID, uint16(port))
 			switch {
 			case err == nil:
 				route, found = rt, true
@@ -553,14 +642,26 @@ func (g *Gateway) resolve(w http.ResponseWriter, label, name, sandboxID string, 
 				return Route{}, false
 			case status == 404:
 				// fall through to the shared 404 below
-			case status == 503:
-				// feluccad could not expose it right now (e.g. no free node
-				// port on the worker): retryable, not "no such service".
-				w.Header().Set("Retry-After", "5")
-				httpError(w, 503, "dynamic port temporarily unavailable")
+			case status == 429:
+				// The tenant's expose churn cap: feluccad says when to retry.
+				w.Header().Set("Retry-After", retryAfterOr(retry, "5"))
+				httpError(w, 429, "too many new dynamic ports for this tenant")
 				return Route{}, false
 			default:
-				slog.Warn("gw: ensure failed", "label", label, "err", err)
+				// feluccad could not expose it right now: a 503 (e.g. no free
+				// node port, or its store failing), no answer, a 409 (no
+				// address yet), a 502, or a table fetch after the ensure that
+				// failed. All retryable, none "no such service".
+				if status != 503 {
+					slog.Warn("gw: ensure failed", "label", label, "status", status, "err", err)
+				}
+				ra := "5"
+				if status == 503 {
+					ra = retryAfterOr(retry, "5")
+				}
+				w.Header().Set("Retry-After", ra)
+				httpError(w, 503, "dynamic port temporarily unavailable")
+				return Route{}, false
 			}
 		}
 	}
@@ -655,13 +756,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// reported on the refresh tick.
 	g.markActive(route.SandboxID)
 
-	// The URL names the sandbox and guest port, not the node port; the
-	// transport dials the node port it maps to (see newTransport).
-	authority := upstreamAuthority(route)
-	g.umu.Lock()
-	g.upstreams[authority] = net.JoinHostPort(route.NodeHost, strconv.Itoa(int(route.NodePort)))
-	g.umu.Unlock()
-	target := &url.URL{Scheme: "http", Host: authority}
+	// The URL names the sandbox and guest port as well as the node address;
+	// the transport dials the node address it encodes (see newTransport).
+	target := &url.URL{Scheme: "http", Host: upstreamAuthority(route)}
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
@@ -675,6 +772,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// without this, requests hang ~30s before the 502.
 		Transport: g.transport,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			// The client only gets "unreachable"; the cause (a refused or
+			// timed-out dial, an undecodable upstream) goes to the log.
+			slog.Warn("gw: upstream", "label", label, "err", err)
 			httpError(w, 502, "backend unreachable")
 		},
 		FlushInterval: 100 * time.Millisecond, // streaming/longpolling friendly
@@ -682,32 +782,67 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
+// upstreamSuffix ends every synthetic upstream authority. ".invalid" can never
+// resolve, should a name escape the dial hook.
+const upstreamSuffix = ".sandbox.invalid:80"
+
 // upstreamAuthority is the synthetic "host:port" the proxy targets for a
-// route: one per (sandbox, guest port). The transport pools connections by
-// this, so a pooled connection is only ever reused for the sandbox it was
-// opened for — after a node port moves to another sandbox, a connection the
-// worker still pins to the OLD sandbox must not carry the new one's request
-// (FLU-6 R9). The sandbox id is hex-encoded: it becomes a host name, and the
-// ".invalid" name can never resolve should it escape the dial hook.
+// route: one per (sandbox, guest port, node host, node port). The transport
+// pools connections by it, so a pooled connection is only ever reused for the
+// sandbox it was opened for — after a node port moves to another sandbox, a
+// connection the worker still pins to the OLD sandbox must not carry the new
+// one's request (FLU-6 R9) — and only for the node address it was opened to:
+// when a sandbox's node address changes, its old idle connections are never
+// picked again.
+//
+// Encoding: "<hex sandbox id>-<guest port>-<hex node host>-<node port>" +
+// upstreamSuffix. Hex keeps any byte of an id or a host (IPv6 colons and
+// brackets, dots, upper case) inside one DNS-safe label, and lowercase hex
+// survives anything that lowercases a host name.
 func upstreamAuthority(r Route) string {
-	return fmt.Sprintf("%x-%d.sandbox.invalid:80", r.SandboxID, r.GuestPort)
+	return fmt.Sprintf("%x-%d-%x-%d%s", r.SandboxID, r.GuestPort, r.NodeHost, r.NodePort, upstreamSuffix)
+}
+
+// upstreamDialAddr decodes the node address an upstream authority names.
+func upstreamDialAddr(authority string) (string, error) {
+	name, ok := strings.CutSuffix(authority, upstreamSuffix)
+	parts := strings.Split(name, "-")
+	if !ok || len(parts) != 4 {
+		return "", fmt.Errorf("not a gateway upstream: %s", authority)
+	}
+	host, err := hex.DecodeString(parts[2])
+	if err != nil {
+		return "", fmt.Errorf("upstream %s: node host: %w", authority, err)
+	}
+	port, err := strconv.ParseUint(parts[3], 10, 16)
+	if err != nil {
+		return "", fmt.Errorf("upstream %s: node port: %w", authority, err)
+	}
+	return nodeAddr(string(host), uint16(port)), nil
+}
+
+// nodeAddr joins a node host and port for dialing. feluccad names an IPv6
+// worker "[addr]" already; net.JoinHostPort on that would bracket it twice.
+func nodeAddr(host string, port uint16) string {
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	return net.JoinHostPort(host, strconv.Itoa(int(port)))
 }
 
 // newTransport is http.DefaultTransport with a tight connect timeout
 // (backends are LAN/overlay hops away; 3s of no SYN-ACK means a dead route,
-// not a slow one), and a dial that resolves the synthetic upstream authority
-// to its node port. Response/read timeouts stay unbounded for longpolling.
+// not a slow one), and a dial that decodes the synthetic upstream authority
+// to its node address. Response/read timeouts stay unbounded for longpolling.
 // The idle timeout is part of the port quarantine's arithmetic (package
 // ingress).
 func (g *Gateway) newTransport() *http.Transport {
 	dialer := &net.Dialer{Timeout: 3 * time.Second}
 	return &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			g.umu.Lock()
-			node, ok := g.upstreams[addr]
-			g.umu.Unlock()
-			if !ok {
-				return nil, fmt.Errorf("no node port known for upstream %s", addr)
+			node, err := upstreamDialAddr(addr)
+			if err != nil {
+				return nil, err
 			}
 			return dialer.DialContext(ctx, network, node)
 		},

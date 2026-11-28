@@ -16,6 +16,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/alpham/infra-saas/felucca/internal/gateway"
@@ -83,10 +85,37 @@ func defineFlags(fs *flag.FlagSet) *options {
 	fs.StringVar(&o.token, "token", "", "feluccad admin token (routes are admin-only); default: $FELUCCA_TOKEN")
 	fs.StringVar(&o.domain, "domain", envOr("FELUCCA_GW_DOMAIN", ""), "wildcard ingress zone, e.g. sb.example.com")
 	fs.UintVar(&o.refresh, "refresh", 5, "route table refresh interval (seconds, 1 to 60)")
-	fs.DurationVar(&o.maxStale, "max-stale", ingress.GatewayMaxStaleCeiling, "oldest route table to serve from; older answers 503 (2 x refresh + 20s to 600s; env FELUCCA_GW_MAX_STALE)")
+	o.maxStale = ingress.GatewayMaxStaleCeiling
+	fs.Var((*seconds)(&o.maxStale), "max-stale", "oldest route table to serve from; older answers 503: seconds (600) or a duration (10m), 2 x refresh + 20s to 600s; env FELUCCA_GW_MAX_STALE")
 	fs.StringVar(&o.limitsPath, "tenant-limits", envOr("FELUCCA_GW_TENANT_LIMITS", ""), "optional JSON file: {\"<tenant-id>\":{\"enabled\":true,\"rps\":10,\"auto_wake\":true}}")
 	fs.BoolVar(&o.autoWake, "auto-wake", envOr("FELUCCA_GW_AUTO_WAKE", "1") != "0", "wake sleeping sandboxes on request instead of serving the 503 page")
 	return o
+}
+
+// seconds is a duration flag that also takes a bare integer as seconds
+// ("600"), the way unit files and env files tend to write it, and prints its
+// value in seconds ("600s") in --help.
+type seconds time.Duration
+
+func (s *seconds) Set(v string) error {
+	if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+		*s = seconds(time.Duration(n) * time.Second)
+		return nil
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(v))
+	if err != nil {
+		return fmt.Errorf("%q is neither whole seconds nor a duration", v)
+	}
+	*s = seconds(d)
+	return nil
+}
+
+func (s *seconds) String() string {
+	d := time.Duration(*s)
+	if d%time.Second == 0 {
+		return strconv.FormatInt(int64(d/time.Second), 10) + "s"
+	}
+	return d.String()
 }
 
 // resolveEnv fills, after parsing, the flags that were not given on the
@@ -99,11 +128,9 @@ func (o *options) resolveEnv(fs *flag.FlagSet) error {
 		o.token = os.Getenv("FELUCCA_TOKEN")
 	}
 	if v := os.Getenv("FELUCCA_GW_MAX_STALE"); v != "" && !given["max-stale"] {
-		d, err := time.ParseDuration(v)
-		if err != nil {
+		if err := (*seconds)(&o.maxStale).Set(v); err != nil {
 			return fmt.Errorf("FELUCCA_GW_MAX_STALE: %v", err)
 		}
-		o.maxStale = d
 	}
 	return gateway.ValidateTimings(time.Duration(o.refresh)*time.Second, o.maxStale)
 }
