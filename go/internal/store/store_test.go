@@ -76,7 +76,7 @@ func TestSnapshotRoundTrip(t *testing.T) {
 		CreatedAt: 456, ParentID: strp("sb-1"),
 	})
 
-	if err := db.SaveSnapshot(st); err != nil {
+	if err := db.SaveSnapshot(st.Snapshot(), nil); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	empty, _ = db.Empty()
@@ -131,7 +131,7 @@ func TestSnapshotRoundTrip(t *testing.T) {
 
 	// Second snapshot replaces, never accumulates.
 	st.Sandboxes = st.Sandboxes[:1]
-	if err := db.SaveSnapshot(st); err != nil {
+	if err := db.SaveSnapshot(st.Snapshot(), nil); err != nil {
 		t.Fatalf("save2: %v", err)
 	}
 	got2 := state.New()
@@ -177,7 +177,7 @@ func TestLoadIntoShortScanIsAnError(t *testing.T) {
 			for _, name := range []string{"ok-1", "ok-2", "poison", "ok-3"} {
 				tc.fill(st, name)
 			}
-			if err := db.SaveSnapshot(st); err != nil {
+			if err := db.SaveSnapshot(st.Snapshot(), nil); err != nil {
 				t.Fatalf("save: %v", err)
 			}
 			poisonScan(t, path, tc.table, tc.nameCol)
@@ -519,7 +519,7 @@ func TestMigrationFromJSON(t *testing.T) {
 	if err := imported.Load(jsonPath); err != nil {
 		t.Fatalf("legacy load: %v", err)
 	}
-	if err := db.SaveSnapshot(imported); err != nil {
+	if err := db.SaveSnapshot(imported.Snapshot(), nil); err != nil {
 		t.Fatalf("import save: %v", err)
 	}
 

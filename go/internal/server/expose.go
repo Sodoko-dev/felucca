@@ -250,8 +250,14 @@ func (srv *Server) exposeCommon(w http.ResponseWriter, r *http.Request, id, tena
 	}
 	v := srv.exposeView(sb.ID, model.Expose{Name: name, GuestPort: guestPort, NodePort: nodePort})
 	srv.st.Unlock()
-	if err := srv.persist(); err != nil {
-		slog.Error("persist failed", "err", err)
+	// Called with exposeMu held: the lock order is exposeMu -> saveMu -> st.
+	// A failed save keeps the row in memory (the rule exists on the worker)
+	// and is not undone there: another saved name on the same guest port may
+	// depend on that rule.
+	if err := srv.save(nil); err != nil {
+		slog.Error("expose: applied on the worker but not saved", "sandbox", id, "expose", name, "request_id", reqID(r.Context()), "err", err)
+		appliedNotSaved(w)
+		return
 	}
 	b, _ := json.Marshal(v)
 	if dynamic {
@@ -394,8 +400,10 @@ func (srv *Server) unexposeSandbox(w http.ResponseWriter, r *http.Request, id, n
 		}
 	}
 	srv.st.Unlock()
-	if err := srv.persist(); err != nil {
-		slog.Error("persist failed", "err", err)
+	if err := srv.save(nil); err != nil {
+		slog.Error("unexpose: applied on the worker but not saved", "sandbox", id, "expose", name, "request_id", reqID(r.Context()), "err", err)
+		appliedNotSaved(w)
+		return
 	}
 	w.WriteHeader(204)
 }

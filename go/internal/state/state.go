@@ -376,6 +376,13 @@ func (s *State) SetSandboxIP(id, ip string) {
 func (s *State) RemoveSandbox(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.RemoveSandboxLocked(id)
+}
+
+// RemoveSandboxLocked is RemoveSandbox for a caller that holds the lock — one
+// that has to remove the record in the same critical section as something
+// else (the usage event describing the removal).
+func (s *State) RemoveSandboxLocked(id string) {
 	for i, sb := range s.Sandboxes {
 		if sb.ID == id {
 			s.Sandboxes = append(s.Sandboxes[:i], s.Sandboxes[i+1:]...)
@@ -408,6 +415,63 @@ func (s *State) RecordExec() {
 }
 
 // ---- Persistence ----
+
+// Snapshot is a point-in-time copy of everything the store persists from the
+// working set. It shares no memory with the State it was taken from, so it can
+// be written to the database after the lock is released while handlers keep
+// changing the live records.
+//
+// The copy has to be DEEP. Records are changed in place under the lock (state
+// and activity clocks, a heartbeat's stats), and slices are compacted in place
+// (expose removal does `kept := sb.Exposes[:0]`, node reclamation does the same
+// to Nodes), so a copy of the pointers, or of a slice header, would be read by
+// the database writer while a handler rewrites the same memory.
+type Snapshot struct {
+	Nodes        []model.Node
+	Sandboxes    []model.Sandbox
+	Seq          uint64
+	RequestCount uint64
+}
+
+// SnapshotLocked deep-copies the persisted part of the working set.
+// Caller must hold the lock.
+func (s *State) SnapshotLocked() *Snapshot {
+	snap := &Snapshot{
+		Nodes:        make([]model.Node, len(s.Nodes)),
+		Sandboxes:    make([]model.Sandbox, len(s.Sandboxes)),
+		Seq:          s.Seq,
+		RequestCount: s.RequestCount,
+	}
+	for i, n := range s.Nodes {
+		snap.Nodes[i] = *n
+	}
+	for i, sb := range s.Sandboxes {
+		c := *sb
+		c.NodeID = copyStr(sb.NodeID)
+		c.IP = copyStr(sb.IP)
+		c.ParentID = copyStr(sb.ParentID)
+		if sb.Exposes != nil {
+			c.Exposes = append([]model.Expose(nil), sb.Exposes...)
+		}
+		snap.Sandboxes[i] = c
+	}
+	return snap
+}
+
+// Snapshot is SnapshotLocked for a caller that does not hold the lock.
+func (s *State) Snapshot() *Snapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.SnapshotLocked()
+}
+
+func copyStr(p *string) *string {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
 
 // persistState is the on-disk JSON format, mirroring Zig's output exactly.
 type persistState struct {

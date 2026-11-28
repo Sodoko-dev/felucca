@@ -97,18 +97,16 @@ func (srv *Server) createTenant(w http.ResponseWriter, r *http.Request) {
 		DefaultAsleepDeleteS: req.DefaultAsleepDeleteS,
 		CreatedAt:            now,
 	}
-	if err := srv.db.CreateTenant(t); err != nil {
+	// The tenant and its first key in ONE transaction: separately, a failed key
+	// insert left a tenant whose name is taken and for which nobody holds a key.
+	key, secret := mintKey(t.ID, now, 0)
+	if err := srv.db.CreateTenantWithKey(t, key); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			writeJSON(w, 409, []byte(`{"error":"tenant name exists"}`))
 			return
 		}
 		slog.Error("create tenant", "err", err)
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
-		return
-	}
-	key, secret := mintKey(t.ID, now, 0)
-	if err := srv.db.CreateKey(key); err != nil {
-		slog.Error("create key", "err", err)
+		srv.storeWriteFailed(err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
@@ -169,6 +167,7 @@ func (srv *Server) createTenantKey(w http.ResponseWriter, r *http.Request, tenan
 	key, secret := mintKey(t.ID, now, expiresAt)
 	if err := srv.db.CreateKey(key); err != nil {
 		slog.Error("create key", "tenant", tenantID, "err", err)
+		srv.storeWriteFailed(err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
@@ -225,6 +224,7 @@ func (srv *Server) revokeTenantKey(w http.ResponseWriter, keyID string) {
 	ok, err := srv.db.RevokeKey(keyID, time.Now().Unix())
 	if err != nil {
 		slog.Error("revoke key", "key", keyID, "err", err)
+		srv.storeWriteFailed(err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
@@ -238,15 +238,17 @@ func (srv *Server) revokeTenantKey(w http.ResponseWriter, keyID string) {
 // quotaRow fetches the tenant row a quota decision is made against. It is
 // deliberately lock-free and called BEFORE the state lock: the limits are not
 // the racing value — the live usage summation is, and that has to happen in
-// the same critical section as the insert it guards. nil means "nothing to
-// enforce" (store trouble, or a row that no longer exists).
-func (srv *Server) quotaRow(tenantID string) *store.Tenant {
+// the same critical section as the insert it guards. A nil row means "nothing
+// to enforce" (a row that no longer exists). A read ERROR is returned, not
+// folded into nil: "the store could not say" is not "no limit", and treating
+// it as one let every create during a store outage run unmetered.
+func (srv *Server) quotaRow(tenantID string) (*store.Tenant, error) {
 	t, err := srv.db.GetTenant(tenantID)
 	if err != nil {
 		slog.Error("quota lookup", "tenant", tenantID, "err", err)
-		return nil // store trouble must not block the data plane
+		return nil, err
 	}
-	return t
+	return t, nil
 }
 
 // quotaExceededLocked checks whether adding one sandbox of the given shape

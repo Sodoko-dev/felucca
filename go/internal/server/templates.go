@@ -310,6 +310,7 @@ func (srv *Server) createTemplate(w http.ResponseWriter, r *http.Request, tenant
 		// A captured image file without a row is harmless (re-capture
 		// refuses; delete cleans) but don't leave it silently.
 		slog.Error("create template", "template", t.Name, "err", err)
+		srv.storeWriteFailed(err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
@@ -369,6 +370,8 @@ func (srv *Server) deleteTemplate(w http.ResponseWriter, name, tenant string) {
 		return
 	}
 	if _, err := srv.db.DeleteTemplate(name); err != nil {
+		slog.Error("delete template", "template", name, "err", err)
+		srv.storeWriteFailed(err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}

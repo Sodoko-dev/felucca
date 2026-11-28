@@ -91,6 +91,7 @@ func (srv *Server) createJoinToken(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := srv.db.CreateJoinToken(jt); err != nil {
 		slog.Error("create join token", "err", err)
+		srv.storeWriteFailed(err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
@@ -126,6 +127,13 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tokenHash := hashSecret(auth[len(prefix):])
+
+	// An enrollment is a durable change (a wg peer row, a credential, a spent
+	// token): refused while the store is failing, before the token is even
+	// looked up, so an outage can never burn one.
+	if srv.refusedWhileStoreFailing(w) {
+		return
+	}
 
 	if srv.cfg.WgIP == "" {
 		writeJSON(w, 503, []byte(`{"error":"wireguard overlay not configured"}`))
@@ -251,6 +259,7 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: now,
 	}); err != nil {
 		slog.Error("persist wg peer", "err", err)
+		srv.storeWriteFailed(err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
@@ -272,18 +281,19 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 	// The address is keyed with the agent's own port: validNodeAddr accepts a
 	// new node address on no other, so this is the endpoint this worker will
 	// register and the one feluccad will dial.
+	//
+	// The credential is stored and the token burned in ONE transaction. As two
+	// writes, a failed consume left the node's credential rotated by a token
+	// that was still redeemable. A consume race is excluded by joinMu; a false
+	// result here means the token was somehow redeemed elsewhere, which must
+	// fail the request — and then no credential was written either, so the
+	// worker can retry.
 	agentToken := newNodeToken()
-	if err := srv.putNodeCred(overlayIP, agentPort, agentToken, now); err != nil {
-		// Before the token is burned, so the worker can retry.
-		slog.Error("persist node credential", "overlay_ip", overlayIP, "err", err)
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
-		return
-	}
-	// Enrollment fully succeeded — burn the token now. A consume race is
-	// excluded by joinMu; a false result here means the token was somehow
-	// redeemed elsewhere, which must fail the request.
-	if ok, err := srv.db.ConsumeJoinToken(tokenHash, now); err != nil || !ok {
-		slog.Error("consume join token", "ok", ok, "err", err)
+	if ok, err := srv.enrollNodeCred(overlayIP, agentPort, agentToken, tokenHash, now); err != nil || !ok {
+		slog.Error("enroll node credential", "overlay_ip", overlayIP, "consumed", ok, "err", err)
+		if err != nil {
+			srv.storeWriteFailed(err)
+		}
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}

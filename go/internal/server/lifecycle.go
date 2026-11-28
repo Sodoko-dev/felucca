@@ -34,8 +34,9 @@ func validPolicy(v, min int64) bool {
 }
 
 // effectivePolicy resolves override → tenant default → disabled, returning
-// seconds (0 = no policy). The tenant may be nil (admin-context sandboxes,
-// store blips — fail open to "no policy", never to surprise deletion).
+// seconds (0 = no policy). The tenant may be nil (admin-context sandboxes, a
+// tenant row that no longer exists — "no policy", never surprise deletion). A
+// row that could not be READ does not get here: the sweep skips its sandboxes.
 func effectivePolicy(override int64, t *store.Tenant, ttl bool) int64 {
 	if override == model.PolicyDisabled {
 		return 0
@@ -81,6 +82,12 @@ func (srv *Server) LifecycleLoop(stop <-chan struct{}) {
 // lifecycleSweep applies the policies once: decisions are taken in one pass
 // under the state lock, the (slow) agent calls happen after it is released.
 func (srv *Server) lifecycleSweep(now int64) {
+	// Nothing while the store is failing: every action ends in a save that
+	// would fail, and the gate refuses the same changes to every caller.
+	if srv.storeFailing() {
+		return
+	}
+
 	type action struct {
 		id string
 		// tenant is the owner at decision time. It is not used to decide
@@ -91,29 +98,44 @@ func (srv *Server) lifecycleSweep(now int64) {
 	}
 	var acts []action
 
-	// One GetTenant per distinct tenant per sweep, memoized. The indexed
-	// point read under the state lock matches the existing recordUsage
-	// discipline (AppendUsage also writes while holding it).
+	// The tenants' policies are read BEFORE the decision pass and off the
+	// state lock: one GetTenant per distinct tenant per sweep. A store read
+	// under the global lock made every request wait on the database.
+	var tenantIDs []string
+	func() {
+		srv.st.Lock()
+		defer srv.st.Unlock()
+		seen := map[string]bool{}
+		for _, sb := range srv.st.Sandboxes {
+			if sb.TenantID != "" && !seen[sb.TenantID] &&
+				(sb.State == model.StateRunning || sb.State == model.StateSleeping) {
+				seen[sb.TenantID] = true
+				tenantIDs = append(tenantIDs, sb.TenantID)
+			}
+		}
+	}()
+	// A tenant whose row could not be read is NOT "no policy": its sandboxes
+	// are skipped this pass (unreadable), and the next sweep tries again.
 	tenants := map[string]*store.Tenant{}
-	lookup := func(id string) *store.Tenant {
-		if id == "" {
-			return nil
-		}
-		if t, ok := tenants[id]; ok {
-			return t
-		}
+	unreadable := map[string]bool{}
+	for _, id := range tenantIDs {
 		t, err := srv.db.GetTenant(id)
 		if err != nil {
-			t = nil
+			slog.Warn("lifecycle: tenant policy unreadable, skipping its sandboxes this sweep", "tenant", id, "err", err)
+			unreadable[id] = true
+			continue
 		}
 		tenants[id] = t
-		return t
 	}
+	lookup := func(id string) *store.Tenant { return tenants[id] }
 
 	func() {
 		srv.st.Lock()
 		defer srv.st.Unlock()
 		for _, sb := range srv.st.Sandboxes {
+			if unreadable[sb.TenantID] {
+				continue
+			}
 			switch sb.State {
 			case model.StateRunning:
 				idle := effectivePolicy(sb.IdleSleepS, lookup(sb.TenantID), false)
@@ -254,14 +276,14 @@ func (srv *Server) autoSleep(id, tenant string, now int64, unreachable map[nodeT
 		return
 	}
 
-	srv.st.SetSandboxState(id, model.StateSleeping)
 	var dynamic []model.Expose
 	func() {
 		srv.st.Lock()
 		defer srv.st.Unlock()
 		if sb := srv.st.FindSandbox(id); sb != nil {
+			sb.State = model.StateSleeping
 			sb.SleptAt = now
-			srv.recordUsage(sb, "slept")
+			srv.queueUsageLocked(sb, "slept")
 			for _, e := range sb.Exposes {
 				if isAllDigits(e.Name) {
 					dynamic = append(dynamic, e)
@@ -272,8 +294,10 @@ func (srv *Server) autoSleep(id, tenant string, now int64, unreachable map[nodeT
 	for _, e := range dynamic {
 		srv.dropExpose(id, e, sweepID)
 	}
-	if err := srv.persist(); err != nil {
-		slog.Error("persist failed", "err", err)
+	if err := srv.save(nil); err != nil {
+		// Memory keeps what the worker did (the VM IS asleep); the recovery
+		// loop writes it.
+		slog.Error("lifecycle: auto-sleep applied on the worker but not saved", "sandbox", id, "request_id", sweepID, "err", err)
 	}
 	slog.Info("lifecycle: auto-slept sandbox", "sandbox", id, "reason", "idle")
 }
@@ -306,7 +330,6 @@ func (srv *Server) autoSleep(id, tenant string, now int64, unreachable map[nodeT
 // unreachable this pass are skipped.
 func (srv *Server) autoDelete(id, tenant string, unreachable map[nodeTenant]bool) {
 	var agentAddr string
-	var usage model.Sandbox
 	if !func() bool {
 		srv.st.Lock()
 		defer srv.st.Unlock()
@@ -314,7 +337,6 @@ func (srv *Server) autoDelete(id, tenant string, unreachable map[nodeTenant]bool
 		if sb == nil || sb.State != model.StateSleeping {
 			return false // raced a manual transition; next sweep re-decides
 		}
-		usage = *sb
 		if sb.NodeID != nil {
 			if node := srv.st.FindNode(*sb.NodeID); node != nil {
 				agentAddr = node.Addr
@@ -351,11 +373,17 @@ func (srv *Server) autoDelete(id, tenant string, unreachable map[nodeTenant]bool
 			return
 		}
 	}
-	srv.st.RemoveSandbox(id)
-	if err := srv.persist(); err != nil {
-		slog.Error("persist failed", "err", err)
+	func() {
+		srv.st.Lock()
+		defer srv.st.Unlock()
+		srv.queueUsageLocked(srv.st.FindSandbox(id), "deleted")
+		srv.st.RemoveSandboxLocked(id)
+	}()
+	if err := srv.save(nil); err != nil {
+		// Memory keeps what the worker did (the VM is gone); the recovery loop
+		// writes it.
+		slog.Error("lifecycle: auto-delete applied on the worker but not saved", "sandbox", id, "request_id", sweepID, "err", err)
 	}
-	srv.recordUsage(&usage, "deleted")
 	slog.Info("lifecycle: auto-deleted sandbox", "sandbox", id, "reason", "asleep past TTL")
 }
 

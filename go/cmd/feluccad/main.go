@@ -5,6 +5,7 @@
 package main
 
 import (
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -106,42 +107,11 @@ func main() {
 	}
 	defer db.Close()
 
-	st := state.New()
-	empty, err := db.Empty()
+	srv, err := boot(cfg, db)
 	if err != nil {
-		slog.Error("store", "err", err)
+		slog.Error("refusing to start", "db", cfg.DBPath, "err", err)
 		os.Exit(1)
 	}
-	if empty {
-		// One-time migration: import the legacy JSON state if present.
-		if _, statErr := os.Stat(cfg.StatePath); statErr == nil {
-			if err := st.Load(cfg.StatePath); err != nil {
-				slog.Warn("could not import legacy state", "path", cfg.StatePath, "err", err)
-			} else if err := db.SaveSnapshot(st); err != nil {
-				slog.Warn("could not save imported state", "err", err)
-			} else {
-				if err := os.Rename(cfg.StatePath, cfg.StatePath+".imported"); err != nil {
-					slog.Warn("could not rename legacy state file", "err", err)
-				}
-				slog.Info("migrated legacy state", "from", cfg.StatePath, "to", cfg.DBPath)
-			}
-		} else if err := db.SaveSnapshot(st); err != nil {
-			slog.Warn("could not initialize store", "err", err)
-		}
-	} else if err := db.LoadInto(st); err != nil {
-		// Fatal, not a warning. LoadInto appends as it scans and does not
-		// clear what it already appended, so a failed load leaves a partially
-		// populated working set — and the first mutation calls persist(), whose
-		// SaveSnapshot deletes every row before reinserting the ones in memory.
-		// Serving from a short load therefore destroys the rest of the database
-		// on the next write. Refusing to start is recoverable by an operator;
-		// a truncated sandboxes table is not.
-		slog.Error("could not load state: refusing to start rather than serve a partial working set the first write would make permanent",
-			"path", cfg.DBPath, "err", err)
-		os.Exit(1)
-	}
-
-	srv := server.New(cfg, st, db)
 
 	// WireGuard overlay (v4 P2): bring up wg-felucca and re-add enrolled peers.
 	// Empty wg_ip means the overlay is disabled (single-network deployments).
@@ -191,6 +161,9 @@ func main() {
 	// Lifecycle sweep (v4 P5.2): idle auto-sleep, asleep-TTL auto-delete,
 	// hourly usage-event retention. Runs for the process lifetime.
 	go srv.LifecycleLoop(make(chan struct{}))
+	// Exec metering rows are queued by the exec path and written here, once a
+	// second, so an exec never waits on the database.
+	go srv.UsageFlushLoop(make(chan struct{}))
 
 	addr := cfg.ListenAddr()
 	slog.Info("feluccad listening", "addr", addr, "ui_dir", cfg.UIDir, "db", cfg.DBPath,
@@ -263,6 +236,65 @@ func main() {
 		slog.Error("listen", "err", err)
 		os.Exit(1)
 	}
+}
+
+// boot loads the working set from an opened store (or imports the legacy JSON
+// state file into an empty one), builds the server and makes the start-up save.
+//
+// What ends the process, and what does not:
+//   - a store that cannot be READ, or a load cut short: an error. LoadInto
+//     appends as it scans and does not clear what it already appended, so a
+//     failed load leaves a partial working set — and the first save deletes
+//     every row before reinserting the ones in memory. Serving from a short
+//     load destroys the rest of the database on the next write; refusing to
+//     start is recoverable by an operator, a truncated sandboxes table is not.
+//   - a legacy state file that is present but does not load: an error, for the
+//     same reason. It used to be a warning, and the start-up save then marked
+//     the empty database as initialized, so the next start never looked at the
+//     file again: the empty state was permanent.
+//   - a store that cannot be WRITTEN (the start-up save fails): NOT an error.
+//     feluccad starts with the store failing — it serves reads and the route
+//     table, refuses changes, and the server's recovery loop keeps retrying —
+//     because every running sandbox's ingress depends on this process answering
+//     the gateway, and a write outage is no reason to take that away.
+//
+// The legacy file is renamed only after its import was saved: if the save
+// fails, the database is still empty, and the next start imports it again.
+func boot(cfg *config.Config, db store.Store) (*server.Server, error) {
+	st := state.New()
+	empty, err := db.Empty()
+	if err != nil {
+		return nil, fmt.Errorf("store cannot be read: %w", err)
+	}
+	imported := false
+	if empty {
+		// One-time migration: import the legacy JSON state if present. Any
+		// stat error other than "not there" counts as present: an unreadable
+		// file is not an absent one.
+		if _, statErr := os.Stat(cfg.StatePath); !os.IsNotExist(statErr) {
+			if err := st.Load(cfg.StatePath); err != nil {
+				return nil, fmt.Errorf("legacy state file %s is present but does not load — fix or move it; starting without it would make the empty state permanent at the first change: %w",
+					cfg.StatePath, err)
+			}
+			imported = true
+		}
+	} else if err := db.LoadInto(st); err != nil {
+		return nil, fmt.Errorf("could not load state, refusing to serve a partial working set the first write would make permanent: %w", err)
+	}
+
+	srv := server.New(cfg, st, db)
+	if err := srv.Save(); err != nil {
+		slog.Error("STORE NOT WRITABLE at start-up: serving reads and the route table, refusing changes, retrying the save until it succeeds",
+			"db", cfg.DBPath, "err", err)
+		return srv, nil
+	}
+	if imported {
+		if err := os.Rename(cfg.StatePath, cfg.StatePath+".imported"); err != nil {
+			slog.Warn("could not rename legacy state file", "err", err)
+		}
+		slog.Info("migrated legacy state", "from", cfg.StatePath, "to", cfg.DBPath)
+	}
+	return srv, nil
 }
 
 // legacyDBPath returns where a pre-rename (Hearth) install would have kept the

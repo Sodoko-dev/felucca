@@ -133,8 +133,11 @@ type UsageEvent struct {
 // the same granularity the JSON file had, just transactional. Entity methods
 // are row-level.
 type Store interface {
-	// Snapshot persistence (replaces state.json).
-	SaveSnapshot(st *state.State) error
+	// Snapshot persistence (replaces state.json). SaveSnapshot writes a copy
+	// taken under the state lock (state.SnapshotLocked) together with the
+	// lifecycle usage events that describe it, in ONE transaction: both land
+	// or neither does. It never takes the state lock itself.
+	SaveSnapshot(snap *state.Snapshot, usage []UsageEvent) error
 	LoadInto(st *state.State) error
 	// Empty reports whether no snapshot has ever been saved (drives the
 	// one-time state.json migration).
@@ -142,6 +145,9 @@ type Store interface {
 
 	// Tenants.
 	CreateTenant(t *Tenant) error
+	// CreateTenantWithKey inserts a tenant and its first key in one
+	// transaction, so a tenant never exists without the key it was created for.
+	CreateTenantWithKey(t *Tenant, k *APIKey) error
 	GetTenant(id string) (*Tenant, error)
 	ListTenants() ([]*Tenant, error)
 
@@ -179,6 +185,10 @@ type Store interface {
 	// operator-issued, so re-enrolling is also the recovery path for a worker
 	// that lost its copy.
 	PutNodeCred(c *NodeCred) error
+	// EnrollNodeCred consumes a join token and upserts the credential it buys
+	// in one transaction. consumed is false, and nothing is written, when the
+	// token is not redeemable.
+	EnrollNodeCred(c *NodeCred, tokenHash string, now int64) (consumed bool, err error)
 	// DeleteNodeCred removes one credential row, reporting whether it existed.
 	// Used to retire a row keyed on the bare host once it has been rewritten
 	// under the "host:port" key — leaving it would keep a SECOND agent on the
@@ -218,6 +228,9 @@ type Store interface {
 
 	// Usage events (append-only).
 	AppendUsage(e UsageEvent) error
+	// AppendUsageBatch writes events in one transaction (all or none): the
+	// queued exec rows, flushed once a second.
+	AppendUsageBatch(events []UsageEvent) error
 	// ListUsage returns, in ts order, the events the usage fold needs: every
 	// lifecycle TRANSITION with ts <= upTo (the aggregation needs the full
 	// transition history up to the window's end to know each sandbox's state
