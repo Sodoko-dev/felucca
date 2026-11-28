@@ -144,6 +144,8 @@ type Server struct {
 	// seedPending: the legacy credential seed failed at start-up and runs
 	// again when the store recovers.
 	seedPending atomic.Bool
+	// unfencedWarnAt is when warnUnfencedPlacement last warned (unix s).
+	unfencedWarnAt atomic.Int64
 	// unansweredDrops are the sweep's drops of dynamic exposes whose worker
 	// call got no answer in time, with the node port of the row
 	// (repeatUnansweredDrops). GUARDED BY exposeMu.
@@ -1956,6 +1958,7 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 	// Schedule: pick ready node with lowest vm_count. Create sandbox record in
 	// "creating" state under the lock, capturing agent address.
 	var agentAddr, sbID string
+	unfenced := false
 	if status, body := func() (int, string) {
 		srv.st.Lock()
 		defer srv.st.Unlock()
@@ -1966,6 +1969,9 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 		if node == nil {
 			return 503, `{"error":"no ready node"}`
 		}
+		// PickNode prefers workers that report their isolation in place; a
+		// pick that reports it down means no such worker is ready.
+		unfenced = state.IsolationDown(node)
 		agentAddr = node.Addr
 		sb := srv.st.CreateSandbox(req.Name, namespace, node.ID, vcpus, memMiB, now)
 		sb.TenantID = tenant
@@ -1980,6 +1986,9 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 	}(); status != 0 {
 		writeJSON(w, status, []byte(body))
 		return
+	}
+	if unfenced {
+		srv.warnUnfencedPlacement(now, agentAddr)
 	}
 
 	// The record is saved BEFORE the worker is asked for a VM. If it cannot be,
@@ -2062,6 +2071,24 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 	observeCreateMs(uint64(time.Since(createStart).Milliseconds()))
 	b, _ := json.Marshal(sb)
 	writeJSON(w, 201, b)
+}
+
+// unfencedWarnInterval bounds the warning of warnUnfencedPlacement.
+const unfencedWarnInterval = 60
+
+// warnUnfencedPlacement says, at most once per unfencedWarnInterval seconds,
+// that a create was placed on a worker that reports its isolation down
+// because no other ready worker exists. Logged after the state lock.
+func (srv *Server) warnUnfencedPlacement(now int64, addr string) {
+	last := srv.unfencedWarnAt.Load()
+	if last != 0 && now-last < unfencedWarnInterval {
+		return
+	}
+	if !srv.unfencedWarnAt.CompareAndSwap(last, now) {
+		return // another create warned just now
+	}
+	slog.Warn("creates are being placed on workers that report their isolation down: no other ready worker exists (such a worker refuses new guests until its fence is repaired)",
+		"node", addr)
 }
 
 // agentBusy reports whether a worker's 409 body is {"error":"busy"}: the

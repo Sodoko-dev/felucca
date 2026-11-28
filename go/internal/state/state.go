@@ -387,10 +387,20 @@ func (s *State) Heartbeat(id string, memFree uint64, vmCount, poolSize uint32, i
 	return *n, wasIsolationOK, true
 }
 
-// PickNode picks the ready node with the lowest vm_count.
-// Caller must hold the lock.
+// PickNode picks the ready node with the lowest vm_count, preferring nodes
+// that do not report their isolation down (IsolationOK nil, from an agent
+// that does not send it, or true).
+//
+// A worker that reports its isolation down refuses new guests (create, fork,
+// wake and start answer IsolationFailed), so it gains no sandboxes and stays
+// the lowest: without the preference every create in the fleet went to that
+// one worker and failed for as long as it was unfenced. The preference is
+// soft: when NO ready node is fine, the lowest of all ready nodes is picked,
+// as before, so a fleet whose every worker reports isolation down keeps the
+// placement it had. The caller can tell that case from the picked node's
+// IsolationOK (IsolationDown). Caller must hold the lock.
 func (s *State) PickNode(now int64) *model.Node {
-	var best *model.Node
+	var best, bestFine *model.Node
 	for _, n := range s.Nodes {
 		if n.NodeStatus(now) != "ready" {
 			continue
@@ -398,8 +408,20 @@ func (s *State) PickNode(now int64) *model.Node {
 		if best == nil || n.VMCount < best.VMCount {
 			best = n
 		}
+		if !IsolationDown(n) && (bestFine == nil || n.VMCount < bestFine.VMCount) {
+			bestFine = n
+		}
+	}
+	if bestFine != nil {
+		return bestFine
 	}
 	return best
+}
+
+// IsolationDown reports whether n's last heartbeat said isolation_ok false.
+// A node that never sent the flag counts as fine.
+func IsolationDown(n *model.Node) bool {
+	return n != nil && n.IsolationOK != nil && !*n.IsolationOK
 }
 
 // ---- Sandboxes ----
