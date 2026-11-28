@@ -1410,6 +1410,12 @@ func (srv *Server) knownNodeAddr(addr string) bool {
 	return false
 }
 
+// maxNodeMemMiB bounds the memory figures a node reports (registration and
+// heartbeat): 2^40 MiB is an exbibyte. Above that the value is not a reading
+// but garbage — and a uint64 with the high bit set is one database/sql cannot
+// even bind, so before this bound one heartbeat made every later save fail.
+const maxNodeMemMiB = 1 << 40
+
 // maxHostnameLen bounds a node hostname on every route that accepts one.
 // nodeJoin has always capped it; agentRegister only checked it was non-empty,
 // and its hostname is the KEY state.RegisterNode appends a node record under.
@@ -1511,6 +1517,10 @@ func (srv *Server) agentRegister(w http.ResponseWriter, r *http.Request, p princ
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, []byte(`{"error":"bad json"}`))
+		return
+	}
+	if req.MemTotal > maxNodeMemMiB {
+		writeJSON(w, 400, []byte(`{"error":"mem_total_mib out of range"}`))
 		return
 	}
 	if !validNodeHostname(req.Hostname) {
@@ -1636,6 +1646,10 @@ func (srv *Server) agentHeartbeat(w http.ResponseWriter, r *http.Request, p prin
 	}
 	if req.ID == "" {
 		writeJSON(w, 400, []byte(`{"error":"id required"}`))
+		return
+	}
+	if req.MemFree > maxNodeMemMiB {
+		writeJSON(w, 400, []byte(`{"error":"mem_free_mib out of range"}`))
 		return
 	}
 	// A node credential heartbeats for ITS node and no other. The stats a

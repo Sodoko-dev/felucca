@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"strings"
 
@@ -218,7 +219,7 @@ func (s *SQLite) SaveSnapshot(st *state.State) error {
 		if _, err := tx.Exec(
 			`INSERT INTO nodes (id, hostname, addr, cpus, mem_total_mib, mem_free_mib, vm_count, pool_size, last_heartbeat)
 			 VALUES (?,?,?,?,?,?,?,?,?)`,
-			n.ID, n.Hostname, n.Addr, n.CPUs, n.MemTotalMiB, n.MemFreeMiB, n.VMCount, n.PoolSize, n.LastHB,
+			n.ID, n.Hostname, n.Addr, n.CPUs, clampU64(n.MemTotalMiB), clampU64(n.MemFreeMiB), n.VMCount, n.PoolSize, n.LastHB,
 		); err != nil {
 			return err
 		}
@@ -236,7 +237,7 @@ func (s *SQLite) SaveSnapshot(st *state.State) error {
 			`INSERT INTO sandboxes (id, name, namespace, node_id, state, vcpus, mem_mib, ip, created_at, parent_id, tenant_id, exposes, allow_dynamic_ports, template, disk_gb, idle_sleep_s, asleep_delete_s, last_activity, slept_at)
 			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			sb.ID, sb.Name, sb.Namespace, nullable(sb.NodeID), string(sb.State),
-			sb.VCPUs, sb.MemMiB, nullable(sb.IP), sb.CreatedAt, nullable(sb.ParentID), sb.TenantID,
+			sb.VCPUs, clampU64(sb.MemMiB), nullable(sb.IP), sb.CreatedAt, nullable(sb.ParentID), sb.TenantID,
 			exposes, sb.AllowDynamicPorts, sb.Template, sb.DiskGB,
 			sb.IdleSleepS, sb.AsleepDeleteS, sb.LastActivity, sb.SleptAt,
 		); err != nil {
@@ -655,7 +656,7 @@ func (s *SQLite) ListWgPeers() ([]*WgPeer, error) {
 func (s *SQLite) CreateTemplate(t *Template) error {
 	_, err := s.db.Exec(
 		`INSERT INTO templates (id, name, image, image_sha256, vcpus, mem_mib, disk_gb, image_size_gb, pool_size, tenant_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-		t.ID, t.Name, t.Image, t.ImageSHA256, t.Vcpus, t.MemMiB, t.DiskGB, t.ImageSizeGB, t.PoolSize, t.TenantID, t.CreatedAt,
+		t.ID, t.Name, t.Image, t.ImageSHA256, t.Vcpus, clampU64(t.MemMiB), t.DiskGB, t.ImageSizeGB, t.PoolSize, t.TenantID, t.CreatedAt,
 	)
 	return err
 }
@@ -705,7 +706,7 @@ func (s *SQLite) DeleteTemplate(name string) (bool, error) {
 func (s *SQLite) AppendUsage(e UsageEvent) error {
 	_, err := s.db.Exec(
 		`INSERT INTO usage_events (tenant_id, sandbox_id, event, vcpus, mem_mib, ts, disk_gb) VALUES (?,?,?,?,?,?,?)`,
-		e.TenantID, e.SandboxID, e.Event, e.Vcpus, e.MemMiB, e.TS, e.DiskGB,
+		e.TenantID, e.SandboxID, e.Event, e.Vcpus, clampU64(e.MemMiB), e.TS, e.DiskGB,
 	)
 	return err
 }
@@ -753,6 +754,19 @@ func (s *SQLite) PruneUsage(before int64) (int64, error) {
 }
 
 // ---- helpers ----
+
+// clampU64 binds an unsigned value into SQLite's signed 64-bit INTEGER.
+// database/sql refuses a uint64 with the high bit set outright, and one such
+// value in memory (a heartbeat's mem_free_mib, say) would then fail every
+// snapshot save that rewrites it — forever, since the value stays in memory.
+// Clamping keeps a nonsensical value from taking the store down; the handlers
+// bound these fields long before they get this large.
+func clampU64(v uint64) int64 {
+	if v > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(v)
+}
 
 func nullable(p *string) any {
 	if p == nil {
