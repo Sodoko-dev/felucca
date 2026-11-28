@@ -47,8 +47,11 @@ pub struct Reconciled {
     pub rewrite: Vec<String>,
     /// Ids of `sleeping` records whose snapshot files could not be examined.
     /// Nothing is decided about them on this start, and nothing in their
-    /// directory is touched.
+    /// directory is touched but the temporary state file.
     pub undecided: Vec<String>,
+    /// Ids of `sleeping` records whose disk outran their snapshot (S3): now
+    /// `stopped`, and their snapshot files are set aside, not removed (S3').
+    pub outrun: Vec<String>,
 }
 
 /// What loading one record found besides the record itself.
@@ -58,6 +61,7 @@ struct Found {
     dead_pool: bool,
     rewrite: bool,
     undecided: bool,
+    outrun: bool,
 }
 
 enum Loaded {
@@ -100,6 +104,9 @@ pub fn reconcile(data_dir: &str, mut alloc: Option<&mut Allocator>, procs: &Proc
                 }
                 if found.undecided {
                     out.undecided.push(vm.id.clone());
+                }
+                if found.outrun {
+                    out.outrun.push(vm.id.clone());
                 }
                 out.vms.push(vm);
             }
@@ -174,6 +181,7 @@ fn reconcile_one(
     let mut dead_pool = false;
     let mut rewrite = false;
     let mut undecided = false;
+    let mut outrun = false;
     let mut snapshot_valid = meta.snapshot_valid;
 
     // A state that implies a running VMM: is the recorded pid still it?
@@ -229,9 +237,10 @@ fn reconcile_one(
                 warn!(vm = %id, rootfs_mtime = %epoch(disk), vmstate_mtime = %epoch(snapshot),
                     "reconcile: this sleeping VM's disk was written after its snapshot was taken (the guest ran \
                      since, under an agent that did not record it); waking it would restore old memory over a \
-                     newer disk. It is stopped and the snapshot is removed");
+                     newer disk. It is stopped and the snapshot is set aside (*.outrun)");
                 state = VmState::Stopped;
                 rewrite = true;
+                outrun = true;
             }
             Sleeper::CannotTell(why) => {
                 error!(vm = %id, err = %why,
@@ -272,12 +281,13 @@ fn reconcile_one(
         disk_gb: meta.disk_gb.unwrap_or(0),
         snapshot_valid,
     };
-    Loaded::Vm(vm, Found { dead_pool, rewrite, undecided })
+    Loaded::Vm(vm, Found { dead_pool, rewrite, undecided, outrun })
 }
 
-/// What start-up makes of a `sleeping` record's snapshot files.
+/// What start-up, and a wake (FLU-4), make of a `sleeping` record's
+/// snapshot files.
 #[derive(Debug, PartialEq, Eq)]
-enum Sleeper {
+pub(super) enum Sleeper {
     Keep,
     /// This file of the two is not there.
     Incomplete(&'static str),
@@ -299,8 +309,8 @@ enum Sleeper {
 /// lab), and a woken guest writes its disk within seconds. Strictly later, at
 /// the file system's own precision, means the guest ran after the snapshot.
 /// Such a record keeps no marker: the same check is repeated at every start,
-/// on inputs that do not change while it sleeps.
-fn judge_sleeper(dir: &str, marker: bool) -> Sleeper {
+/// on inputs that do not change while it sleeps, and by the wake.
+pub(super) fn judge_sleeper(dir: &str, marker: bool) -> Sleeper {
     let look = |name: &'static str| match std::fs::metadata(format!("{}/{}", dir, name)) {
         Ok(m) => Ok(Some(m)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -335,7 +345,7 @@ fn judge_sleeper(dir: &str, marker: bool) -> Sleeper {
 }
 
 /// A modification time as seconds.nanoseconds since the epoch, for a log line.
-fn epoch(t: SystemTime) -> String {
+pub(super) fn epoch(t: SystemTime) -> String {
     match t.duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => format!("{}.{:09}", d.as_secs(), d.subsec_nanos()),
         Err(_) => format!("{:?}", t),

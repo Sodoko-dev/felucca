@@ -17,7 +17,7 @@ use crate::config::authorized_either;
 use crate::registration::NodeToken;
 use crate::vm::{
     image, valid_vm_id, CreateSpec, ExecOutcome, ExecStreamOutcome, ExposeError, Manager,
-    OpError, PoolSpec, RootfsError, BUSY, DEFAULT_IMAGE,
+    OpError, PoolSpec, RootfsError, BUSY, DEFAULT_IMAGE, STOP_GAVE_UP,
 };
 use tracing::warn;
 
@@ -719,8 +719,12 @@ async fn delete_vm(
     let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
     match detached(async move { mgr.delete(&vm).await }).await {
         Ok(()) => empty_response(StatusCode::NO_CONTENT),
-        // An operation in progress did not let go in time: retry.
-        Err(e) if e == BUSY => busy_response(),
+        // An operation in progress did not let go in time: retry. The VM is
+        // `stopped` by then (delete stops it first), and the answer says so.
+        Err(e) if e == STOP_GAVE_UP => json_response(
+            StatusCode::CONFLICT,
+            &serde_json::json!({ "error": e, "state": "stopped" }).to_string(),
+        ),
         Err(e) if e.starts_with("InvalidState") => error_response(StatusCode::CONFLICT, &e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }

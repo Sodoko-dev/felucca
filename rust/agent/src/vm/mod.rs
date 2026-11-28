@@ -578,6 +578,11 @@ impl From<&str> for OpError {
 /// plain string, use it too.
 pub const BUSY: &str = "busy";
 
+/// What stop and delete answer when the operation they pre-empted has not
+/// let go within `CLOSE_WAIT` (409, with `"state":"stopped"`: stop has
+/// written that record). The caller retries.
+pub const STOP_GAVE_UP: &str = "busy: the VM is stopped, but an operation in progress has not let go of it yet; try again";
+
 /// The lifecycle operations that hold a sandbox while they run (FLU-4). At
 /// most one is in progress per sandbox: each of them reads the record, talks
 /// to the VMM and writes the record back, and two of them interleaved on one
@@ -600,18 +605,31 @@ enum OpKind {
 #[derive(Debug, Default)]
 struct BusyMark {
     op: Option<OpKind>,
+    /// Forks of this sandbox while it is asleep (S4'). They only read its
+    /// snapshot files and its disk, so any number of them run side by side;
+    /// to everything else they are an operation in progress.
+    readers: usize,
     /// Stops and deletes in progress (delete stops first, so two can nest).
     /// While any runs, no operation starts and none commits.
     closing: usize,
 }
 
+impl BusyMark {
+    fn idle(&self) -> bool {
+        self.op.is_none() && self.readers == 0 && self.closing == 0
+    }
+}
+
 type BusyMap = std::sync::Mutex<std::collections::HashMap<String, BusyMark>>;
 
-/// A second request of the same kind waits this long for the one in progress
-/// and then answers from the state that one left: a retried sleep finds the
-/// sandbox asleep and says so, instead of a 409 its caller would have to
-/// interpret.
-const SAME_OP_WAIT: Duration = Duration::from_secs(120);
+/// The longest a second request of the same kind waits for the one in
+/// progress (S4'); then it answers 409 `busy`. Within it, it answers from
+/// the state the first one left: a retried sleep finds the sandbox asleep and
+/// says so, instead of a 409 its caller would have to interpret. Below the
+/// control plane's 30 s worker-call timeout: a waiter that outlived its
+/// caller would carry the operation out for nobody (it used to wait 120 s).
+const SAME_OP_LIMIT: Duration = Duration::from_secs(25);
+const SAME_OP_WAIT: Duration = if cfg!(test) { Duration::from_secs(3) } else { SAME_OP_LIMIT };
 
 /// How long stop and delete wait for an operation in progress to let go
 /// after they have ended its VMM. There is no timeout on a Firecracker API
@@ -630,14 +648,37 @@ const BUSY_POLL: Duration = Duration::from_millis(20);
 struct OpGuard<'a> {
     busy: &'a BusyMap,
     id: String,
+    /// One of the `readers` of a sleeping parent, not its `op`.
+    shared: bool,
+}
+
+impl OpGuard<'_> {
+    /// Turn a fork's hold on its parent into a shared one: the parent is
+    /// asleep, so other forks of it may read its files alongside this one.
+    /// Called inside the `inner` section that read the parent's state, which
+    /// cannot change while the parent is held.
+    fn share(&mut self) {
+        let mut map = lock_std(self.busy);
+        if let Some(m) = map.get_mut(&self.id) {
+            if !self.shared && m.op == Some(OpKind::Fork) {
+                m.op = None;
+                m.readers += 1;
+                self.shared = true;
+            }
+        }
+    }
 }
 
 impl Drop for OpGuard<'_> {
     fn drop(&mut self) {
         let mut map = lock_std(self.busy);
         if let Some(m) = map.get_mut(&self.id) {
-            m.op = None;
-            if m.closing == 0 {
+            if self.shared {
+                m.readers = m.readers.saturating_sub(1);
+            } else {
+                m.op = None;
+            }
+            if m.idle() {
                 map.remove(&self.id);
             }
         }
@@ -655,7 +696,7 @@ impl Drop for CloseGuard<'_> {
         let mut map = lock_std(self.busy);
         if let Some(m) = map.get_mut(&self.id) {
             m.closing = m.closing.saturating_sub(1);
-            if m.closing == 0 && m.op.is_none() {
+            if m.idle() {
                 map.remove(&self.id);
             }
         }
@@ -666,6 +707,16 @@ impl Drop for CloseGuard<'_> {
 const VMSTATE: &str = "vmstate.bin";
 const VMSTATE_TMP: &str = "vmstate.bin.tmp";
 const MEM: &str = "mem.bin";
+/// The suffix of a snapshot file set aside as stale (S3', `set_snapshot_aside`).
+const OUTRUN: &str = ".outrun";
+
+/// Was `image` modified after `vmstate` was written (strictly later, at the
+/// file system's own precision)? The guest of that snapshot ran since (S3).
+fn modified_after(image: &str, vmstate: &str) -> std::io::Result<bool> {
+    let disk = std::fs::metadata(image)?.modified()?;
+    let snapshot = std::fs::metadata(vmstate)?.modified()?;
+    Ok(disk > snapshot)
+}
 
 /// What looking at one file found. "Could not look" is its own answer: a
 /// failed `stat` is not a missing file, and acting on it as one would discard
@@ -1114,19 +1165,19 @@ impl Manager {
     /// start brings the port up again as soon as the pin holds.
     pub async fn reconcile(&self) {
         let procs = self.procs();
-        let (unreadable, metaless, dead_pool, rewrite, undecided, adopted) = {
+        let (unreadable, metaless, dead_pool, rewrite, undecided, outrun, adopted) = {
             let mut g = self.inner.lock().await;
             let rec = reconcile::reconcile(&self.data_dir, g.allocator.as_mut(), &procs);
             g.vms = rec.vms;
             let adopted = g.vms.iter().filter(|v| v.pid.is_some()).count();
-            (rec.unreadable, rec.metaless, rec.dead_pool, rec.rewrite, rec.undecided, adopted)
+            (rec.unreadable, rec.metaless, rec.dead_pool, rec.rewrite, rec.undecided, rec.outrun, adopted)
         };
 
         let mut swept = self.sweep_orphans(&procs, &unreadable, &metaless, &dead_pool).await;
         swept.pool_removed = self.remove_dead_pool_vms(&procs, &dead_pool).await;
         // After the sweep: whether a VMM was adopted for a sandbox decides
         // what of its snapshot may go.
-        self.settle_snapshot_files_at_start(&rewrite, &undecided).await;
+        self.settle_snapshot_files_at_start(&rewrite, &undecided, &outrun).await;
         // Counted after the sweep: it may have adopted a VMM itself.
         let adopted = adopted + swept.rolled_forward;
 
@@ -1665,12 +1716,15 @@ impl Manager {
     ///
     /// * Nothing holds the sandbox: it is this operation's.
     /// * An operation of the same kind holds it: wait for that one (at most
-    ///   `SAME_OP_WAIT`), then go on — the caller then answers from the state
-    ///   the first one left, so a retried sleep says "already asleep".
-    /// * An operation of another kind holds it, or it is being stopped or
-    ///   deleted: `Busy`, at once. Carrying out a wake queued behind a sleep,
-    ///   or anything queued behind a stop, would act on a state its caller
-    ///   never saw.
+    ///   `SAME_OP_WAIT`, then `Busy`), then go on — the caller then answers
+    ///   from the state the first one left, so a retried sleep says "already
+    ///   asleep".
+    /// * An operation of another kind holds it, forks of it read its files
+    ///   while it sleeps, or it is being stopped or deleted: `Busy`, at once.
+    ///   Carrying out a wake queued behind a sleep, or anything queued behind
+    ///   a stop, would act on a state its caller never saw.
+    ///
+    /// Fork does not come through here (`begin_fork`).
     ///
     /// Composes with `claim_unsettled`, which every operation still calls
     /// after this: the mark keeps operations apart from each other, the
@@ -1685,16 +1739,40 @@ impl Manager {
                     return Err(OpError::Busy);
                 }
                 match m.op {
-                    None => {
+                    None if m.readers == 0 => {
                         m.op = Some(kind);
-                        return Ok(OpGuard { busy: &self.busy, id: id.to_string() });
+                        return Ok(OpGuard { busy: &self.busy, id: id.to_string(), shared: false });
                     }
                     Some(k) if k == kind && Instant::now() < deadline => {}
-                    Some(_) => return Err(OpError::Busy),
+                    _ => return Err(OpError::Busy),
                 }
             }
             sleep(BUSY_POLL).await;
         }
+    }
+
+    /// Hold `id` for a fork (S4'), without waiting: a fork queued behind
+    /// another operation would act on a state its caller never saw, and its
+    /// caller (the control plane) gives up after 30 s anyway. Anything that
+    /// holds the sandbox answers `Busy`, except forks of it while it sleeps:
+    /// this one joins them (`readers`). Otherwise the hold is exclusive; the
+    /// fork shares it (`OpGuard::share`) once it has read that the sandbox is
+    /// asleep.
+    ///
+    /// Also the mark of a fork's CHILD, from its reservation to the end of
+    /// the fork: no record has that id before, so nothing else holds it.
+    fn begin_fork(&self, id: &str) -> Result<OpGuard<'_>, OpError> {
+        let mut map = lock_std(&self.busy);
+        let m = map.entry(id.to_string()).or_default();
+        if m.closing > 0 || m.op.is_some() {
+            return Err(OpError::Busy);
+        }
+        if m.readers > 0 {
+            m.readers += 1;
+            return Ok(OpGuard { busy: &self.busy, id: id.to_string(), shared: true });
+        }
+        m.op = Some(OpKind::Fork);
+        Ok(OpGuard { busy: &self.busy, id: id.to_string(), shared: false })
     }
 
     /// Mark `id` as being stopped or deleted, until the guard drops: from now
@@ -1725,9 +1803,15 @@ impl Manager {
         }
     }
 
-    /// Does a lifecycle operation hold `id` right now?
+    /// Does a lifecycle operation, or a fork reading its files, hold `id`
+    /// right now?
     fn op_in_progress(&self, id: &str) -> bool {
-        matches!(lock_std(&self.busy).get(id), Some(m) if m.op.is_some())
+        matches!(lock_std(&self.busy).get(id), Some(m) if m.op.is_some() || m.readers > 0)
+    }
+
+    /// Is `id` being stopped or deleted right now?
+    fn closing(&self, id: &str) -> bool {
+        matches!(lock_std(&self.busy).get(id), Some(m) if m.closing > 0)
     }
 
     /// May an operation that started out from VMM `pid` commit to this
@@ -1737,16 +1821,21 @@ impl Manager {
     /// more), and not when the record no longer holds the VMM the operation
     /// was talking to (the exit reaper recorded its death, or a stop took it).
     fn may_commit(&self, v: &Vm, pid: Option<i32>) -> bool {
-        v.pid == pid && !matches!(lock_std(&self.busy).get(&v.id), Some(m) if m.closing > 0)
+        v.pid == pid && !self.closing(&v.id)
     }
 
-    /// Is `mem` mapped by a Firecracker of the instance `dir_id`, by device
-    /// and inode in `/proc/<pid>/maps`? `None` when that cannot be told.
+    /// Is `mem` mapped by a Firecracker of the instance `dir_id` (one of the
+    /// processes `scan` listed), by device and inode in `/proc/<pid>/maps`?
+    /// `None` when that cannot be told.
     ///
     /// A guest that was woken runs on a private mapping of its `mem.bin` for
-    /// the rest of its life, so removing that file under a live VMM takes the
-    /// guest's memory away from it.
-    fn mem_mapped(&self, dir_id: &str, mem: &str) -> Option<bool> {
+    /// the rest of its life. Unlinking the file under it is harmless (the lab
+    /// showed it: the mapping keeps its pages); what this check is for is
+    /// keeping the file a running guest was loaded from in its directory, as
+    /// long as that guest runs. A wrong "not mapped" is harmless for the same
+    /// reason — btrfs subvolumes, for one, print another device number in
+    /// `maps` than `stat` reports.
+    fn mem_mapped(&self, dir_id: &str, mem: &str, scan: &[FcProc]) -> Option<bool> {
         use std::os::unix::fs::MetadataExt;
         let st = match std::fs::metadata(mem) {
             Ok(m) => m,
@@ -1754,7 +1843,7 @@ impl Manager {
             Err(_) => return None,
         };
         let (major, minor) = dev_major_minor(st.dev());
-        for p in self.procs().scan().into_iter().filter(|p| p.dir_name == dir_id) {
+        for p in scan.iter().filter(|p| p.dir_name == dir_id) {
             match std::fs::read_to_string(self.proc_root.join(p.pid.to_string()).join("maps")) {
                 Ok(text) => match maps_contain(&text, major, minor, st.ino()) {
                     Some(false) => {}
@@ -1776,13 +1865,19 @@ impl Manager {
     /// `vmstate.bin` goes first: it is what an older agent takes as "asleep",
     /// so it must not outlive the `sleeping` record (S11).
     fn discard_snapshot_files(&self, id: &str, dir_id: &str) {
+        self.discard_snapshot_files_in(id, dir_id, &self.procs().scan());
+    }
+
+    /// `discard_snapshot_files`, with the Firecrackers of this data dir
+    /// already listed (`scan`).
+    fn discard_snapshot_files_in(&self, id: &str, dir_id: &str, scan: &[FcProc]) {
         let Some(dir) = instance_path(&self.data_dir, dir_id) else {
             return;
         };
         remove_if_present(id, &format!("{}/{}", dir, VMSTATE_TMP));
         remove_if_present(id, &format!("{}/{}", dir, VMSTATE));
         let mem = format!("{}/{}", dir, MEM);
-        match self.mem_mapped(dir_id, &mem) {
+        match self.mem_mapped(dir_id, &mem, scan) {
             Some(false) => {
                 remove_if_present(id, &mem);
             }
@@ -1791,13 +1886,49 @@ impl Manager {
         }
     }
 
+    /// Set a stale snapshot aside (S3'): `vmstate.bin` and `mem.bin` are
+    /// renamed to `*.outrun`, not removed. The verdict that the guest ran
+    /// after the snapshot rests on file times (or, for a wake, on a reply
+    /// that never came), and a wrong one — a restore that lost the times, say
+    /// — must not destroy every old snapshot on a node at once. Nothing takes
+    /// a `*.outrun` file for a snapshot. Only `start`, `stop` and the next
+    /// sleep of the sandbox remove them (`remove_outrun`), and delete with the
+    /// directory; start-up leaves them. The temporary state file goes: it is
+    /// never a snapshot.
+    fn set_snapshot_aside(&self, id: &str, dir_id: &str) {
+        let Some(dir) = instance_path(&self.data_dir, dir_id) else {
+            return;
+        };
+        remove_if_present(id, &format!("{}/{}", dir, VMSTATE_TMP));
+        // The state file first: it is what an older agent takes as "asleep".
+        for name in [VMSTATE, MEM] {
+            let (from, to) = (format!("{}/{}", dir, name), format!("{}/{}{}", dir, name, OUTRUN));
+            match std::fs::rename(&from, &to) {
+                Ok(()) => warn!(vm = %id, file = %from, to = %to, "a stale snapshot file was set aside"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(vm = %id, file = %from, err = %e, "could not set a stale snapshot file aside"),
+            }
+        }
+    }
+
+    /// Remove what `set_snapshot_aside` kept.
+    fn remove_outrun(&self, id: &str, dir_id: &str) {
+        let Some(dir) = instance_path(&self.data_dir, dir_id) else {
+            return;
+        };
+        for name in [VMSTATE, MEM] {
+            remove_if_present(id, &format!("{}/{}{}", dir, name, OUTRUN));
+        }
+    }
+
     /// Start-up, after the sweep (S1, S3, S9): write the records whose state
     /// start-up changed, and remove the snapshot files nothing can use any
-    /// more. Only by the agent that holds the data-dir lock, and only for
-    /// records that loaded — a directory whose `meta.json` does not load is
-    /// not touched, nor a record whose files could not be examined
-    /// (`undecided`).
-    async fn settle_snapshot_files_at_start(&self, rewrite: &[String], undecided: &[String]) {
+    /// more — or, for a sleeper whose disk outran its snapshot (`outrun`),
+    /// set them aside (S3'). Only by the agent that holds the data-dir lock,
+    /// and only for records that loaded — a directory whose `meta.json` does
+    /// not load is not touched. Of a record whose files could not be
+    /// examined (`undecided`) only the temporary state file goes.
+    async fn settle_snapshot_files_at_start(&self, rewrite: &[String], undecided: &[String], outrun: &[String]) {
         if !self.hold_data_dir_lock() {
             return;
         }
@@ -1810,26 +1941,30 @@ impl Manager {
             let g = self.inner.lock().await;
             g.vms
                 .iter()
-                .filter(|v| !undecided.contains(&v.id))
                 .map(|v| (v.id.clone(), v.dir_id.clone(), v.state.clone(), v.pid.is_some()))
                 .collect()
         };
+        // One look at the process table for all of them (it used to be one
+        // per stopped record).
+        let scan = self.procs().scan();
         for (id, dir_id, state, has_vmm) in vms {
             let Some(dir) = instance_path(&self.data_dir, &dir_id) else {
                 continue;
             };
             // A sleep the previous agent did not finish: never part of a
-            // snapshot anything relies on.
+            // snapshot anything relies on, whatever else is undecided (S9).
             remove_if_present(&id, &format!("{}/{}", dir, VMSTATE_TMP));
-            if state == VmState::Sleeping {
+            if state == VmState::Sleeping || undecided.contains(&id) {
                 continue;
             }
-            if has_vmm {
+            if outrun.contains(&id) {
+                self.set_snapshot_aside(&id, &dir_id);
+            } else if has_vmm {
                 // The guest may run on mem.bin (it was woken): only the state
                 // file goes.
                 remove_if_present(&id, &format!("{}/{}", dir, VMSTATE));
             } else {
-                self.discard_snapshot_files(&id, &dir_id);
+                self.discard_snapshot_files_in(&id, &dir_id, &scan);
             }
         }
     }
@@ -2756,6 +2891,9 @@ impl Manager {
 
         let sock = self.sock_path(id).await.ok_or("InvalidId")?;
         let dir_path = self.instance_dir(id).await.ok_or("InvalidId")?;
+        // A new snapshot is on its way: one set aside as stale is of no use
+        // any more (S3'), and its memory file takes the space this one needs.
+        self.remove_outrun(id, &dir_id);
 
         fc::patch_vm_state(&sock, "Paused").await.map_err(|e| e.to_string())?;
         // Only a guest this sleep paused is resumed when it fails: a sandbox
@@ -2826,6 +2964,12 @@ impl Manager {
                     if v.pid == pid && v.state == VmState::Sleeping {
                         v.state = was;
                         v.snapshot_valid = false;
+                        // Owed from this same section: the failed write's own
+                        // claim on the list can have been settled meanwhile
+                        // by another writer (the liveness flush, an expose)
+                        // that wrote `sleeping` — leaving it on disk under a
+                        // record that no longer says so.
+                        lock_std(&self.meta_owed).insert(id.to_string());
                     }
                 }
             }
@@ -2838,12 +2982,18 @@ impl Manager {
         // mismatch and treat this as a deliberate kill (no error transition).
         // The pid-less record is owed to meta.json from this same step, so a
         // caller that goes away before the write below cannot leave the
-        // file naming a dead VMM. (A stop that came in since has taken the
-        // pid and signalled the VMM itself: nothing left to do here.)
+        // file naming a dead VMM.
         let (dying, dir_id) = {
             let mut g = self.inner.lock().await;
             let v = g.vms.iter_mut().find(|v| v.id == id).ok_or("NotFound")?;
-            let p = if v.pid == pid { v.pid.take() } else { None };
+            // A stop that came in since the commit has taken the pid,
+            // signalled the VMM and recorded `stopped`: this sleep did not
+            // happen, and answering 200 would report a sandbox asleep that is
+            // not. (Its snapshot is the stop's to remove, once this lets go.)
+            if v.state != VmState::Sleeping || v.pid != pid {
+                return Err(aborted(id));
+            }
+            let p = v.pid.take();
             lock_std(&self.meta_owed).insert(id.to_string());
             (p, v.dir_id.clone())
         };
@@ -2968,6 +3118,30 @@ impl Manager {
         if let Some(name) = incomplete {
             return Err(self.discard_incomplete_snapshot(id, pid0, name).await);
         }
+        // A record without the marker was written by an older agent: the
+        // judgement start-up makes of it (S3) is made again here. A record
+        // start-up could not judge ("cannot tell") stayed `sleeping`, and
+        // nothing else would ever look at its disk before waking it.
+        if !marker {
+            match reconcile::judge_sleeper(&dir_path, false) {
+                reconcile::Sleeper::Keep => {}
+                reconcile::Sleeper::Incomplete(name) => {
+                    return Err(self.discard_incomplete_snapshot(id, pid0, name).await);
+                }
+                reconcile::Sleeper::Outrun { disk, snapshot } => {
+                    let reason = format!(
+                        "InvalidState: the disk was written after the snapshot (rootfs.ext4 {}, vmstate.bin {}): \
+                         the guest ran since; the VM is stopped (use start)",
+                        reconcile::epoch(disk),
+                        reconcile::epoch(snapshot)
+                    );
+                    return Err(self.stop_stale_wake(id, pid0, None, reason).await);
+                }
+                reconcile::Sleeper::CannotTell(e) => {
+                    return Err(OpError::Other(format!("cannot examine the snapshot of {}: {}", id, e)));
+                }
+            }
+        }
 
         // Re-assert tap exists (idempotent) and re-pin it, MAC included: the
         // nft chains do not survive a host reboot.
@@ -3021,6 +3195,42 @@ impl Manager {
             return Err(e.to_string().into());
         }
 
+        // Which image the loaded guest's disk is (K6). A sandbox forked
+        // before this release runs on its PARENT's image (the snapshot names
+        // it, and nothing re-pointed it). That image may have been written
+        // since this snapshot by the parent; waking would then pair this
+        // memory with a disk that moved on without it.
+        let own_rootfs = format!("{}/rootfs.ext4", dir_path);
+        let drive = match fc::get_root_drive_path(&sock).await {
+            Ok(p) => p,
+            Err(e) => {
+                kill_and_reap(pid); // never ran
+                return Err(e.to_string().into());
+            }
+        };
+        if drive != own_rootfs {
+            match modified_after(&drive, &vmstate) {
+                Ok(false) => warn!(
+                    vm = %id,
+                    image = %drive,
+                    "wake: this sandbox runs on another image than its own rootfs.ext4 (it was forked before this \
+                     release); that image has not been written since the snapshot, so it is woken on it"
+                ),
+                Ok(true) => {
+                    let reason = format!(
+                        "InvalidState: the VM runs on the image {} (it was forked before this release), and that \
+                         image was written after the snapshot; the VM is stopped (use start)",
+                        drive
+                    );
+                    return Err(self.stop_stale_wake(id, pid0, Some(pid), reason).await);
+                }
+                Err(e) => {
+                    kill_and_reap(pid); // never ran
+                    return Err(OpError::Other(format!("cannot examine {}: {}", drive, e)));
+                }
+            }
+        }
+
         // The commit point: the record takes the new VMM and says `running`.
         {
             let mut g = self.inner.lock().await;
@@ -3046,15 +3256,33 @@ impl Manager {
             return Err(e.into());
         }
 
-        if let Err(e) = fc::patch_vm_state(&sock, "Resumed").await {
-            // The guest never ran, so the snapshot is still good: back to
-            // `sleeping`, marker as it was, on disk as well.
-            if self.unwind_wake(id, pid, marker).await {
-                if let Err(we) = self.write_meta(id).await {
-                    warn!(vm = %id, err = %we, "wake: could not write the record back to sleeping yet");
+        match fc::patch_vm_state_answer(&sock, "Resumed").await {
+            Ok((status, _)) if status < 300 => {}
+            answer => {
+                let (answered, err) = match answer {
+                    Ok((status, body)) => (true, format!("FcError: PATCH /vm -> {}: {}", status, body)),
+                    Err(e) => (false, e.to_string()),
+                };
+                // Back to `sleeping` only on proof that the guest did not
+                // run (S7'): Firecracker refused the resume, and says the VM
+                // is still paused. Without an answer the request may well
+                // have reached it and the vCPUs run before the VMM died or
+                // the reply was lost — and waking that snapshot again would
+                // restore old memory over a disk the guest has written.
+                if answered && probe_vmm(&sock).await.as_deref() == Some("Paused") {
+                    if self.unwind_wake(id, pid, marker).await {
+                        if let Err(we) = self.write_meta(id).await {
+                            warn!(vm = %id, err = %we, "wake: could not write the record back to sleeping yet");
+                        }
+                    }
+                    return Err(err.into());
                 }
+                let reason = format!(
+                    "InvalidState: the resume failed ({}) and the guest may have run; the VM is stopped (use start)",
+                    err
+                );
+                return Err(self.stop_stale_wake(id, Some(pid), Some(pid), reason).await);
             }
-            return Err(e.to_string().into());
         }
         let elapsed = start.elapsed().as_millis() as u64;
 
@@ -3078,12 +3306,53 @@ impl Manager {
                     v.pid = None;
                     v.state = VmState::Sleeping;
                     v.snapshot_valid = marker;
+                    // Owed from this same section, as in sleep's revert: a
+                    // writer that settled the failed write's claim meanwhile
+                    // wrote `running` with this pid.
+                    lock_std(&self.meta_owed).insert(id.to_string());
                 }
                 _ => return false,
             }
         }
         kill_and_reap(pid);
         true
+    }
+
+    /// A wake found its snapshot stale, or possibly so (S3', S7', K6): the
+    /// guest ran after it was taken, or may have. The record becomes
+    /// `stopped`, on disk too; the VMM this wake spawned (`vmm`) is killed —
+    /// the record lets go of it first, so the exit reaper takes it for a
+    /// deliberate kill; the snapshot files are set aside, not removed
+    /// (`set_snapshot_aside`). The answer is the 409 that says `stopped`
+    /// (`reason`). Not when the record no longer holds `expect` or the
+    /// sandbox is being stopped or deleted (`may_commit`): the record is not
+    /// this wake's to write any more, and only the VMM goes.
+    async fn stop_stale_wake(&self, id: &str, expect: Option<i32>, vmm: Option<i32>, reason: String) -> OpError {
+        let dir_id = {
+            let mut g = self.inner.lock().await;
+            match g.vms.iter_mut().find(|v| v.id == id) {
+                Some(v) if self.may_commit(v, expect) => {
+                    v.state = VmState::Stopped;
+                    v.pid = None;
+                    v.snapshot_valid = false;
+                    lock_std(&self.meta_owed).insert(id.to_string());
+                    Some(v.dir_id.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(p) = vmm {
+            kill_and_reap(p);
+        }
+        let Some(dir_id) = dir_id else {
+            return aborted(id);
+        };
+        warn!(vm = %id, reason = %reason, "wake: the snapshot is stale or may be; the VM is stopped and its snapshot set aside");
+        self.set_snapshot_aside(id, &dir_id);
+        if let Err(e) = self.write_meta(id).await {
+            warn!(vm = %id, err = %e, "wake: could not write the stopped record yet");
+        }
+        OpError::invalid(&VmState::Stopped, reason)
     }
 
     /// A wake found a snapshot file missing or empty (`missing` names it):
@@ -3131,7 +3400,8 @@ impl Manager {
         // The parent is held until the child's files are complete: a sleep,
         // wake, stop or delete of the parent in between would move or remove
         // the parent's files under the copy, or kill the VMM being snapshot.
-        let parent_op = self.begin_op(parent_id, OpKind::Fork).await.map_err(|e| e.to_string())?;
+        // A parent that is busy answers busy at once, and nothing is reserved.
+        let mut parent_op = self.begin_fork(parent_id).map_err(|e| e.to_string())?;
         // Fork pauses, snapshots and resumes the parent itself.
         self.claim_unsettled(parent_id).await;
 
@@ -3141,7 +3411,7 @@ impl Manager {
         // had by then copied the parent's disk and snapshot over that
         // sandbox's own. A pool VM that was claimed lives in a directory
         // named after its pool id, so a directory id counts as taken too.
-        let (parent_state, parent_pid, parent_dir, parent_sock, parent_vsock) = {
+        let (parent, _child_op) = {
             let mut g = self.inner.lock().await;
             let p = g.vms.iter().find(|v| v.id == parent_id).ok_or("NotFound")?;
             let child = Vm {
@@ -3179,9 +3449,24 @@ impl Manager {
             if g.vms.iter().any(|v| v.id == child_id || v.dir_id == child_id) {
                 return Err("AlreadyExists".into());
             }
+            // A parent that is asleep is only read from: other forks of it
+            // may run alongside this one (S4'). A stop or delete of it that
+            // came in since this fork joined them has the last word.
+            if parent.0 == VmState::Sleeping {
+                parent_op.share();
+            }
+            if self.closing(parent_id) {
+                return Err(BUSY.into());
+            }
+            // The child is this fork's from its reservation to the end
+            // (S4'): a stop or delete of it meanwhile pre-empts the fork (it
+            // kills the child's VMM, and the fork aborts at its next check)
+            // instead of racing it.
+            let child_op = self.begin_fork(child_id).map_err(|e| e.to_string())?;
             g.vms.push(child);
-            parent
+            (parent, child_op)
         };
+        let (parent_state, parent_pid, parent_dir, parent_sock, parent_vsock) = parent;
 
         // The child's directory is its own from the start: created
         // exclusively. One that exists although no record owns it can be a
@@ -3352,15 +3637,17 @@ impl Manager {
 
         {
             let mut g = self.inner.lock().await;
+            let closing = self.closing(child_id);
             match g.vms.iter_mut().find(|v| v.id == child_id) {
-                Some(v) if v.state == VmState::Creating => {
+                Some(v) if v.state == VmState::Creating && !closing => {
                     v.pid = Some(child_pid);
                     v.slot = child_slot;
                     v.state = VmState::Running;
                     v.ip = child_ip.clone();
                     v.vsock = parent_vsock;
                 }
-                // Deleted while it was being made: its VMM is not wanted.
+                // Stopped or deleted while it was being made: its VMM is not
+                // wanted.
                 _ => {
                     drop(g);
                     kill_and_reap(child_pid);
@@ -3460,8 +3747,17 @@ impl Manager {
             }
         }
         let mut g = self.inner.lock().await;
-        if let Some(pos) = g.vms.iter().position(|v| v.id == child_id && v.state == VmState::Creating && v.pid.is_none()) {
+        // A stop of the child that came in meanwhile has made the reserved
+        // record `stopped`; it is still the reservation, and goes with the
+        // directory it would otherwise outlive.
+        let closing = self.closing(child_id);
+        if let Some(pos) = g
+            .vms
+            .iter()
+            .position(|v| v.id == child_id && v.pid.is_none() && (v.state == VmState::Creating || closing))
+        {
             g.vms.remove(pos);
+            lock_std(&self.meta_owed).remove(child_id);
         }
     }
 
@@ -3474,11 +3770,17 @@ impl Manager {
     async fn fail_child(&self, child_id: &str, child_pid: Option<i32>, err: String) -> String {
         let found = {
             let mut g = self.inner.lock().await;
+            // A stop or delete of the child pre-empted the fork (that is
+            // most likely why it failed): the record is theirs. Only the
+            // VMM and the snapshot files are still this fork's to remove.
+            let closing = self.closing(child_id);
             g.vms.iter_mut().find(|v| v.id == child_id).map(|v| {
-                let written = v.state != VmState::Creating;
-                v.state = VmState::Error;
-                v.pid = None;
-                v.snapshot_valid = false;
+                let written = !closing && v.state != VmState::Creating;
+                if !closing {
+                    v.state = VmState::Error;
+                    v.pid = None;
+                    v.snapshot_valid = false;
+                }
                 (v.dir_id.clone(), written)
             })
         };
@@ -3780,6 +4082,15 @@ impl Manager {
             // Otherwise it is gone long ago, or a stranger now has the number:
             // there is nothing of ours to wait for.
         }
+        // Pre-empting an operation in progress (S4'): every Firecracker of
+        // this unit in the instance directory is killed, not only the one the
+        // record names — a wake, a start or a fork child whose new VMM is not
+        // in the record yet holds its operation in a call to that VMM, and
+        // only its death ends the call. Killed outright, not asked: a stop
+        // that gives up below must not leave a signalled VMM alive.
+        if self.op_in_progress(id) {
+            self.kill_instance_vmms(id, &dir_id);
+        }
         // On disk straight away. A stop that was never written down reads as
         // `running` with a dead pid at the next agent start.
         let persisted = self.write_meta(id).await;
@@ -3790,8 +4101,12 @@ impl Manager {
         // it reaches its commit point and finds the VM being stopped. Until it
         // has, the files below may still be its to write or read.
         if !self.wait_op_released(id).await {
-            warn!(vm = %id, "stop: an operation in progress did not let go of this VM in time; answering busy");
-            return Err(OpError::Busy);
+            // The record says `stopped`, on disk: that is the answer, so
+            // that the control plane records it (S10). A plain `busy` says
+            // "nothing was decided", and it would go on listing the sandbox
+            // as running or asleep.
+            warn!(vm = %id, "stop: an operation in progress did not let go of this VM in time");
+            return Err(OpError::invalid(&VmState::Stopped, STOP_GAVE_UP));
         }
         if let Some(p) = wait_for {
             // Wait for the FC process to actually exit: "stopped" gates the
@@ -3824,7 +4139,24 @@ impl Manager {
         // any more (and, left there, an older agent would read the VM as
         // asleep). mem.bin is kept if a VMM that did not exit still maps it.
         self.discard_snapshot_files(id, &dir_id);
+        self.remove_outrun(id, &dir_id);
         Ok(persisted?)
+    }
+
+    /// SIGKILL every Firecracker this unit started that serves the instance
+    /// directory `dir_id` (the scan delete makes, `in_my_cgroup`), whether or
+    /// not a record names it. Not without the data-dir lock, as there.
+    fn kill_instance_vmms(&self, id: &str, dir_id: &str) {
+        if !valid_vm_id(dir_id) || !self.hold_data_dir_lock() {
+            return;
+        }
+        let procs = self.procs();
+        for p in procs.scan().into_iter().filter(|p| p.dir_name == dir_id) {
+            if procs.in_my_cgroup(p.pid) {
+                warn!(vm = %id, pid = p.pid, "stop: killing a Firecracker of this VM an operation in progress is waiting on");
+                self.kill_fc(p.pid, dir_id);
+            }
+        }
     }
 
     pub async fn start(self: &Arc<Self>, id: &str) -> Result<(), OpError> {
@@ -3863,8 +4195,10 @@ impl Manager {
         let rootfs_dst = format!("{}/rootfs.ext4", dir_path);
 
         // A cold boot starts from the disk alone; a snapshot from before it
-        // would describe a guest that never was (S8).
+        // would describe a guest that never was (S8), and one set aside as
+        // stale is of no use from here either (S3').
         self.discard_snapshot_files(id, &dir_id);
+        self.remove_outrun(id, &dir_id);
 
         // Cold boot: configure_guest sets the NIC's MAC, so the full pin
         // (address, ARP and L2) applies from the first frame.
@@ -3944,9 +4278,11 @@ impl Manager {
         // stop is best-effort (idempotent delete) — except when an operation
         // in progress did not let go of the VM: the directory removed below
         // may still hold the files it is writing or reading. The caller
-        // retries.
-        if let Err(OpError::Busy) = self.stop(id).await {
-            return Err(BUSY.into());
+        // retries; the VM is `stopped` by then, and the answer says so.
+        if let Err(OpError::InvalidState { msg, .. }) = self.stop(id).await {
+            if msg == STOP_GAVE_UP {
+                return Err(STOP_GAVE_UP.into());
+            }
         }
 
         // Nothing may be left running out of the directory this is about to
@@ -4084,9 +4420,15 @@ impl Manager {
             let mut g = self.inner.lock().await;
             // A dead pool VM leaves the claimable set by this very transition:
             // claims match on state == Pooled, and Error is not claimable.
+            // While an operation holds the VM, its record is that operation's
+            // to settle (S7'): a wake whose new VMM died before the resume
+            // answered must decide what that means, and an `error` written
+            // here first would leave its intact snapshot under `error`.
+            // Whatever the operation leaves, `sweep_dead` settles within 5 s.
             match g.vms.iter_mut().find(|v| v.id == id) {
                 Some(v) if v.pid == Some(pid)
-                    && matches!(v.state, VmState::Creating | VmState::Running | VmState::Paused | VmState::Pooled) =>
+                    && matches!(v.state, VmState::Creating | VmState::Running | VmState::Paused | VmState::Pooled)
+                    && !self.op_in_progress(id) =>
                 {
                     let dead_pool = (v.state == VmState::Pooled).then(|| pool_spec_key_of(v));
                     v.state = VmState::Error;
@@ -5866,6 +6208,17 @@ mod tests {
         /// as Firecracker does, unless `keep_drive`.
         drive: Option<String>,
         keep_drive: bool,
+        /// Requests whose line starts with one of these are read and then
+        /// left without an answer: the connection is closed, as when the
+        /// reply is lost or the VMM dies before it answers.
+        drop: Vec<&'static str>,
+        /// A request whose line starts with this is held until the process
+        /// whose pid is in this file (once it exists) is gone, and then left
+        /// unanswered: a call to a VMM a wake or a start has just spawned.
+        hang_pidfile: Option<(&'static str, String)>,
+        /// The state a refused `PATCH /vm` leaves (the request was refused,
+        /// but the VM did change: no proof of anything).
+        refused_sets: Option<&'static str>,
     }
 
     /// Has `pid` exited (gone, or a zombie nobody has reaped yet)?
@@ -5887,7 +6240,10 @@ mod tests {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
             let meta_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let drive = Arc::new(std::sync::Mutex::new(behavior.drive.clone().unwrap_or_default()));
+            // Unless told otherwise, the root drive is the image beside the
+            // socket: the instance's own `rootfs.ext4`.
+            let own = Path::new(sock).parent().map(|d| d.join("rootfs.ext4").to_string_lossy().into_owned()).unwrap_or_default();
+            let drive = Arc::new(std::sync::Mutex::new(behavior.drive.clone().unwrap_or(own)));
             let (st, sn, bd, ms) = (Arc::clone(&state), Arc::clone(&seen), Arc::clone(&bodies), Arc::clone(&meta_seen));
             let task = tokio::spawn(async move {
                 loop {
@@ -5936,6 +6292,20 @@ mod tests {
                                 }
                             }
                         }
+                        if behavior.drop.iter().any(|p| line.starts_with(p)) {
+                            return;
+                        }
+                        if let Some((prefix, pidfile)) = &behavior.hang_pidfile {
+                            if line.starts_with(prefix) {
+                                loop {
+                                    let pid = std::fs::read_to_string(pidfile).ok().and_then(|s| s.trim().parse::<i32>().ok());
+                                    if pid.is_some_and(proc_gone) {
+                                        return;
+                                    }
+                                    sleep(Duration::from_millis(10)).await;
+                                }
+                            }
+                        }
                         if let Some((prefix, d)) = behavior.delay {
                             if line.starts_with(prefix) {
                                 sleep(d).await;
@@ -5943,7 +6313,16 @@ mod tests {
                         }
                         let failed = behavior.fail.iter().any(|p| line.starts_with(p))
                             || behavior.fail_body.iter().any(|b| body.contains(b));
+                        if failed && line.starts_with("PATCH /vm") {
+                            if let Some(to) = behavior.refused_sets {
+                                *st.lock().unwrap() = to.into();
+                            }
+                        }
                         if !failed {
+                            // A snapshot is loaded paused unless told to resume.
+                            if line.starts_with("PUT /snapshot/load") {
+                                *st.lock().unwrap() = if body.contains("\"resume_vm\":true") { "Running" } else { "Paused" }.into();
+                            }
                             if line.starts_with("PATCH /vm") {
                                 if request.contains("Resumed") {
                                     *st.lock().unwrap() = "Running".into();
@@ -6336,12 +6715,27 @@ mod tests {
     /// Written once per test process and left to settle, so that no exec of
     /// it can meet a descriptor another test thread's fork still holds open
     /// for writing (ETXTBSY).
+    ///
+    /// It lives beside the test binary — a directory that can certainly
+    /// execute, where the temp dir may be mounted noexec — and is removed when
+    /// the test process exits.
     fn fake_fc_bin() -> String {
+        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
         static BIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        extern "C" fn remove_fake_fc_dir() {
+            if let Some(dir) = DIR.get() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
         BIN.get_or_init(|| {
             use std::os::unix::fs::PermissionsExt;
-            let dir = std::env::temp_dir().join(format!("felucca-fake-fc-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
+            let exe = std::env::current_exe().expect("the test binary's path");
+            let dir = DIR.get_or_init(|| exe.parent().unwrap().join(format!("felucca-fake-fc-{}", std::process::id())));
+            std::fs::create_dir_all(dir).unwrap();
+            // SAFETY: registers a plain function; it only reads a OnceLock.
+            unsafe {
+                libc::atexit(remove_fake_fc_dir);
+            }
             let path = dir.join("firecracker");
             // The socket is linked to `<sock>.fake`, or, when there is none,
             // to `<instance dir>.fake.sock` beside the instance directory: a
@@ -6500,7 +6894,7 @@ mod tests {
         let api = FakeApi::serve_with(
             &format!("{}/fc.sock", dir),
             "Running",
-            Behavior { write_snapshot: true, delay: Some(("PUT /snapshot/create", Duration::from_millis(400))), ..Default::default() },
+            Behavior { write_snapshot: true, delay: Some(("PUT /snapshot/create", Duration::from_millis(1500))), ..Default::default() },
         );
         let mgr = mgr_for(data_dir.clone());
         mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
@@ -6519,7 +6913,9 @@ mod tests {
         assert_eq!(mgr.resume("vm-1").await, Err(OpError::Busy));
         assert_eq!(mgr.start("vm-1").await, Err(OpError::Busy));
         assert_eq!(mgr.fork("vm-1", "vm-2", "c").await, Err(BUSY.to_string()));
-        assert!(t.elapsed() < Duration::from_millis(300), "a refusal must not wait");
+        // Well below the 1.5 s the first one takes: a refusal must not wait
+        // (a tighter bound flaked under load).
+        assert!(t.elapsed() < Duration::from_millis(1000), "a refusal must not wait");
         // The same kind: waits, then answers from what the first one left.
         assert_eq!(mgr.sleep_vm("vm-1").await, Ok(()));
         assert_eq!(first.await.unwrap(), Ok(()));
@@ -6723,13 +7119,15 @@ mod tests {
         }
 
         let t = Instant::now();
-        assert_eq!(mgr.stop("vm-1").await, Err(OpError::Busy));
-        assert!(t.elapsed() >= CLOSE_WAIT && t.elapsed() < CLOSE_WAIT + Duration::from_secs(2), "{:?}", t.elapsed());
+        // FLU-4 S4' changed the answer on purpose: stop has written
+        // `stopped`, so it says so (it used to answer a plain `busy`).
+        assert_eq!(mgr.stop("vm-1").await, Err(OpError::invalid(&VmState::Stopped, STOP_GAVE_UP)));
+        assert!(t.elapsed() >= CLOSE_WAIT && t.elapsed() < CLOSE_WAIT + Duration::from_secs(8), "{:?}", t.elapsed());
         // The VMM was ended and the record says so, on disk too: a retry finds
         // a stopped VM.
         assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Stopped, None)));
         assert_eq!(meta_on_disk(&data_dir, "vm-1").state, VmState::Stopped);
-        assert_eq!(mgr.delete("vm-1").await, Err(BUSY.to_string()));
+        assert_eq!(mgr.delete("vm-1").await, Err(STOP_GAVE_UP.to_string()));
         assert!(Path::new(&dir).exists(), "nothing may be removed under an operation that holds the VM");
 
         // The stuck operation goes away (its caller was dropped): the mark
@@ -7060,6 +7458,531 @@ mod tests {
         // And a stop ends that VMM.
         mgr.stop("vm-1").await.unwrap();
         assert!(gone_soon(pid).await);
+    }
+
+    // -- review fixes (FLU-4) --
+
+    /// A sleeping `vm-1` with its snapshot, its disk image and its record on
+    /// disk, under a manager whose Firecracker is `fc_bin`; the API of the
+    /// VMM a wake or start spawns is served with `behavior`.
+    async fn asleep(marker: bool, behavior: Behavior, fc_bin: &str) -> (tempfile::TempDir, String, String, Arc<Manager>, FakeApi) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        snapshot_files(&dir);
+        let line = if marker { sleeper_line("vm-1") } else { meta_line("vm-1", None, "sleeping") };
+        std::fs::write(format!("{}/meta.json", dir), line).unwrap();
+        let api = FakeApi::serve_with(&format!("{}/fc.sock.fake", dir), "Not started", behavior);
+        let mgr = mgr_with_fc(data_dir.clone(), fc_bin);
+        let mut v = sleeping_vm("vm-1");
+        v.snapshot_valid = marker;
+        mgr.inner.lock().await.vms.push(v);
+        (tmp, data_dir, dir, mgr, api)
+    }
+
+    fn set_mtime(path: &str, t: std::time::SystemTime) {
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(t).unwrap();
+    }
+
+    /// The disk image of `dir` made newer (`later`) or older than its state file.
+    fn disk_vs_snapshot(dir: &str, image: &str, later: bool) {
+        let t0 = std::fs::metadata(format!("{}/vmstate.bin", dir)).unwrap().modified().unwrap();
+        let t = if later { t0 + Duration::from_secs(5) } else { t0 - Duration::from_secs(5) };
+        set_mtime(image, t);
+    }
+
+    fn set_aside(dir: &str) -> bool {
+        !exists(&format!("{}/vmstate.bin", dir))
+            && !exists(&format!("{}/mem.bin", dir))
+            && read(&format!("{}/vmstate.bin.outrun", dir)) == "device state"
+            && read(&format!("{}/mem.bin.outrun", dir)) == "guest memory"
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_resume_goes_back_to_sleep_only_on_proof_that_the_guest_did_not_run() {
+        for case in ["refused, still paused", "refused, but running", "no answer"] {
+            let behavior = match case {
+                "refused, still paused" => Behavior { fail: vec!["PATCH /vm"], ..Default::default() },
+                "refused, but running" => Behavior { fail: vec!["PATCH /vm"], refused_sets: Some("Running"), ..Default::default() },
+                _ => Behavior { drop: vec!["PATCH /vm"], ..Default::default() },
+            };
+            let (_tmp, data_dir, dir, mgr, _api) = asleep(true, behavior, &fake_fc_bin()).await;
+
+            let r = mgr.wake_vm("vm-1").await;
+            let pid = spawned_pid(&dir).await;
+            assert!(gone_soon(pid).await, "{case}: the VMM the wake spawned must be gone");
+            assert!(lock_std(&mgr.busy).is_empty(), "{case}");
+            if case == "refused, still paused" {
+                // Firecracker answered, and the VM never left `Paused`.
+                assert!(matches!(r, Err(OpError::Other(_))), "{case}: {r:?}");
+                assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Sleeping, None)), "{case}");
+                assert!(marker_of(&mgr, "vm-1").await, "{case}");
+                let disk = meta_on_disk(&data_dir, "vm-1");
+                assert_eq!((disk.state, disk.snapshot_valid), (VmState::Sleeping, true), "{case}");
+                assert!(exists(&format!("{}/vmstate.bin", dir)) && exists(&format!("{}/mem.bin", dir)), "{case}");
+            } else {
+                // The guest may have run: never woken from this snapshot again.
+                assert!(matches!(r, Err(OpError::InvalidState { state: VmState::Stopped, .. })), "{case}: {r:?}");
+                assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Stopped, None)), "{case}");
+                let disk = meta_on_disk(&data_dir, "vm-1");
+                assert_eq!((disk.state, disk.pid, disk.snapshot_valid), (VmState::Stopped, None, false), "{case}");
+                assert!(set_aside(&dir), "{case}: the snapshot is set aside, not removed");
+                // start and stop clear what was set aside.
+                if case == "no answer" {
+                    mgr.start("vm-1").await.unwrap();
+                    let started = record_of(&mgr, "vm-1").await.unwrap().1.unwrap();
+                    assert!(!exists(&format!("{}/vmstate.bin.outrun", dir)) && !exists(&format!("{}/mem.bin.outrun", dir)));
+                    mgr.stop("vm-1").await.unwrap();
+                    assert!(gone_soon(started).await);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_vmm_that_dies_under_a_wake_leaves_the_record_to_the_wake() {
+        // The VMM dies after the commit and before the resume answers: the
+        // exit reaper used to record `error` first, and the wake answered 500
+        // with its snapshot under that `error`.
+        let (_tmp, data_dir, dir, mgr, _api) =
+            asleep(true, Behavior { delay: Some(("PATCH /vm", Duration::from_millis(400))), ..Default::default() }, &fake_fc_bin())
+                .await;
+        let waking = {
+            let m = Arc::clone(&mgr);
+            tokio::spawn(async move { m.wake_vm("vm-1").await })
+        };
+        let pid = spawned_pid(&dir).await;
+        while record_of(&mgr, "vm-1").await.map(|r| r.0) != Some(VmState::Running) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        kill_and_reap(pid);
+        // The reaper has run by now: it left the record alone.
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Running, Some(pid))));
+        // The resume is answered (the stand-in API outlives the VMM), and
+        // the wake goes on; the next sweep finds the VMM dead.
+        let _ = waking.await.unwrap();
+        mgr.sweep_dead().await;
+        assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Error, None)));
+        assert_eq!(meta_on_disk(&data_dir, "vm-1").state, VmState::Error);
+    }
+
+    #[tokio::test]
+    async fn test_wake_judges_a_record_without_the_marker_before_it_spawns_anything() {
+        for later in [true, false] {
+            let (_tmp, data_dir, dir, mgr, _api) = asleep(false, Behavior::default(), &fake_fc_bin()).await;
+            disk_vs_snapshot(&dir, &format!("{}/rootfs.ext4", dir), later);
+
+            let r = mgr.wake_vm("vm-1").await;
+            if later {
+                assert!(matches!(&r, Err(OpError::InvalidState { state: VmState::Stopped, msg }) if msg.contains("rootfs.ext4")), "{r:?}");
+                assert!(!exists(&format!("{}/fc.sock.pid", dir)), "nothing may be spawned for a stale snapshot");
+                assert_eq!(meta_on_disk(&data_dir, "vm-1").state, VmState::Stopped);
+                assert!(set_aside(&dir));
+            } else {
+                assert!(r.is_ok(), "{r:?}");
+                let pid = spawned_pid(&dir).await;
+                assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Running, Some(pid))));
+                mgr.stop("vm-1").await.unwrap();
+                assert!(gone_soon(pid).await);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_wake_on_another_image_goes_on_only_while_that_image_is_unchanged() {
+        for later in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let image = format!("{}/parents-rootfs.ext4", tmp.path().to_str().unwrap());
+            std::fs::write(&image, b"the parent's disk").unwrap();
+            let behavior = Behavior { drive: Some(image.clone()), ..Default::default() };
+            let (_tmp, data_dir, dir, mgr, api) = asleep(true, behavior, &fake_fc_bin()).await;
+            disk_vs_snapshot(&dir, &image, later);
+
+            let r = mgr.wake_vm("vm-1").await;
+            let pid = spawned_pid(&dir).await;
+            // Asked after the load, before anything was committed or resumed.
+            let lines = api.requests();
+            let (load, config) = (
+                lines.iter().position(|l| l.starts_with("PUT /snapshot/load")).unwrap(),
+                lines.iter().position(|l| l.starts_with("GET /vm/config")).expect("the drive is asked for"),
+            );
+            assert!(load < config, "{lines:?}");
+            if later {
+                assert!(matches!(&r, Err(OpError::InvalidState { state: VmState::Stopped, msg }) if msg.contains(&image)), "{r:?}");
+                assert!(gone_soon(pid).await);
+                assert!(!api.bodies().iter().any(|b| b.contains("Resumed")), "never resumed: {lines:?}");
+                assert_eq!(meta_on_disk(&data_dir, "vm-1").state, VmState::Stopped);
+                assert!(set_aside(&dir));
+            } else {
+                assert!(r.is_ok(), "{r:?}");
+                assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Running, Some(pid))));
+                mgr.stop("vm-1").await.unwrap();
+                assert!(gone_soon(pid).await);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_start_up_sets_an_outrun_snapshot_aside_and_keeps_it_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-old", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        snapshot_files(&dir);
+        // An older agent's sleeper whose guest ran after its snapshot.
+        std::fs::write(format!("{}/meta.json", dir), meta_line("vm-old", None, "sleeping")).unwrap();
+        disk_vs_snapshot(&dir, &format!("{}/rootfs.ext4", dir), true);
+
+        let mgr = mgr_for(data_dir.clone());
+        mgr.reconcile().await;
+        assert_eq!(meta_on_disk(&data_dir, "vm-old").state, VmState::Stopped);
+        assert!(set_aside(&dir), "set aside, not removed");
+        drop(mgr);
+        // The next start-up does not remove them either.
+        let again = mgr_for(data_dir.clone());
+        again.reconcile().await;
+        assert!(set_aside(&dir), "start-up leaves what was set aside");
+        // stop does.
+        again.stop("vm-old").await.unwrap();
+        assert!(!exists(&format!("{}/vmstate.bin.outrun", dir)) && !exists(&format!("{}/mem.bin.outrun", dir)));
+    }
+
+    #[tokio::test]
+    async fn test_start_up_leaves_a_sleeper_it_cannot_judge_but_removes_its_temp_state_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-q", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        std::fs::write(format!("{}/mem.bin", dir), b"guest memory").unwrap();
+        std::fs::write(format!("{}/vmstate.bin.tmp", dir), b"half a state").unwrap();
+        // stat fails with ELOOP: "cannot tell".
+        std::os::unix::fs::symlink("vmstate.bin", format!("{}/vmstate.bin", dir)).unwrap();
+        let line = meta_line("vm-q", None, "sleeping");
+        std::fs::write(format!("{}/meta.json", dir), &line).unwrap();
+
+        let mgr = mgr_for(data_dir.clone());
+        mgr.reconcile().await;
+        assert_eq!(record_of(&mgr, "vm-q").await, Some((VmState::Sleeping, None)));
+        assert_eq!(read(&format!("{}/meta.json", dir)), line, "nothing is written");
+        assert!(exists(&format!("{}/vmstate.bin", dir)) && exists(&format!("{}/mem.bin", dir)), "nothing is removed");
+        assert!(!exists(&format!("{}/vmstate.bin.tmp", dir)), "a temporary state file is never a snapshot (S9)");
+    }
+
+    #[tokio::test]
+    async fn test_stop_ends_a_vmm_no_record_names_yet() {
+        // A wake whose load never answers: the new VMM is not in the record,
+        // and only its death ends the call the wake waits in.
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = format!("{}/instances/vm-1/fc.sock.pid", tmp.path().to_str().unwrap());
+        let behavior = Behavior { hang_pidfile: Some(("PUT /snapshot/load", pidfile)), ..Default::default() };
+        let (_tmp, data_dir, dir, mgr, api) = {
+            // `asleep` makes its own temp dir: build the same in `tmp`.
+            let data_dir = tmp.path().to_str().unwrap().to_string();
+            let dir = format!("{}/instances/vm-1", data_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            disk_image(&dir);
+            snapshot_files(&dir);
+            std::fs::write(format!("{}/meta.json", dir), sleeper_line("vm-1")).unwrap();
+            let api = FakeApi::serve_with(&format!("{}/fc.sock.fake", dir), "Not started", behavior);
+            let mgr = mgr_with_fc(data_dir.clone(), &fake_fc_bin());
+            mgr.inner.lock().await.vms.push(sleeping_vm("vm-1"));
+            (tmp, data_dir, dir, mgr, api)
+        };
+        let waking = {
+            let m = Arc::clone(&mgr);
+            tokio::spawn(async move { m.wake_vm("vm-1").await })
+        };
+        while !api.requests().iter().any(|l| l.starts_with("PUT /snapshot/load")) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        let pid = spawned_pid(&dir).await;
+        let t = Instant::now();
+        mgr.stop("vm-1").await.unwrap();
+        assert!(t.elapsed() < CLOSE_WAIT, "took {:?}", t.elapsed());
+        assert!(gone_soon(pid).await, "the VMM the wake spawned must be killed");
+        assert!(waking.await.unwrap().is_err());
+        assert_eq!(meta_on_disk(&data_dir, "vm-1").state, VmState::Stopped);
+        mgr.delete("vm-1").await.unwrap();
+        assert!(!exists(&dir));
+    }
+
+    #[tokio::test]
+    async fn test_a_late_firecracker_answer_after_a_stop_commits_nothing() {
+        for op in ["sleep", "wake", "start"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().to_str().unwrap().to_string();
+            let dir = format!("{}/instances/vm-1", data_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            disk_image(&dir);
+            let late = |what| Some((what, Duration::from_millis(600)));
+            let mgr = mgr_with_fc(data_dir.clone(), &fake_fc_bin());
+            let mut vmm = None;
+            let api = match op {
+                "sleep" => {
+                    let fake = FakeVmm::spawn(&data_dir, "vm-1");
+                    mgr.inner.lock().await.vms.push(running_vm("vm-1", fake.pid()));
+                    vmm = Some(fake);
+                    let b = Behavior { write_snapshot: true, delay: late("PUT /snapshot/create"), ..Default::default() };
+                    FakeApi::serve_with(&format!("{}/fc.sock", dir), "Running", b)
+                }
+                "wake" => {
+                    snapshot_files(&dir);
+                    std::fs::write(format!("{}/meta.json", dir), sleeper_line("vm-1")).unwrap();
+                    mgr.inner.lock().await.vms.push(sleeping_vm("vm-1"));
+                    let b = Behavior { delay: late("PUT /snapshot/load"), ..Default::default() };
+                    FakeApi::serve_with(&format!("{}/fc.sock.fake", dir), "Not started", b)
+                }
+                _ => {
+                    let mut v = running_vm("vm-1", 0);
+                    v.state = VmState::Stopped;
+                    v.pid = None;
+                    mgr.inner.lock().await.vms.push(v);
+                    let b = Behavior { delay: late("PUT /actions"), ..Default::default() };
+                    FakeApi::serve_with(&format!("{}/fc.sock.fake", dir), "Not started", b)
+                }
+            };
+            let running = {
+                let m = Arc::clone(&mgr);
+                let op = op.to_string();
+                tokio::spawn(async move {
+                    match op.as_str() {
+                        "sleep" => m.sleep_vm("vm-1").await,
+                        "wake" => m.wake_vm("vm-1").await.map(|_| ()),
+                        _ => m.start("vm-1").await,
+                    }
+                })
+            };
+            let call = match op {
+                "sleep" => "PUT /snapshot/create",
+                "wake" => "PUT /snapshot/load",
+                _ => "PUT /actions",
+            };
+            while !api.requests().iter().any(|l| l.starts_with(call)) {
+                sleep(Duration::from_millis(5)).await;
+            }
+            mgr.stop("vm-1").await.unwrap();
+            let r = running.await.unwrap();
+            assert!(matches!(&r, Err(OpError::Other(m)) if m.starts_with("Aborted")), "{op}: {r:?}");
+            assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Stopped, None)), "{op}");
+            let disk = meta_on_disk(&data_dir, "vm-1");
+            assert_eq!((disk.state, disk.pid, disk.snapshot_valid), (VmState::Stopped, None, false), "{op}");
+            for f in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
+                assert!(!exists(&format!("{}/{}", dir, f)), "{op}: {f}");
+            }
+            if op == "sleep" {
+                assert!(!vmm.as_mut().unwrap().alive(), "{op}");
+            } else {
+                let pid = spawned_pid(&dir).await;
+                assert!(gone_soon(pid).await, "{op}: the VMM it spawned must be gone");
+            }
+            assert!(lock_std(&mgr.busy).is_empty(), "{op}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_sleep_overtaken_by_a_stop_before_its_kill_step_does_not_answer_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        let vmm = FakeVmm::spawn(&data_dir, "vm-1");
+        let _api = FakeApi::serve_with(&format!("{}/fc.sock", dir), "Running", Behavior { write_snapshot: true, ..Default::default() });
+        let mgr = mgr_for(data_dir.clone());
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
+
+        // The sleep commits `sleeping` and then waits for the meta.json lock.
+        let writing = mgr.meta_write_lock.lock().await;
+        let sleeping = {
+            let m = Arc::clone(&mgr);
+            tokio::spawn(async move { m.sleep_vm("vm-1").await })
+        };
+        while record_of(&mgr, "vm-1").await.map(|r| r.0) != Some(VmState::Sleeping) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        // A stop takes the record meanwhile.
+        let stopping = {
+            let m = Arc::clone(&mgr);
+            tokio::spawn(async move { m.stop("vm-1").await })
+        };
+        while record_of(&mgr, "vm-1").await.map(|r| r.0) != Some(VmState::Stopped) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        drop(writing);
+        let r = sleeping.await.unwrap();
+        assert!(matches!(&r, Err(OpError::Other(m)) if m.starts_with("Aborted")), "{r:?}");
+        stopping.await.unwrap().unwrap();
+        assert_eq!(meta_on_disk(&data_dir, "vm-1").state, VmState::Stopped);
+        for f in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
+            assert!(!exists(&format!("{}/{}", dir, f)), "{f}");
+        }
+        drop(vmm);
+    }
+
+    #[tokio::test]
+    async fn test_a_sleep_whose_record_write_failed_owes_the_reverted_record() {
+        // Another writer settles the failed write's claim on the owed list
+        // between the failure and the revert (here: the test, standing in for
+        // the liveness flush).
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        let vmm = FakeVmm::spawn(&data_dir, "vm-1");
+        let _api = FakeApi::serve_with(&format!("{}/fc.sock", dir), "Running", Behavior { write_snapshot: true, ..Default::default() });
+        let mgr = mgr_for(data_dir.clone());
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
+        break_meta_writes(&dir);
+
+        let writing = mgr.meta_write_lock.lock().await;
+        let sleeping = {
+            let m = Arc::clone(&mgr);
+            tokio::spawn(async move { m.sleep_vm("vm-1").await })
+        };
+        while record_of(&mgr, "vm-1").await.map(|r| r.0) != Some(VmState::Sleeping) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        // Single-threaded runtime: from here the order is fixed. The sleep
+        // gets the write lock and waits for `inner` (held here)...
+        let held = mgr.inner.lock().await;
+        drop(writing);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        // ...takes it for its snapshot of the record, fails to write, and
+        // waits for `inner` again to revert — behind this second hold.
+        drop(held);
+        let held = mgr.inner.lock().await;
+        assert!(lock_std(&mgr.meta_owed).contains("vm-1"), "the failed write is owed");
+        lock_std(&mgr.meta_owed).remove("vm-1");
+        drop(held);
+        assert!(sleeping.await.unwrap().is_err());
+        assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Running, Some(vmm.pid()))));
+        assert!(lock_std(&mgr.meta_owed).contains("vm-1"), "the reverted record must be owed to meta.json");
+    }
+
+    #[tokio::test]
+    async fn test_a_same_kind_wait_is_bounded_and_answers_from_what_the_first_left() {
+        // Below the control plane's 30 s call timeout (S4').
+        assert!(SAME_OP_LIMIT < Duration::from_secs(30));
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = mgr_with_fc(tmp.path().to_str().unwrap().to_string(), "/nonexistent/firecracker");
+        // Bounded: then busy.
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", 4242));
+        let held = mgr.begin_op("vm-1", OpKind::Sleep).await.unwrap();
+        let t = Instant::now();
+        assert_eq!(mgr.sleep_vm("vm-1").await, Err(OpError::Busy));
+        assert!(t.elapsed() >= SAME_OP_WAIT, "{:?}", t.elapsed());
+        drop(held);
+        // Wake and start wait for the first one, then answer from its result.
+        for kind in [OpKind::Wake, OpKind::Start] {
+            let mut v = sleeping_vm("vm-1");
+            if kind == OpKind::Start {
+                v.state = VmState::Stopped;
+            }
+            mgr.inner.lock().await.vms = vec![v];
+            let held = mgr.begin_op("vm-1", kind).await.unwrap();
+            let second = {
+                let m = Arc::clone(&mgr);
+                tokio::spawn(async move {
+                    if kind == OpKind::Wake { m.wake_vm("vm-1").await.map(|_| ()) } else { m.start("vm-1").await }
+                })
+            };
+            sleep(Duration::from_millis(200)).await;
+            assert!(!second.is_finished(), "{kind:?}: the second one waits");
+            mgr.inner.lock().await.vms[0].state = VmState::Running;
+            drop(held);
+            assert_eq!(second.await.unwrap(), Ok(()), "{kind:?}: already running");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_never_waits_for_its_parent() {
+        let f = forking(VmState::Running, Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+        let held = f.mgr.begin_fork("vm-1").unwrap();
+        let t = Instant::now();
+        assert_eq!(f.mgr.fork("vm-1", "vm-2", "c").await, Err(BUSY.to_string()));
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        assert!(record_of(&f.mgr, "vm-2").await.is_none(), "nothing reserved");
+        assert!(!exists(&f.child_dir));
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn test_forks_of_a_sleeping_parent_share_it_and_everything_else_waits_or_is_refused() {
+        let f = forking(VmState::Sleeping, Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+        // Another fork of the sleeping parent reads its files right now.
+        let mut other = f.mgr.begin_fork("vm-1").unwrap();
+        other.share();
+        // This one joins it.
+        f.mgr.fork("vm-1", "vm-2", "c").await.unwrap();
+        let child_pid = spawned_pid(&f.child_dir).await;
+        // To anything else the parent is busy.
+        assert_eq!(f.mgr.wake_vm("vm-1").await, Err(OpError::Busy));
+        assert_eq!(f.mgr.sleep_vm("vm-1").await, Err(OpError::Busy));
+        assert_eq!(f.mgr.start("vm-1").await, Err(OpError::Busy));
+        // A stop cannot pre-empt a file copy: it waits, and gives up saying
+        // what it did.
+        assert_eq!(f.mgr.stop("vm-1").await, Err(OpError::invalid(&VmState::Stopped, STOP_GAVE_UP)));
+        drop(other);
+        assert!(lock_std(&f.mgr.busy).is_empty());
+        f.mgr.stop("vm-2").await.unwrap();
+        assert!(gone_soon(child_pid).await);
+    }
+
+    #[tokio::test]
+    async fn test_a_stop_of_the_child_pre_empts_its_fork() {
+        let f = forking_with(
+            VmState::Running,
+            |_, child_dir| {
+                let pidfile = format!("{}/fc.sock.pid", child_dir);
+                (Behavior::default(), Behavior { hang_pidfile: Some(("PUT /snapshot/load", pidfile)), ..Default::default() })
+            },
+            &fake_fc_bin(),
+        )
+        .await;
+        let forked = {
+            let m = Arc::clone(&f.mgr);
+            tokio::spawn(async move { m.fork("vm-1", "vm-2", "c").await })
+        };
+        while !f.child_api.requests().iter().any(|l| l.starts_with("PUT /snapshot/load")) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        let child_pid = spawned_pid(&f.child_dir).await;
+        let t = Instant::now();
+        f.mgr.stop("vm-2").await.unwrap();
+        assert!(t.elapsed() < CLOSE_WAIT, "took {:?}", t.elapsed());
+        assert!(gone_soon(child_pid).await, "the child's VMM must be killed");
+        let r = tokio::time::timeout(Duration::from_secs(10), forked).await.expect("the fork must end").unwrap();
+        assert!(r.is_err(), "{r:?}");
+        // The record is the stop's.
+        assert_eq!(record_of(&f.mgr, "vm-2").await, Some((VmState::Stopped, None)));
+        for name in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
+            assert!(!exists(&format!("{}/{}", f.child_dir, name)), "{name}");
+        }
+        assert!(lock_std(&f.mgr.busy).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_expose_of_a_sleeping_sandbox_keeps_its_marker_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        std::fs::create_dir_all(format!("{}/instances/vm-1", data_dir)).unwrap();
+        let mgr = mgr_for(data_dir.clone());
+        let mut v = sleeping_vm("vm-1");
+        v.ip = Some("10.231.0.2".into());
+        mgr.inner.lock().await.vms.push(v);
+        mgr.expose("vm-1", 8080, &HashSet::new(), None).await.unwrap();
+        let disk = meta_on_disk(&data_dir, "vm-1");
+        assert_eq!((disk.state, disk.snapshot_valid, disk.exposes.len()), (VmState::Sleeping, true, 1));
+        mgr.unexpose("vm-1", 8080).await.unwrap();
+        assert!(meta_on_disk(&data_dir, "vm-1").snapshot_valid);
     }
 
     // -- fork (FLU-70) --
@@ -7510,13 +8433,22 @@ mod tests {
             mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
             let op = if held { Some(mgr.begin_op("vm-1", OpKind::Sleep).await.unwrap()) } else { None };
 
+            let pid = vmm.pid();
             drop(vmm); // the Firecracker dies
             mgr.sweep_dead().await;
-            assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Error, None)));
+            // FLU-4 S7' changed this on purpose: while an operation holds the
+            // VM, the record is that operation's to settle too (it used to go
+            // to `error` here, with the files left).
+            let want = if held { (VmState::Running, Some(pid)) } else { (VmState::Error, None) };
+            assert_eq!(record_of(&mgr, "vm-1").await, Some(want), "held={held}");
             assert!(!marker_of(&mgr, "vm-1").await);
             let left = exists(&format!("{}/vmstate.bin", dir)) && exists(&format!("{}/mem.bin", dir));
             assert_eq!(left, held, "held={held}");
             drop(op);
+            // Whatever the operation left, the next sweep settles.
+            mgr.sweep_dead().await;
+            assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Error, None)), "held={held}");
+            assert!(!exists(&format!("{}/vmstate.bin", dir)) && !exists(&format!("{}/mem.bin", dir)), "held={held}");
         }
     }
 

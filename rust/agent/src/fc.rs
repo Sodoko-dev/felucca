@@ -233,6 +233,16 @@ pub async fn patch_vm_state(sock: &str, state: &str) -> Result<()> {
     patch(sock, "/vm", &body).await
 }
 
+/// PATCH /vm, with Firecracker's answer whatever its status: `Ok((status,
+/// body))` whenever an HTTP answer came back, `Err` when none did (the VMM
+/// died or the reply was lost). A wake tells the two apart (FLU-4 S7'): only a
+/// resume Firecracker answered with a refusal is proof that the guest did not
+/// run.
+pub async fn patch_vm_state_answer(sock: &str, state: &str) -> Result<(u16, String)> {
+    let body = format!("{{\"state\":\"{}\"}}", state);
+    request_uds(sock, Method::PATCH, "/vm", &body).await
+}
+
 /// PUT /snapshot/create {snapshot_type:"Full", snapshot_path, mem_file_path}
 pub async fn put_snapshot_create(sock: &str, vmstate_path: &str, mem_path: &str) -> Result<()> {
     let body = build_snapshot_create(vmstate_path, mem_path);
