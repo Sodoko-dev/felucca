@@ -129,9 +129,24 @@ fi
 if want B5; then
 say "== B5. the agent's and the host's nft tables are deleted while sandboxes run =="
 [ -n "$(vm_state bk-m1)" ] || { mk bk-m1 256 >/dev/null; wait_exec bk-m1 150; }
-FC0="$(fcs)"
+FC0="$(fcs)"; AP0="$(agent_pid)"
+# The agent's three tables, stateless (every chain starts with a counter marker since FLU-8), one line per chain, sorted.
+b5_fp() { local f; for f in ip bridge netdev; do sudo nft -s -t list table $f felucca 2>/dev/null | awk -v f=$f '
+  /^\tchain /{c=$0; body=""; inb=1; next} inb && /^\t}/{print f" "c" |"body; inb=0; next} inb{body=body" "$0; next}
+  /^\tset /{print f" "$0}'; done | tr -s '\t' ' ' | sort; }
+b5_agent_tables() { for t in "ip felucca" "bridge felucca" "netdev felucca"; do sudo nft list table $t >/dev/null 2>&1 || return 1; done; }
+FP0="$(b5_fp)"
 for t in "inet felucca_host" "ip felucca" "bridge felucca" "netdev felucca"; do sudo nft delete table $t 2>/dev/null; done
-say "  tables gone; agent still $(systemctl is-active $UNIT) (nothing re-checks at runtime: FLU-8)"
+# FLU-8: the isolation watch looks every 5 s and puts the agent's own tables back without a restart; the host
+# table belongs to felucca-firewall.service and is not put back by the agent, and /healthz says so.
+i=0; until b5_agent_tables || [ $i -ge 60 ]; do sleep 0.25; i=$((i+1)); done
+b5_agent_tables && ok "without a restart: the isolation watch put the agent's three tables back ($(awk -v i=$i 'BEGIN{printf "%.2f", i/4}') s; limit 15 s)" || bad "without a restart: the agent's tables are not back within 15 s"
+eq "without a restart: the agent kept its pid" "$(agent_pid)" "$AP0"
+sleep 6
+eq "without a restart: the rebuilt tables are the ones before (nft -s, per chain)" "$(b5_fp | md5sum | cut -c1-12)" "$(printf '%s\n' "$FP0" | md5sum | cut -c1-12)"
+eq "without a restart: the host table stays gone (the agent does not own it)" "$(sudo nft list table inet felucca_host >/dev/null 2>&1 && echo present || echo absent)" absent
+eq "/healthz isolation while the host table is missing" "$(curl -s -m 2 "$A/healthz" | jq -r '.isolation')" false
+say "  while the host table is missing: felucca0 $(link_admin_up felucca0 && echo up || echo down), exec $(exec_ok bk-m1 && echo works || echo FAILS)"
 sudo systemctl restart $UNIT
 i=0; until [ "$(systemctl is-active $UNIT)" = active ] && wait_up 2 || [ $i -ge 20 ]; do sleep 1; i=$((i+1)); done
 eq "tables deleted, agent restarted: it is back by itself (the unit reloads the host firewall)" "$(systemctl is-active $UNIT)" active
@@ -140,6 +155,8 @@ eq "sandboxes kept their pids" "$(fcs)" "$FC0"
 link_admin_up felucca0 && ok "felucca0 is up" || bad "felucca0 is down"
 for t in "ip felucca" "bridge felucca" "netdev felucca"; do sudo nft list table $t >/dev/null 2>&1 && ok "agent rebuilt table $t" || bad "table $t missing"; done
 eq "one anti-spoof chain per tap again" "$(chain_count)" "$(tap_count)"
+i=0; until [ "$(curl -s -m 2 "$A/healthz" | jq -r '.isolation')" = true ] || [ $i -ge 30 ]; do sleep 1; i=$((i+1)); done
+eq "/healthz isolation after the restart (30 s limit)" "$(curl -s -m 2 "$A/healthz" | jq -r '.isolation')" true
 check "exec works" exec_ok bk-m1
 fi
 

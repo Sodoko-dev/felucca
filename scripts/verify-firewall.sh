@@ -27,7 +27,8 @@
 #   FELUCCA_LAB_AGENT_BIN=/path/to/static/felucca-agent bash scripts/verify-firewall.sh
 #
 # Other VMs used: FELUCCA_LAB_CP (default infra-saas-lab) and FELUCCA_LAB_OTHER
-# (default: the other of kata-lab-0 / kata-lab-1). Takes about 7 minutes. The
+# (default: the other of kata-lab-0 / kata-lab-1; `none` leaves out the probe
+# from a VM that is not on the allow-list, and says so). Takes about 7 minutes. The
 # agent on the worker is restarted several times and is down for about half a
 # minute in two of the cases; its sandboxes are not touched.
 set -u
@@ -37,9 +38,10 @@ WORKER="${1:-${FELUCCA_LAB_WORKER:-kata-lab-0}}"
 CP_VM="${FELUCCA_LAB_CP:-infra-saas-lab}"
 case "$WORKER" in kata-lab-0) DEF_OTHER=kata-lab-1;; *) DEF_OTHER=kata-lab-0;; esac
 OTHER="${FELUCCA_LAB_OTHER:-$DEF_OTHER}"
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 ok()  { PASS=$((PASS+1)); printf '  PASS: %s\n' "$*"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL: %s\n' "$*"; }
+skip() { SKIP=$((SKIP+1)); printf '  SKIP: %s\n' "$*"; }
 
 echo "== 1. port 9090 from the outside while $WORKER reloads its rules =="
 # Lima's user-v2 addresses move across long stops, so both are looked up now.
@@ -54,27 +56,36 @@ else
   probe() { # <vm> <ip> <seconds> -> "ok=N fail=M"
     limactl shell "$1" -- bash -c "ok=0; fail=0; end=\$((SECONDS+$3)); while [ \$SECONDS -lt \$end ]; do if curl -s -m 2 -o /dev/null http://$2:9090/healthz; then ok=\$((ok+1)); else fail=\$((fail+1)); fi; done; echo ok=\$ok fail=\$fail" 2>/dev/null | tr -d '\r'
   }
-  if limactl shell "$OTHER" -- ping -c2 -W2 "$WORKER_IP" >/dev/null 2>&1; then
+  if [ "$OTHER" = none ]; then
+    skip "no VM that is not on the allow-list (FELUCCA_LAB_OTHER=none): the 'never gets through' probe is left out"
+  elif limactl shell "$OTHER" -- ping -c2 -W2 "$WORKER_IP" >/dev/null 2>&1; then
     ok "$OTHER can reach $WORKER ($WORKER_IP) at all (ping)"
   else
     bad "$OTHER cannot ping $WORKER_IP — the 'never gets through' check below would prove nothing"
   fi
   TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
   probe "$CP_VM" "$CP_TARGET" 30 > "$TMP/cp" &
-  probe "$OTHER" "$WORKER_IP" 30 > "$TMP/other" &
+  [ "$OTHER" != none ] && probe "$OTHER" "$WORKER_IP" 30 > "$TMP/other" &
   sleep 2
   limactl shell "$WORKER" -- mkdir -p /tmp/felucca-lab
   limactl cp "$REPO/test/lab/lib.sh" "$WORKER:/tmp/felucca-lab/lib.sh" >/dev/null
   limactl cp "$REPO/test/lab/firewall.sh" "$WORKER:/tmp/felucca-lab/firewall.sh" >/dev/null
   TOKEN_FILE="${FELUCCA_TOKEN_FILE:-$HOME/.config/felucca/lab-token}"
   TOKEN="${2:-${FELUCCA_TOKEN:-}}"; [ -z "$TOKEN" ] && [ -r "$TOKEN_FILE" ] && TOKEN="$(tr -d " \t\r\n" < "$TOKEN_FILE")"
-  LOOP="$(limactl shell "$WORKER" -- env FELUCCA_TOKEN="$TOKEN" bash /tmp/felucca-lab/firewall.sh loop 200 2>/dev/null | tr -d '\r' | tail -1)"
+  # The token goes over standard input into a 0600 header file (lib.sh hands it to curl with -H @file), as in
+  # test/lab/run-on-worker.sh: it is on no command line, here or in the VM. Removed right after the loop.
+  AUTHD=/tmp/felucca-lab-auth; AUTH="$AUTHD/auth-fwloop.hdr"
+  printf '%s' "$TOKEN" | limactl shell "$WORKER" -- bash -c "umask 077; mkdir -p $AUTHD && chmod 700 $AUTHD && { printf 'Authorization: Bearer '; tr -d ' \t\r\n'; printf '\n'; } > $AUTH && chmod 600 $AUTH"
+  TOKEN=""
+  LOOP="$(limactl shell "$WORKER" -- env FELUCCA_AUTH_FILE="$AUTH" bash /tmp/felucca-lab/firewall.sh loop 200 2>/dev/null | tr -d '\r' | tail -1)"
+  limactl shell "$WORKER" -- rm -f "$AUTH"
   wait
   [ "$LOOP" = "reloads=200 failed=0" ] && ok "200 reloads, none failed" || bad "reload loop: $LOOP"
   CP_OK="$(sed -n 's/.*ok=\([0-9]*\).*/\1/p' "$TMP/cp")"; CP_FAIL="$(sed -n 's/.*fail=\([0-9]*\).*/\1/p' "$TMP/cp")"
-  OT_OK="$(sed -n 's/.*ok=\([0-9]*\).*/\1/p' "$TMP/other")"; OT_FAIL="$(sed -n 's/.*fail=\([0-9]*\).*/\1/p' "$TMP/other")"
+  [ "$OTHER" = none ] || OT_OK="$(sed -n 's/.*ok=\([0-9]*\).*/\1/p' "$TMP/other")"; [ "$OTHER" = none ] || OT_FAIL="$(sed -n 's/.*fail=\([0-9]*\).*/\1/p' "$TMP/other")"
   if [ "${CP_OK:-0}" -gt 0 ] && [ "${CP_FAIL:-1}" = 0 ]; then ok "control plane ($CP_VM -> $CP_TARGET:9090): ${CP_OK} requests, 0 failed"; else bad "control plane ($CP_VM -> $CP_TARGET:9090): ok=${CP_OK:-?} fail=${CP_FAIL:-?}"; fi
-  if [ "${OT_OK:-1}" = 0 ] && [ "${OT_FAIL:-0}" -gt 0 ]; then ok "not on the allow-list ($OTHER -> $WORKER_IP:9090): ${OT_FAIL} attempts, 0 got through"; else bad "not on the allow-list ($OTHER -> $WORKER_IP:9090): ok=${OT_OK:-?} fail=${OT_FAIL:-?}"; fi
+  if [ "$OTHER" = none ]; then :
+  elif [ "${OT_OK:-1}" = 0 ] && [ "${OT_FAIL:-0}" -gt 0 ]; then ok "not on the allow-list ($OTHER -> $WORKER_IP:9090): ${OT_FAIL} attempts, 0 got through"; else bad "not on the allow-list ($OTHER -> $WORKER_IP:9090): ok=${OT_OK:-?} fail=${OT_FAIL:-?}"; fi
 fi
 
 # An installer bundle on the worker, when a binary was given.
@@ -93,5 +104,5 @@ echo "== 2. on the worker =="
 INSTALLER_BUNDLE="$BUNDLE" bash "$REPO/test/lab/run-on-worker.sh" firewall "$WORKER" "${2:-}"; RC=$?
 
 echo ""
-echo "OUTSIDE PROBES: $PASS passed, $FAIL failed"
+echo "OUTSIDE PROBES: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ] && [ "$RC" -eq 0 ]
