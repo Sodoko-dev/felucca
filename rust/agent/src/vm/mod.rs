@@ -2992,15 +2992,9 @@ impl Manager {
 
         let pid = self.spawn_firecracker(id, &sock, dir_path)?;
 
-        // Poll the API socket up to 3000ms in 50ms steps.
-        let deadline = Instant::now() + Duration::from_millis(3000);
-        loop {
-            if Path::new(&sock).exists() { break; }
-            if Instant::now() >= deadline {
-                kill_and_reap(pid); // don't leak the half-spawned FC
-                return Err("SocketNeverAppeared".into());
-            }
-            sleep(Duration::from_millis(50)).await;
+        if let Err(e) = wait_api_socket(&sock, API_SOCKET_WAIT).await {
+            kill_and_reap(pid); // don't leak the half-spawned FC
+            return Err(e);
         }
 
         // Cold boot only attaches a vsock device when the guest-agent marker is
@@ -3528,15 +3522,9 @@ impl Manager {
 
         let pid = self.spawn_firecracker(id, &sock, &dir_path)?;
 
-        // Poll socket.
-        let deadline = Instant::now() + Duration::from_millis(3000);
-        loop {
-            if Path::new(&sock).exists() { break; }
-            if Instant::now() >= deadline {
-                kill_and_reap(pid); // don't leak the half-spawned FC
-                return Err("SocketNeverAppeared".into());
-            }
-            sleep(Duration::from_millis(50)).await;
+        if let Err(e) = wait_api_socket(&sock, API_SOCKET_WAIT).await {
+            kill_and_reap(pid); // don't leak the half-spawned FC
+            return Err(e.into());
         }
 
         // Wake restores into the VM's OWN dir, so the baked vsock uds_path is
@@ -4029,14 +4017,9 @@ impl Manager {
             Err(e) => return Err(self.fail_child(child_id, &child_dir, None, child_slot, e).await),
         };
 
-        let deadline = Instant::now() + Duration::from_millis(3000);
-        loop {
-            if Path::new(&child_sock).exists() { break; }
-            if Instant::now() >= deadline {
-                // Don't leak the half-spawned child FC.
-                return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, "SocketNeverAppeared".into()).await);
-            }
-            sleep(Duration::from_millis(50)).await;
+        if let Err(e) = wait_api_socket(&child_sock, API_SOCKET_WAIT).await {
+            // Don't leak the half-spawned child FC.
+            return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e).await);
         }
 
         // If the parent had a vsock device, the snapshot's baked uds_path points
@@ -5357,6 +5340,36 @@ fn copy_rootfs(src: &str, dst: &str) -> Result<(), String> {
     std::fs::copy(src, dst)
         .map(|_| ())
         .map_err(|e| format!("copy {} → {}: {}", src, dst, e))
+}
+
+/// How long a freshly spawned Firecracker has to accept on its API socket.
+const API_SOCKET_WAIT: Duration = Duration::from_millis(3000);
+
+/// Wait until a freshly spawned Firecracker's API socket ACCEPTS a
+/// connection, every 50 ms, for at most `limit` (V1). The socket file exists
+/// as soon as Firecracker has bound it; under load the first request used to
+/// arrive before it listened, and the refused connection failed the whole
+/// create (`FcError: send request: client error (Connect)`). A missing file
+/// or a refused connection is "not yet"; a connection that succeeds is
+/// closed at once (Firecracker ignores it). The error names no path: it can
+/// reach a tenant.
+async fn wait_api_socket(sock: &str, limit: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + limit;
+    loop {
+        // Bounded too: a full accept queue can hold a connect.
+        if let Ok(Ok(_conn)) = tokio::time::timeout(Duration::from_millis(250), tokio::net::UnixStream::connect(sock)).await {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let file = if Path::new(sock).exists() { "existed" } else { "did not exist" };
+            return Err(format!(
+                "SocketNeverAppeared: the Firecracker API socket did not accept a connection within {} ms (its file {})",
+                limit.as_millis(),
+                file
+            ));
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
 }
 
 fn kill_and_reap(pid: i32) {
@@ -6884,6 +6897,11 @@ mod tests {
                             }
                         };
                         let line = request.lines().next().unwrap_or("").to_string();
+                        // A connection that sends nothing is the agent's
+                        // readiness probe (`wait_api_socket`): not a request.
+                        if line.is_empty() {
+                            return;
+                        }
                         let body = request.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
                         if let Some(path) = &behavior.watch_meta {
                             let now = std::fs::read_to_string(path).unwrap_or_default();
@@ -9456,6 +9474,79 @@ mod tests {
         assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Running, Some(pid))));
         mgr.stop("vm-1").await.unwrap();
         assert!(gone_soon(pid).await);
+    }
+
+    // ---- V1: wait until the API socket accepts, not until its file exists ----
+
+    /// A unix socket bound at `path` and NOT listening (connects are
+    /// refused); `listen` on the returned fd makes it accept.
+    fn bound_not_listening(path: &str) -> i32 {
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0);
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (i, b) in path.bytes().enumerate() {
+            addr.sun_path[i] = b as libc::c_char;
+        }
+        let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        assert_eq!(unsafe { libc::bind(fd, &addr as *const _ as *const libc::sockaddr, len) }, 0, "bind {path}");
+        fd
+    }
+
+    #[tokio::test]
+    async fn test_v1_the_api_socket_is_ready_when_it_accepts_not_when_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("fc.sock").to_str().unwrap().to_string();
+        let fd = bound_not_listening(&sock);
+        assert!(Path::new(&sock).exists(), "the file is there from the bind on");
+        let listen_at = Instant::now() + Duration::from_millis(200);
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(unsafe { libc::listen(fd, 8) }, 0);
+        });
+        let started = Instant::now();
+        wait_api_socket(&sock, API_SOCKET_WAIT).await.expect("ready once it listens");
+        assert!(Instant::now() >= listen_at, "ready before the socket listened (after {:?})", started.elapsed());
+        assert!(started.elapsed() < Duration::from_millis(1200), "took {:?}", started.elapsed());
+        t.join().unwrap();
+        unsafe { libc::close(fd) };
+    }
+
+    #[tokio::test]
+    async fn test_v1_a_socket_that_never_appears_is_an_error_after_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("fc.sock").to_str().unwrap().to_string();
+        let started = Instant::now();
+        let e = wait_api_socket(&sock, Duration::from_millis(300)).await.unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert!(started.elapsed() < Duration::from_millis(1000), "took {:?}", started.elapsed());
+        assert!(e.starts_with("SocketNeverAppeared") && e.contains("did not accept") && e.contains("did not exist"), "{e}");
+        assert!(!e.contains('/'), "no path in an answer that can reach a tenant: {e}");
+        // Bound but never listening: the file existed.
+        let fd = bound_not_listening(&sock);
+        let e = wait_api_socket(&sock, Duration::from_millis(200)).await.unwrap_err();
+        assert!(e.contains("(its file existed)"), "{e}");
+        unsafe { libc::close(fd) };
+    }
+
+    #[tokio::test]
+    async fn test_v1_a_socket_that_accepts_at_once_adds_no_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("fc.sock").to_str().unwrap().to_string();
+        let _l = tokio::net::UnixListener::bind(&sock).unwrap();
+        let started = Instant::now();
+        wait_api_socket(&sock, API_SOCKET_WAIT).await.unwrap();
+        assert!(started.elapsed() < Duration::from_millis(40), "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn test_v1_every_spawn_site_waits_for_the_socket_to_accept() {
+        // create and start (`spawn_and_configure`), wake, the fork child.
+        let src = include_str!("mod.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(prod.matches("wait_api_socket(&").count(), 3, "one wait per spawn site");
+        assert_eq!(prod.matches("self.spawn_firecracker(").count(), 3, "a spawn site without the wait?");
+        assert!(!prod.contains("sock).exists() { break; }"), "a wait on the socket FILE is back");
     }
 
     // ---- FLU-8 r7 W19: the lifecycle with networking ON, through the rule fake ----
