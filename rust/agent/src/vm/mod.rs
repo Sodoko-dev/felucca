@@ -2155,7 +2155,16 @@ impl Manager {
     /// start-up's and the last rule change's (`net::netfilter_ready`).
     pub fn isolation_ok(&self) -> bool {
         if !self.rules_on() { return true; }
-        let verdict = lock_std(&self.watch).verdict(Instant::now());
+        let (withheld, verdict) = {
+            let w = lock_std(&self.watch);
+            (w.withheld, w.verdict(Instant::now()))
+        };
+        // Z2: a worker that hands out no guest address says so, in every
+        // watch mode — the control plane would otherwise keep placing every
+        // create on it (it has the fewest sandboxes, since it refuses them).
+        if withheld {
+            return false;
+        }
         verdict.unwrap_or_else(|| self.rules.fences_ready())
     }
 
@@ -2185,6 +2194,7 @@ impl Manager {
         };
         if ingress_ok && g.slots_withheld {
             g.slots_withheld = false;
+            lock_std(&self.watch).withheld = false;
             info!("the ingress DNAT chain has been rebuilt: guest addresses are handed out again");
         }
         if pair_ok && !g.held_slots.is_empty() {
@@ -2216,6 +2226,7 @@ impl Manager {
                    exposed ports do not answer until a rebuild succeeds");
         } else {
             self.inner.lock().await.slots_withheld = true;
+            lock_std(&self.watch).withheld = true;
             error!("the ingress DNAT chain could be neither rebuilt nor emptied at start-up: it may still hold \
                     the previous run's node-port rules for addresses no sandbox holds now, so creates, forks \
                     and pool refills are refused (no guest address is handed out) until it is rebuilt");
@@ -4067,9 +4078,17 @@ impl Manager {
                 warn!(vm = %parent_id, child = %child_id, image = %p,
                     "fork refused: the parent ran on another image than its own rootfs.ext4 when it was \
                      snapshotted (it was forked before this release); the child is not started");
-                let e = self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, FORK_REFUSED_FORKED_BEFORE.into()).await;
+                // Z1: a refusal leaves nothing behind — the control plane
+                // takes a 409 InvalidState from fork as "nothing was
+                // created" and forgets the id, so an `error` record kept
+                // "for its owner to see" (`fail_child`) would never be
+                // deleted, and each retry left another full disk copy. The
+                // VMM goes, then the record, the directory, the tap and the
+                // slot, as for a fork refused before its pause.
+                kill_and_reap(child_pid);
+                self.drop_unborn_child(child_id, Some(&child_dir), child_slot).await;
                 *refused = Some(self.state_now(parent_id, &parent_state).await);
-                return Err(e);
+                return Err(FORK_REFUSED_FORKED_BEFORE.into());
             }
             Err(e) => return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e.to_string()).await),
         }
@@ -8865,6 +8884,26 @@ mod tests {
         assert!(lock_std(&f.mgr.busy).is_empty());
     }
 
+    /// No process whose command line names `dir` is alive (zombies aside).
+    fn no_process_in(dir: &str) -> bool {
+        for _ in 0..200 {
+            let mut found = false;
+            for e in std::fs::read_dir("/proc").unwrap().flatten() {
+                let p = e.path();
+                let cmd = std::fs::read(p.join("cmdline")).unwrap_or_default();
+                let stat = std::fs::read_to_string(p.join("stat")).unwrap_or_default();
+                if String::from_utf8_lossy(&cmd).contains(dir) && stat.split_whitespace().nth(2) != Some("Z") {
+                    found = true;
+                }
+            }
+            if !found {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
     #[tokio::test]
     async fn test_a_child_whose_snapshot_names_another_image_than_its_parents_is_never_started() {
         for state in [VmState::Running, VmState::Paused, VmState::Sleeping] {
@@ -8879,6 +8918,7 @@ mod tests {
                     FakeApi::serve_with(&format!("{}.fake.sock", f.child_dir), "Not started", Behavior { drive: Some(image.clone()), ..Default::default() })
                 },
             ));
+            let (rules, free) = netted(&mut f);
             let r = f.mgr.fork_answer("vm-1", "vm-2", "c").await;
             // Changed on purpose (items 6, 7): a 409 refusal with the
             // parent's state for every parent state — the sleeping parent's
@@ -8890,10 +8930,18 @@ mod tests {
             );
             let lines = f.child_api.requests();
             assert!(!lines.iter().any(|l| l.starts_with("PATCH")), "{state}: neither re-pointed nor resumed: {lines:?}");
-            let pid = spawned_pid(&f.child_dir).await;
-            assert!(gone_soon(pid).await, "{state}");
-            assert_eq!(record_of(&f.mgr, "vm-2").await, Some((VmState::Error, None)), "{state}");
-            assert!(!exists(&format!("{}/mem.bin", f.child_dir)), "{state}");
+            // Changed on purpose (Z1): a refused fork leaves NOTHING — the
+            // control plane forgets the id on a 409, so the `error` record
+            // and its directory (a full disk copy) were never deleted.
+            assert!(no_process_in(&f.child_dir), "{state}: the child's VMM is still running");
+            assert_eq!(record_of(&f.mgr, "vm-2").await, None, "{state}");
+            assert!(!exists(&f.child_dir), "{state}: the child's directory is left");
+            gave_back(&rules, &free, &format!("{state}"));
+            // The parent is as it was: asleep and valid, or running, or paused.
+            assert_eq!(record_of(&f.mgr, "vm-1").await.unwrap().0, state, "{state}");
+            if state == VmState::Sleeping {
+                assert!(marker_of(&f.mgr, "vm-1").await, "the parent's snapshot stays valid");
+            }
         }
         // The same file under another spelling of its path is the same file.
         let mut f = forking(VmState::Running, Behavior::default(), Behavior::default(), &fake_fc_bin()).await;

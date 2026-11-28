@@ -555,7 +555,8 @@
         lock_std(&w.rules.reject).push("ip felucca ingress".into());
         assert!(!w.mgr.start_ingress().await);
         assert_eq!(Manager::claim_slot(&mut *w.mgr.inner.lock().await), Err("IsolationFailed"));
-        assert!(w.mgr.isolation_ok(), "ingress is not isolation");
+        // Changed on purpose (Z2): a worker that hands out no address says so.
+        assert!(!w.mgr.isolation_ok(), "withheld slots must report isolation down");
         // The tick that rebuilds it lets addresses through again.
         w.rules.fail_ingress.store(false, Ordering::SeqCst);
         mend(&w.rules);
@@ -1190,4 +1191,43 @@
         assert!(rules.contains(&format!("ip saddr {} accept", new_ip)), "{rules:?}");
         drop(held);
         let _ = deleting.await;
+    }
+
+    // ---- r10 ----
+
+    #[tokio::test]
+    async fn test_z2_withheld_slots_report_isolation_down_in_every_mode() {
+        for mode in [IsolationWatch::Off, IsolationWatch::Enforce] {
+            let w = worker().await;
+            if mode == ENFORCE {
+                tick(&w).await;
+            }
+            assert!(w.mgr.isolation_ok(), "{mode:?}");
+            w.rules.fail_ingress.store(true, Ordering::SeqCst);
+            lock_std(&w.rules.reject).push("ip felucca ingress".into());
+            assert!(!w.mgr.start_ingress().await);
+            assert!(!w.mgr.isolation_ok(), "{mode:?}: no guest address is handed out, and isolation said true");
+            // The healthz body and the heartbeat carry the same value.
+            assert!(crate::registration::heartbeat_body("n", 0, 0, 0, w.mgr.isolation_ok()).ends_with("\"isolation_ok\":false}"));
+            if mode == ENFORCE {
+                tick(&w).await;
+                assert!(!w.mgr.isolation_ok(), "a tick must not hide it");
+            }
+            // The cause goes; the retry rebuilds the chain: true again.
+            w.rules.fail_ingress.store(false, Ordering::SeqCst);
+            mend(&w.rules);
+            if mode == ENFORCE {
+                tick(&w).await;
+            } else {
+                let retry = tokio::spawn(withheld_retry_loop(Arc::clone(&w.mgr)));
+                for _ in 0..100 {
+                    if w.mgr.isolation_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                retry.abort();
+            }
+            assert!(w.mgr.isolation_ok(), "{mode:?}: still down after the rebuild");
+        }
     }

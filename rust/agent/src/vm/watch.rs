@@ -131,6 +131,10 @@ pub(crate) struct Record {
     /// None until a look could be made.
     host_fence_expected: Option<bool>,
     fence_warned: Option<Instant>,
+    /// Start-up could neither rebuild nor empty the ingress chain, and no
+    /// guest address is handed out (`Inner.slots_withheld`, mirrored here so
+    /// `isolation` can say so without the state lock — Z2).
+    pub(crate) withheld: bool,
     pub(crate) counters: Counters,
 }
 
