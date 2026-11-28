@@ -284,8 +284,29 @@ async fn main() {
         warn!("the guest bridge could not be brought up; guests have no network");
     }
     // Ingress DNAT rules don't survive a host reboot either; rebuild them
-    // from the exposes persisted in meta.json.
-    mgr.refresh_ingress().await;
+    // from the exposes persisted in meta.json. A failure no longer passes
+    // silently: the chain is emptied instead, or — when even that fails —
+    // no guest address is handed out until it is rebuilt (the watch retries
+    // it every tick, like any chain whose last rebuild failed).
+    if !mgr.start_ingress().await {
+        error!("the ingress DNAT rules could not be rebuilt at start-up; exposed node ports do not answer until a rebuild succeeds");
+    }
+
+    // FLU-8: look at the kernel every 5 s and put back what is missing.
+    // `report` and `off` change the watch only: everything above still
+    // refused to serve, and took the bridge down, exactly as before.
+    if cfg.net {
+        match cfg.isolation_watch {
+            config::IsolationWatch::Off => warn!("isolation watch is off: nothing notices rules that vanish while the agent runs"),
+            mode => {
+                info!(mode = ?mode, "isolation watch started");
+                let mgr5 = Arc::clone(&mgr);
+                tokio::spawn(async move {
+                    vm::watch::watch_loop(mgr5, mode).await;
+                });
+            }
+        }
+    }
 
     // Background registration + heartbeat loop.
     let node_id: NodeId = Arc::new(RwLock::new(String::new()));

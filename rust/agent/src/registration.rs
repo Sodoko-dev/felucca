@@ -222,6 +222,19 @@ async fn register_once(
     Ok(())
 }
 
+/// The heartbeat's JSON body. `isolation_ok` is `Manager::isolation_ok`, the
+/// same value `/healthz` carries.
+pub(crate) fn heartbeat_body(id: &str, mem_free: u64, vm_count: u32, pool_size: u32, isolation_ok: bool) -> String {
+    format!(
+        "{{\"id\":{},\"mem_free_mib\":{},\"vm_count\":{},\"pool_size\":{},\"isolation_ok\":{}}}",
+        json_str(id),
+        mem_free,
+        vm_count,
+        pool_size,
+        isolation_ok,
+    )
+}
+
 async fn heartbeat_once(
     mgr: &Arc<Manager>,
     control_plane: &str,
@@ -243,16 +256,7 @@ async fn heartbeat_once(
     // So feluccad can stop scheduling onto a worker whose guest-network fences
     // are down: every sandbox placed there would share one flat network, and
     // nothing on the tenant's side would show it.
-    let isolation_ok = mgr.isolation_ok();
-
-    let body = format!(
-        "{{\"id\":{},\"mem_free_mib\":{},\"vm_count\":{},\"pool_size\":{},\"isolation_ok\":{}}}",
-        json_str(&id),
-        mem_free,
-        vm_count,
-        pool_size,
-        isolation_ok,
-    );
+    let body = heartbeat_body(&id, mem_free, vm_count, pool_size, mgr.isolation_ok());
 
     let (host, port) = split_host_port(control_plane);
     let bearer = outbound_token(node_token, token);

@@ -1003,6 +1003,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_healthz_and_the_heartbeat_carry_the_watch_verdict() {
+        // FLU-8 N9': the same value in both, in every state; the healthz
+        // body byte-identical to before for true and false.
+        use crate::config::IsolationWatch;
+        use std::sync::atomic::Ordering;
+        let w = crate::vm::watch::tests::worker().await;
+        let state = AppState {
+            mgr: Arc::clone(&w.mgr),
+            token: "t".into(),
+            node_token: Arc::new(std::sync::RwLock::new(String::new())),
+        };
+        let check = |want: bool| {
+            let state = state.clone();
+            async move {
+                let resp = healthz(State(state.clone())).await;
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+                assert_eq!(std::str::from_utf8(&bytes).unwrap(), format!("{{\"ok\":true,\"isolation\":{}}}", want));
+                let hb = crate::registration::heartbeat_body("n1", 1, 2, 0, state.mgr.isolation_ok());
+                assert!(hb.ends_with(&format!("\"isolation_ok\":{}}}", want)), "{hb}");
+            }
+        };
+        // Before the first tick: start-up's verdict, either way.
+        check(true).await;
+        w.rules.fences_down.store(true, Ordering::SeqCst);
+        check(false).await;
+        // After a tick: the watch's.
+        w.mgr.watch_tick(IsolationWatch::Enforce).await.unwrap();
+        check(true).await;
+        // The host fence missing.
+        let fence = std::mem::take(&mut w.rules.k().chain_mut("inet", "felucca_host", "input").unwrap().rules);
+        w.mgr.watch_tick(IsolationWatch::Enforce).await.unwrap();
+        check(false).await;
+        w.rules.k().chain_mut("inet", "felucca_host", "input").unwrap().rules = fence;
+        w.mgr.watch_tick(IsolationWatch::Enforce).await.unwrap();
+        check(true).await;
+        // A fence that cannot be put back.
+        w.rules.k().tables.get_mut(&("ip".to_string(), "felucca".to_string())).unwrap().remove("forward");
+        w.rules.reject.lock().unwrap().push("ip felucca forward".into());
+        w.mgr.watch_tick(IsolationWatch::Enforce).await.unwrap();
+        check(false).await;
+    }
+
     // ---- inbound credentials ----
 
     fn auth_state(dir: &std::path::Path, shared: &str, node: &str) -> AppState {
