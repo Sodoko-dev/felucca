@@ -88,12 +88,12 @@ func newRefusalFixture(t *testing.T) *refusalFixture {
 	t.Cleanup(func() { sqlite.Close() })
 	fs := &faultStore{Store: sqlite}
 	srv := New(cfg, state.New(), fs)
-	t.Cleanup(srv.stopBackground)
+	t.Cleanup(srv.StopBackground)
 	rw := &refusingWorker{}
 	ts := httptest.NewServer(rw.handler())
 	t.Cleanup(ts.Close)
 	srv.st.RegisterNode("worker-1", ts.URL, 4, 8192, time.Now().Unix())
-	if err := srv.save(nil); err != nil {
+	if err := srv.saveState(); err != nil {
 		t.Fatalf("initial save: %v", err)
 	}
 	p := &persistFixture{srv: srv, fs: fs, sqlite: sqlite, fw: &rw.fsWorker, path: cfg.DBPath, h: srv.Handler()}
@@ -110,7 +110,7 @@ func (f *refusalFixture) setRecord(t *testing.T, id string, s model.SandboxState
 		sb := f.srv.st.FindSandbox(id)
 		sb.State, sb.LastActivity, sb.SleptAt = s, lastActivity, sleptAt
 	}()
-	if err := f.srv.save(nil); err != nil {
+	if err := f.srv.saveState(); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 }

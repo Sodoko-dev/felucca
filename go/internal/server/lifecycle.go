@@ -274,6 +274,12 @@ func nodeUnreachable(unreachable map[nodeTenant]bool, addr, tenant string, err e
 // GC'd later, by dropDynamicExposes. unreachable is the sweep's per-pass set of (node, tenant) pairs whose agent
 // could not be reached; see lifecycleSweep.
 func (srv *Server) autoSleep(id, tenant string, now int64, unreachable map[nodeTenant]bool) {
+	// Checked per action, not once per sweep: a save that failed earlier in
+	// this sweep has the store failing, and every later action would carry out
+	// its worker call only to fail its save too.
+	if srv.storeFailing() {
+		return
+	}
 	agentAddr, state := srv.agentAddrAndState(id)
 	if state != model.StateRunning || agentAddr == "" {
 		return // raced a manual transition or lost the node; next sweep re-decides
@@ -319,7 +325,7 @@ func (srv *Server) autoSleep(id, tenant string, now int64, unreachable map[nodeT
 			srv.queueUsageLocked(sb, "slept")
 		}
 	}()
-	if err := srv.save(nil); err != nil {
+	if err := srv.saveState(); err != nil {
 		// Memory keeps what the worker did (the VM IS asleep); the recovery
 		// loop writes it.
 		slog.Error("lifecycle: auto-sleep applied on the worker but not saved", "sandbox", id, "request_id", sweepID, "err", err)
@@ -354,6 +360,10 @@ func (srv *Server) autoSleep(id, tenant string, now int64, unreachable map[nodeT
 // attempts by the same tenant against an agent that has already proved
 // unreachable this pass are skipped.
 func (srv *Server) autoDelete(id, tenant string, unreachable map[nodeTenant]bool) {
+	// Per action, as in autoSleep.
+	if srv.storeFailing() {
+		return
+	}
 	var agentAddr string
 	if !func() bool {
 		srv.st.Lock()
@@ -404,7 +414,7 @@ func (srv *Server) autoDelete(id, tenant string, unreachable map[nodeTenant]bool
 		srv.queueUsageLocked(srv.st.FindSandbox(id), "deleted")
 		srv.st.RemoveSandboxLocked(id)
 	}()
-	if err := srv.save(nil); err != nil {
+	if err := srv.saveState(); err != nil {
 		// Memory keeps what the worker did (the VM is gone); the recovery loop
 		// writes it.
 		slog.Error("lifecycle: auto-delete applied on the worker but not saved", "sandbox", id, "request_id", sweepID, "err", err)
@@ -456,7 +466,7 @@ func (srv *Server) dropDynamicExposes(id, tenant string, unreachable map[nodeTen
 	if dropped == 0 {
 		return
 	}
-	if err := srv.save(nil); err != nil {
+	if err := srv.saveState(); err != nil {
 		slog.Error("lifecycle: dynamic exposes dropped on the worker but not saved", "sandbox", id, "request_id", sweepID, "err", err)
 	}
 	slog.Info("lifecycle: dropped dynamic exposes of a long-sleeping sandbox", "sandbox", id, "count", dropped, "request_id", sweepID)

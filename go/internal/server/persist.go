@@ -11,6 +11,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -26,7 +27,7 @@ import (
 
 const (
 	// storeRetryInterval is how often the recovery loop retries the save while
-	// the store is failing.
+	// the store is failing (srv.retryInterval; tests shorten it).
 	storeRetryInterval = 2 * time.Second
 	// storeRetryAfter is the Retry-After (seconds) on every 503 the store's
 	// state causes.
@@ -39,21 +40,29 @@ const (
 	execUsageFlushInterval = time.Second
 )
 
+// errStoreFailing is what a request's save returns, without asking the
+// database, while the store is already failing (P16).
+var errStoreFailing = errors.New("store failing: not attempted, the recovery loop retries the save")
+
 // Process-lifetime counters for /metrics, kept off the state lock like the
 // latency histograms (metrics.go).
 var (
-	// persistFailures counts failed saves: snapshot saves and the row-level
-	// writes whose failure a handler reports as an error.
+	// persistFailures counts failed writes: snapshot saves, exec usage
+	// flushes, and the row-level writes whose failure a handler reports as an
+	// error. A save refused because the store is already failing is not a
+	// write and is not counted.
 	persistFailures atomic.Uint64
-	// usageWriteFailures counts usage rows whose write failed (per attempt)
-	// and exec rows dropped from the full queue.
+	// usageWriteFailures counts failed write attempts that carried usage rows
+	// (one per attempt, snapshot save or exec flush, however many rows it
+	// carried), plus each exec row dropped from the full queue, once.
 	usageWriteFailures atomic.Uint64
 )
 
 // storeHealth is whether the database has caught up with memory. failing is set
-// by any failed save and cleared ONLY by a successful snapshot save — which
-// writes whatever memory holds at that moment, so "healthy" means nothing
-// acknowledged or applied is missing from the database any more.
+// by any failed write and cleared ONLY by the recovery loop, when one attempt
+// wrote both the snapshot (whatever memory holds at that moment) and the
+// queued exec rows — so "healthy" means nothing acknowledged or applied is
+// missing from the database any more.
 type storeHealth struct {
 	mu      sync.Mutex
 	failing bool
@@ -61,6 +70,9 @@ type storeHealth struct {
 	lastErr error
 	// recovering is true while a recovery loop runs; at most one does.
 	recovering bool
+	// onRecovered runs once, after the next recovery (cmd/feluccad: rename a
+	// legacy state file whose import was saved only then).
+	onRecovered func()
 }
 
 // storeFailing reports whether the last save failed and none has succeeded
@@ -75,58 +87,86 @@ func (srv *Server) storeFailing() bool {
 func (srv *Server) StoreHealthy() bool { return !srv.storeFailing() }
 
 // storeWriteFailed records a failed write: counted, the store marked failing,
-// and the recovery loop started if none is running.
+// and the recovery loop started if none is running. It logs after releasing
+// the health mutex: /healthz and the gate take it, and a blocked stderr must
+// not stall them.
 func (srv *Server) storeWriteFailed(err error) {
 	persistFailures.Add(1)
 	srv.health.mu.Lock()
-	defer srv.health.mu.Unlock()
-	if !srv.health.failing {
+	first := !srv.health.failing
+	if first {
 		srv.health.failing = true
 		srv.health.since = time.Now()
-		slog.Error("store failing: changes are refused until a save succeeds", "err", err)
 	}
 	srv.health.lastErr = err
-	if !srv.health.recovering {
-		srv.health.recovering = true
+	start := !srv.health.recovering
+	srv.health.recovering = true
+	srv.health.mu.Unlock()
+	if first {
+		slog.Error("store failing: changes are refused until a save succeeds", "err", err)
+	}
+	if start {
 		go srv.storeRecoveryLoop()
 	}
 }
 
-// storeSaved records a successful snapshot save.
+// storeSaved records a recovery: the snapshot and the exec rows are written.
 func (srv *Server) storeSaved() {
 	srv.health.mu.Lock()
-	defer srv.health.mu.Unlock()
-	if srv.health.failing {
-		slog.Info("store recovered: the database has caught up with memory",
-			"outage", time.Since(srv.health.since).Round(time.Millisecond), "last_err", srv.health.lastErr)
-	}
+	was, since, lastErr := srv.health.failing, srv.health.since, srv.health.lastErr
 	srv.health.failing = false
 	srv.health.lastErr = nil
+	srv.health.mu.Unlock()
+	if was {
+		slog.Info("store recovered: the database has caught up with memory",
+			"outage", time.Since(since).Round(time.Millisecond), "last_err", lastErr)
+	}
+}
+
+// OnStoreRecovered sets fn to run once, after the recovery loop next finds
+// the database caught up. cmd/feluccad uses it for a legacy state file whose
+// import could not be saved at start-up.
+func (srv *Server) OnStoreRecovered(fn func()) {
+	srv.health.mu.Lock()
+	defer srv.health.mu.Unlock()
+	srv.health.onRecovered = fn
 }
 
 // stopRecoveringIfHealthy ends the recovery loop's run when the store is
 // healthy. The check and the flag change share the mutex storeWriteFailed
 // takes, so a failure that lands right after this returns true starts a new
 // loop rather than being missed by an exiting one.
-func (srv *Server) stopRecoveringIfHealthy() bool {
+//
+// It returns, when it ends the run, the onRecovered callback to call (nil when
+// none is set), which then is cleared.
+func (srv *Server) stopRecoveringIfHealthy() (bool, func()) {
 	srv.health.mu.Lock()
 	defer srv.health.mu.Unlock()
 	if srv.health.failing {
-		return false
+		return false, nil
 	}
 	srv.health.recovering = false
-	return true
+	fn := srv.health.onRecovered
+	srv.health.onRecovered = nil
+	return true, fn
 }
 
-// storeRecoveryLoop retries the save every storeRetryInterval while the store
-// is failing. Nothing else would: the gate refuses every change, so without it
-// a store that comes back would never be written to again and the control
-// plane would refuse changes forever. A panic is recovered per attempt — this
-// goroutine has no net/http underneath it, and a panic here would end the
-// process.
+// storeRecoveryLoop retries every srv.retryInterval while the store is
+// failing. Nothing else would: the gate refuses every change and a request's
+// save fails at once, so without it a store that comes back would never be
+// written to again and the control plane would refuse changes forever. A panic
+// is recovered per attempt — this goroutine has no net/http underneath it, and
+// a panic here would end the process.
 func (srv *Server) storeRecoveryLoop() {
-	t := time.NewTicker(storeRetryInterval)
+	t := time.NewTicker(srv.retryInterval)
 	defer t.Stop()
+	stopIfHealthy := func() bool {
+		ok, fn := srv.stopRecoveringIfHealthy()
+		if fn != nil {
+			fn()
+		}
+		return ok
+	}
 	for {
 		select {
 		case <-t.C:
@@ -136,7 +176,7 @@ func (srv *Server) storeRecoveryLoop() {
 			srv.health.mu.Unlock()
 			return
 		}
-		if srv.stopRecoveringIfHealthy() {
+		if stopIfHealthy() {
 			return
 		}
 		func() {
@@ -145,23 +185,48 @@ func (srv *Server) storeRecoveryLoop() {
 					slog.Error("store recovery: save panicked", "panic", r)
 				}
 			}()
-			if err := srv.save(nil); err != nil {
+			if err := srv.recoverStore(); err != nil {
 				slog.Warn("store still failing", "err", err)
 			}
 		}()
-		if srv.stopRecoveringIfHealthy() {
+		if stopIfHealthy() {
 			return
 		}
 	}
 }
 
-// stopBackground ends the recovery loop (tests; feluccad never stops).
-func (srv *Server) stopBackground() {
+// recoverStore is one attempt of the recovery loop: a fresh writer connection,
+// then the snapshot save, then the exec flush. The store is healthy again only
+// when both writes succeeded; marked by either alone, health would flap
+// between the flusher and the loop while one of them still fails.
+//
+// All of it under saveMu, the healthy mark included. A request whose change
+// is in memory but not in this copy reaches saveMu only after the mark, so its
+// own save is a real write, not a refusal the loop has already stopped
+// retrying for.
+func (srv *Server) recoverStore() error {
+	srv.saveMu.Lock()
+	defer srv.saveMu.Unlock()
+	// Before each retry: a connection opened while the file could not be
+	// written stays read-only for its whole life (store.SQLite.ResetWriter).
+	srv.db.ResetWriter()
+	if err := srv.saveLocked(nil, nil); err != nil {
+		return err
+	}
+	if err := srv.flushExecUsage(); err != nil {
+		return err
+	}
+	srv.storeSaved()
+	return nil
+}
+
+// StopBackground ends the recovery loop (tests, and cmd/feluccad's shutdown).
+func (srv *Server) StopBackground() {
 	srv.quitOnce.Do(func() { close(srv.quit) })
 }
 
-// save is THE save path: every change to the working set reaches the database
-// through here.
+// save is THE save path of a request (and of the sweep and the clean-ups):
+// every change to the working set reaches the database through here.
 //
 //   - It copies the working set and takes the queued lifecycle events under the
 //     state lock, releases it, and only then talks to the database. A save that
@@ -170,22 +235,60 @@ func (srv *Server) stopBackground() {
 //     they were taken: a stale copy can never be written after a newer one.
 //     Lock order: exposeMu -> saveMu -> st. It must never be called with the
 //     state lock held.
+//   - mutate, when not nil, runs under saveMu and the state lock immediately
+//     before the copy. A change made there cannot be stored by any other save
+//     before this one: a save of another request that runs between a
+//     handler's change and its own save would otherwise write the change, and
+//     then this save's undo could not take it back out of the database.
 //   - On failure the events go back to the head of the queue (the next save
 //     writes them with the state they describe), the store is marked failing,
-//     and undo — if the caller passed one — runs BEFORE saveMu is released.
-//     That last part is the point of taking it here: no other save, the
-//     recovery loop included, can store the state that is being undone.
+//     and undo — if the caller passed one — runs BEFORE saveMu is released, so
+//     no later save, the recovery loop included, can store the state that is
+//     being undone.
+//   - While the store is ALREADY failing it does not ask the database (P16):
+//     mutate and undo run as for a failed write and errStoreFailing is
+//     returned at once. Each save would otherwise wait out its own busy
+//     timeout in turn, and a dozen changes in flight at the onset of a lock
+//     outlast the server's WriteTimeout. The recovery loop is the one that
+//     retries.
 //
+// mutate runs with the state lock held (it uses the *Locked state methods);
 // undo takes the state lock itself.
-func (srv *Server) save(undo func()) error {
+func (srv *Server) save(mutate, undo func()) error {
 	srv.saveMu.Lock()
 	defer srv.saveMu.Unlock()
+	if srv.storeFailing() {
+		if mutate != nil {
+			func() {
+				srv.st.Lock()
+				defer srv.st.Unlock()
+				mutate()
+			}()
+		}
+		if undo != nil {
+			undo()
+		}
+		return errStoreFailing
+	}
+	return srv.saveLocked(mutate, undo)
+}
 
+// saveState is save for a caller with nothing to change under the save mutex
+// and nothing to undo: it writes what memory holds.
+func (srv *Server) saveState() error { return srv.save(nil, nil) }
+
+// saveLocked is the write of save, for a caller that holds saveMu: save, and
+// the two callers that wait for the database however long it takes (the
+// recovery loop and the start-up save).
+func (srv *Server) saveLocked(mutate, undo func()) error {
 	var snap *state.Snapshot
 	var events []store.UsageEvent
 	func() {
 		srv.st.Lock()
 		defer srv.st.Unlock()
+		if mutate != nil {
+			mutate()
+		}
 		snap = srv.st.SnapshotLocked()
 		events = srv.pendingUsage
 		srv.pendingUsage = nil
@@ -193,8 +296,10 @@ func (srv *Server) save(undo func()) error {
 
 	err := srv.writeSnapshot(snap, events)
 	if err == nil {
-		srv.storeSaved()
 		return nil
+	}
+	if len(events) > 0 {
+		usageWriteFailures.Add(1)
 	}
 	func() {
 		srv.st.Lock()
@@ -208,8 +313,24 @@ func (srv *Server) save(undo func()) error {
 	return err
 }
 
-// Save is save(nil) for cmd/feluccad's start-up save.
-func (srv *Server) Save() error { return srv.save(nil) }
+// StartupWrite is cmd/feluccad's start-up check that the database can be
+// written. full (an empty database, or a legacy import) saves the whole
+// working set, waiting for the database like the recovery loop; otherwise one
+// small row is written (store.MarkStarted), so what the start loaded is not
+// rewritten before the first request. A failure marks the store failing and
+// starts the recovery loop.
+func (srv *Server) StartupWrite(full bool) error {
+	if full {
+		srv.saveMu.Lock()
+		defer srv.saveMu.Unlock()
+		return srv.saveLocked(nil, nil)
+	}
+	if err := srv.db.MarkStarted(time.Now().Unix()); err != nil {
+		srv.storeWriteFailed(err)
+		return err
+	}
+	return nil
+}
 
 // writeSnapshot calls the store, turning a panic into an error. A panic there
 // is a failed save like any other: the events are re-queued, the store is
@@ -270,8 +391,11 @@ func appendBounded(q *execUsageQueue, dst []store.UsageEvent, rows ...store.Usag
 }
 
 // flushExecUsage writes the queued exec rows in one transaction. On failure
-// they go back to the head of the queue (still bounded). Tests call it
-// directly to flush synchronously.
+// they go back to the head of the queue (still bounded), and the store is
+// marked failing like for any failed write: with a full disk and only exec
+// traffic, nothing else would notice, /healthz would say 200 and the next
+// sleep would pass the gate only to be answered "applied but not saved".
+// Tests call it directly to flush synchronously.
 func (srv *Server) flushExecUsage() error {
 	srv.execFlushMu.Lock()
 	defer srv.execFlushMu.Unlock()
@@ -300,21 +424,28 @@ func (srv *Server) flushExecUsage() error {
 	if err == nil {
 		return nil
 	}
-	usageWriteFailures.Add(uint64(len(batch)))
+	// One per failed attempt: the same backlog retried every second is the
+	// same rows, not new failures.
+	usageWriteFailures.Add(1)
 	q.mu.Lock()
 	q.rows = appendBounded(q, batch, q.rows...)
 	q.mu.Unlock()
+	srv.storeWriteFailed(err)
 	return err
 }
 
 // UsageFlushLoop flushes the exec rows every execUsageFlushInterval until stop
-// closes, then once more.
+// closes, then once more. While the store is failing it leaves the rows to
+// the recovery loop, whose attempt flushes them with the snapshot.
 func (srv *Server) UsageFlushLoop(stop <-chan struct{}) {
 	t := time.NewTicker(execUsageFlushInterval)
 	defer t.Stop()
 	for {
 		select {
 		case <-t.C:
+			if srv.storeFailing() {
+				continue
+			}
 			if err := srv.flushExecUsage(); err != nil {
 				slog.Warn("usage: exec rows not written, kept for the next flush", "err", err)
 			}
@@ -367,13 +498,19 @@ func (srv *Server) refusedWhileStoreFailing(w http.ResponseWriter) bool {
 // spends a join token: the node rows are rebuilt by registration anyway), and
 // the gateway's activity report. /metrics, /healthz and the node join are not
 // routed through here.
+//
+// The exec exemption is exactly the route serveAPI sends to execSandbox (plain
+// and streamed exec are one route): POST /api/v1/sandboxes/{id}/exec. "exec"
+// is also a valid expose name, so a looser match would let
+// DELETE /api/v1/sandboxes/{id}/expose/exec through while failing.
 func changesDurableState(method, path string) bool {
 	if method == http.MethodGet || method == http.MethodHead {
 		return false
 	}
-	switch {
-	case strings.HasPrefix(path, "/api/v1/sandboxes/") && strings.HasSuffix(path, "/exec"):
+	if _, ok := matchSuffix(path, "/api/v1/sandboxes/", "/exec"); ok && method == http.MethodPost {
 		return false
+	}
+	switch {
 	case path == "/api/v1/sandboxes", strings.HasPrefix(path, "/api/v1/sandboxes/"),
 		path == "/api/v1/routes/ensure",
 		path == "/api/v1/tenants", strings.HasPrefix(path, "/api/v1/tenants/"),
@@ -396,6 +533,12 @@ func changesDurableState(method, path string) bool {
 // (the undo already queued "stopped", so the usage interval is closed either
 // way); then a save is attempted. When it does not, the record stays in error:
 // visible, and deletable by its owner.
+//
+// A record that is no longer in error once the worker has deleted the VM was
+// moved on by its owner meanwhile (a start, answered 200): it is NOT removed
+// — that answer was true when given — but it is set back to error with a
+// "stopped" event, since its VM is gone (P5'). Left as it was, it would be a
+// running record with no VM and an open usage interval.
 func (srv *Server) removeUnsavedVM(agentAddr, id, reqID string) {
 	resp, err := srv.dialNode(agentAddr).do(http.MethodDelete, "/v1/vms/"+id, nil, reqID)
 	if err != nil || (resp.Status >= 300 && resp.Status != 404) {
@@ -407,23 +550,48 @@ func (srv *Server) removeUnsavedVM(agentAddr, id, reqID string) {
 			"sandbox", id, "node", agentAddr, "request_id", reqID, "status", status, "err", err)
 		return
 	}
-	removed := false
+	changed, removed := false, false
 	func() {
 		srv.st.Lock()
 		defer srv.st.Unlock()
 		sb := srv.st.FindSandbox(id)
-		if sb == nil || sb.State != model.StateError {
-			return // already deleted by its owner, or no longer ours to remove
+		switch {
+		case sb == nil:
+			return // already deleted by its owner
+		case sb.State != model.StateError:
+			sb.State = model.StateError
+			srv.queueUsageLocked(sb, "stopped")
+		default:
+			srv.queueUsageLocked(sb, "deleted")
+			srv.st.RemoveSandboxLocked(id)
+			removed = true
 		}
-		srv.queueUsageLocked(sb, "deleted")
-		srv.st.RemoveSandboxLocked(id)
-		removed = true
+		changed = true
 	}()
-	if !removed {
+	if !changed {
 		return
 	}
-	if err := srv.save(nil); err != nil {
-		slog.Error("unsaved VM removed from its worker; the removal is not saved yet (the recovery loop will write it)",
+	if !removed {
+		slog.Warn("unsaved VM removed from its worker after its owner had moved the record on: the record is set back to error",
+			"sandbox", id, "request_id", reqID)
+	}
+	if err := srv.saveState(); err != nil {
+		slog.Error("unsaved VM removed from its worker; the record's change is not saved yet (the recovery loop will write it)",
 			"sandbox", id, "request_id", reqID, "err", err)
 	}
+}
+
+// rowWriteFailed answers a failed row-level write (a tenant, a key, a template,
+// a join token, a wg peer). A constraint error is the request's conflict — two
+// concurrent creates of one name, an id collision — answered 409 with
+// conflict, and the database is fine: marking the store failing for it would
+// refuse every change and fail /healthz for a working database. Anything else
+// marks the store failing and is answered 500.
+func (srv *Server) rowWriteFailed(w http.ResponseWriter, err error, conflict string) {
+	if store.IsConstraint(err) {
+		writeJSON(w, 409, []byte(conflict))
+		return
+	}
+	srv.storeWriteFailed(err)
+	writeJSON(w, 500, []byte(`{"error":"store error"}`))
 }

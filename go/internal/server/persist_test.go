@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alpham/infra-saas/felucca/internal/agentclient"
 	"github.com/alpham/infra-saas/felucca/internal/config"
 	"github.com/alpham/infra-saas/felucca/internal/model"
 	"github.com/alpham/infra-saas/felucca/internal/state"
@@ -28,18 +29,24 @@ import (
 
 // faultStore wraps the real SQLite store. Its snapshot save can be made to let
 // `pass` saves through and then fail `fail` of them (<0: every one), or to wait
-// until released; its key lookup can be made to fail; its exec batch write can
-// be made to fail.
+// until released (block: every call; blockNext: the next call only, which
+// closes blocked once it waits); its key lookup, tenant read, key insert and
+// exec batch write can be made to fail; its template insert can be made to
+// lose a race against a concurrent create of the same name.
 type faultStore struct {
 	store.Store
-	mu        sync.Mutex
-	pass      int
-	fail      int
-	block     chan struct{}
-	keyErr    bool
-	tenantErr bool
-	batchErr  bool
-	saveCalls int
+	mu           sync.Mutex
+	pass         int
+	fail         int
+	block        chan struct{}
+	blockNext    chan struct{}
+	blocked      chan struct{}
+	keyErr       bool
+	tenantErr    bool
+	batchErr     bool
+	createKeyErr bool
+	templateRace bool
+	saveCalls    int
 }
 
 var errInjected = errors.New("injected: database is locked")
@@ -48,6 +55,11 @@ func (f *faultStore) SaveSnapshot(snap *state.Snapshot, usage []store.UsageEvent
 	f.mu.Lock()
 	f.saveCalls++
 	block := f.block
+	var blocked chan struct{}
+	if f.blockNext != nil {
+		block, blocked = f.blockNext, f.blocked
+		f.blockNext, f.blocked = nil, nil
+	}
 	failing := false
 	switch {
 	case f.pass > 0:
@@ -59,6 +71,9 @@ func (f *faultStore) SaveSnapshot(snap *state.Snapshot, usage []store.UsageEvent
 		}
 	}
 	f.mu.Unlock()
+	if blocked != nil {
+		close(blocked)
+	}
 	if block != nil {
 		<-block
 	}
@@ -66,6 +81,49 @@ func (f *faultStore) SaveSnapshot(snap *state.Snapshot, usage []store.UsageEvent
 		return errInjected
 	}
 	return f.Store.SaveSnapshot(snap, usage)
+}
+
+// holdNextSave makes the next snapshot save wait (after its copy was taken)
+// until release is closed; the returned channel closes once it waits.
+func (f *faultStore) holdNextSave(release chan struct{}) <-chan struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.blockNext = release
+	f.blocked = make(chan struct{})
+	return f.blocked
+}
+
+func (f *faultStore) calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.saveCalls
+}
+
+func (f *faultStore) CreateKey(k *store.APIKey) error {
+	f.mu.Lock()
+	fail := f.createKeyErr
+	f.mu.Unlock()
+	if fail {
+		return errInjected
+	}
+	return f.Store.CreateKey(k)
+}
+
+// CreateTemplate, when templateRace is set, first inserts a template of the
+// same name under another id (the concurrent create that won), so the real
+// insert meets the UNIQUE constraint.
+func (f *faultStore) CreateTemplate(t *store.Template) error {
+	f.mu.Lock()
+	race := f.templateRace
+	f.mu.Unlock()
+	if race {
+		winner := *t
+		winner.ID = t.ID + "-winner"
+		if err := f.Store.CreateTemplate(&winner); err != nil {
+			return err
+		}
+	}
+	return f.Store.CreateTemplate(t)
 }
 
 func (f *faultStore) LookupKeyByHash(hash string) (string, error) {
@@ -115,8 +173,11 @@ type fsWorker struct {
 	calls       []string
 	failCreate  bool
 	failFork    bool
+	forkBusy    bool // the fork answers 409 {"error":"busy"}
 	deleteDelay time.Duration
 	port        int
+	// onCreate, when set, runs once before a create is answered.
+	onCreate func()
 }
 
 func (f *fsWorker) handler() http.HandlerFunc {
@@ -124,10 +185,19 @@ func (f *fsWorker) handler() http.HandlerFunc {
 		p := r.URL.Path
 		f.mu.Lock()
 		f.calls = append(f.calls, r.Method+" "+p)
-		failCreate, failFork, delay := f.failCreate, f.failFork, f.deleteDelay
+		failCreate, failFork, forkBusy, delay := f.failCreate, f.failFork, f.forkBusy, f.deleteDelay
+		onCreate := f.onCreate
+		if r.Method == http.MethodPost && p == "/v1/vms" {
+			f.onCreate = nil
+		} else {
+			onCreate = nil
+		}
 		f.port++
 		port := 20000 + f.port
 		f.mu.Unlock()
+		if onCreate != nil {
+			onCreate()
+		}
 		ok := func(body string) { w.WriteHeader(200); _, _ = w.Write([]byte(body)) }
 		switch {
 		case r.Method == http.MethodPost && p == "/v1/vms":
@@ -137,6 +207,11 @@ func (f *fsWorker) handler() http.HandlerFunc {
 			}
 			ok(`{"ip":"10.231.0.9"}`)
 		case r.Method == http.MethodPost && strings.HasSuffix(p, "/fork"):
+			if forkBusy {
+				w.WriteHeader(409)
+				_, _ = w.Write([]byte(`{"error":"busy"}`))
+				return
+			}
 			if failFork {
 				w.WriteHeader(500)
 				return
@@ -196,12 +271,15 @@ func newPersistFixture(t *testing.T) *persistFixture {
 	t.Cleanup(func() { sqlite.Close() })
 	fs := &faultStore{Store: sqlite}
 	srv := New(cfg, state.New(), fs)
-	t.Cleanup(srv.stopBackground)
+	// The recovery loop at test speed (the 2 s of production would make every
+	// recovery test wait for it).
+	srv.retryInterval = 20 * time.Millisecond
+	t.Cleanup(srv.StopBackground)
 	fw := &fsWorker{}
 	ts := httptest.NewServer(fw.handler())
 	t.Cleanup(ts.Close)
 	srv.st.RegisterNode("worker-1", ts.URL, 4, 8192, time.Now().Unix())
-	if err := srv.save(nil); err != nil {
+	if err := srv.saveState(); err != nil {
 		t.Fatalf("initial save: %v", err)
 	}
 	return &persistFixture{srv: srv, fs: fs, sqlite: sqlite, fw: fw, path: cfg.DBPath, h: srv.Handler()}
@@ -267,11 +345,12 @@ func (p *persistFixture) events(t *testing.T, id string) []string {
 	return out
 }
 
-// healAndSave heals the store and saves, as the recovery loop would.
+// healAndSave heals the store and runs one recovery attempt, as the recovery
+// loop would (a request's save is refused while the store is failing).
 func (p *persistFixture) healAndSave(t *testing.T) {
 	t.Helper()
 	p.fs.heal()
-	if err := p.srv.save(nil); err != nil {
+	if err := p.srv.recoverStore(); err != nil {
 		t.Fatalf("save after heal: %v", err)
 	}
 	if p.srv.storeFailing() {
@@ -344,7 +423,7 @@ func TestHugeMemoryValueCannotPoisonEverySave(t *testing.T) {
 
 	// The store half, reached directly: whatever is in memory must be savable.
 	srv.st.Heartbeat(nodeID, uint64(1)<<63, 1, 0, nil, time.Now().Unix())
-	if err := srv.save(nil); err != nil {
+	if err := srv.saveState(); err != nil {
 		t.Fatalf("save after a 2^63 heartbeat: %v — one value in memory now fails every save", err)
 	}
 }
@@ -703,13 +782,16 @@ func TestEverySaveSiteWhenTheSaveFails(t *testing.T) {
 
 func TestCreateWhoseLastSaveFailsLeavesNoGhost(t *testing.T) {
 	p := newPersistFixture(t)
-	p.fw.set(func(f *fsWorker) { f.deleteDelay = 300 * time.Millisecond })
+	// The worker's delete takes twice the threshold below, so an answer that
+	// waited for it cannot come in under the threshold however fast the rest.
+	const deleteDelay = time.Second
+	p.fw.set(func(f *fsWorker) { f.deleteDelay = deleteDelay })
 	p.fs.failAfter(1, 1)
 
 	start := time.Now()
 	n := p.fw.count()
 	wantStoreUnavailable(t, p.do("POST", "/api/v1/sandboxes", `{"name":"a"}`), "create")
-	if took := time.Since(start); took >= 300*time.Millisecond {
+	if took := time.Since(start); took >= deleteDelay/2 {
 		t.Errorf("the answer took %v: it waited for the worker delete (P15)", took)
 	}
 	waitFor(t, "the store to be healthy again", 5*time.Second, func() bool {
@@ -757,12 +839,50 @@ func viewOf(sbs []model.Sandbox) []sbView {
 	return out
 }
 
+// equalToMemory fails the test when the saved sandboxes differ from memory.
+func (p *persistFixture) equalToMemory(t *testing.T, when string) {
+	t.Helper()
+	mem := viewOf(p.srv.st.Snapshot().Sandboxes)
+	var saved []model.Sandbox
+	for _, sb := range p.saved(t).Sandboxes {
+		saved = append(saved, *sb)
+	}
+	if db := viewOf(saved); fmt.Sprint(mem) != fmt.Sprint(db) {
+		t.Fatalf("saved snapshot differs from memory %s:\nmemory   %v\ndatabase %v", when, mem, db)
+	}
+}
+
 func TestConcurrentChangesLeaveTheDatabaseEqualToMemory(t *testing.T) {
 	p := newPersistFixture(t)
 	var ids []string
-	for i := 0; i < 6; i++ {
+	for i := 0; i < 7; i++ {
 		ids = append(ids, p.create(t, `{"name":"a"}`))
 	}
+
+	// Forced interleaving first. Save 1 has taken its copy and is held inside
+	// the store; then a change is made and its save (save 2) starts. saveMu
+	// keeps save 2 waiting until save 1 has written. Without it, save 2 writes
+	// the newer state and save 1 then overwrites it with its older copy: the
+	// database ends one change behind memory, for good.
+	release := make(chan struct{})
+	held := p.fs.holdNextSave(release)
+	first := make(chan error, 1)
+	go func() { first <- p.srv.saveState() }()
+	<-held
+	second := make(chan int, 1)
+	go func() { second <- p.do("POST", "/api/v1/sandboxes/"+ids[6]+"/stop", "").Code }()
+	// Long enough for save 2 to overtake save 1, if it can.
+	time.Sleep(300 * time.Millisecond)
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatalf("save 1: %v", err)
+	}
+	if code := <-second; code != 200 {
+		t.Fatalf("stop (save 2): %d", code)
+	}
+	p.equalToMemory(t, "after a save that waited behind another")
+
+	// Then a burst of concurrent changes of every kind.
 	var wg sync.WaitGroup
 	run := func(method, path, body string) {
 		wg.Add(1)
@@ -782,24 +902,69 @@ func TestConcurrentChangesLeaveTheDatabaseEqualToMemory(t *testing.T) {
 	run("POST", "/api/v1/sandboxes/"+ids[4]+"/pause", "")
 	run("POST", "/api/v1/sandboxes/"+ids[5]+"/fork", `{"name":"kid"}`)
 	wg.Wait()
+	p.equalToMemory(t, "after concurrent changes")
+}
 
-	mem := viewOf(p.srv.st.Snapshot().Sandboxes)
-	var saved []model.Sandbox
-	for _, sb := range p.saved(t).Sandboxes {
-		saved = append(saved, *sb)
+// The undo of a failed save runs before saveMu is released: the save waiting
+// behind it — here the recovery loop's — can never copy the state that is
+// being undone. The undo is made slow on purpose; run after the release, it
+// would lose that race every time.
+func TestUndoRunsBeforeTheSaveMutexIsReleased(t *testing.T) {
+	p := newPersistFixture(t)
+	p.srv.retryInterval = time.Hour // only this test's recovery attempt saves
+	var id string
+	func() {
+		p.srv.st.Lock()
+		defer p.srv.st.Unlock()
+		id = p.srv.st.CreateSandbox("ghost", "default", p.srv.st.Nodes[0].ID, 1, 256, time.Now().Unix()).ID
+	}()
+
+	release := make(chan struct{})
+	held := p.fs.holdNextSave(release)
+	p.fs.failAfter(0, 1)
+	failed := make(chan error, 1)
+	go func() {
+		failed <- p.srv.save(nil, func() {
+			time.Sleep(200 * time.Millisecond)
+			p.srv.st.RemoveSandbox(id)
+		})
+	}()
+	<-held
+	recovered := make(chan error, 1)
+	go func() { recovered <- p.srv.recoverStore() }()
+	time.Sleep(50 * time.Millisecond) // the recovery attempt waits on saveMu
+	close(release)
+	if err := <-failed; err == nil {
+		t.Fatal("the held save did not fail")
 	}
-	db := viewOf(saved)
-	if fmt.Sprint(mem) != fmt.Sprint(db) {
-		t.Fatalf("saved snapshot differs from memory after concurrent changes:\nmemory   %v\ndatabase %v", mem, db)
+	if err := <-recovered; err != nil {
+		t.Fatalf("recovery attempt: %v", err)
+	}
+	if p.savedSandbox(t, id) != nil {
+		t.Fatal("the save behind a failed one stored the state its undo was taking back: the undo ran after saveMu was released")
 	}
 }
 
 // ---- P1 under -race: saves against in-place changes ----
 
+// What this test is for shows under -race: saves copying the working set while
+// expose, unexpose, heartbeat and registration change it in place. Without
+// -race it still checks that the final save leaves the database equal to
+// memory.
 func TestSavesRaceUnexposeHeartbeatAndRegistration(t *testing.T) {
 	p := newPersistFixture(t)
 	id := p.create(t, `{"name":"a"}`)
 	nodeID := p.srv.st.Nodes[0].ID
+	// Each registration below pushes pool specs to its address. 203.0.113.9 is
+	// TEST-NET-3: a real dial there waits out the client's 30 s timeout, one
+	// per iteration, and the sockets outlive the test. Refuse it at once.
+	agentCall := p.srv.agentCall
+	p.srv.agentCall = func(host string, port uint16, method, path string, body []byte, reqID string) (*agentclient.Response, error) {
+		if host == "203.0.113.9" {
+			return nil, errors.New("test: no worker at 203.0.113.9")
+		}
+		return agentCall(host, port, method, path, body, reqID)
+	}
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	loop := func(fn func(i int)) {
@@ -816,7 +981,7 @@ func TestSavesRaceUnexposeHeartbeatAndRegistration(t *testing.T) {
 			}
 		}()
 	}
-	loop(func(int) { _ = p.srv.save(nil) })
+	loop(func(int) { _ = p.srv.saveState() })
 	loop(func(i int) {
 		name := fmt.Sprintf("n%d", i%3)
 		p.do("POST", "/api/v1/sandboxes/"+id+"/expose", fmt.Sprintf(`{"name":%q,"port":%d}`, name, 8000+i%3))
@@ -831,8 +996,12 @@ func TestSavesRaceUnexposeHeartbeatAndRegistration(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	close(stop)
 	wg.Wait()
-	if err := p.srv.save(nil); err != nil {
+	if err := p.srv.saveState(); err != nil {
 		t.Fatalf("final save: %v", err)
+	}
+	p.equalToMemory(t, "after the final save")
+	if mem, db := len(p.srv.st.Snapshot().Nodes), len(p.saved(t).Nodes); mem != db {
+		t.Errorf("nodes: %d in memory, %d saved", mem, db)
 	}
 }
 
@@ -857,7 +1026,7 @@ func TestStoreGateRefusesChangesAndServesTheRest(t *testing.T) {
 	nodeID := p.srv.st.Nodes[0].ID
 
 	p.fs.failAll()
-	if err := p.srv.save(nil); err == nil {
+	if err := p.srv.saveState(); err == nil {
 		t.Fatal("save did not fail")
 	}
 	n := p.fw.count()
@@ -961,7 +1130,7 @@ func TestRecoveryLoopCatchesUpWithoutARequest(t *testing.T) {
 		return !p.srv.health.recovering
 	})
 	p.fs.failAfter(0, 1)
-	if err := p.srv.save(nil); err == nil {
+	if err := p.srv.saveState(); err == nil {
 		t.Fatal("save did not fail")
 	}
 	waitFor(t, "a second recovery", 6*time.Second, func() bool { return !p.srv.storeFailing() })
@@ -977,9 +1146,10 @@ func TestRecoveryLoopSurvivesAPanickingSave(t *testing.T) {
 	t.Cleanup(func() { sqlite.Close() })
 	ps := &panicStore{Store: sqlite}
 	srv := newJoinServerStore(t, ps, tmp)
-	t.Cleanup(srv.stopBackground)
+	srv.retryInterval = 20 * time.Millisecond
+	t.Cleanup(srv.StopBackground)
 	ps.armSave(2) // the first save and the first retry panic
-	if err := srv.save(nil); err == nil {
+	if err := srv.saveState(); err == nil {
 		t.Fatal("a panicking save reported success")
 	}
 	waitFor(t, "recovery after a panicking retry", 8*time.Second, func() bool { return !srv.storeFailing() })
@@ -993,7 +1163,7 @@ func TestHealthzBodiesAndNoStateLock(t *testing.T) {
 		t.Errorf("healthy: %d %s", w.Code, w.Body)
 	}
 	p.fs.failAll()
-	_ = p.srv.save(nil)
+	_ = p.srv.saveState()
 	if w := p.do("GET", "/healthz", ""); w.Code != 503 || w.Body.String() != `{"ok":false,"store":"failing"}` {
 		t.Errorf("failing: %d %s", w.Code, w.Body)
 	}
@@ -1020,7 +1190,7 @@ func TestSlowSaveDoesNotHoldTheStateLock(t *testing.T) {
 	p.fs.block = release
 	p.fs.mu.Unlock()
 	saved := make(chan error, 1)
-	go func() { saved <- p.srv.save(nil) }()
+	go func() { saved <- p.srv.saveState() }()
 	time.Sleep(50 * time.Millisecond)
 
 	start := time.Now()
@@ -1067,7 +1237,7 @@ func TestReadsAndExecProceedWhileTheDatabaseIsWriteLocked(t *testing.T) {
 		t.Fatalf("begin immediate: %v", err)
 	}
 	saved := make(chan error, 1)
-	go func() { saved <- p.srv.save(nil) }()
+	go func() { saved <- p.srv.saveState() }()
 	time.Sleep(50 * time.Millisecond)
 
 	start := time.Now()
@@ -1128,13 +1298,33 @@ func TestTenantReadErrorsAreNotNoLimit(t *testing.T) {
 	p := newPersistFixture(t)
 	tenantID, key := mintTenant(t, p.h, "acme")
 	parent := p.create(t, `{"name":"parent"}`)
-	// A tenant-owned sandbox past an idle policy the TENANT row would decide.
+	// A sandbox of the tenant with its OWN idle override: it pins "every
+	// sandbox of a tenant whose row is unreadable is skipped" (read as no row,
+	// its override alone would put it to sleep).
 	func() {
 		p.srv.st.Lock()
 		defer p.srv.st.Unlock()
 		sb := p.srv.st.FindSandbox(parent)
 		sb.TenantID = tenantID
 		sb.IdleSleepS = 5
+		sb.LastActivity = time.Now().Unix() - 60
+	}()
+	// And one whose policy only the tenant row has (a default, no override):
+	// asleep after the sweep only if the row is read and used.
+	tw := p.do("POST", "/api/v1/tenants", `{"name":"globex","default_idle_sleep_s":5}`)
+	if tw.Code != 201 {
+		t.Fatalf("tenant with a default idle policy: %d %s", tw.Code, tw.Body)
+	}
+	var globex struct {
+		Tenant struct{ ID string } `json:"tenant"`
+	}
+	_ = json.Unmarshal(tw.Body.Bytes(), &globex)
+	byRow := p.create(t, `{"name":"by-row"}`)
+	func() {
+		p.srv.st.Lock()
+		defer p.srv.st.Unlock()
+		sb := p.srv.st.FindSandbox(byRow)
+		sb.TenantID = globex.Tenant.ID
 		sb.LastActivity = time.Now().Unix() - 60
 	}()
 
@@ -1151,6 +1341,9 @@ func TestTenantReadErrorsAreNotNoLimit(t *testing.T) {
 	if sb := p.mem(parent); sb.State != model.StateRunning {
 		t.Errorf("sweep acted on a sandbox whose tenant policy was unreadable: %s", sb.State)
 	}
+	if sb := p.mem(byRow); sb.State != model.StateRunning {
+		t.Errorf("sweep acted on the tenant-default sandbox with its tenant row unreadable: %s", sb.State)
+	}
 
 	p.fs.mu.Lock()
 	p.fs.tenantErr = false
@@ -1158,6 +1351,9 @@ func TestTenantReadErrorsAreNotNoLimit(t *testing.T) {
 	p.srv.lifecycleSweep(time.Now().Unix())
 	if sb := p.mem(parent); sb.State != model.StateSleeping {
 		t.Errorf("sweep after the store recovered: %s, want sleeping", sb.State)
+	}
+	if sb := p.mem(byRow); sb.State != model.StateSleeping {
+		t.Errorf("sweep after the store recovered, sandbox whose policy is its tenant row's default: %s, want sleeping", sb.State)
 	}
 }
 
@@ -1173,21 +1369,24 @@ func TestExecUsageQueueFlushesBoundsAndCountsDrops(t *testing.T) {
 		t.Errorf("dropped rows counted: %d, want 5", got)
 	}
 
-	// A failed flush keeps the rows and counts the failure.
+	// A failed flush keeps the rows and counts ONE failure per attempt, not
+	// one per row: the same backlog retried is the same rows (PS-8).
 	p.fs.mu.Lock()
 	p.fs.batchErr = true
 	p.fs.mu.Unlock()
-	if err := p.srv.flushExecUsage(); err == nil {
-		t.Fatal("flush against a failing store reported success")
-	}
-	if got := usageWriteFailures.Load() - before; got != 5+maxExecUsageQueue {
-		t.Errorf("failures counted after a failed flush: %d, want %d", got, 5+maxExecUsageQueue)
+	for i := 1; i <= 2; i++ {
+		if err := p.srv.flushExecUsage(); err == nil {
+			t.Fatal("flush against a failing store reported success")
+		}
+		if got := usageWriteFailures.Load() - before; got != uint64(5+i) {
+			t.Errorf("failures counted after %d failed flushes of %d rows: %d, want %d", i, maxExecUsageQueue, got, 5+i)
+		}
 	}
 	p.fs.mu.Lock()
 	p.fs.batchErr = false
 	p.fs.mu.Unlock()
-	if err := p.srv.flushExecUsage(); err != nil {
-		t.Fatalf("flush: %v", err)
+	if err := p.srv.recoverStore(); err != nil {
+		t.Fatalf("recovery (save and flush): %v", err)
 	}
 	evs, err := p.sqlite.ListUsage("", 0, math.MaxInt32)
 	if err != nil {

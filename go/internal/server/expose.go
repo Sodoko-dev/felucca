@@ -407,7 +407,7 @@ func (srv *Server) acquireNodePort(agentAddr, sbID string, guestPort uint16, req
 		}
 	}()
 	if staleRemoved {
-		if err := srv.save(nil); err != nil {
+		if err := srv.saveState(); err != nil {
 			slog.Error("expose: stale route row removed but not saved (the recovery loop will write it)", "sandbox", sbID, "request_id", reqID, "err", err)
 		}
 	}
@@ -480,6 +480,15 @@ func (srv *Server) exposeCommon(w http.ResponseWriter, r *http.Request, id, tena
 	// taken per-section so reads elsewhere never wait on the agent call.
 	srv.exposeMu.Lock()
 	defer srv.exposeMu.Unlock()
+	// The gate again, now that this request holds exposeMu. It was admitted
+	// while the store was healthy, but may have waited here behind an expose
+	// whose save then failed: that one is answered 503, and its row is in
+	// memory, so without this the idempotent repeat below would answer 200 for
+	// a row that is not in the database. Race-free: whoever marks the store
+	// failing in an expose still holds exposeMu when it does.
+	if srv.refusedWhileStoreFailing(w) {
+		return
+	}
 
 	// Resolve + validate under the lock; do the agent call outside it.
 	srv.st.Lock()
@@ -555,7 +564,7 @@ func (srv *Server) exposeCommon(w http.ResponseWriter, r *http.Request, id, tena
 	// A failed save keeps the row in memory (the rule exists on the worker)
 	// and is not undone there: another saved name on the same guest port may
 	// depend on that rule.
-	if err := srv.save(nil); err != nil {
+	if err := srv.saveState(); err != nil {
 		slog.Error("expose: applied on the worker but not saved", "sandbox", id, "expose", name, "request_id", reqID(r.Context()), "err", err)
 		appliedNotSaved(w)
 		return
@@ -643,6 +652,11 @@ func (srv *Server) reExposeFork(agentAddr, childID string, parentExposes []model
 func (srv *Server) unexposeSandbox(w http.ResponseWriter, r *http.Request, id, name, tenant string) {
 	srv.exposeMu.Lock()
 	defer srv.exposeMu.Unlock()
+	// The gate again under exposeMu, as in exposeCommon: an unexpose that
+	// waited here behind one whose save failed must not answer from memory.
+	if srv.refusedWhileStoreFailing(w) {
+		return
+	}
 
 	srv.st.Lock()
 	sb := srv.st.FindSandbox(id)
@@ -704,7 +718,7 @@ func (srv *Server) unexposeSandbox(w http.ResponseWriter, r *http.Request, id, n
 		defer srv.st.Unlock()
 		srv.st.RemoveExposeLocked(id, name)
 	}()
-	if err := srv.save(nil); err != nil {
+	if err := srv.saveState(); err != nil {
 		slog.Error("unexpose: applied on the worker but not saved", "sandbox", id, "expose", name, "request_id", reqID(r.Context()), "err", err)
 		appliedNotSaved(w)
 		return

@@ -132,9 +132,12 @@ type Server struct {
 	// execFlushMu serializes flushes so rows keep their order.
 	execUsage   execUsageQueue
 	execFlushMu sync.Mutex
-	// quit ends the background recovery loop (tests).
+	// quit ends the background recovery loop (tests, shutdown).
 	quit     chan struct{}
 	quitOnce sync.Once
+	// retryInterval is the recovery loop's cadence: storeRetryInterval, shorter
+	// in tests. Set before the first failure; the loop reads it when it starts.
+	retryInterval time.Duration
 }
 
 // New creates a new Server.
@@ -147,6 +150,8 @@ func New(cfg *config.Config, st *state.State, db store.Store) *Server {
 		nodeIdx:     newNodeTokenIndex(),
 		credLookups: newCredGate(maxCredLookups),
 		quit:        make(chan struct{}),
+
+		retryInterval: storeRetryInterval,
 	}
 	// Startup validation (config.ValidateTrustedProxies) already refuses a
 	// malformed entry, so a parse failure here can only mean the two parsers
@@ -529,21 +534,12 @@ func (d nodeDial) execStream(id string, body []byte, timeout time.Duration, reqI
 	return agentclient.ExecVMStream(d.host, d.port, id, body, d.token, timeout, reqID)
 }
 
-// putNodeCred records (or rotates) a node's own credential, drops the memoized
-// value so the very next dial uses it, and re-points the inbound index so the
-// node can authenticate to feluccad with it immediately.
-func (srv *Server) putNodeCred(host string, port uint16, token string, now int64) error {
-	key := nodeCredKey(host, port)
-	if err := srv.db.PutNodeCred(&store.NodeCred{Host: key, Token: token, CreatedAt: now}); err != nil {
-		return err
-	}
-	srv.noteNodeCred(key, token)
-	return nil
-}
-
-// enrollNodeCred is putNodeCred for an enrollment: the join token is consumed
-// in the same transaction as the credential it buys (store.EnrollNodeCred).
-// consumed is false when the token was not redeemable; nothing changed then.
+// enrollNodeCred records (or rotates) a node's own credential for an
+// enrollment: the join token is consumed in the same transaction as the
+// credential it buys (store.EnrollNodeCred). It then drops the memoized value
+// so the very next dial uses it, and re-points the inbound index so the node
+// can authenticate to feluccad with it immediately. consumed is false when the
+// token was not redeemable; nothing changed then.
 func (srv *Server) enrollNodeCred(host string, port uint16, token, tokenHash string, now int64) (consumed bool, err error) {
 	key := nodeCredKey(host, port)
 	consumed, err = srv.db.EnrollNodeCred(&store.NodeCred{Host: key, Token: token, CreatedAt: now}, tokenHash, now)
@@ -1661,9 +1657,13 @@ func (srv *Server) agentRegister(w http.ResponseWriter, r *http.Request, p princ
 	// A failed save does not fail the registration: memory has the node, the
 	// recovery loop writes it, and the agent re-registers after any restart,
 	// which rebuilds the row anyway. Refusing would only take a worker off the
-	// control plane for the length of a store outage.
-	if err := srv.save(nil); err != nil {
-		slog.Error("node registration not saved yet (the recovery loop will write it)", "hostname", req.Hostname, "err", err)
+	// control plane for the length of a store outage. While the store is
+	// already failing it is not even attempted: the recovery loop's save
+	// writes the node rows with everything else (P16).
+	if !srv.storeFailing() {
+		if err := srv.saveState(); err != nil {
+			slog.Error("node registration not saved yet (the recovery loop will write it)", "hostname", req.Hostname, "err", err)
+		}
 	}
 	// Push the current warm-pool specs to the (re)registering node off the
 	// response path (v4 P4). Pools have exactly one delivery channel
@@ -1922,7 +1922,7 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 	// the create stops here: undo drops the record (inside the save, so no other
 	// save can store it), nothing exists on the worker, and the caller is told
 	// to retry.
-	if err := srv.save(func() { srv.st.RemoveSandbox(sbID) }); err != nil {
+	if err := srv.save(nil, func() { srv.st.RemoveSandbox(sbID) }); err != nil {
 		slog.Error("create: record not saved, worker not called", "sandbox", sbID, "request_id", reqID(r.Context()), "err", err)
 		refuseStoreUnavailable(w)
 		return
@@ -1945,7 +1945,7 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 	resp, err := srv.dialNode(agentAddr).do(http.MethodPost, "/v1/vms", agentBody, reqID(r.Context()))
 	if err != nil {
 		srv.st.SetSandboxState(sbID, model.StateError)
-		if perr := srv.save(nil); perr != nil {
+		if perr := srv.saveState(); perr != nil {
 			// The answer stays the 502: nothing exists on the worker, memory
 			// says error, and the recovery loop writes it.
 			slog.Error("create: error state not saved yet", "sandbox", sbID, "request_id", reqID(r.Context()), "err", perr)
@@ -1956,7 +1956,7 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 	}
 	if resp.Status >= 300 {
 		srv.st.SetSandboxState(sbID, model.StateError)
-		if perr := srv.save(nil); perr != nil {
+		if perr := srv.saveState(); perr != nil {
 			slog.Error("create: error state not saved yet", "sandbox", sbID, "request_id", reqID(r.Context()), "err", perr)
 		}
 		slog.Error("agent create failed", "sandbox", sbID, "request_id", reqID(r.Context()), "status", resp.Status)
@@ -1969,23 +1969,14 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 		IP string `json:"ip"`
 	}
 	_ = json.Unmarshal(resp.Body, &agentResp)
-	// The running state and its "created" event in one critical section, so
-	// the save below writes both or neither.
-	func() {
-		srv.st.Lock()
-		defer srv.st.Unlock()
-		sb := srv.st.FindSandbox(sbID)
-		if sb == nil {
-			return
-		}
-		if agentResp.IP != "" {
-			ip := agentResp.IP
-			sb.IP = &ip
-		}
-		sb.State = model.StateRunning
-		srv.queueUsageLocked(sb, "created")
-	}()
-	if err := srv.save(func() { srv.unsaveCreated(sbID) }); err != nil {
+	// The running state and its "created" event are made INSIDE the save
+	// (mutate), so the save below writes both or neither, and no other save
+	// can store them first: a save of another request between this change and
+	// this save would write a running row and an open usage interval that the
+	// undo below can no longer take back, for a create its caller is told
+	// failed.
+	if err := srv.save(func() { srv.markCreatedLocked(sbID, agentResp.IP, "created") },
+		func() { srv.unsaveCreated(sbID) }); err != nil {
 		// The VM exists but the control plane could not record it. The caller
 		// is told the create failed, so the VM must not outlive the answer:
 		// the undo has set the record to error (closing its usage interval),
@@ -2006,6 +1997,30 @@ func (srv *Server) createSandbox(w http.ResponseWriter, r *http.Request, tenant 
 	observeCreateMs(uint64(time.Since(createStart).Milliseconds()))
 	b, _ := json.Marshal(sb)
 	writeJSON(w, 201, b)
+}
+
+// agentBusy reports whether a worker's 409 body is {"error":"busy"}: the
+// sandbox has another lifecycle operation in progress there (FLU-4 S4).
+func agentBusy(body []byte) bool {
+	var e struct {
+		Error string `json:"error"`
+	}
+	return json.Unmarshal(body, &e) == nil && e.Error == "busy"
+}
+
+// markCreatedLocked is the mutate of a create's (or fork's) last save: the
+// record takes the worker's address, becomes running, and queues the event
+// that opens its usage interval. Caller holds the state lock (save does).
+func (srv *Server) markCreatedLocked(id, ip, event string) {
+	sb := srv.st.FindSandbox(id)
+	if sb == nil {
+		return
+	}
+	if ip != "" {
+		sb.IP = &ip
+	}
+	sb.State = model.StateRunning
+	srv.queueUsageLocked(sb, event)
 }
 
 // unsaveCreated is the undo of a create's (or fork's) last save: the VM exists
@@ -2098,7 +2113,7 @@ func (srv *Server) adoptRefusedState(id string, from model.SandboxState, body []
 	}
 	slog.Warn("worker holds the sandbox in another state: recorded what it holds",
 		"sandbox", id, "request_id", reqID, "was", from, "now", to)
-	if err := srv.save(nil); err != nil {
+	if err := srv.saveState(); err != nil {
 		slog.Error("worker's state recorded but not saved (the recovery loop will write it)",
 			"sandbox", id, "request_id", reqID, "state", to, "err", err)
 	}
@@ -2171,7 +2186,7 @@ func (srv *Server) sandboxAction(w http.ResponseWriter, r *http.Request, id, act
 				srv.queueUsageLocked(sb, usageEvent)
 			}
 		}()
-		if err := srv.save(nil); err != nil {
+		if err := srv.saveState(); err != nil {
 			slog.Error(action+": applied on the worker but not saved", "sandbox", id, "request_id", reqID(r.Context()), "err", err)
 			appliedNotSaved(w)
 			return
@@ -2252,7 +2267,7 @@ func (srv *Server) deleteSandbox(w http.ResponseWriter, r *http.Request, id stri
 		srv.queueUsageLocked(srv.st.FindSandbox(id), "deleted")
 		srv.st.RemoveSandboxLocked(id)
 	}()
-	if err := srv.save(nil); err != nil {
+	if err := srv.saveState(); err != nil {
 		slog.Error("delete: applied on the worker but not saved", "sandbox", id, "request_id", reqID(r.Context()), "err", err)
 		appliedNotSaved(w)
 		return
@@ -2297,7 +2312,7 @@ func (srv *Server) sleepSandbox(w http.ResponseWriter, r *http.Request, id, tena
 		writeJSON(w, 500, []byte(`{"error":"lost sandbox"}`))
 		return
 	}
-	if err := srv.save(nil); err != nil {
+	if err := srv.saveState(); err != nil {
 		slog.Error("sleep: applied on the worker but not saved", "sandbox", id, "request_id", reqID(r.Context()), "err", err)
 		appliedNotSaved(w)
 		return
@@ -2362,7 +2377,7 @@ func (srv *Server) wakeSandbox(w http.ResponseWriter, r *http.Request, id, tenan
 	}
 	// Saved AFTER releasing the lock (save copies under it) so the snapshot
 	// carries the fresh activity clocks.
-	if err := srv.save(nil); err != nil {
+	if err := srv.saveState(); err != nil {
 		slog.Error("wake: applied on the worker but not saved", "sandbox", id, "request_id", reqID(r.Context()), "err", err)
 		appliedNotSaved(w)
 		return
@@ -2421,6 +2436,8 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID,
 
 	var agentAddr, childID string
 	var parentExposes []model.Expose
+	// The parent's clocks before the fork bumped them, for the first save's undo.
+	var parentLast, parentSlept int64
 	if status, body := func() (int, string) {
 		srv.st.Lock()
 		defer srv.st.Unlock()
@@ -2468,6 +2485,7 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID,
 		// parent this defers its idle auto-sleep; a SLEEPING fork-base parent's
 		// auto-delete TTL is also pushed out, so a regularly-forked golden image
 		// is never reaped out from under its children.
+		parentLast, parentSlept = parent.LastActivity, parent.SleptAt
 		parent.LastActivity = now
 		if parent.State == model.StateSleeping {
 			parent.SleptAt = now
@@ -2478,8 +2496,22 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID,
 		return
 	}
 
-	// Saved before the worker is asked to fork; see createSandbox.
-	if err := srv.save(func() { srv.st.RemoveSandbox(childID) }); err != nil {
+	// Saved before the worker is asked to fork; see createSandbox. The undo
+	// also gives the parent back the clocks this fork bumped — a fork that
+	// never happened is no activity — unless something set them since.
+	if err := srv.save(nil, func() {
+		srv.st.Lock()
+		defer srv.st.Unlock()
+		srv.st.RemoveSandboxLocked(childID)
+		if parent := srv.st.FindSandbox(parentID); parent != nil {
+			if parent.LastActivity == now {
+				parent.LastActivity = parentLast
+			}
+			if parent.SleptAt == now && parent.State == model.StateSleeping {
+				parent.SleptAt = parentSlept
+			}
+		}
+	}); err != nil {
 		slog.Error("fork: child record not saved, worker not called", "sandbox", childID, "request_id", reqID(r.Context()), "err", err)
 		refuseStoreUnavailable(w)
 		return
@@ -2493,16 +2525,29 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID,
 	resp, err := srv.dialNode(agentAddr).do(http.MethodPost, agentPath, agentBody, reqID(r.Context()))
 	if err != nil {
 		srv.st.SetSandboxState(childID, model.StateError)
-		if perr := srv.save(nil); perr != nil {
+		if perr := srv.saveState(); perr != nil {
 			slog.Error("fork: error state not saved yet", "sandbox", childID, "request_id", reqID(r.Context()), "err", perr)
 		}
 		slog.Error("agent unreachable", "sandbox", childID, "request_id", reqID(r.Context()), "err", err)
 		writeJSON(w, 502, []byte(`{"error":"agent unreachable"}`))
 		return
 	}
+	if resp.Status == 409 && agentBusy(resp.Body) {
+		// The parent has another operation in progress on the worker and
+		// nothing was created there (FLU-4 S4', P5'): the reserved child record
+		// goes, and the caller retries. A failed save of the removal does not
+		// change the answer — the recovery loop writes it, and until then the
+		// database holds a "creating" row, which carries no usage event.
+		if perr := srv.save(func() { srv.st.RemoveSandboxLocked(childID) }, nil); perr != nil {
+			slog.Error("fork: busy parent, reserved child record removed but not saved yet", "sandbox", childID, "request_id", reqID(r.Context()), "err", perr)
+		}
+		w.Header().Set("Retry-After", "2")
+		writeJSON(w, 409, []byte(`{"error":"busy"}`))
+		return
+	}
 	if resp.Status >= 300 {
 		srv.st.SetSandboxState(childID, model.StateError)
-		if perr := srv.save(nil); perr != nil {
+		if perr := srv.saveState(); perr != nil {
 			slog.Error("fork: error state not saved yet", "sandbox", childID, "request_id", reqID(r.Context()), "err", perr)
 		}
 		slog.Error("agent fork failed", "sandbox", childID, "request_id", reqID(r.Context()), "status", resp.Status)
@@ -2514,21 +2559,6 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID,
 		IP string `json:"ip"`
 	}
 	_ = json.Unmarshal(resp.Body, &agentResp)
-	// The running state and its "forked" event in one critical section.
-	func() {
-		srv.st.Lock()
-		defer srv.st.Unlock()
-		sb := srv.st.FindSandbox(childID)
-		if sb == nil {
-			return
-		}
-		if agentResp.IP != "" {
-			ip := agentResp.IP
-			sb.IP = &ip
-		}
-		sb.State = model.StateRunning
-		srv.queueUsageLocked(sb, "forked")
-	}()
 	srv.st.RecordFork()
 
 	// Re-expose the parent's services on the child (fresh node ports) under the
@@ -2536,7 +2566,10 @@ func (srv *Server) forkSandbox(w http.ResponseWriter, r *http.Request, parentID,
 	// failed re-expose degrades that one URL, not the fork — the operator can
 	// retry via the expose API.
 	srv.reExposeFork(agentAddr, childID, parentExposes, reqID(r.Context()))
-	if err := srv.save(func() { srv.unsaveCreated(childID) }); err != nil {
+	// The running state and its "forked" event are made inside the save, for
+	// the reason given in createSandbox.
+	if err := srv.save(func() { srv.markCreatedLocked(childID, agentResp.IP, "forked") },
+		func() { srv.unsaveCreated(childID) }); err != nil {
 		// As for create: the child exists on the worker but is not recorded,
 		// and the caller is told the fork failed — so it is removed from the
 		// worker after this response (its re-exposed rules go with it).
@@ -2899,9 +2932,9 @@ func (srv *Server) serveMetrics(w http.ResponseWriter) {
 	if srv.storeFailing() {
 		healthy = 0
 	}
-	fmt.Fprintf(&buf, "# HELP felucca_persist_failures_total Failed saves (snapshot saves and row-level writes)\n# TYPE felucca_persist_failures_total counter\nfelucca_persist_failures_total %d\n", persistFailures.Load())
+	fmt.Fprintf(&buf, "# HELP felucca_persist_failures_total Failed writes (snapshot saves, exec usage flushes and row-level writes)\n# TYPE felucca_persist_failures_total counter\nfelucca_persist_failures_total %d\n", persistFailures.Load())
 	fmt.Fprintf(&buf, "# HELP felucca_store_healthy 1 when the database has caught up with memory, 0 while saves are failing\n# TYPE felucca_store_healthy gauge\nfelucca_store_healthy %d\n", healthy)
-	fmt.Fprintf(&buf, "# HELP felucca_usage_write_failures_total Usage rows whose write failed (each attempt) or that were dropped from the full exec queue\n# TYPE felucca_usage_write_failures_total counter\nfelucca_usage_write_failures_total %d\n", usageWriteFailures.Load())
+	fmt.Fprintf(&buf, "# HELP felucca_usage_write_failures_total Failed write attempts that carried usage rows (one per attempt, however many rows), plus each exec row dropped from the full queue\n# TYPE felucca_usage_write_failures_total counter\nfelucca_usage_write_failures_total %d\n", usageWriteFailures.Load())
 
 	// Latency histograms (v4 P6, ADR-0010): always emitted, in-memory only.
 	appendHistograms(&buf)

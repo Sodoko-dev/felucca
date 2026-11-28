@@ -12,7 +12,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/alpham/infra-saas/felucca/internal/model"
@@ -101,13 +100,12 @@ func (srv *Server) createTenant(w http.ResponseWriter, r *http.Request) {
 	// insert left a tenant whose name is taken and for which nobody holds a key.
 	key, secret := mintKey(t.ID, now, 0)
 	if err := srv.db.CreateTenantWithKey(t, key); err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
-			writeJSON(w, 409, []byte(`{"error":"tenant name exists"}`))
-			return
+		// A constraint is the name (or, vanishingly, a minted id) already
+		// taken: 409, and the database is fine.
+		if !store.IsConstraint(err) {
+			slog.Error("create tenant", "err", err)
 		}
-		slog.Error("create tenant", "err", err)
-		srv.storeWriteFailed(err)
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
+		srv.rowWriteFailed(w, err, `{"error":"tenant name exists"}`)
 		return
 	}
 	body, _ := json.Marshal(struct {
@@ -167,8 +165,7 @@ func (srv *Server) createTenantKey(w http.ResponseWriter, r *http.Request, tenan
 	key, secret := mintKey(t.ID, now, expiresAt)
 	if err := srv.db.CreateKey(key); err != nil {
 		slog.Error("create key", "tenant", tenantID, "err", err)
-		srv.storeWriteFailed(err)
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
+		srv.rowWriteFailed(w, err, `{"error":"key id collision, retry"}`)
 		return
 	}
 	body, _ := json.Marshal(struct {

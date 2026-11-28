@@ -797,7 +797,7 @@ func TestSweepNeverSendsTheAdminTokenToANode(t *testing.T) {
 	// Enroll the node the way a join does: its own feluccad→agent bearer.
 	const nodeTok = "felucca_nt_lifecycle"
 	host, port := nodeHostOf(t, srv)
-	if err := srv.putNodeCred(host, port, nodeTok, now); err != nil {
+	if err := putNodeCred(srv, host, port, nodeTok, now); err != nil {
 		t.Fatalf("put node cred: %v", err)
 	}
 

@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -12,7 +13,8 @@ import (
 	"github.com/alpham/infra-saas/felucca/internal/model"
 	"github.com/alpham/infra-saas/felucca/internal/state"
 
-	_ "modernc.org/sqlite" // pure-Go driver: feluccad stays CGO_ENABLED=0
+	"modernc.org/sqlite" // pure-Go driver: feluccad stays CGO_ENABLED=0
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const schema = `
@@ -163,6 +165,12 @@ const maxReadConns = 4
 // and for feluccad's single-process write pattern (ADR-0002) — and a second,
 // read-only handle serves the reads (see SQLite).
 func OpenSQLite(path string) (*SQLite, error) {
+	// An in-memory database is private to the connection that opened it: the
+	// writer and the read handle would be two unrelated, empty databases, and
+	// every read would miss every write.
+	if path == ":memory:" || strings.HasPrefix(path, "file::memory:") || strings.Contains(path, "mode=memory") {
+		return nil, fmt.Errorf("open %s: an in-memory database is not supported (the writer and the read handle would be two different databases)", path)
+	}
 	// journal_mode is a property of the database file; it is set on the writer
 	// only (a read-only connection cannot change it, and does not need to).
 	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&"+dsnPragmas)
@@ -232,6 +240,39 @@ func OpenSQLite(path string) (*SQLite, error) {
 		return nil, fmt.Errorf("open read handle %s: %w", path, err)
 	}
 	return &SQLite{db: db, ro: ro}, nil
+}
+
+// ResetWriter closes the writer's idle connection, so the next write opens a
+// fresh one. SQLite opens a file it cannot write read-only, without an error,
+// and the writer pool keeps its one connection for ever: a database that was
+// read-only when feluccad opened it (a read-only mount, an immutable file)
+// stays read-only to this process after the operator has made it writable,
+// until a restart. A connection in use is not affected; it is closed by a
+// later call.
+func (s *SQLite) ResetWriter() {
+	s.db.SetMaxIdleConns(0)
+	s.db.SetMaxIdleConns(1)
+}
+
+// MarkStarted records the start time in meta: one small real write, the
+// start-up's "can this database be written" check. Rewriting the whole
+// snapshot instead would make whatever the start loaded permanent before the
+// first request.
+func (s *SQLite) MarkStarted(now int64) error {
+	_, err := s.db.Exec(
+		`INSERT INTO meta (k, v) VALUES ('started_at', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`,
+		fmt.Sprintf("%d", now),
+	)
+	return err
+}
+
+// IsConstraint reports whether err is SQLite refusing a write that breaks a
+// constraint (a UNIQUE name, a duplicate key): the request's conflict, not a
+// database that cannot be written. Classified by the result code, not by
+// the message text.
+func IsConstraint(err error) bool {
+	var e *sqlite.Error
+	return errors.As(err, &e) && e.Code()&0xff == sqlite3.SQLITE_CONSTRAINT
 }
 
 func (s *SQLite) Close() error {

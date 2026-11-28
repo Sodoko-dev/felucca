@@ -205,7 +205,7 @@ func newQFixture(t *testing.T, honor bool) *qFixture {
 	}
 	fs := &faultStore{Store: sqlite}
 	srv := New(cfg, state.New(), fs)
-	t.Cleanup(srv.stopBackground)
+	t.Cleanup(srv.StopBackground)
 	now := &atomic.Int64{}
 	now.Store(time.Now().Unix())
 	srv.st.Clock = now.Load
@@ -426,8 +426,8 @@ func TestQuarantineIsSavedWithTheRemovalAndSurvivesARestart(t *testing.T) {
 		t.Fatalf("after the failed save: rows %+v quarantine %+v, want the row and no entry", sb, saved.Quarantine)
 	}
 	fx.fs.heal()
-	if err := fx.srv.save(nil); err != nil {
-		t.Fatalf("save: %v", err)
+	if err := fx.srv.recoverStore(); err != nil {
+		t.Fatalf("recovery save: %v", err)
 	}
 	saved = fx.saved(t)
 	if sb := saved.FindSandbox(id); sb == nil || len(sb.Exposes) != 0 || len(saved.Quarantine) != 1 || saved.Quarantine[0].Port != port {
@@ -436,7 +436,7 @@ func TestQuarantineIsSavedWithTheRemovalAndSurvivesARestart(t *testing.T) {
 
 	// A restart: a new server on what the database holds.
 	srv2 := New(fx.cfg, saved, fx.sqlite)
-	t.Cleanup(srv2.stopBackground)
+	t.Cleanup(srv2.StopBackground)
 	b := func() string {
 		srv2.st.Lock()
 		defer srv2.st.Unlock()
@@ -827,7 +827,7 @@ func TestDynamicExposeDropWaitsWhileTheStoreIsFailing(t *testing.T) {
 	}()
 
 	fx.fs.failAll()
-	if err := fx.srv.save(nil); err == nil {
+	if err := fx.srv.saveState(); err == nil {
 		t.Fatal("save did not fail")
 	}
 	fx.srv.lifecycleSweep(now)
@@ -836,8 +836,8 @@ func TestDynamicExposeDropWaitsWhileTheStoreIsFailing(t *testing.T) {
 	}
 
 	fx.fs.heal()
-	if err := fx.srv.save(nil); err != nil {
-		t.Fatalf("save: %v", err)
+	if err := fx.srv.recoverStore(); err != nil {
+		t.Fatalf("recovery save: %v", err)
 	}
 	fx.srv.lifecycleSweep(now)
 	if !fx.pw.unexposed(id+"/8080") || len(fx.rows(id)) != 0 {

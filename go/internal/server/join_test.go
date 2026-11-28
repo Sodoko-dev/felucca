@@ -1211,6 +1211,18 @@ func TestRotatedNodeTokenStopsAuthenticating(t *testing.T) {
 
 // ---- Credential keying ----
 
+// putNodeCred records (or rotates) a node's own credential the way an
+// enrollment does, without a join token: the row, then the in-memory views.
+// Production stores one only through enrollNodeCred.
+func putNodeCred(srv *Server, host string, port uint16, token string, now int64) error {
+	key := nodeCredKey(host, port)
+	if err := srv.db.PutNodeCred(&store.NodeCred{Host: key, Token: token, CreatedAt: now}); err != nil {
+		return err
+	}
+	srv.noteNodeCred(key, token)
+	return nil
+}
+
 // A credential stands for an agent ENDPOINT. Keyed on the host alone, one
 // credential covered every agent on an address — narrower than the identity it
 // authorizes, and "worth one worker" has to mean one worker.
@@ -1218,10 +1230,10 @@ func TestNodeCredentialsAreKeyedOnHostAndPort(t *testing.T) {
 	srv := newJoinServerWgIP(t, "")
 	now := time.Now().Unix()
 
-	if err := srv.putNodeCred("203.0.113.9", 9090, "felucca_nt_first", now); err != nil {
+	if err := putNodeCred(srv, "203.0.113.9", 9090, "felucca_nt_first", now); err != nil {
 		t.Fatalf("put first: %v", err)
 	}
-	if err := srv.putNodeCred("203.0.113.9", 9191, "felucca_nt_second", now); err != nil {
+	if err := putNodeCred(srv, "203.0.113.9", 9191, "felucca_nt_second", now); err != nil {
 		t.Fatalf("put second: %v", err)
 	}
 	if got := srv.agentTokenFor("203.0.113.9", 9090); got != "felucca_nt_first" {
@@ -1418,9 +1430,21 @@ func TestRejoinFailsClosedWhenTheCredentialStoreCannotBeRead(t *testing.T) {
 	srv.credMu.Unlock()
 	flaky.setFail(true)
 
-	if w := joinWith(srv, attack, validPubKeyA, "attacker"); w.Code != 409 {
-		t.Fatalf("re-join while the credential store is unreadable: got %d %s, want 409 — an unreadable store is not evidence that a node has no credential",
-			w.Code, w.Body)
+	// Refused as the store's failure (503), not the caller's: a 409 through
+	// srv.refuse fed the failed-credential throttle, so during a read outage a
+	// worker holding the RIGHT token collected failures and then 429s that
+	// outlived the outage.
+	for i := 0; i < authFailThreshold+2; i++ {
+		if w := joinWith(srv, attack, validPubKeyA, "attacker"); w.Code != 503 || w.Body.String() != `{"error":"store unavailable"}` {
+			t.Fatalf("re-join while the credential store is unreadable: got %d %s, want 503 store unavailable — an unreadable store is not evidence that a node has no credential",
+				w.Code, w.Body)
+		}
+	}
+	srv.authFails.mu.Lock()
+	recorded := len(srv.authFails.fail)
+	srv.authFails.mu.Unlock()
+	if recorded != 0 {
+		t.Errorf("credential read errors were fed to the failed-credential throttle (%d records)", recorded)
 	}
 
 	// The store recovers: the victim still holds exactly the credential it was
@@ -1782,7 +1806,7 @@ func TestAPanicUnderTheStateLockDoesNotDeadlockTheControlPlane(t *testing.T) {
 	t.Cleanup(func() { sqlite.Close() })
 	ps := &panicStore{Store: sqlite}
 	srv := newJoinServerStore(t, ps, tmp)
-	t.Cleanup(srv.stopBackground)
+	t.Cleanup(srv.StopBackground)
 	h := srv.Handler()
 
 	// A running sandbox on an agent that says yes to everything, so the request
@@ -1820,7 +1844,13 @@ func TestAPanicUnderTheStateLockDoesNotDeadlockTheControlPlane(t *testing.T) {
 			done <- fmt.Errorf("list sandboxes after the panic: %d, want 200", code)
 			return
 		}
-		done <- srv.save(nil)
+		// The store is failing, so a request's save is refused at once (P16)
+		// — but only after it took the save mutex, which is what this checks.
+		if err := srv.saveState(); !errors.Is(err, errStoreFailing) {
+			done <- fmt.Errorf("save after the panic: %v, want errStoreFailing", err)
+			return
+		}
+		done <- nil
 	}()
 	select {
 	case err := <-done:

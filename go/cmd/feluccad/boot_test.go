@@ -20,21 +20,49 @@ import (
 	"github.com/alpham/infra-saas/felucca/internal/store"
 )
 
-// unwritable fails every snapshot save until healed.
+// unwritable fails every write of the start-up and of the recovery loop (the
+// snapshot save and the start-up's small write) until healed, and counts the
+// snapshot saves.
 type unwritable struct {
 	store.Store
 	mu     sync.Mutex
 	healed bool
+	saves  int
+	marks  int
 }
 
 func (u *unwritable) SaveSnapshot(snap *state.Snapshot, usage []store.UsageEvent) error {
 	u.mu.Lock()
 	healed := u.healed
+	u.saves++
 	u.mu.Unlock()
 	if !healed {
 		return errors.New("injected: attempt to write a readonly database")
 	}
 	return u.Store.SaveSnapshot(snap, usage)
+}
+
+func (u *unwritable) MarkStarted(now int64) error {
+	u.mu.Lock()
+	healed := u.healed
+	u.marks++
+	u.mu.Unlock()
+	if !healed {
+		return errors.New("injected: attempt to write a readonly database")
+	}
+	return u.Store.MarkStarted(now)
+}
+
+func (u *unwritable) heal() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.healed = true
+}
+
+func (u *unwritable) saveCount() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.saves
 }
 
 func bootFixture(t *testing.T) (*config.Config, *store.SQLite) {
@@ -77,6 +105,7 @@ func TestBootWithAnUnwritableStoreStartsFailing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("boot with an unwritable store: %v — it must start, failing", err)
 	}
+	t.Cleanup(srv.StopBackground)
 	if srv.StoreHealthy() {
 		t.Fatal("store reported healthy after a failed start-up save")
 	}
@@ -95,9 +124,7 @@ func TestBootWithAnUnwritableStoreStartsFailing(t *testing.T) {
 	}
 
 	// The recovery loop heals it without a request.
-	u.mu.Lock()
-	u.healed = true
-	u.mu.Unlock()
+	u.heal()
 	deadline := time.Now().Add(6 * time.Second)
 	for !srv.StoreHealthy() && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
@@ -132,29 +159,111 @@ func TestBootRenamesTheLegacyFileOnlyAfterItsImportIsSaved(t *testing.T) {
 	}
 
 	u := &unwritable{Store: db}
-	if _, err := boot(cfg, u); err != nil {
+	srv, err := boot(cfg, u)
+	if err != nil {
 		t.Fatalf("boot: %v", err)
 	}
+	t.Cleanup(srv.StopBackground)
 	if _, err := os.Stat(cfg.StatePath); err != nil {
 		t.Fatalf("legacy file renamed although its import was not saved: %v", err)
 	}
-	// Let that server's recovery loop finish before the next boot.
-	u.mu.Lock()
-	u.healed = true
-	u.mu.Unlock()
+	// When the recovery loop saves the import, the file is renamed then: left
+	// in place, it would be imported again into a recreated database.
+	u.heal()
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(cfg.StatePath + ".imported"); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(cfg.StatePath + ".imported"); err != nil {
+		t.Errorf("legacy file not renamed after the recovery loop saved its import: %v", err)
+	}
+	if got := state.New(); db.LoadInto(got) != nil || got.FindSandbox("sb-old") == nil {
+		t.Error("the import is not in the database after the recovery")
+	}
 
 	cfg2, db2 := bootFixture(t)
 	if err := legacy.Persist(cfg2.StatePath); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := boot(cfg2, db2); err != nil {
+	srv2, err := boot(cfg2, db2)
+	if err != nil {
 		t.Fatalf("boot: %v", err)
 	}
+	t.Cleanup(srv2.StopBackground)
 	if _, err := os.Stat(cfg2.StatePath + ".imported"); err != nil {
 		t.Errorf("legacy file not renamed after a saved import: %v", err)
 	}
 	got := state.New()
 	if err := db2.LoadInto(got); err != nil || got.FindSandbox("sb-old") == nil {
 		t.Errorf("imported state not in the database: err %v", err)
+	}
+}
+
+// A database that loaded is not rewritten at start-up: the check that it can
+// be written is one small row (meta started_at), so whatever the start loaded
+// is not made permanent before the first request.
+func TestBootDoesNotRewriteTheSnapshotOfALoadedDatabase(t *testing.T) {
+	cfg, db := bootFixture(t)
+	st := state.New()
+	st.Sandboxes = append(st.Sandboxes, &model.Sandbox{ID: "sb-1", Name: "a", Namespace: "default", State: model.StateRunning, VCPUs: 1, MemMiB: 256})
+	if err := db.SaveSnapshot(st.Snapshot(), nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	u := &unwritable{Store: db, healed: true}
+	srv, err := boot(cfg, u)
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	t.Cleanup(srv.StopBackground)
+	if !srv.StoreHealthy() {
+		t.Error("store failing after a successful start-up write")
+	}
+	if n := u.saveCount(); n != 0 {
+		t.Errorf("start-up rewrote the snapshot %d time(s), want 0", n)
+	}
+	u.mu.Lock()
+	marks := u.marks
+	u.mu.Unlock()
+	if marks != 1 {
+		t.Errorf("start-up writes of meta started_at: %d, want 1", marks)
+	}
+}
+
+// unreadable fails the reads boot makes.
+type unreadable struct {
+	store.Store
+	emptyErr, loadErr bool
+}
+
+func (u *unreadable) Empty() (bool, error) {
+	if u.emptyErr {
+		return false, errors.New("injected: disk I/O error")
+	}
+	return u.Store.Empty()
+}
+
+func (u *unreadable) LoadInto(st *state.State) error {
+	if u.loadErr {
+		return errors.New("injected: disk I/O error")
+	}
+	return u.Store.LoadInto(st)
+}
+
+// A store that cannot be READ ends start-up (P12): serving from a short load
+// would destroy the rest of the database at the first save.
+func TestBootRefusesAnUnreadableStore(t *testing.T) {
+	cfg, db := bootFixture(t)
+	if _, err := boot(cfg, &unreadable{Store: db, emptyErr: true}); err == nil {
+		t.Error("boot accepted a store whose emptiness could not be read")
+	}
+	st := state.New()
+	if err := db.SaveSnapshot(st.Snapshot(), nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := boot(cfg, &unreadable{Store: db, loadErr: true}); err == nil {
+		t.Error("boot accepted a store whose working set could not be loaded")
 	}
 }

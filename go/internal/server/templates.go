@@ -310,8 +310,8 @@ func (srv *Server) createTemplate(w http.ResponseWriter, r *http.Request, tenant
 		// A captured image file without a row is harmless (re-capture
 		// refuses; delete cleans) but don't leave it silently.
 		slog.Error("create template", "template", t.Name, "err", err)
-		srv.storeWriteFailed(err)
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
+		// A constraint is a concurrent create of the same name that won.
+		srv.rowWriteFailed(w, err, `{"error":"template exists"}`)
 		return
 	}
 

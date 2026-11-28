@@ -5,12 +5,15 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
@@ -158,12 +161,24 @@ func main() {
 		slog.Info("wg overlay up", "ip", cfg.WgIP, "iface", wg.InterfaceName, "port", cfg.WgPort, "peers", len(peers))
 	}
 
+	// SIGTERM and SIGINT stop feluccad (stopOnSignal); registered before
+	// anything is served so a signal is never the default kill.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM, os.Interrupt)
+
 	// Lifecycle sweep (v4 P5.2): idle auto-sleep, asleep-TTL auto-delete,
-	// hourly usage-event retention. Runs for the process lifetime.
-	go srv.LifecycleLoop(make(chan struct{}))
+	// hourly usage-event retention. Runs until the stop.
+	stop := make(chan struct{})
+	go srv.LifecycleLoop(stop)
 	// Exec metering rows are queued by the exec path and written here, once a
-	// second, so an exec never waits on the database.
-	go srv.UsageFlushLoop(make(chan struct{}))
+	// second, so an exec never waits on the database; once more at the stop.
+	flushed := make(chan struct{})
+	go func() {
+		srv.UsageFlushLoop(stop)
+		close(flushed)
+	}()
+	// Every listener, for the stop to close.
+	var servers []*http.Server
 
 	addr := cfg.ListenAddr()
 	slog.Info("feluccad listening", "addr", addr, "ui_dir", cfg.UIDir, "db", cfg.DBPath,
@@ -200,9 +215,10 @@ func main() {
 			MaxHeaderBytes: maxHeaderBytes,
 			TLSConfig:      m.TLSConfig(),
 		}
+		servers = append(servers, tlsSrv)
 		go func() {
 			// Cert/key paths empty: certificates come from autocert.
-			if err := tlsSrv.ListenAndServeTLS("", ""); err != nil {
+			if err := tlsSrv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				slog.Error("tls listen :443", "err", err)
 				os.Exit(1)
 			}
@@ -220,8 +236,9 @@ func main() {
 			WriteTimeout:   60 * time.Second,
 			MaxHeaderBytes: maxHeaderBytes,
 		}
+		servers = append(servers, acmeSrv)
 		go func() {
-			if err := acmeSrv.ListenAndServe(); err != nil {
+			if err := acmeSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				slog.Error("tls listen :80", "err", err)
 				os.Exit(1)
 			}
@@ -232,10 +249,43 @@ func main() {
 	// overlay-joined agents speak plain HTTP to feluccad's overlay IP inside the
 	// wg tunnel (the tunnel provides the encryption). Removing this listener
 	// would cut every enrolled agent off from the control plane.
-	if err := httpSrv.ListenAndServe(); err != nil {
+	servers = append(servers, httpSrv)
+	stopped := make(chan struct{})
+	go func() {
+		stopOnSignal(sigs, servers, srv, stop, flushed)
+		close(stopped)
+	}()
+	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("listen", "err", err)
 		os.Exit(1)
 	}
+	<-stopped
+	slog.Info("feluccad stopped")
+	// Returning runs the deferred db.Close, which waits for a save that is
+	// still in its transaction; the exit status is 0.
+}
+
+// stopOnSignal waits for SIGTERM or SIGINT, then stops feluccad: every
+// listener is closed (no new request is accepted), the background loops end,
+// and the queued exec usage rows get their final flush (flushed closes after
+// it). Without it, the stop channels were never closed, the final flush was
+// dead code, and every restart dropped up to a second of exec rows.
+//
+// It does not drain. A request in flight has its connection closed under it:
+// its client gets no answer (a reset or an EOF) and must treat the outcome as
+// unknown — what such a request had already saved is in the database, what it
+// had not is lost with the process, as on any other stop.
+func stopOnSignal(sigs <-chan os.Signal, servers []*http.Server, srv *server.Server, stop chan<- struct{}, flushed <-chan struct{}) {
+	sig := <-sigs
+	slog.Info("stopping: closing the listeners and flushing the exec usage rows", "signal", sig.String())
+	for _, s := range servers {
+		if err := s.Close(); err != nil {
+			slog.Warn("closing a listener", "addr", s.Addr, "err", err)
+		}
+	}
+	close(stop)
+	<-flushed
+	srv.StopBackground()
 }
 
 // boot loads the working set from an opened store (or imports the legacy JSON
@@ -258,8 +308,16 @@ func main() {
 //     because every running sandbox's ingress depends on this process answering
 //     the gateway, and a write outage is no reason to take that away.
 //
+// The start-up write is the whole snapshot only for an empty database or a
+// legacy import (there is nothing else to write then). A database that loaded
+// gets one small real write instead (store.MarkStarted): rewriting the
+// snapshot on every start made whatever the start loaded — a lossy load after
+// a downgrade, say — permanent before the first request.
+//
 // The legacy file is renamed only after its import was saved: if the save
 // fails, the database is still empty, and the next start imports it again.
+// When the recovery loop saves it later, the file is renamed then: left in
+// place, it would be imported again if the database were ever recreated.
 func boot(cfg *config.Config, db store.Store) (*server.Server, error) {
 	st := state.New()
 	empty, err := db.Empty()
@@ -283,16 +341,24 @@ func boot(cfg *config.Config, db store.Store) (*server.Server, error) {
 	}
 
 	srv := server.New(cfg, st, db)
-	if err := srv.Save(); err != nil {
+	renameLegacy := func() {
+		if err := os.Rename(cfg.StatePath, cfg.StatePath+".imported"); err != nil {
+			slog.Warn("could not rename legacy state file", "err", err)
+		}
+		slog.Info("migrated legacy state", "from", cfg.StatePath, "to", cfg.DBPath)
+	}
+	// Set before the write, so a recovery can never come before it.
+	if imported {
+		srv.OnStoreRecovered(renameLegacy)
+	}
+	if err := srv.StartupWrite(empty); err != nil {
 		slog.Error("STORE NOT WRITABLE at start-up: serving reads and the route table, refusing changes, retrying the save until it succeeds",
 			"db", cfg.DBPath, "err", err)
 		return srv, nil
 	}
 	if imported {
-		if err := os.Rename(cfg.StatePath, cfg.StatePath+".imported"); err != nil {
-			slog.Warn("could not rename legacy state file", "err", err)
-		}
-		slog.Info("migrated legacy state", "from", cfg.StatePath, "to", cfg.DBPath)
+		srv.OnStoreRecovered(nil)
+		renameLegacy()
 	}
 	return srv, nil
 }

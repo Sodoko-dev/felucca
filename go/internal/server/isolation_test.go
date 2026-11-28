@@ -219,7 +219,7 @@ func TestIsolationIsNotServedNorSaved(t *testing.T) {
 			t.Error("the snapshot copy carries isolation_ok")
 		}
 	}()
-	if err := p.srv.save(nil); err != nil {
+	if err := p.srv.saveState(); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	loaded := state.New()

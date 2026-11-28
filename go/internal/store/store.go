@@ -142,6 +142,14 @@ type Store interface {
 	// Empty reports whether no snapshot has ever been saved (drives the
 	// one-time state.json migration).
 	Empty() (bool, error)
+	// MarkStarted records the start time: the start-up's one small write that
+	// shows whether the database can be written, without rewriting the
+	// snapshot it just loaded.
+	MarkStarted(now int64) error
+	// ResetWriter makes the next write open a fresh writer connection. The
+	// recovery loop calls it before each retry: a connection opened while the
+	// file could not be written stays read-only for its whole life.
+	ResetWriter()
 
 	// Tenants.
 	CreateTenant(t *Tenant) error
