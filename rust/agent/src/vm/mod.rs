@@ -1038,6 +1038,9 @@ trait RuleOps: Send + Sync {
     fn rebuild_isolation(&self, members: &[(String, String)]) -> bool;
     fn rebuild_ingress(&self, members: &[(u16, String, u16)]) -> bool;
     fn remove_tap(&self, tap: &str);
+    /// Create `tap` if needed and pin it to `ip` and `mac`; false (and the
+    /// tap removed) when it cannot be pinned. A fork's child.
+    fn pin_tap(&self, tap: &str, ip: Option<&str>, mac: &net::GuestMac) -> bool;
 }
 
 /// `RuleOps` on the host: nft and ip.
@@ -1058,6 +1061,9 @@ impl RuleOps for HostRules {
         // the next VM to claim this slot will reuse.
         net::clear_tap_antispoof(tap);
         net::delete_tap(tap);
+    }
+    fn pin_tap(&self, tap: &str, ip: Option<&str>, mac: &net::GuestMac) -> bool {
+        ensure_pinned_tap(tap, ip, mac, Unpinned::Remove)
     }
 }
 
@@ -3032,10 +3038,18 @@ impl Manager {
         err: String,
     ) -> OpError {
         warn!(vm = %id, err = %err, "the snapshot failed; its files are removed and the guest is left as it was");
-        self.discard_snapshot_files(id, dir_id);
+        // The state files first: they are small, and they are what makes a
+        // snapshot look valid. Then the guest is given back, and only then
+        // `mem.bin` is dealt with — the `/proc` scan and the unlink of a
+        // multi-GiB file used to keep the guest paused for their length.
+        if let Some(dir) = instance_path(&self.data_dir, dir_id) {
+            remove_if_present(id, &format!("{}/{}", dir, VMSTATE_TMP));
+            remove_if_present(id, &format!("{}/{}", dir, VMSTATE));
+        }
         if paused_here {
             self.resume_or_record_paused(id, sock, pid).await;
         }
+        self.discard_snapshot_files(id, dir_id);
         OpError::Other(err)
     }
 
@@ -3414,6 +3428,15 @@ impl Manager {
         let (parent, _child_op) = {
             let mut g = self.inner.lock().await;
             let p = g.vms.iter().find(|v| v.id == parent_id).ok_or("NotFound")?;
+            // Only a guest that exists can be forked: a `pooled` or
+            // `creating` parent whose VMM is alive used to be snapshotted
+            // too. Refused before anything is reserved.
+            if !matches!(p.state, VmState::Running | VmState::Paused | VmState::Sleeping) {
+                return Err(format!(
+                    "InvalidState: {} (only a running, paused or sleeping VM can be forked)",
+                    p.state.as_str()
+                ));
+            }
             let child = Vm {
                 id: child_id.to_string(),
                 name: child_name.to_string(),
@@ -3473,13 +3496,37 @@ impl Manager {
         // VM whose meta.json did not load at start-up, still running out of
         // it — it is never written into.
         if let Err(e) = create_new_instance_dir(&child_dir) {
-            self.drop_unborn_child(child_id, None).await;
+            self.drop_unborn_child(child_id, None, None).await;
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 warn!(vm = %child_id, "fork: the child's directory exists although no record owns it; left alone");
                 return Err("AlreadyExists".into());
             }
             return Err(format!("create {}: {}", child_dir, e));
         }
+
+        // The child's network slot, before the parent is touched: a node out
+        // of addresses used to pause the parent and write the whole snapshot
+        // first, for nothing. From here every failure gives it back. And the
+        // reservation is looked at once more: a stop or delete of the child
+        // that came in meanwhile ends the fork here.
+        let (child_slot, child_ip) = {
+            let mut g = self.inner.lock().await;
+            if !self.child_reserved(&g, child_id) {
+                drop(g);
+                self.drop_unborn_child(child_id, Some(&child_dir), None).await;
+                return Err(aborted(child_id).to_string());
+            }
+            if self.rules_on() {
+                let Some(s) = Self::claim_slot(&mut g) else {
+                    drop(g);
+                    self.drop_unborn_child(child_id, Some(&child_dir), None).await;
+                    return Err("IpPoolExhausted".into());
+                };
+                (Some(s), Self::ip_for_slot(&g, s))
+            } else {
+                (None, None)
+            }
+        };
 
         let parent_rootfs = format!("{}/rootfs.ext4", parent_dir);
         let child_rootfs = format!("{}/rootfs.ext4", child_dir);
@@ -3497,7 +3544,7 @@ impl Manager {
             let parent_mem_file = format!("{}/{}", parent_dir, MEM);
             for (src, dst) in [(&parent_rootfs, &child_rootfs), (&parent_vmstate, &child_vmstate), (&parent_mem_file, &child_mem_file)] {
                 if let Err(e) = copy_rootfs(src, dst) {
-                    self.drop_unborn_child(child_id, Some(&child_dir)).await;
+                    self.drop_unborn_child(child_id, Some(&child_dir), child_slot).await;
                     return Err(e);
                 }
             }
@@ -3507,7 +3554,7 @@ impl Manager {
             let paused_here = parent_state == VmState::Running;
             if paused_here {
                 if let Err(e) = fc::patch_vm_state(&parent_sock, "Paused").await {
-                    self.drop_unborn_child(child_id, Some(&child_dir)).await;
+                    self.drop_unborn_child(child_id, Some(&child_dir), child_slot).await;
                     return Err(e.to_string());
                 }
             }
@@ -3533,34 +3580,18 @@ impl Manager {
             let resumed = !paused_here || self.resume_or_record_paused(parent_id, &parent_sock, parent_pid).await;
             if let Err(e) = made {
                 warn!(vm = %parent_id, child = %child_id, err = %e, "fork: the snapshot failed; the child is removed");
-                self.drop_unborn_child(child_id, Some(&child_dir)).await;
+                self.drop_unborn_child(child_id, Some(&child_dir), child_slot).await;
                 return Err(e);
             }
             if !resumed {
-                self.drop_unborn_child(child_id, Some(&child_dir)).await;
+                self.drop_unborn_child(child_id, Some(&child_dir), child_slot).await;
                 return Err(format!("fork: {} could not be resumed after its snapshot and stays paused", parent_id));
             }
         }
         // Everything from here is the child's.
         drop(parent_op);
 
-        let mut child_ip: Option<String> = None;
-        let mut child_slot: Option<u32> = None;
-
-        if self.net_on {
-            let s = {
-                let mut g = self.inner.lock().await;
-                Self::claim_slot(&mut g)
-            };
-            let Some(s) = s else {
-                self.drop_unborn_child(child_id, Some(&child_dir)).await;
-                return Err("IpPoolExhausted".into());
-            };
-            child_slot = Some(s);
-            child_ip = {
-                let g = self.inner.lock().await;
-                Self::ip_for_slot(&g, s)
-            };
+        if let Some(s) = child_slot {
             // Pinned to the child's OWN MAC before its Firecracker is even
             // spawned, not after the in-guest re-MAC below: the clone restores
             // still carrying the parent's L2 identity, and a window in which it
@@ -3569,11 +3600,8 @@ impl Manager {
             // MAC that matches it — and the re-MAC travels over vsock, not over
             // this tap, so it is unaffected.
             let (tap, mac) = tap_pin_for_slot(s);
-            if !ensure_pinned_tap(&tap, child_ip.as_deref(), &mac, Unpinned::Remove) {
-                let mut g = self.inner.lock().await;
-                Self::free_slot(&mut g, s);
-                drop(g);
-                return Err(self.fail_child(child_id, None, "TapSetupFailed".into()).await);
+            if !self.rules.pin_tap(&tap, child_ip.as_deref(), &mac) {
+                return Err(self.fail_child(child_id, &child_dir, None, child_slot, "TapSetupFailed".into()).await);
             }
         }
 
@@ -3583,7 +3611,7 @@ impl Manager {
 
         let child_pid = match self.spawn_firecracker(child_id, &child_sock, &child_dir) {
             Ok(p) => p,
-            Err(e) => return Err(self.fail_child(child_id, None, e).await),
+            Err(e) => return Err(self.fail_child(child_id, &child_dir, None, child_slot, e).await),
         };
 
         let deadline = Instant::now() + Duration::from_millis(3000);
@@ -3591,7 +3619,7 @@ impl Manager {
             if Path::new(&child_sock).exists() { break; }
             if Instant::now() >= deadline {
                 // Don't leak the half-spawned child FC.
-                return Err(self.fail_child(child_id, Some(child_pid), "SocketNeverAppeared".into()).await);
+                return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, "SocketNeverAppeared".into()).await);
             }
             sleep(Duration::from_millis(50)).await;
         }
@@ -3614,7 +3642,7 @@ impl Manager {
         // for it), so the child must not run before its drive is its own.
         if let Err(e) = fc::put_snapshot_load(&child_sock, &child_vmstate, &child_mem_file, self.net_on, child_slot, vsock_override, false).await {
             // Don't leak the child FC that failed to restore.
-            return Err(self.fail_child(child_id, Some(child_pid), e.to_string()).await);
+            return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e.to_string()).await);
         }
         // Loaded: its state file is used up and describes nothing the child
         // will be (S11: `vmstate.bin` only beside a `sleeping` record).
@@ -3624,15 +3652,15 @@ impl Manager {
         // Its own disk (FLU-72), and checked: a child resumed on its parent's
         // image writes over the parent's filesystem from a second kernel.
         if let Err(e) = fc::patch_drive_rootfs(&child_sock, &child_rootfs).await {
-            return Err(self.fail_child(child_id, Some(child_pid), e.to_string()).await);
+            return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e.to_string()).await);
         }
         match fc::get_root_drive_path(&child_sock).await {
             Ok(p) if p == child_rootfs => {}
             Ok(p) => {
                 let e = format!("fork: the child's drive is {} after the PATCH, not {}", p, child_rootfs);
-                return Err(self.fail_child(child_id, Some(child_pid), e).await);
+                return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e).await);
             }
-            Err(e) => return Err(self.fail_child(child_id, Some(child_pid), e.to_string()).await),
+            Err(e) => return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e.to_string()).await),
         }
 
         {
@@ -3647,22 +3675,23 @@ impl Manager {
                     v.vsock = parent_vsock;
                 }
                 // Stopped or deleted while it was being made: its VMM is not
-                // wanted.
+                // wanted, nor anything else of it (E2).
                 _ => {
                     drop(g);
                     kill_and_reap(child_pid);
+                    self.drop_unborn_child(child_id, Some(&child_dir), child_slot).await;
                     return Err(aborted(child_id).to_string());
                 }
             }
         }
         if let Err(e) = self.write_meta(child_id).await {
-            return Err(self.fail_child(child_id, Some(child_pid), e).await);
+            return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e).await);
         }
         // Only now does the child run: its record says `running` on disk, and
         // a start-up that finds this VMM still paused resumes it — on its own
         // drive by then.
         if let Err(e) = fc::patch_vm_state(&child_sock, "Resumed").await {
-            return Err(self.fail_child(child_id, Some(child_pid), e.to_string()).await);
+            return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e.to_string()).await);
         }
 
         // Fork re-IP: the child restored with the parent's guest-internal IP.
@@ -3737,8 +3766,9 @@ impl Manager {
 
     /// A fork that failed before its child had a VMM leaves nothing behind
     /// (F4): the child's directory, when this fork created it (`child_dir`),
-    /// and the record it reserved.
-    async fn drop_unborn_child(&self, child_id: &str, child_dir: Option<&str>) {
+    /// the record it reserved, and the network slot and tap it claimed
+    /// (`slot`).
+    async fn drop_unborn_child(&self, child_id: &str, child_dir: Option<&str>, slot: Option<u32>) {
         if let Some(d) = child_dir {
             if let Err(e) = std::fs::remove_dir_all(d) {
                 if e.kind() != std::io::ErrorKind::NotFound {
@@ -3746,54 +3776,84 @@ impl Manager {
                 }
             }
         }
-        let mut g = self.inner.lock().await;
-        // A stop of the child that came in meanwhile has made the reserved
-        // record `stopped`; it is still the reservation, and goes with the
-        // directory it would otherwise outlive.
-        let closing = self.closing(child_id);
-        if let Some(pos) = g
-            .vms
-            .iter()
-            .position(|v| v.id == child_id && v.pid.is_none() && (v.state == VmState::Creating || closing))
         {
-            g.vms.remove(pos);
-            lock_std(&self.meta_owed).remove(child_id);
+            let mut g = self.inner.lock().await;
+            // A stop of the child that came in meanwhile has made the
+            // reserved record `stopped`; it is still the reservation (the
+            // child id is this fork's, nothing else can have written it), and
+            // goes with the directory it would otherwise outlive.
+            if let Some(pos) = g.vms.iter().position(|v| {
+                v.id == child_id && v.pid.is_none() && matches!(v.state, VmState::Creating | VmState::Stopped)
+            }) {
+                g.vms.remove(pos);
+                lock_std(&self.meta_owed).remove(child_id);
+            }
         }
+        self.release_child_slot(slot).await;
+    }
+
+    /// Give back the network slot a fork claimed for its child, and the tap
+    /// of that slot: the tap first, then the slot, so that the next sandbox
+    /// to take the slot never finds this one's device (FLU-6 R7's order).
+    async fn release_child_slot(&self, slot: Option<u32>) {
+        let Some(s) = slot else { return };
+        if self.rules_on() {
+            self.rules.remove_tap(&net::tap_name(s));
+        }
+        let mut g = self.inner.lock().await;
+        Self::free_slot(&mut g, s);
+    }
+
+    /// Is the child's reservation still this fork's: the record is there, in
+    /// `creating`, and no stop or delete of it has come in?
+    fn child_reserved(&self, g: &Inner, child_id: &str) -> bool {
+        g.vms.iter().any(|v| v.id == child_id && v.state == VmState::Creating) && !self.closing(child_id)
     }
 
     /// A fork that failed once its child had, or was about to get, a VMM
     /// (F4): that VMM is killed — the record lets go of its pid first, so the
     /// exit reaper takes it for a deliberate kill — the child's snapshot
-    /// files go, and the child stays as an `error` record for its owner to
-    /// see and delete. A record that was already written (`running`) is
-    /// written again. Returns `err` as the answer.
-    async fn fail_child(&self, child_id: &str, child_pid: Option<i32>, err: String) -> String {
+    /// files go, the slot and the tap this fork claimed (`slot`) are given
+    /// back, and the child stays as an `error` record for its owner to see
+    /// and delete. A record that was already written (`running`) is written
+    /// again. Returns `err` as the answer.
+    ///
+    /// A reservation that is no longer this fork's — the record gone, or a
+    /// stop or delete of the child pre-empted the fork (most likely why it
+    /// failed) — leaves nothing of the child behind (`drop_unborn_child`).
+    async fn fail_child(&self, child_id: &str, child_dir: &str, child_pid: Option<i32>, slot: Option<u32>, err: String) -> String {
         let found = {
             let mut g = self.inner.lock().await;
-            // A stop or delete of the child pre-empted the fork (that is
-            // most likely why it failed): the record is theirs. Only the
-            // VMM and the snapshot files are still this fork's to remove.
             let closing = self.closing(child_id);
-            g.vms.iter_mut().find(|v| v.id == child_id).map(|v| {
-                let written = !closing && v.state != VmState::Creating;
-                if !closing {
+            match g.vms.iter_mut().find(|v| v.id == child_id) {
+                Some(v) if !closing && matches!(v.state, VmState::Creating | VmState::Running) => {
+                    let written = v.state != VmState::Creating;
                     v.state = VmState::Error;
                     v.pid = None;
                     v.snapshot_valid = false;
+                    // The slot goes back below: the record must not keep it.
+                    if v.slot == slot {
+                        v.slot = None;
+                        v.ip = None;
+                    }
+                    Some((v.dir_id.clone(), written))
                 }
-                (v.dir_id.clone(), written)
-            })
+                _ => None,
+            }
         };
         if let Some(p) = child_pid {
             kill_and_reap(p);
         }
         warn!(vm = %child_id, err = %err, "fork: the child failed; its VMM is gone and its snapshot files are removed");
-        if let Some((dir_id, written)) = found {
-            self.discard_snapshot_files(child_id, &dir_id);
-            if written {
-                if let Err(e) = self.write_meta(child_id).await {
-                    warn!(vm = %child_id, err = %e, "fork: could not write the child's error record yet");
-                }
+        let Some((dir_id, written)) = found else {
+            self.drop_unborn_child(child_id, Some(child_dir), slot).await;
+            return err;
+        };
+        self.discard_snapshot_files(child_id, &dir_id);
+        self.release_child_slot(slot).await;
+        if written {
+            if let Err(e) = self.write_meta(child_id).await {
+                warn!(vm = %child_id, err = %e, "fork: could not write the child's error record yet");
             }
         }
         err
@@ -6216,6 +6276,9 @@ mod tests {
         /// whose pid is in this file (once it exists) is gone, and then left
         /// unanswered: a call to a VMM a wake or a start has just spawned.
         hang_pidfile: Option<(&'static str, String)>,
+        /// `forking`: the parent's `snapshot/create` answers success and
+        /// writes nothing.
+        writes_nothing: bool,
         /// The state a refused `PATCH /vm` leaves (the request was refused,
         /// but the VM did change: no proof of anything).
         refused_sets: Option<&'static str>,
@@ -6740,11 +6803,13 @@ mod tests {
             // The socket is linked to `<sock>.fake`, or, when there is none,
             // to `<instance dir>.fake.sock` beside the instance directory: a
             // fork creates its child's directory itself, so the child's fake
-            // API has to be bound outside it, before the fork starts.
+            // API has to be bound outside it, before the fork starts. The pid
+            // is written first: a caller that sees the socket may kill the
+            // stand-in at once, and `spawned_pid` must still find it.
             std::fs::write(
                 &path,
                 "#!/bin/bash\nt=\"$2.fake\"; [ -e \"$t\" ] || t=\"$(dirname \"$2\").fake.sock\"\n\
-                 ln -sf \"$t\" \"$2\"\necho $$ > \"$2.pid\"\n\
+                 echo $$ > \"$2.pid\"\nln -sf \"$t\" \"$2\"\n\
                  exec -a firecracker bash -c 'while :; do sleep 1; done' firecracker --api-sock \"$2\"\n",
             )
             .unwrap();
@@ -7961,11 +8026,10 @@ mod tests {
         assert!(gone_soon(child_pid).await, "the child's VMM must be killed");
         let r = tokio::time::timeout(Duration::from_secs(10), forked).await.expect("the fork must end").unwrap();
         assert!(r.is_err(), "{r:?}");
-        // The record is the stop's.
-        assert_eq!(record_of(&f.mgr, "vm-2").await, Some((VmState::Stopped, None)));
-        for name in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
-            assert!(!exists(&format!("{}/{}", f.child_dir, name)), "{name}");
-        }
+        // The reservation was the fork's: nothing of the child is left
+        // (FLU-70 E2; the record used to stay as the stop's `stopped`).
+        assert!(record_of(&f.mgr, "vm-2").await.is_none());
+        assert!(!exists(&f.child_dir));
         assert!(lock_std(&f.mgr.busy).is_empty());
     }
 
@@ -7983,6 +8047,243 @@ mod tests {
         assert_eq!((disk.state, disk.snapshot_valid, disk.exposes.len()), (VmState::Sleeping, true, 1));
         mgr.unexpose("vm-1", 8080).await.unwrap();
         assert!(meta_on_disk(&data_dir, "vm-1").snapshot_valid);
+    }
+
+    // -- review fixes (FLU-70) --
+
+    /// Networking "on" for a fork: the rule stand-in, a slot allocator, and
+    /// the free slots before anything happened.
+    fn netted(f: &mut Forking) -> (Arc<super::rule_fake::FakeRules>, Vec<u32>) {
+        let rules = super::rule_fake::install(&mut f.mgr);
+        let free = rules.free_slots();
+        (rules, free)
+    }
+
+    /// The fork gave back what it claimed: every slot free that was, and the
+    /// tap of each slot it pinned removed again.
+    fn gave_back(rules: &super::rule_fake::FakeRules, free: &[u32], what: &str) {
+        use super::rule_fake::RuleCall;
+        assert_eq!(rules.free_slots(), free, "{what}: the child's slot must be free again");
+        let calls = rules.calls();
+        for c in &calls {
+            if let RuleCall::PinTap { tap } = c {
+                assert!(
+                    calls.iter().any(|r| matches!(r, RuleCall::RemoveTap { tap: t, .. } if t == tap)),
+                    "{what}: the tap {tap} must be removed: {calls:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_refuses_a_parent_that_is_not_a_guest_before_it_reserves_anything() {
+        for state in [VmState::Pooled, VmState::Creating, VmState::Stopped, VmState::Error] {
+            let f = forking(VmState::Running, Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+            f.mgr.inner.lock().await.vms[0].state = state.clone();
+            let r = f.mgr.fork("vm-1", "vm-2", "c").await;
+            assert!(matches!(&r, Err(e) if e.starts_with("InvalidState") && e.contains(state.as_str())), "{state}: {r:?}");
+            assert!(record_of(&f.mgr, "vm-2").await.is_none(), "{state}");
+            assert!(!exists(&f.child_dir), "{state}");
+            assert!(f.parent_api.as_ref().unwrap().requests().is_empty(), "{state}: {:?}", f.parent_api.as_ref().unwrap().requests());
+            assert!(lock_std(&f.mgr.busy).is_empty(), "{state}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_without_a_free_slot_never_pauses_its_parent() {
+        let mut f = forking(VmState::Running, Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+        let (_rules, _) = netted(&mut f);
+        {
+            let mut g = f.mgr.inner.lock().await;
+            let a = g.allocator.as_mut().unwrap();
+            while a.claim().is_some() {}
+        }
+        assert_eq!(f.mgr.fork("vm-1", "vm-2", "c").await, Err("IpPoolExhausted".to_string()));
+        assert!(f.parent_api.as_ref().unwrap().requests().is_empty(), "{:?}", f.parent_api.as_ref().unwrap().requests());
+        assert!(record_of(&f.mgr, "vm-2").await.is_none());
+        assert!(!exists(&f.child_dir));
+    }
+
+    #[tokio::test]
+    async fn test_every_failure_of_a_fork_gives_back_the_slot_and_the_tap() {
+        for case in ["tap", "load", "socket", "rename", "child resume"] {
+            let parent = if case == "rename" { Behavior { writes_nothing: true, ..Default::default() } } else { Behavior::default() };
+            let child = match case {
+                "load" => Behavior { fail: vec!["PUT /snapshot/load"], ..Default::default() },
+                "child resume" => Behavior { fail_body: vec!["Resumed"], ..Default::default() },
+                _ => Behavior::default(),
+            };
+            // A Firecracker that never makes its socket.
+            let bin = if case == "socket" { "/bin/true".to_string() } else { fake_fc_bin() };
+            let mut f = forking(VmState::Running, parent, child, &bin).await;
+            let (rules, free) = netted(&mut f);
+            if case == "tap" {
+                rules.fail_pin.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let r = f.mgr.fork("vm-1", "vm-2", "c").await;
+            assert!(r.is_err(), "{case}: {r:?}");
+            gave_back(&rules, &free, case);
+            match case {
+                // Before the child had a VMM: nothing of it is left.
+                "rename" => {
+                    assert!(record_of(&f.mgr, "vm-2").await.is_none(), "{case}");
+                    assert!(!exists(&f.child_dir), "{case}");
+                }
+                _ => {
+                    assert_eq!(record_of(&f.mgr, "vm-2").await, Some((VmState::Error, None)), "{case}");
+                    let ip = f.mgr.inner.lock().await.vms.iter().find(|v| v.id == "vm-2").unwrap().ip.clone();
+                    assert_eq!(ip, None, "{case}: the error record holds no address");
+                    for name in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
+                        assert!(!exists(&format!("{}/{}", f.child_dir, name)), "{case}: {name}");
+                    }
+                }
+            }
+            // The parent runs on.
+            assert_eq!(f.parent_api.as_ref().unwrap().state(), "Running", "{case}");
+            assert!(lock_std(&f.mgr.busy).is_empty(), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_whose_child_record_cannot_be_written_leaves_an_error_record_and_no_vmm() {
+        let f = forking(
+            VmState::Running,
+            Behavior::default(),
+            Behavior { delay: Some(("PATCH /drives/rootfs", Duration::from_millis(300))), ..Default::default() },
+            &fake_fc_bin(),
+        )
+        .await;
+        let forked = {
+            let m = Arc::clone(&f.mgr);
+            tokio::spawn(async move { m.fork("vm-1", "vm-2", "c").await })
+        };
+        while !f.child_api.requests().iter().any(|l| l.starts_with("PATCH /drives/rootfs")) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        break_meta_writes(&f.child_dir);
+        assert!(forked.await.unwrap().is_err());
+        let pid = spawned_pid(&f.child_dir).await;
+        assert!(gone_soon(pid).await);
+        assert_eq!(record_of(&f.mgr, "vm-2").await, Some((VmState::Error, None)));
+        assert!(!f.child_api.bodies().iter().any(|b| b.contains("Resumed")), "never resumed");
+        assert!(!exists(&format!("{}/mem.bin", f.child_dir)));
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_whose_child_is_stopped_before_its_commit_leaves_nothing() {
+        let mut f = forking(
+            VmState::Running,
+            Behavior::default(),
+            Behavior { delay: Some(("GET /vm/config", Duration::from_millis(600))), ..Default::default() },
+            &fake_fc_bin(),
+        )
+        .await;
+        let (rules, free) = netted(&mut f);
+        let forked = {
+            let m = Arc::clone(&f.mgr);
+            tokio::spawn(async move { m.fork("vm-1", "vm-2", "c").await })
+        };
+        while !f.child_api.requests().iter().any(|l| l.starts_with("GET /vm/config")) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        let pid = spawned_pid(&f.child_dir).await;
+        f.mgr.stop("vm-2").await.unwrap();
+        let r = forked.await.unwrap();
+        assert!(matches!(&r, Err(e) if e.starts_with("Aborted")), "{r:?}");
+        assert!(gone_soon(pid).await);
+        assert!(record_of(&f.mgr, "vm-2").await.is_none(), "the reservation was the fork's: it goes");
+        assert!(!exists(&f.child_dir));
+        gave_back(&rules, &free, "stopped before the commit");
+        assert!(lock_std(&f.mgr.busy).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_sleep_gives_the_guest_back_before_it_deals_with_mem_bin() {
+        // What the snapshot left, at the moment the resume reaches the VMM.
+        for (watch, want) in [("vmstate.bin.tmp", ""), ("mem.bin", "half the memory")] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().to_str().unwrap().to_string();
+            let dir = format!("{}/instances/vm-1", data_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            disk_image(&dir);
+            std::fs::write(format!("{}/vmstate.bin.tmp", dir), b"device state").unwrap();
+            std::fs::write(format!("{}/mem.bin", dir), b"half the memory").unwrap();
+            let api = FakeApi::serve_with(
+                &format!("{}/fc.sock", dir),
+                "Running",
+                Behavior { fail: vec!["PUT /snapshot/create"], watch_meta: Some(format!("{}/{}", dir, watch)), ..Default::default() },
+            );
+            let mgr = mgr_for(data_dir.clone());
+            mgr.inner.lock().await.vms.push(running_vm("vm-1", 4000));
+            assert!(mgr.sleep_vm("vm-1").await.is_err());
+            let seen = api.meta_seen();
+            let resume = seen.iter().rposition(|(l, _)| l.starts_with("PATCH /vm")).unwrap();
+            assert_eq!(seen[resume].1, want, "{watch} at the resume");
+            assert!(!exists(&format!("{}/mem.bin", dir)), "and mem.bin goes after it");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_parent_whose_vmm_dies_during_a_fork_loses_its_snapshot_files_too() {
+        // Its VMM dies while it writes the child's snapshot. The fork fails;
+        // the record of the parent is settled by the next sweep, and with it
+        // a mem.bin from an earlier wake (S8).
+        let f = forking(VmState::Running, Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+        drop(f.parent_api);
+        let _ = std::fs::remove_file(format!("{}/fc.sock", f.parent_dir));
+        let vmm_pid = f.vmm.as_ref().unwrap().pid();
+        let api = FakeApi::serve_with(
+            &format!("{}/fc.sock", f.parent_dir),
+            "Running",
+            Behavior { hang: Some(("PUT /snapshot/create", Some(vmm_pid))), ..Default::default() },
+        );
+        std::fs::write(format!("{}/mem.bin", f.parent_dir), b"woken from").unwrap();
+        let forked = {
+            let m = Arc::clone(&f.mgr);
+            tokio::spawn(async move { m.fork("vm-1", "vm-2", "c").await })
+        };
+        while !api.requests().iter().any(|l| l.starts_with("PUT /snapshot/create")) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        drop(f.vmm);
+        assert!(forked.await.unwrap().is_err());
+        assert!(record_of(&f.mgr, "vm-2").await.is_none());
+        f.mgr.sweep_dead().await;
+        assert_eq!(record_of(&f.mgr, "vm-1").await, Some((VmState::Error, None)));
+        assert!(!exists(&format!("{}/mem.bin", f.parent_dir)));
+    }
+
+    #[tokio::test]
+    async fn test_a_sleep_that_outlives_a_stop_removes_its_own_snapshot() {
+        // The stop gives up (the create is answered only after its limit),
+        // so the files the late create wrote are the sleep's alone to remove.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        let vmm = FakeVmm::spawn(&data_dir, "vm-1");
+        let api = FakeApi::serve_with(
+            &format!("{}/fc.sock", dir),
+            "Running",
+            Behavior { write_snapshot: true, delay: Some(("PUT /snapshot/create", CLOSE_WAIT + Duration::from_millis(800))), ..Default::default() },
+        );
+        let mgr = mgr_for(data_dir.clone());
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
+        let sleeping = {
+            let m = Arc::clone(&mgr);
+            tokio::spawn(async move { m.sleep_vm("vm-1").await })
+        };
+        while !api.requests().iter().any(|l| l.starts_with("PUT /snapshot/create")) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(mgr.stop("vm-1").await, Err(OpError::invalid(&VmState::Stopped, STOP_GAVE_UP)));
+        let r = sleeping.await.unwrap();
+        assert!(matches!(&r, Err(OpError::Other(m)) if m.starts_with("Aborted")), "{r:?}");
+        for f in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
+            assert!(!exists(&format!("{}/{}", dir, f)), "{f} beside a stopped record");
+        }
+        drop(vmm);
     }
 
     // -- fork (FLU-70) --
@@ -8036,7 +8337,7 @@ mod tests {
             let api = FakeApi::serve_with(
                 &format!("{}/fc.sock", parent_dir),
                 initial,
-                Behavior { write_snapshot: true, ..parent },
+                Behavior { write_snapshot: !parent.writes_nothing, ..parent },
             );
             let mut v = running_vm("vm-1", vmm.pid());
             v.state = state;
@@ -8545,6 +8846,7 @@ pub(crate) mod rule_fake {
         Isolation { ips: Vec<String>, free_slots: Vec<u32> },
         Ingress { members: Vec<(u16, String, u16)>, free_slots: Vec<u32> },
         RemoveTap { tap: String, free_slots: Vec<u32> },
+        PinTap { tap: String },
     }
 
     #[derive(Default)]
@@ -8552,6 +8854,7 @@ pub(crate) mod rule_fake {
         calls: std::sync::Mutex<Vec<RuleCall>>,
         pub(crate) fail_isolation: AtomicBool,
         pub(crate) fail_ingress: AtomicBool,
+        pub(crate) fail_pin: AtomicBool,
         mgr: std::sync::OnceLock<std::sync::Weak<Manager>>,
     }
 
@@ -8603,6 +8906,10 @@ pub(crate) mod rule_fake {
         fn remove_tap(&self, tap: &str) {
             let free_slots = self.free_slots();
             lock_std(&self.calls).push(RuleCall::RemoveTap { tap: tap.to_string(), free_slots });
+        }
+        fn pin_tap(&self, tap: &str, _ip: Option<&str>, _mac: &net::GuestMac) -> bool {
+            lock_std(&self.calls).push(RuleCall::PinTap { tap: tap.to_string() });
+            !self.fail_pin.load(Ordering::SeqCst)
         }
     }
 

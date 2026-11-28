@@ -357,6 +357,8 @@ async fn fork_vm(
         // The child id, or a directory of that name, is taken; nothing was
         // written.
         Err(e) if e == "AlreadyExists" => error_response(StatusCode::CONFLICT, &e),
+        // The parent is in a state that cannot be forked (the text names it).
+        Err(e) if e.starts_with("InvalidState") => error_response(StatusCode::CONFLICT, &e),
         Err(e) => {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
         }
