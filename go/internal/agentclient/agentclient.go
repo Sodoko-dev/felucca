@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/alpham/infra-saas/felucca/internal/ingress"
 )
 
 // RequestIDHeader carries the feluccad-minted per-request trace ID on every
@@ -23,7 +25,33 @@ type Response struct {
 	Body   []byte
 }
 
-var httpClient = &http.Client{Timeout: 30 * time.Second}
+// The ingress quarantine (ingress.PortQuarantine) is sized on the longest a
+// call to a worker may still be under way, so the client's timeout IS that
+// constant rather than a copy of its value.
+var httpClient = &http.Client{Timeout: ingress.WorkerCallTimeout}
+
+// MaxBody bounds an agent answer Request reads. The largest legitimate one is
+// the VM list: a few hundred bytes per VM, and a worker runs one VM per guest
+// address of its CIDR (253 in a /24, rust/agent/src/ipalloc.rs); everything else is one short JSON object. A worker that
+// answers more is not one the contract describes, and reading it whole would
+// let it make feluccad allocate without limit.
+const MaxBody = 1 << 20
+
+// MaxExecBody bounds a buffered exec answer: stdout and stderr are each capped
+// at 1 MiB by the guest, and JSON escaping can grow them up to six-fold.
+const MaxExecBody = 16 << 20
+
+// readBody reads at most limit bytes of body; a longer body is an error.
+func readBody(body io.Reader, limit int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("read body: agent answer longer than %d bytes", limit)
+	}
+	return b, nil
+}
 
 // Request performs an HTTP request to the agent at host:port.
 // token is attached as "Authorization: Bearer <token>" when non-empty.
@@ -59,9 +87,9 @@ func Request(host string, port uint16, method, path string, body []byte, token, 
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readBody(resp.Body, MaxBody)
 	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
+		return nil, err
 	}
 
 	return &Response{Status: resp.StatusCode, Body: respBody}, nil
@@ -99,9 +127,9 @@ func ExecVM(host string, port uint16, id string, body []byte, token string, time
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readBody(resp.Body, MaxExecBody)
 	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
+		return nil, err
 	}
 
 	return &Response{Status: resp.StatusCode, Body: respBody}, nil

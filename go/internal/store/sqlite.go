@@ -117,6 +117,17 @@ CREATE TABLE IF NOT EXISTS wg_peers (
   hostname   TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
+-- FLU-6: node ports released less than the port quarantine ago. Part of the
+-- snapshot (rewritten with it), so no key: two sandboxes may have released
+-- the same port of one host within the quarantine.
+CREATE TABLE IF NOT EXISTS released_ports (
+  host        TEXT NOT NULL,
+  port        INTEGER NOT NULL,
+  sandbox_id  TEXT NOT NULL,
+  guest_port  INTEGER NOT NULL,
+  tenant_id   TEXT NOT NULL DEFAULT '',
+  released_at INTEGER NOT NULL
+);
 `
 
 // SQLite implements Store on a single SQLite database (WAL mode).
@@ -266,6 +277,21 @@ func (s *SQLite) SaveSnapshot(snap *state.Snapshot, usage []UsageEvent) error {
 	if _, err := tx.Exec(`DELETE FROM sandboxes`); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(`DELETE FROM released_ports`); err != nil {
+		return err
+	}
+	// The quarantined ports in the same transaction as the rows: a removed
+	// route row whose port is not quarantined after a restart would hand that
+	// port to the next sandbox while gateways still route the old hostname.
+	for i := range snap.Quarantine {
+		q := &snap.Quarantine[i]
+		if _, err := tx.Exec(
+			`INSERT INTO released_ports (host, port, sandbox_id, guest_port, tenant_id, released_at) VALUES (?,?,?,?,?,?)`,
+			q.Host, q.Port, q.SandboxID, q.GuestPort, q.TenantID, q.ReleasedAt,
+		); err != nil {
+			return err
+		}
+	}
 	for i := range snap.Nodes {
 		n := &snap.Nodes[i]
 		if _, err := tx.Exec(
@@ -384,6 +410,23 @@ func (s *SQLite) LoadInto(st *state.State) error {
 			}
 		}
 		st.Sandboxes = append(st.Sandboxes, sb)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	rows, err = s.ro.Query(`SELECT host, port, sandbox_id, guest_port, tenant_id, released_at FROM released_ports`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var q model.ReleasedPort
+		if err := rows.Scan(&q.Host, &q.Port, &q.SandboxID, &q.GuestPort, &q.TenantID, &q.ReleasedAt); err != nil {
+			rows.Close()
+			return err
+		}
+		st.Quarantine = append(st.Quarantine, q)
 	}
 	rows.Close()
 	return rows.Err()

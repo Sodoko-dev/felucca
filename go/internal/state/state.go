@@ -10,7 +10,10 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
+	"github.com/alpham/infra-saas/felucca/internal/agentclient"
+	"github.com/alpham/infra-saas/felucca/internal/ingress"
 	"github.com/alpham/infra-saas/felucca/internal/model"
 )
 
@@ -31,6 +34,40 @@ type State struct {
 	WakeMsSum  uint64
 	ForksTotal uint64
 	ExecsTotal uint64
+
+	// Quarantine lists the node ports released less than
+	// ingress.PortQuarantine ago (FLU-6), plus expired entries not yet dropped
+	// (SnapshotLocked drops them). Entries are created ONLY by the removal
+	// methods below, in the same critical section as the row they describe, so
+	// no caller can remove a route row and forget its port.
+	Quarantine []model.ReleasedPort
+
+	// Clock returns unix seconds; nil means the wall clock. Tests set it to
+	// age quarantine entries.
+	Clock func() int64
+}
+
+// Now is the state's clock (unix seconds). Caller need not hold the lock.
+func (s *State) Now() int64 {
+	if s.Clock != nil {
+		return s.Clock()
+	}
+	return time.Now().Unix()
+}
+
+// quarantineS is ingress.PortQuarantine in the unit the entries carry.
+var quarantineS = int64(ingress.PortQuarantine / time.Second)
+
+// QuarantineActive reports whether an entry is still within its quarantine
+// at now.
+func QuarantineActive(q model.ReleasedPort, now int64) bool {
+	return now-q.ReleasedAt < quarantineS
+}
+
+// QuarantineExpiresIn is the number of seconds until q's quarantine ends
+// (<= 0: ended).
+func QuarantineExpiresIn(q model.ReleasedPort, now int64) int64 {
+	return q.ReleasedAt + quarantineS - now
 }
 
 // New creates an empty State.
@@ -387,13 +424,153 @@ func (s *State) RemoveSandbox(id string) {
 // RemoveSandboxLocked is RemoveSandbox for a caller that holds the lock — one
 // that has to remove the record in the same critical section as something
 // else (the usage event describing the removal).
+//
+// Every node port the sandbox's route rows held is quarantined here (FLU-6),
+// once per port: two names on one guest port share one node port.
 func (s *State) RemoveSandboxLocked(id string) {
 	for i, sb := range s.Sandboxes {
 		if sb.ID == id {
+			released := map[uint16]bool{}
+			for _, e := range sb.Exposes {
+				if !released[e.NodePort] {
+					released[e.NodePort] = true
+					s.releaseLocked(sb, e)
+				}
+			}
 			s.Sandboxes = append(s.Sandboxes[:i], s.Sandboxes[i+1:]...)
 			return
 		}
 	}
+}
+
+// RemoveExposeLocked removes the route row name of sandbox id and reports
+// whether there was one. Its node port is quarantined when no other row of
+// the sandbox maps the same guest port or node port: the worker keeps one
+// DNAT rule per guest port, and the unexpose paths leave it in place while
+// another name uses it, so removing one of two such names releases nothing.
+// Caller holds the lock.
+func (s *State) RemoveExposeLocked(id, name string) bool {
+	sb := s.FindSandbox(id)
+	if sb == nil {
+		return false
+	}
+	var gone *model.Expose
+	kept := sb.Exposes[:0]
+	for _, e := range sb.Exposes {
+		if e.Name == name && gone == nil {
+			c := e
+			gone = &c
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if gone == nil {
+		return false
+	}
+	sb.Exposes = kept
+	shared := false
+	for _, e := range sb.Exposes {
+		if e.GuestPort == gone.GuestPort || e.NodePort == gone.NodePort {
+			shared = true
+			break
+		}
+	}
+	if !shared {
+		s.releaseLocked(sb, *gone)
+	}
+	if len(sb.Exposes) == 0 {
+		sb.Exposes = nil
+	}
+	return true
+}
+
+// RemoveExposesOnPortLocked removes every route row of sandbox id that maps
+// nodePort, quarantining the port once, and returns how many rows went. It is
+// for a row the worker has proved stale (it handed the port to another
+// sandbox). Caller holds the lock.
+func (s *State) RemoveExposesOnPortLocked(id string, nodePort uint16) int {
+	sb := s.FindSandbox(id)
+	if sb == nil {
+		return 0
+	}
+	var first *model.Expose
+	n := 0
+	kept := sb.Exposes[:0]
+	for _, e := range sb.Exposes {
+		if e.NodePort == nodePort {
+			if first == nil {
+				c := e
+				first = &c
+			}
+			n++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	sb.Exposes = kept
+	if len(sb.Exposes) == 0 {
+		sb.Exposes = nil
+	}
+	if first != nil {
+		s.releaseLocked(sb, *first)
+	}
+	return n
+}
+
+// NodeHostLocked is the worker host of a sandbox: the host part of its node's
+// agent address, as route rows carry it. ok is false when the sandbox has no
+// node record (a port there is not reachable through any route). Caller holds
+// the lock.
+func (s *State) NodeHostLocked(sb *model.Sandbox) (host string, ok bool) {
+	if sb == nil || sb.NodeID == nil {
+		return "", false
+	}
+	n := s.FindNode(*sb.NodeID)
+	if n == nil {
+		return "", false
+	}
+	host, _ = agentclient.SplitHostPort(n.Addr)
+	return host, true
+}
+
+// releaseLocked quarantines e's node port. A sandbox without a node record
+// releases nothing that can be routed: no entry. Caller holds the lock.
+func (s *State) releaseLocked(sb *model.Sandbox, e model.Expose) {
+	host, ok := s.NodeHostLocked(sb)
+	if !ok || e.NodePort == 0 {
+		return
+	}
+	s.Quarantine = append(s.Quarantine, model.ReleasedPort{
+		Host: host, Port: e.NodePort, SandboxID: sb.ID, GuestPort: e.GuestPort,
+		TenantID: sb.TenantID, ReleasedAt: s.Now(),
+	})
+}
+
+// QuarantineLocked returns copies of the entries still in quarantine at now.
+// Caller holds the lock.
+func (s *State) QuarantineLocked(now int64) []model.ReleasedPort {
+	var out []model.ReleasedPort
+	for _, q := range s.Quarantine {
+		if QuarantineActive(q, now) {
+			out = append(out, q)
+		}
+	}
+	return out
+}
+
+// UnquarantineLocked drops the entries of (host, port) that sandbox sbID
+// released for guestPort: the worker handed the port back to its last owner
+// for the same service, so its old hostname reaches the same service again.
+// Entries other sandboxes left on the same port stay. Caller holds the lock.
+func (s *State) UnquarantineLocked(host string, port uint16, sbID string, guestPort uint16) {
+	kept := s.Quarantine[:0]
+	for _, q := range s.Quarantine {
+		if q.Host == host && q.Port == port && q.SandboxID == sbID && q.GuestPort == guestPort {
+			continue
+		}
+		kept = append(kept, q)
+	}
+	s.Quarantine = kept
 }
 
 // RecordWake updates wake metrics.
@@ -436,16 +613,31 @@ type Snapshot struct {
 	Sandboxes    []model.Sandbox
 	Seq          uint64
 	RequestCount uint64
+	// Quarantine is the released node ports still in quarantine (FLU-6). It
+	// is in the snapshot, not written on its own, so a route row's removal and
+	// its port's quarantine reach the database in one transaction.
+	Quarantine []model.ReleasedPort
 }
 
-// SnapshotLocked deep-copies the persisted part of the working set.
+// SnapshotLocked deep-copies the persisted part of the working set. Expired
+// quarantine entries are dropped from the working set here: this is the one
+// place that runs after every change, and an expired entry protects nothing.
 // Caller must hold the lock.
 func (s *State) SnapshotLocked() *Snapshot {
+	now := s.Now()
+	kept := s.Quarantine[:0]
+	for _, q := range s.Quarantine {
+		if QuarantineActive(q, now) {
+			kept = append(kept, q)
+		}
+	}
+	s.Quarantine = kept
 	snap := &Snapshot{
 		Nodes:        make([]model.Node, len(s.Nodes)),
 		Sandboxes:    make([]model.Sandbox, len(s.Sandboxes)),
 		Seq:          s.Seq,
 		RequestCount: s.RequestCount,
+		Quarantine:   append([]model.ReleasedPort(nil), s.Quarantine...),
 	}
 	for i, n := range s.Nodes {
 		snap.Nodes[i] = *n

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/alpham/infra-saas/felucca/internal/ingress"
 	"github.com/alpham/infra-saas/felucca/internal/model"
 	"github.com/alpham/infra-saas/felucca/internal/store"
 )
@@ -94,7 +95,10 @@ func (srv *Server) lifecycleSweep(now int64) {
 		// anything — only to key the unreachable set, so that one tenant's
 		// transport failure cannot defer a co-tenant's reclamation. See below.
 		tenant string
-		sleep  bool // false = delete
+		sleep  bool // false = delete, or drop when drop is set
+		// drop: GC the dynamic exposes of a sandbox asleep for at least the
+		// port quarantine (dropDynamicExposes).
+		drop bool
 	}
 	var acts []action
 
@@ -147,7 +151,7 @@ func (srv *Server) lifecycleSweep(now int64) {
 					last = sb.CreatedAt
 				}
 				if now-last >= idle {
-					acts = append(acts, action{sb.ID, sb.TenantID, true})
+					acts = append(acts, action{sb.ID, sb.TenantID, true, false})
 				}
 			case model.StateSleeping:
 				if sb.SleptAt == 0 {
@@ -158,7 +162,11 @@ func (srv *Server) lifecycleSweep(now int64) {
 				}
 				ttl := effectivePolicy(sb.AsleepDeleteS, lookup(sb.TenantID), true)
 				if ttl > 0 && now-sb.SleptAt >= ttl {
-					acts = append(acts, action{sb.ID, sb.TenantID, false})
+					acts = append(acts, action{sb.ID, sb.TenantID, false, false})
+				} else if now-sb.SleptAt >= int64(ingress.PortQuarantine/time.Second) && hasDynamicExpose(sb) {
+					// Not before: a sandbox that wakes within the quarantine
+					// keeps its rows and ports (FLU-6 R12).
+					acts = append(acts, action{sb.ID, sb.TenantID, false, true})
 				}
 			}
 		}
@@ -221,10 +229,25 @@ func (srv *Server) lifecycleSweep(now int64) {
 		}
 	}
 	for i := range acts {
-		if a := acts[(i+off)%len(acts)]; !a.sleep {
+		if a := acts[(i+off)%len(acts)]; !a.sleep && !a.drop {
 			srv.autoDelete(a.id, a.tenant, unreachable)
 		}
 	}
+	for i := range acts {
+		if a := acts[(i+off)%len(acts)]; a.drop {
+			srv.dropDynamicExposes(a.id, a.tenant, unreachable)
+		}
+	}
+}
+
+// hasDynamicExpose reports whether sb has a dynamic (all-digit) expose.
+func hasDynamicExpose(sb *model.Sandbox) bool {
+	for _, e := range sb.Exposes {
+		if isAllDigits(e.Name) {
+			return true
+		}
+	}
+	return false
 }
 
 // nodeTenant is the key of the per-sweep unreachable set: a node's agent address
@@ -246,10 +269,9 @@ func nodeUnreachable(unreachable map[nodeTenant]bool, addr, tenant string, err e
 }
 
 // autoSleep is the sweep's twin of the sleep handler: best-effort (an agent
-// failure is just retried by the next sweep), and it GCs the sandbox's
-// dynamic (ensure-created, all-digit-named) exposes — the ADR-0007 deferral.
-// The next gateway request re-ensures them; auto-wake makes that seamless.
-// unreachable is the sweep's per-pass set of (node, tenant) pairs whose agent
+// failure is just retried by the next sweep). The sandbox's dynamic
+// (ensure-created, all-digit-named) exposes — the ADR-0007 deferral — are
+// GC'd later, by dropDynamicExposes. unreachable is the sweep's per-pass set of (node, tenant) pairs whose agent
 // could not be reached; see lifecycleSweep.
 func (srv *Server) autoSleep(id, tenant string, now int64, unreachable map[nodeTenant]bool) {
 	agentAddr, state := srv.agentAddrAndState(id)
@@ -284,7 +306,10 @@ func (srv *Server) autoSleep(id, tenant string, now int64, unreachable map[nodeT
 		return
 	}
 
-	var dynamic []model.Expose
+	// The dynamic exposes are NOT dropped here (FLU-6 R12): dropping them
+	// releases their node ports into quarantine, and a sandbox that wakes
+	// within it would get fresh ports and quarantine more. They go once the
+	// sandbox has slept for ingress.PortQuarantine (dropDynamicExposes).
 	func() {
 		srv.st.Lock()
 		defer srv.st.Unlock()
@@ -292,16 +317,8 @@ func (srv *Server) autoSleep(id, tenant string, now int64, unreachable map[nodeT
 			sb.State = model.StateSleeping
 			sb.SleptAt = now
 			srv.queueUsageLocked(sb, "slept")
-			for _, e := range sb.Exposes {
-				if isAllDigits(e.Name) {
-					dynamic = append(dynamic, e)
-				}
-			}
 		}
 	}()
-	for _, e := range dynamic {
-		srv.dropExpose(id, e, sweepID)
-	}
 	if err := srv.save(nil); err != nil {
 		// Memory keeps what the worker did (the VM IS asleep); the recovery
 		// loop writes it.
@@ -395,10 +412,61 @@ func (srv *Server) autoDelete(id, tenant string, unreachable map[nodeTenant]bool
 	slog.Info("lifecycle: auto-deleted sandbox", "sandbox", id, "reason", "asleep past TTL")
 }
 
+// dropDynamicExposes is the sweep's GC of a sleeping sandbox's dynamic
+// (all-digit-named) exposes, once it has slept for ingress.PortQuarantine
+// (FLU-6 R12). Each row goes with its DNAT rule; its node port is quarantined
+// with the row (state.RemoveExposeLocked). A durable change like any other:
+// not attempted while the store is failing (an earlier action of this sweep
+// may have failed it), saved, a failed save logged — memory keeps what the
+// worker did and the recovery loop writes it.
+func (srv *Server) dropDynamicExposes(id, tenant string, unreachable map[nodeTenant]bool) {
+	if srv.storeFailing() {
+		return
+	}
+	agentAddr, state := srv.agentAddrAndState(id)
+	if state != model.StateSleeping {
+		return // woke (or was deleted) since the decision; it keeps its rows
+	}
+	if agentAddr != "" && unreachable[nodeTenant{agentAddr, tenant}] {
+		return // retried next sweep; see lifecycleSweep
+	}
+	var dynamic []model.Expose
+	func() {
+		srv.st.Lock()
+		defer srv.st.Unlock()
+		if sb := srv.st.FindSandbox(id); sb != nil {
+			for _, e := range sb.Exposes {
+				if isAllDigits(e.Name) {
+					dynamic = append(dynamic, e)
+				}
+			}
+		}
+	}()
+	if len(dynamic) == 0 {
+		return
+	}
+	sweepID := newTraceID("sweep")
+	dropped := 0
+	for _, e := range dynamic {
+		if err := srv.dropExpose(id, e, sweepID); err != nil {
+			break // the rest are retried by the next sweep
+		}
+		dropped++
+	}
+	if dropped == 0 {
+		return
+	}
+	if err := srv.save(nil); err != nil {
+		slog.Error("lifecycle: dynamic exposes dropped on the worker but not saved", "sandbox", id, "request_id", sweepID, "err", err)
+	}
+	slog.Info("lifecycle: dropped dynamic exposes of a long-sleeping sandbox", "sandbox", id, "count", dropped, "request_id", sweepID)
+}
+
 // dropExpose removes one expose row and its agent DNAT rule, preserving the
-// shared-guest-port rule like the unexpose handler. Best-effort: on agent
-// failure the row stays (the rule is still live) for a later manual delete.
-func (srv *Server) dropExpose(id string, e model.Expose, reqID string) {
+// shared-guest-port rule like the unexpose handler. On agent failure the row
+// stays (the rule is still live) and the error is returned: the sweep retries.
+// It does not save; the caller does.
+func (srv *Server) dropExpose(id string, e model.Expose, reqID string) error {
 	srv.exposeMu.Lock()
 	defer srv.exposeMu.Unlock()
 
@@ -425,27 +493,15 @@ func (srv *Server) dropExpose(id string, e model.Expose, reqID string) {
 	if agentAddr != "" && !shared {
 		if err := srv.agentUnexpose(agentAddr, id, e.GuestPort, reqID); err != nil {
 			slog.Warn("lifecycle: drop expose failed", "sandbox", id, "expose", e.Name, "err", err)
-			return
+			return err
 		}
 	}
 	func() {
 		srv.st.Lock()
 		defer srv.st.Unlock()
-		sb := srv.st.FindSandbox(id)
-		if sb == nil {
-			return
-		}
-		kept := sb.Exposes[:0]
-		for _, other := range sb.Exposes {
-			if other.Name != e.Name {
-				kept = append(kept, other)
-			}
-		}
-		sb.Exposes = kept
-		if len(sb.Exposes) == 0 {
-			sb.Exposes = nil
-		}
+		srv.st.RemoveExposeLocked(id, e.Name)
 	}()
+	return nil
 }
 
 // agentAddrAndState returns the sandbox's current state and its node's agent

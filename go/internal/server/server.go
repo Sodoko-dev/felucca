@@ -2849,9 +2849,11 @@ func (srv *Server) serveMetrics(w http.ResponseWriter) {
 	var pools []poolGauge
 	counts := make(map[model.SandboxState]int)
 	var requestCount, wakeMsLast, wakeTotal, wakeMsSum, forksTotal, execsTotal uint64
+	var quarantined int
 	func() {
 		srv.st.Lock()
 		defer srv.st.Unlock()
+		quarantined = len(srv.st.QuarantineLocked(srv.st.Now()))
 		for _, n := range srv.st.Nodes {
 			if n.NodeStatus(now) == "ready" {
 				readyCount++
@@ -2885,6 +2887,7 @@ func (srv *Server) serveMetrics(w http.ResponseWriter) {
 	fmt.Fprintf(&buf, "# HELP felucca_wake_ms_sum Sum of wake latencies (ms)\n# TYPE felucca_wake_ms_sum counter\nfelucca_wake_ms_sum %d\n", wakeMsSum)
 	fmt.Fprintf(&buf, "# HELP felucca_forks_total Total forks\n# TYPE felucca_forks_total counter\nfelucca_forks_total %d\n", forksTotal)
 	fmt.Fprintf(&buf, "# HELP felucca_execs_total Total exec attempts\n# TYPE felucca_execs_total counter\nfelucca_execs_total %d\n", execsTotal)
+	fmt.Fprintf(&buf, "# HELP felucca_node_ports_quarantined Released node ports still kept away from other sandboxes\n# TYPE felucca_node_ports_quarantined gauge\nfelucca_node_ports_quarantined %d\n", quarantined)
 	buf.WriteString("# HELP felucca_pool_size Warm-pool depth per node\n# TYPE felucca_pool_size gauge\n")
 	for _, p := range pools {
 		fmt.Fprintf(&buf, "felucca_pool_size{node=%q} %d\n", p.hostname, p.size)
