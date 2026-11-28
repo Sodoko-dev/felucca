@@ -116,6 +116,12 @@ type Node struct {
 	VMCount     uint32 `json:"vm_count"`
 	PoolSize    uint32 `json:"pool_size"`
 	LastHB      int64  `json:"last_heartbeat"`
+	// IsolationOK is the isolation_ok of the node's last heartbeat (FLU-8
+	// N10): nil when that heartbeat did not carry it (an older agent), or none
+	// has arrived since feluccad started. In memory only: not in the wire
+	// shape (nodeView), not in the snapshot copy, not in the database.
+	// Replaced on each heartbeat, never written through.
+	IsolationOK *bool `json:"-"`
 }
 
 // NodeStatus computes whether the node is ready based on the supplied now (unix secs).

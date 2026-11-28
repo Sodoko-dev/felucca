@@ -33,6 +33,7 @@ felucca_exec_duration_ms_sum
 felucca_execs_total
 felucca_forks_total
 felucca_nodes_ready
+felucca_nodes_unfenced
 felucca_persist_failures_total
 felucca_pool_size{node=*}
 felucca_sandboxes_total{state="creating"}

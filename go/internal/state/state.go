@@ -261,19 +261,24 @@ func (s *State) reclaimStaleNodesLocked(now int64) []string {
 	return reclaimed
 }
 
-// Heartbeat updates a node's live stats. Returns false if the node is unknown.
-func (s *State) Heartbeat(id string, memFree uint64, vmCount, poolSize uint32, now int64) bool {
+// Heartbeat updates a node's live stats and the isolation it reports
+// (isolationOK nil: the heartbeat did not carry it). It returns a copy of the
+// node as updated and the isolation value it held before, so the caller can
+// tell a change from a repeat; ok is false if the node is unknown.
+func (s *State) Heartbeat(id string, memFree uint64, vmCount, poolSize uint32, isolationOK *bool, now int64) (node model.Node, wasIsolationOK *bool, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := s.FindNode(id)
 	if n == nil {
-		return false
+		return model.Node{}, nil, false
 	}
+	wasIsolationOK = n.IsolationOK
 	n.MemFreeMiB = memFree
 	n.VMCount = vmCount
 	n.PoolSize = poolSize
 	n.LastHB = now
-	return true
+	n.IsolationOK = isolationOK
+	return *n, wasIsolationOK, true
 }
 
 // PickNode picks the ready node with the lowest vm_count.
@@ -444,6 +449,9 @@ func (s *State) SnapshotLocked() *Snapshot {
 	}
 	for i, n := range s.Nodes {
 		snap.Nodes[i] = *n
+		// Not part of the persisted set: a reported value is only true until
+		// the next heartbeat (FLU-8 N10).
+		snap.Nodes[i].IsolationOK = nil
 	}
 	for i, sb := range s.Sandboxes {
 		c := *sb

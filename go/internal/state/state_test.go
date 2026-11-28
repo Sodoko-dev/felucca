@@ -272,8 +272,8 @@ func TestPickNodeLowestVMCount(t *testing.T) {
 	id2 := st.RegisterNode("h2", "addr2", 4, 8192, now)
 
 	// Set vm_count via heartbeat.
-	st.Heartbeat(id1, 8000, 5, 0, now)
-	st.Heartbeat(id2, 8000, 2, 0, now)
+	st.Heartbeat(id1, 8000, 5, 0, nil, now)
+	st.Heartbeat(id2, 8000, 2, 0, nil, now)
 
 	st.Lock()
 	best := st.PickNode(now)
@@ -297,6 +297,60 @@ func TestPickNodeLowestVMCount(t *testing.T) {
 // Every record here is freshly heartbeated, so reclamation (see
 // TestFullNodeTableReclaimsOnlyProvablyDeadRecords) finds nothing to drop and the
 // cap is the hard backstop it is meant to be.
+// The isolation a heartbeat reports (FLU-8 N10) is kept in memory: Heartbeat
+// returns the node as updated and the value before, and an unknown node is
+// reported as such. Neither the snapshot copy nor the legacy state file carry
+// it, so after a restart every node is unknown until its next heartbeat.
+func TestHeartbeatIsolationIsInMemoryOnly(t *testing.T) {
+	st := state.New()
+	now := time.Now().Unix()
+	id := st.RegisterNode("h1", "1.2.3.4:9090", 4, 8192, now)
+	f, tr := false, true
+
+	if _, _, ok := st.Heartbeat("node-nope", 1, 0, 0, &f, now); ok {
+		t.Error("heartbeat of an unknown node reported ok")
+	}
+	n, was, ok := st.Heartbeat(id, 8000, 1, 0, &f, now)
+	if !ok || was != nil || n.ID != id || n.Hostname != "h1" || n.Addr != "1.2.3.4:9090" ||
+		n.IsolationOK == nil || *n.IsolationOK || n.MemFreeMiB != 8000 || n.VMCount != 1 {
+		t.Fatalf("first heartbeat: node %+v was %v ok %v", n, was, ok)
+	}
+	if _, was, _ = st.Heartbeat(id, 8000, 1, 0, &tr, now); was == nil || *was {
+		t.Errorf("second heartbeat: was %v, want false", was)
+	}
+	st.Heartbeat(id, 8000, 1, 0, &f, now)
+
+	st.Lock()
+	snap := st.SnapshotLocked()
+	live := st.FindNode(id).IsolationOK
+	st.Unlock()
+	if snap.Nodes[0].IsolationOK != nil {
+		t.Error("snapshot copy carries the isolation value")
+	}
+	if live == nil || *live {
+		t.Error("taking the snapshot changed the live value")
+	}
+
+	p := filepath.Join(t.TempDir(), "state.json")
+	if err := st.Persist(p); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if regexp.MustCompile(`isolation`).Match(raw) {
+		t.Errorf("state file carries the isolation value: %s", raw)
+	}
+	loaded := state.New()
+	if err := loaded.Load(p); err != nil {
+		t.Fatal(err)
+	}
+	if ln := loaded.FindNode(id); ln == nil || ln.IsolationOK != nil {
+		t.Errorf("loaded node: %+v, want isolation unknown", ln)
+	}
+}
+
 func TestRegisterNodeIsCapped(t *testing.T) {
 	st := state.New()
 	now := time.Now().Unix()

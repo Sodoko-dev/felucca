@@ -343,7 +343,7 @@ func TestHugeMemoryValueCannotPoisonEverySave(t *testing.T) {
 	}
 
 	// The store half, reached directly: whatever is in memory must be savable.
-	srv.st.Heartbeat(nodeID, uint64(1)<<63, 1, 0, time.Now().Unix())
+	srv.st.Heartbeat(nodeID, uint64(1)<<63, 1, 0, nil, time.Now().Unix())
 	if err := srv.save(nil); err != nil {
 		t.Fatalf("save after a 2^63 heartbeat: %v — one value in memory now fails every save", err)
 	}

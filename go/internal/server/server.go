@@ -1696,6 +1696,9 @@ func (srv *Server) agentHeartbeat(w http.ResponseWriter, r *http.Request, p prin
 		MemFree  uint64 `json:"mem_free_mib"`
 		VMCount  uint32 `json:"vm_count"`
 		PoolSize uint32 `json:"pool_size"`
+		// Three-valued: nil when absent (an agent from before FLU-8), which
+		// counts as fine.
+		IsolationOK *bool `json:"isolation_ok"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, []byte(`{"error":"bad json"}`))
@@ -1718,9 +1721,27 @@ func (srv *Server) agentHeartbeat(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	now := time.Now().Unix()
-	if !srv.st.Heartbeat(req.ID, req.MemFree, req.VMCount, req.PoolSize, now) {
+	node, was, ok := srv.st.Heartbeat(req.ID, req.MemFree, req.VMCount, req.PoolSize, req.IsolationOK, now)
+	if !ok {
 		writeJSON(w, 404, []byte(`{"error":"unknown node"}`))
 		return
+	}
+	// FLU-8 N10: say it once when a node starts reporting its isolation down
+	// (its rules are missing and a repair failed, or its host fence is gone)
+	// and once when it stops; placement does not change.
+	wasDown := was != nil && !*was
+	isDown := req.IsolationOK != nil && !*req.IsolationOK
+	switch {
+	case isDown && !wasDown:
+		slog.Warn("node reports its isolation down: its sandboxes may not be fenced from each other or from the host",
+			"node", node.ID, "hostname", node.Hostname, "addr", node.Addr)
+	case wasDown && !isDown:
+		reported := "absent"
+		if req.IsolationOK != nil {
+			reported = "true"
+		}
+		slog.Info("node reports its isolation in place again",
+			"node", node.ID, "hostname", node.Hostname, "addr", node.Addr, "isolation_ok", reported)
 	}
 	writeEmpty(w, 200)
 }
@@ -2824,7 +2845,7 @@ func (srv *Server) serveMetrics(w http.ResponseWriter) {
 		hostname string
 		size     uint32
 	}
-	var readyCount int
+	var readyCount, unfencedCount int
 	var pools []poolGauge
 	counts := make(map[model.SandboxState]int)
 	var requestCount, wakeMsLast, wakeTotal, wakeMsSum, forksTotal, execsTotal uint64
@@ -2834,6 +2855,11 @@ func (srv *Server) serveMetrics(w http.ResponseWriter) {
 		for _, n := range srv.st.Nodes {
 			if n.NodeStatus(now) == "ready" {
 				readyCount++
+				// A silent node is down, not unfenced: its last report is
+				// no longer news.
+				if n.IsolationOK != nil && !*n.IsolationOK {
+					unfencedCount++
+				}
 			}
 			pools = append(pools, poolGauge{n.Hostname, n.PoolSize})
 		}
@@ -2848,6 +2874,7 @@ func (srv *Server) serveMetrics(w http.ResponseWriter) {
 
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "# HELP felucca_nodes_ready Number of ready nodes\n# TYPE felucca_nodes_ready gauge\nfelucca_nodes_ready %d\n", readyCount)
+	fmt.Fprintf(&buf, "# HELP felucca_nodes_unfenced Ready nodes whose last heartbeat reported isolation_ok false\n# TYPE felucca_nodes_unfenced gauge\nfelucca_nodes_unfenced %d\n", unfencedCount)
 	buf.WriteString("# HELP felucca_sandboxes_total Sandboxes by state\n# TYPE felucca_sandboxes_total gauge\n")
 	for _, st := range model.AllStates {
 		fmt.Fprintf(&buf, "felucca_sandboxes_total{state=%q} %d\n", string(st), counts[st])
