@@ -20,6 +20,7 @@ For the local Lima dev environment see `deploy/config/local-lab.md`.
 9. [How local dev and production differ](#9-how-local-dev-and-production-differ)
 10. [Upgrade procedure](#10-upgrade-procedure)
 11. [Troubleshooting](#11-troubleshooting)
+12. [Running through failures: the store, the route table, node ports, snapshots](#12-running-through-failures-the-store-the-route-table-node-ports-snapshots)
 
 ---
 
@@ -1305,7 +1306,7 @@ Known limits (each is tracked as its own issue):
   when — and only when — the host is shutting down: it is stopped after the
   agent and before that loader. Guests are killed, not asked to shut down
   (that was already so). A sandbox still running when the node goes down
-  comes back `stopped`, or `sleeping` if it has a snapshot; see §10.
+  comes back `stopped` (a sandbox that was asleep stays `sleeping`); see §10.
 
 Ports 443/80 for Caddy are yours to open as usual:
 
@@ -1357,12 +1358,13 @@ is what keeps the sandboxes that outlive it (§10) fenced.
 What does remove them, both layers at once, is a `nft flush ruleset` — by
 hand, by the distribution's own `nftables.service` (its stock config begins
 with one, and so does its stop: see "Host shutdown" in §8), or by a
-rules file of your own that starts with one. Nothing notices while the agent
-keeps running. To put everything back: `systemctl restart felucca-agent`. Its
-start gate loads the host rules again (§8) and the agent rebuilds its own
-tables; the sandboxes keep running through it. The firewall unit is ordered
-after `nftables.service` so that at boot the distribution's loader cannot wipe
-a table that is already loaded.
+rules file of your own that starts with one. Since stability wave 1 the
+agent's **isolation watch** (§8.2) puts its own tables back within one tick
+(5 s); it does not put back the host table `inet felucca_host`, which belongs
+to `felucca-firewall.service`: reload that unit (`systemctl reload-or-restart
+felucca-firewall`), or restart the agent, whose start gate loads it (§8). The
+firewall unit is ordered after `nftables.service` so that at boot the
+distribution's loader cannot wipe a table that is already loaded.
 
 `felucca-agent` also refuses a `bind` inside the guest CIDR outright, for the
 same reason the wildcard is not the default (§6.3):
@@ -1377,6 +1379,300 @@ back, `bind_any` (`FELUCCA_BIND_ANY`, `--bind-any`) is the named opt-out. It is
 off by default; leaving it off, the agent listens on its management address
 **and** on `127.0.0.1` — so local health checks and the rollout scripts keep
 working, which is why dropping the wildcard costs nothing.
+
+### 8.2 The isolation watch
+
+Every 5 s the agent compares what is in the kernel with what it last applied,
+and puts back what is missing. It looks at:
+
+- the guest bridge `felucca0` itself;
+- the five fixed chains: `ip felucca` `postrouting` (NAT), `input`, `forward`
+  and `ingress`, and `bridge felucca forward` (one `nft -t list table` per
+  table per tick);
+- the anti-spoof chain `netdev felucca as_<tap>` (for tap `hth-3`:
+  `as_hth_3`) of every tap enslaved to `felucca0` that has carrier. A tap no
+  Firecracker holds (a sleeping or stopped sandbox) shows `NO-CARRIER`,
+  carries nothing and is skipped;
+- the switches the agent sets at start-up:
+  `/proc/sys/net/bridge/bridge-nf-call-iptables`, and, on a kernel with IPv6,
+  `/proc/sys/net/ipv6/conf/felucca0/disable_ipv6`; both must read `1`;
+- the host fence `iifname "felucca0" drop` in chain `input` of `inet
+  felucca_host` — reported, never repaired (below).
+
+**The marker rule.** Every chain the agent builds starts with a rule
+
+```
+counter comment "felucca:<16 hex digits>"
+```
+
+whose hex digits are a hash over the whole ruleset the agent applied for that
+chain (for `ip felucca forward`, the members of the `tenant_pairs` set
+included). It matches every packet and does nothing else. On nftables 1.0.9,
+`nft list` shows it at the head of every Felucca chain as `counter packets N
+bytes M comment "felucca:…"`, and `nft -s list` as `counter comment
+"felucca:…"`. Because it is a counter, its packet and byte counts change all
+the time: a tool that hashes or diffs `nft list` output to detect changes must
+list with `nft -s` (stateless), or it sees a change on every run. The agent
+reads the marker in either form.
+
+**Before it trusts what it reads.** Right after start-up has applied its
+chains, the agent reads each of them back once. If a chain it has just applied
+is listed without a marker it can read, this build cannot read what this
+kernel prints, and a watch would see every chain as missing. The watch then
+**does not run in this process** (as with `off`), and the agent logs, as an
+ERROR and on stderr, a line beginning `isolation watch NOT started:` that
+names the chain and quotes its first rule. **Alert on this line fleet-wide:**
+it means the watch is off on that worker without anyone having chosen it.
+
+The same check runs per table (`ip`, `bridge`, `netdev`) while the watch runs:
+nothing is taken down, and no new guest is refused, because of what a table
+shows until one of the agent's own markers has been read back in it. A table
+in which a chain the agent applied lists without a readable marker is left
+alone for the rest of the process, with the ERROR `isolation watch: a chain
+this agent applied is listed without a marker it can read; nothing in this
+table is watched or taken down in this process` (also on stderr, with the
+chain and its first rule).
+
+**What counts as drift.** For each chain, the watch compares the marker in the
+kernel with the hash the agent last applied. A missing table, a missing chain,
+a flushed chain, a chain re-created empty, a chain rebuilt with other content
+and a table set `dormant` all show as drift: the watch logs `isolation watch:
+drift — the chain is not what this agent last applied; rebuilding it` (with
+`table`, `chain` and what it `found`), rebuilds the chain with the same
+builder start-up uses and the current membership, looks again, and logs
+`isolation watch: chain repaired and confirmed`. A switch that does not read
+`1` is set again (`isolation watch: drift — a switch this agent set to 1 is
+not; setting it again`, then `isolation watch: switch repaired and
+confirmed`). The watch never recomputes what the rules should be from the
+sandboxes on the worker: that is the job of the rebuilds that run when
+sandboxes come and go. A chain whose last rebuild by the agent itself failed
+is rebuilt every tick (ERROR `isolation watch: the chain's last rebuild failed
+and rebuilding it failed again; it is retried every tick`, logged again only
+when the outcome changes).
+
+A failure is logged once per episode, and again when its text changes; the
+`failed_repairs` counter counts episodes. The counters `repairs`,
+`failed_repairs` and `skipped_ticks` are logged in one line, `isolation watch
+counters`, whenever one changes.
+
+**Taking something down needs positive evidence twice.** A look has three
+outcomes: in place, positively not in place, or could not look (the command
+failed or timed out). A repair has three too: applied, refused by the kernel
+(`nft` exited non-zero with an nft error such as `Error: …` or
+`/dev/stdin:L:C-C: Error: …`), or unknown (no answer: timed out, killed, could
+not run). Something is taken down only when the first look said positively not
+in place **and** the repair was refused, or it was applied and a second look
+still says positively not in place. A look that could not be made, or a repair
+with no answer, takes nothing down: the tick is incomplete and the next one
+tries again. A refusal is not tried again under `sudo -n`; running as root the
+agent never uses `sudo -n` at all.
+
+| What positively could not be put back | `enforce` (default) | `report` |
+|---|---|---|
+| `ip felucca input`, `ip felucca forward`, `bridge felucca forward`, or a switch (also a switch file that is missing because its module was unloaded) | The **guest bridge `felucca0` is taken down** | Left up; ERROR `isolation watch (report mode): a fence or switch could not be put back; the guest bridge is left up — GUESTS ARE NOT FENCED on this node`, at most once a minute |
+| A table that stays `dormant` after a rebuild | The guest bridge is taken down; ERROR `isolation watch: the table stays dormant after a rebuild — its chains are unhooked although their rules are in place: run nft delete table <family> felucca, after which the agent rebuilds it` | Left up, same ERROR |
+| One tap's `as_<tap>` chain | **That tap is taken down** | Left up, unpinned |
+| `ip felucca postrouting` (NAT) or `ip felucca ingress` | Nothing is taken down: their absence closes traffic (no egress; exposed ports do not answer). They never enter `isolation` and never make a tick incomplete | Same |
+
+The log lines that say which case it was: `isolation watch: the repair was
+refused` (with `nft`'s first line), `isolation watch: the repair was applied
+but the chain is still not there`, and, when nothing is taken down because the
+answer is missing, `isolation watch: the repair got no answer (timed out,
+killed or could not run); nothing is taken down, it is tried again`.
+
+**With the bridge down**, every guest on the worker keeps running, with its
+memory and its processes, but has no network: no egress, no ingress through
+the gateway, no traffic between guests. exec keeps working in a running guest
+(it goes over vsock, not the bridge). A request from another machine to one of
+the worker's exposed node ports fails at once — the `unreachable` route
+answers it — rather than timing out. The journal
+says `isolation watch: a fence or switch could not be put back — the guest
+bridge has been taken down; guests keep running without network until a tick
+repairs it` (also on stderr). Every later tick tries again; the first tick
+that confirms every fence and switch in place brings the bridge back up
+(`isolation watch: every fence is confirmed again — the guest bridge is up
+again`). If something else raises the bridge while the fence is still not
+back, the watch takes it down again (`isolation watch: the guest bridge held
+down for an unrepaired fence was raised by something else; it is taken down
+again`). When the kernel refuses a repair, the bridge goes down within one to
+two ticks, and it is up again within seconds of the cause being removed.
+
+After the guest bridge has been down and is up again, measured on the lab
+(Ubuntu 24.04, kernel 6.8; the bridge down for 6 s during a 100 MB transfer at
+4 MB/s):
+
+- Traffic forwarded through the worker (the control plane or another host to
+  a guest) moves again 0.3 to 7.1 s after the bridge is up. That is the
+  sender's own retransmission back-off.
+- One kind of connection stalls: a TCP connection in which a process on the
+  worker itself was receiving from a guest and had its receive window closed
+  when the bridge went down (a rate-limited download, a slow reader). It moved
+  again after 54 to 57 s, and in one run after about 115 s, when a keepalive
+  or probe exchange restarted it.
+- With the `unreachable` route for the guest network removed, the same
+  connection took 117 to 123 s. So the route stays; do not remove it.
+  `blackhole` in place of `unreachable` made no difference.
+- Not measured: a guest sending to an outside host whose receiver was in that
+  state.
+
+This matters where a process on the worker host talks TCP to guests directly,
+for example a gateway that runs on the same host as the worker. Tracked as
+FLU-92.
+
+A tap taken down logs `isolation watch: the tap's anti-spoof chain could not
+be put back — the tap has been taken down until a tick pins it again`, and
+comes back with `isolation watch: the tap is pinned again and back up`. A
+create, wake, start or fork that pins the tap itself releases it as well. A
+held tap raised by something else is lowered again only when its pin is seen
+missing on that same tick (`isolation watch: a tap held down for want of its
+pin was raised by something else; it is taken down again`). Taps that start-up
+could not pin for an adopted sandbox are held the same way, and the watch pins
+and raises them later; start-up says which failure happened (`adopted VM's tap
+could not be set up … nothing was taken down …`, `adopted VM's tap could not
+be pinned — the port has been taken down …`, `adopted VM's tap was pinned but
+could not be brought up …`).
+
+So: fix what makes `nft` fail (the ERRORs before these lines name the chain),
+and the next tick restores the network. No restart is needed.
+
+**The route for the guest network.** At start-up, before anything can take
+the bridge down, the agent installs `ip route replace unreachable <guest net>
+metric 4294967295`, and it installs it again before it takes the bridge down
+and on every tick while the bridge is down. While the bridge is up, the
+bridge's own connected route wins; while it is down, traffic for guest
+addresses is answered "unreachable" on the worker instead of following the
+default route. If the route cannot be installed: ERROR `the unreachable route
+for the guest network could not be installed: while the guest bridge is down,
+traffic for guest addresses may follow the default route`.
+
+**A deleted guest bridge** is not rebuilt by the watch: ERROR `isolation
+watch: the guest bridge is gone; restart the agent to rebuild it`, `isolation`
+false, and new guests are refused until it is back.
+
+**New guests are refused** while a fence the agent owns (the input, forward or
+L2 chain, a switch, a table left dormant) is positively not in place and could
+not be put back, while such a repair has no answer yet, while the guest bridge
+is gone, and while start-up could not settle the ingress chain (below) — in
+`enforce` and in `report` alike. Create, fork, wake, start and the warm-pool
+refill fail with `IsolationFailed` (the agent's `500
+{"error":"IsolationFailed"}`; feluccad answers its usual 502 for that worker
+call). Each refusal logs `refused: no new guest on this node now` with a
+`reason`; the pool refill logs `pool refill refused: no new guest on this node
+now` once, and `pool refill: new guests are allowed again` when it ends. The
+host fence, a stale verdict, NAT and ingress never refuse a guest.
+
+**The modes.** `isolation_watch` in the agent's JSON config,
+`FELUCCA_ISOLATION_WATCH`, `--isolation-watch <value>` or
+`--isolation-watch=<value>` (flag beats environment beats file); the value is
+case-insensitive. Anything else, or the flag without a value, makes the agent
+refuse to start (`isolation_watch: unknown value "…" (want enforce, report or
+off)`, `--isolation-watch needs a value (enforce, report or off)`).
+
+| Mode | Use it when | What it costs |
+|---|---|---|
+| `enforce` (default) | Production | A fence the agent cannot restore takes that worker's guest network down: guests keep running but are unreachable until it is fixed |
+| `report` | A first roll-out, to see what the watch would do before it may take anything down; or a single-tenant worker where reachable beats fenced | Nothing is taken down: while a fence cannot be put back, tenants on that worker may share one network. New guests are still refused |
+| `off` | Never in production | Nothing notices rules that vanish while the agent runs; start-up says `isolation watch is off: nothing notices rules that vanish while the agent runs` |
+
+`report` and `off` change only the watch. Start-up still refuses to serve, and
+takes the bridge down, when the fences cannot be loaded (§8.1).
+
+**The host fence is reported, not repaired.** `inet felucca_host` belongs to
+`felucca-firewall.service` (§8). It counts only if it was in place when the
+agent started. If it was not (no firewall unit on this node, say), the agent
+warns once `the host fence (iifname "felucca0" drop, chain input of table inet
+felucca_host) is not loaded as this agent starts; it is not watched in this
+run (no firewall unit?) and does not enter isolation`. If it was and goes
+missing, the watch warns, at most once a minute, `isolation watch: the host
+fence (iifname "felucca0" drop, chain input of table inet felucca_host) is
+missing; it belongs to felucca-firewall.service, which this agent does not
+repair — isolation is reported false until it is back`, and reports
+`isolation` false. Put it back with `systemctl reload-or-restart
+felucca-firewall`. The agent's own `ip felucca input` chain still fences
+guest-to-host traffic meanwhile. With the host table deleted, `isolation`
+reads false within a second or two, and true again a few seconds after
+`systemctl reload felucca-firewall`.
+
+**What `isolation` means now.** The agent's `/healthz`
+(`{"ok":true,"isolation":<bool>}`) and the heartbeat's `isolation_ok` carry
+the same value. Once a tick has completed, it is true when the last completed
+tick left no fence, switch or tap pin unrepaired, no fence chain's latest
+rebuild has failed, the guest bridge exists, the host fence is there (if it
+was at start), and that tick is at most 45 s old. With the watch on, it is
+false when no tick has completed within 45 s of the watch's start. Before
+that, and with the watch `off`, it is start-up's verdict and that of the last
+rule change. NAT and ingress never count. In every mode, `off` included, it
+is also false while start-up could neither rebuild nor empty the ingress chain
+(no guest address is handed out then, below), and true again once the retry
+has rebuilt it. feluccad shows it in `felucca_nodes_unfenced` and places new
+sandboxes elsewhere (§12.5).
+
+**Timing.** A tick runs every 5 s and never overlaps the previous one. It
+waits up to 15 s for the agent's rule lock (otherwise it is skipped and
+counted: `isolation watch: the rule lock stayed busy; this tick is skipped`),
+and works for at most 15 s with the lock held; what it has not finished by
+then takes nothing down and leaves the tick incomplete.
+
+**Every command has a limit.** Every `nft` and `ip` command the agent runs is
+killed, with its whole process group, after 10 s (`wg` commands: 60 s), and
+counts as "no answer": `command outran its time limit and was killed`. A
+command that timed out is not run a second time. A create, delete or expose
+that used to hang behind a stuck `nft` now fails after 10 s. With 16 such
+commands still not reaped, new commands answer "timed out" at once, with the
+ERROR `too many commands that outran their time limit are still not reaped;
+new commands answer "timed out" at once until they are`.
+
+**Addresses held after a failed rebuild.** When a delete's isolation or
+ingress rebuild fails, the old rules may still name the deleted sandbox's
+address; its IP slot is held (`delete: a rule rebuild failed, so the old rules
+may still name this sandbox's address; its IP slot is held until both rebuilds
+succeed again rather than go to the next sandbox`) and released at the first
+moment the latest isolation and ingress rebuilds have both succeeded — a later
+change, or a watch tick (`both rule rebuilds succeeded: the slots held since a
+failed rebuild are free again`).
+
+**The ingress chain at start-up.** If start-up cannot rebuild `ip felucca
+ingress`, it empties the chain instead (exposed ports do not answer until a
+rebuild succeeds). If it can do neither, the chain may still hold the previous
+run's node-port rules for addresses nobody holds now, so **no guest address is
+handed out**: creates, forks and pool refills fail (`IsolationFailed`), and so
+do wakes and starts, until the chain has been rebuilt. The journal says `the
+ingress DNAT chain could be neither rebuilt nor emptied at start-up: …`. The
+rebuild is retried every 5 s in every watch mode, `off` included, and its
+success logs `the ingress DNAT chain has been rebuilt: guest addresses are
+handed out again`.
+
+**What the watch gives, and what it does not.** It shortens an exposure from
+"until someone notices" to seconds; it does not prevent one. A deleted table
+or a flushed chain is back within about 3 to 5 s, and in that window the fence
+is open: on the lab, cross-tenant probes sent every 0.5 s got through 5 or 6
+times while the whole `ip felucca` table was deleted, and not at all when a
+single chain was deleted or flushed.
+
+**What the watch does not detect.** A rule edited by hand *inside* a chain,
+below an intact marker, looks unchanged. A flush of only the `tenant_pairs`
+set does not touch the marker either; that closes traffic between a tenant's
+own sandboxes (the forward chain drops what the set does not allow), it does
+not open it. Do not hand-edit the agent's tables.
+
+**Lines to alert on** (ERROR unless noted):
+
+- `isolation watch NOT started: …` — the watch is not running on that worker
+- `isolation watch: a chain this agent applied is listed without a marker it can read; …`
+- `isolation watch: a fence or switch could not be put back — the guest bridge has been taken down; …`
+- `isolation watch: the tap's anti-spoof chain could not be put back — the tap has been taken down …`
+- `isolation watch (report mode): a fence or switch could not be put back; the guest bridge is left up — GUESTS ARE NOT FENCED on this node`
+- `isolation watch: the repair was refused`, `isolation watch: the repair was applied but the chain is still not there`, `isolation watch: the repair failed` (a tap)
+- `isolation watch: the table stays dormant after a rebuild …`
+- `isolation watch: the guest bridge is gone; restart the agent to rebuild it`
+- `isolation watch: the switch file is missing (module unloaded or device gone) — it cannot be set` and `isolation watch: the switch could not be set again`
+- `the unreachable route for the guest network could not be installed: …`
+- `the ingress DNAT chain could be neither rebuilt nor emptied at start-up: …`
+- `too many commands that outran their time limit are still not reaped; …`
+- `isolation watch: the host fence (…) is missing; …` (WARN, at most once a minute)
+- `isolation watch: drift — …` (WARN: something other than the agent changed its rules; find out what)
+- `isolation watch: the repair got no answer …` and `command outran its time limit and was killed` (WARN)
+- `refused: no new guest on this node now` and `pool refill refused: …` (WARN)
 
 ---
 
@@ -1466,7 +1762,7 @@ Things that follow from VMs outliving the agent:
 | `systemctl stop felucca-agent` | Agent stops; **sandboxes keep running**, unmanaged until you start it again. The unit shows `inactive` while its cgroup still lists the Firecrackers. |
 | `systemctl kill felucca-agent` | Signals **every** process in the unit: the agent **and every sandbox**. To signal the agent only: `systemctl kill --kill-whom=main felucca-agent` (`--kill-who=` before systemd 252). |
 | `systemctl stop felucca-agent && systemctl kill felucca-agent` | The way to power off every sandbox on a node. |
-| host reboot / shutdown | The firewall unit ends the sandboxes right after the agent has stopped and before any other unit can unload firewall rules (§8). They are killed, not shut down. After boot each is `stopped`, or `sleeping` if it has a snapshot. Keep `{data_dir}` on a local filesystem. |
+| host reboot / shutdown | The firewall unit ends the sandboxes right after the agent has stopped and before any other unit can unload firewall rules (§8). They are killed, not shut down. After boot each sandbox that was running or paused is `stopped` (never `sleeping`, whatever files are in its directory); one that was asleep stays `sleeping`. Keep `{data_dir}` on a local filesystem. |
 
 Each agent restart makes systemd log three warnings **per running sandbox**:
 one `Unit process N (firecracker) remains running after unit stopped.` and two
@@ -1489,20 +1785,21 @@ a node with many sandboxes a start that fails for hours fills the journal.
 Limits to know about (each is tracked as its own issue):
 
 - A sandbox whose Firecracker **died while the agent was down** is not
-  reported as `error` when the agent returns: it is listed `stopped`, or
-  `sleeping` if an earlier snapshot of it is still on disk — and waking that
-  one restores old memory over a newer disk. The same goes for every sandbox
-  that was running at a host reboot or at the power-off command above. Until
-  FLU-4 is fixed, cold-start (`stop`, `start`) such a sandbox instead of
-  waking it. (A sandbox you stopped yourself stays `stopped`: a stop is
-  written to disk.)
+  reported as `error` when the agent returns: it is listed `stopped`, and the
+  record is written that way. The same goes for every sandbox that was running
+  at a host reboot or at the power-off command above. Since stability wave 1
+  it is never listed `sleeping` because an old snapshot lies in its directory
+  (FLU-4): `start` cold-boots it. feluccad learns the state from the first
+  sleep, wake, stop, start, pause or resume the worker refuses with a 409 that
+  names it; until then it may still list the sandbox as it was.
 - The agent has no graceful stop: a create, fork, sleep or wake that is in
   progress when it is restarted fails for the caller (FLU-61). A create or
   fork cut at the wrong moment can leave a running VM that the caller was told
   had failed; deleting the sandbox removes it (FLU-28).
-- At each start the agent rebuilds its NAT and ingress rules one rule at a
-  time, so new inbound connections to an exposed port can be refused for a
-  moment (FLU-45).
+- Since stability wave 1 the agent builds its NAT and ingress (DNAT) chains as
+  one `nft -f -` transaction each (FLU-45), so each goes from the old rules to
+  the new ones in one step. If start-up cannot rebuild the ingress chain, see
+  §8.2.
 - A record whose `meta.json` cannot be read is not adopted. If a Firecracker
   is running there the agent leaves it alone and logs an ERROR
   (`left_unreadable`); it is your call whether to repair the file and restart
@@ -1515,7 +1812,9 @@ Limits to know about (each is tracked as its own issue):
   first: guests keep their state but have no network until an agent start gets
   the rules loaded. Nothing raises the bridge in between, however often the
   unit retries. A single tap that cannot be re-pinned is likewise taken down,
-  not removed — and stays down until the next agent start (FLU-65).
+  not removed. Since stability wave 1 the isolation watch pins and raises such
+  a tap on a later tick (FLU-65, §8.2); with the watch `off` it stays down
+  until the next agent start.
 - A warm-pool VM whose Firecracker dies is removed, and its pool is not
   refilled for five minutes (or until the agent restarts).
 - Helper processes of an operation that was cut short (`cp` of a root
@@ -1636,6 +1935,112 @@ every restart then orphans one live Firecracker per pool VM. Empty the pools
 first (`pool_size: 0`, and `PUT /v1/pools` with `[]`), or clear the leftovers
 with `systemctl kill felucca-agent` once the node is drained.
 
+### Upgrading to stability wave 1
+
+Design and reasons: [ADR-0012](adr/ADR-0012-data-safety.md). No unit file
+changes. New settings: the agent's `isolation_watch` (`FELUCCA_ISOLATION_WATCH`,
+`--isolation-watch`, default `enforce`, §8.2); the gateway's `--max-stale`
+(`FELUCCA_GW_MAX_STALE`, default 600 s) and `/readyz` (§12.2). In the default
+mode a worker whose fences the agent cannot restore takes its guest network
+down; read §8.2 before you upgrade the agents.
+
+**Order: every agent first, then every gateway, then feluccad.** Each step
+works with the components that are still old; what each mixed state gives:
+
+| Mixed state | What you get |
+|---|---|
+| New agent, old feluccad | The agent allocates node ports round-robin from a random start, so a released port is rarely handed out again at once — rarely, not never: an old feluccad sends no `avoid` and quarantines nothing. Lifecycle refusals carry `state`; an old feluccad forwards stop/start/pause/resume 409s as before and turns sleep/wake 409s into `502 agent sleep failed` / `502 agent wake failed`. A fork the worker refuses (a busy parent, or one forked before this release) answers 502 and leaves the child in `error`. The old feluccad still drops dynamic exposes when it auto-sleeps a sandbox, and still acknowledges changes it could not save |
+| New feluccad, old agent | Works. The old agent ignores `avoid` and `prefer` and hands out the lowest free port, so **the hostname exposure of FLU-6 remains for that worker** until its agent is upgraded: feluccad accepts a quarantined port from it and logs `expose: an agent that does not honour avoid returned a quarantined node port; accepted (upgrade the agent)` each time. The old agent answers 500 where the new one answers 409 with `state`, so nothing is recorded from its refusals |
+| Old gateway (any feluccad) | No staleness bound: it serves from its last table for as long as feluccad is unreachable. It pools upstream connections per `node:port`, gives every waiter of a wake the first request's route, and answers a `routes/ensure` 429 or 503 with 404. It has no `/readyz` |
+| New gateway, old feluccad | Works |
+
+**Rolling feluccad back** needs no database restore: the previous feluccad
+starts and works on the database this one has written.
+
+
+Upgrade the agents with the worker procedure above; nothing else is needed
+on a worker. A sandbox that is running keeps running.
+
+What the new agent does with what the old one left, at its first start:
+
+- A record in `running` or `paused` whose Firecracker is gone becomes
+  `stopped`, and is written so. Snapshot files beside it are removed
+  (`mem.bin` is kept while a live Firecracker of that sandbox maps it).
+- A `sleeping` record (the old agent wrote no `snapshot_valid`) stays
+  `sleeping` when both `vmstate.bin` and `mem.bin` exist and `rootfs.ext4` was
+  not modified after `vmstate.bin`. If the disk is newer, the guest ran after
+  that snapshot: the record becomes `stopped` and the two files are set aside
+  as `*.outrun` (§12.4), with a warning that names both modification times.
+- Only running, paused and pooled sandboxes are re-pinned at agent start. The
+  taps of sandboxes that are asleep or stopped keep the previous agent's
+  anti-spoof chain — no marker rule, no final `drop` rule; its policy is
+  `drop`, so it protects the same way — until the sandbox is woken or started.
+  Listing the rules after an upgrade therefore shows both forms.
+- Sandboxes forked before this release need attention: see below.
+
+#### Sandboxes forked before this release
+
+Before this release a fork child opened its **parent's** `rootfs.ext4`: the
+snapshot records the drive's path, and nothing pointed the child elsewhere.
+Every such child that is still running, or that has slept and is woken,
+runs on its parent's image. Parent and child have been writing to one file
+system from two kernels. The child's own `rootfs.ext4` is the copy made at the
+fork — after the parent had been resumed — and holds none of the child's
+writes since.
+
+To find them, ask each running sandbox's Firecracker which image its root
+drive has open. `GET /vm/config` only reads; still, do not run it while a
+lifecycle operation (a sleep, wake, fork, stop) is in progress on that
+sandbox, because a Firecracker answers one request at a time and the agent's
+call would wait behind yours.
+
+```sh
+# On the worker, per instance directory with a running Firecracker:
+curl -s --unix-socket {data_dir}/instances/<dir>/fc.sock http://localhost/vm/config \
+  | jq -r '.drives[] | select(.drive_id=="rootfs") | .path_on_host'
+# Anything other than {data_dir}/instances/<dir>/rootfs.ext4 is such a child.
+```
+
+A sleeping one shows itself when it is next slept or woken: the agent logs
+`sleep: this sandbox runs on another image than its own rootfs.ext4 (it was
+forked before this release); that image is synced` or `wake: this sandbox runs
+on another image than its own rootfs.ext4 …` (the image is in the log
+line's `image` field).
+
+What the new agent does with them:
+
+- **It does not fork them**, running, paused or sleeping: feluccad answers
+  `409 {"error":"InvalidState: this sandbox was forked before this release and
+  runs on its parent's disk image, not on its own; it cannot be forked","state":"<its state>"}`,
+  and nothing is left of the child, in feluccad or on the worker, whatever the
+  parent's state.
+- **It wakes one only if the image it runs on has not been modified since its
+  `vmstate.bin` was written.** Otherwise the wake stops it, sets its snapshot
+  aside and answers 409 with `"state":"stopped"` and `InvalidState: this
+  sandbox was forked before this release and runs on its parent's disk image,
+  which has changed since it slept; it cannot be woken and is now stopped (use
+  start)`.
+- A sleep of one fsyncs the image it really runs on.
+- A `start` (after a `stop`) cold-boots it from its **own** `rootfs.ext4`, the
+  disk as it was at the fork: what it wrote since went into the parent's image.
+
+Felucca cannot separate the two guests' writes. For a child whose data
+matters, copy that data out from inside the running guest (with exec, or over
+its own network) before you stop it.
+
+#### Rolling the agent back
+
+The previous agent binary ignores `snapshot_valid` and still calls a sandbox
+`sleeping` whenever a `vmstate.bin` lies in its directory. The new agent keeps
+that file only beside a `sleeping` record (it is removed after a wake, a stop,
+a start, at start-up for every other record, and after a fork child's load),
+so the previous agent reads every record the new one has touched as it was
+meant. Files set aside as `*.outrun` are not snapshots to the previous agent
+either; it leaves them alone. Rolled back, the worker has the old behaviour
+again: lowest-free node ports, fork children on their parent's disk, and a
+failed snapshot that a later wake can take for a good one. Roll back the binary only (the
+units did not change in this release), as described in "Rolling back" above.
+
 ### Rolling upgrades (multiple workers)
 
 Upgrade workers one at a time. There is no drain command, and feluccad keeps
@@ -1696,7 +2101,11 @@ ritual: `scripts/bench.sh <endpoint> <token>` and refresh `docs/BENCHMARKS.md`.
 | `feluccad` exits: `msg=trusted-proxies err="trust_x_real_ip is set but no trusted_proxies are declared"` | `trust_x_real_ip` on with nothing declared would believe `X-Real-IP` from every peer — a header any client can set | Either list the proxy in `trusted_proxies`, or drop `trust_x_real_ip` and have the proxy send `X-Forwarded-For` (preferred). See §7.1 |
 | One client's bad token turns everyone else's `401`s into `429`s | Behind a proxy with no forwarded-header config, every client shares the proxy's address as its throttle key (holders of a valid token are unaffected — §6.2) | Configure both halves in §7.1: proxy **overwrites** `X-Forwarded-For`, feluccad lists the proxy in `trusted_proxies`. Never one without the other |
 | `felucca-agent` keeps restarting (`activating (auto-restart)`, never `failed`); journal has `felucca-agent: not starting: the guest fence (iifname felucca0 drop) is not loaded …`; guests on that worker have no network | The start gate (§8). The agent already asked systemd to load the rules file again and the rule `iifname "felucca0" drop` is still not in the kernel: the file does not load (syntax error, empty, `nft` missing), or it loads but that line was removed or rewritten — a file generated for the control-plane role looks like that. The gate took `felucca0` down so the sandboxes, which are still running, are not on an unfenced network | `systemctl status felucca-firewall` says why the file does not load; `sudo nft list chain inet felucca_host input` shows what is loaded. Fix `/etc/felucca/firewall.nft` — that is all: the next retry, within 5 s, loads it, the agent starts, and it raises the bridge again. To apply by hand: `systemctl reload-or-restart felucca-firewall` (a plain `reload` is refused when the unit is failed or stopped). No sandbox was stopped |
-| The ruleset was flushed (`nft flush ruleset`, or `nftables.service` reloaded) on a worker with running sandboxes | Every table is gone, the agent's and the installer's. Nothing notices while the agent keeps running; `systemctl status felucca-firewall` still says `active` | `systemctl restart felucca-agent`: its start gate loads the host rules again and the agent rebuilds its own tables. Sandboxes keep running (§8.1) |
+| The ruleset was flushed (`nft flush ruleset`, or `nftables.service` reloaded) on a worker with running sandboxes | Every table is gone, the agent's and the installer's. The isolation watch rebuilds the agent's tables within 5 s (`isolation watch: drift …`, then `chain repaired and confirmed`); the host table stays missing and `isolation` is reported false (`isolation watch: the host fence … is missing`); `systemctl status felucca-firewall` still says `active` | `systemctl reload-or-restart felucca-firewall` puts the host table back. Sandboxes keep running (§8.1, §8.2) |
+| Guests on one worker lost all network; journal has `isolation watch: a fence or switch could not be put back — the guest bridge has been taken down` | `enforce` mode: an isolation chain or switch went missing and the agent could not put it back (§8.2) | Fix what makes `nft` (or the switch) fail — the ERRORs just before say which; the next tick that confirms every fence raises the bridge again. No sandbox was stopped |
+| `felucca-agent` exits at start: `isolation_watch: unknown value …` or `--isolation-watch needs a value …` | `isolation_watch` / `FELUCCA_ISOLATION_WATCH` / `--isolation-watch` is not `enforce`, `report` or `off` | Fix the value (§8.2) |
+| Journal has `isolation watch NOT started: …` | Start-up applied its chains but cannot read their markers back on this kernel; the watch is off in this process | Report it with the quoted first rule and the `nft --version`; until then the worker runs as with `off` (§8.2) |
+| Creates on one worker fail; its journal has `refused: no new guest on this node now` | A fence of the agent is positively not in place (or its repair has no answer), the guest bridge is gone, or the ingress chain was not settled at start-up — the `reason` says which (§8.2) | Fix the cause named in the ERRORs before it; new guests are allowed again by the next tick that confirms the fences |
 | `systemctl reload felucca-firewall` fails | The rules file does not parse, is empty, or defines no `input` chain — or the unit is stopped or failed, in which case `reload` is refused whatever the file says | Nothing was changed — the previous rules are still in force. Fix `/etc/felucca/firewall.nft` and `systemctl reload-or-restart felucca-firewall` |
 | Worker installer stops with `FELUCCA_CONTROL_PLANE_IP …` | The value is not a list of literal addresses, has a `/prefix`, or names nobody (`,`, or loopback only) | Nothing was installed or changed. Pass literal addresses (`'10.0.1.10, 10.100.0.1'`), or leave the variable unset to keep the rules as they are (§5) |
 | Worker installer ends with `The host firewall step did not complete: the existing /etc/felucca/firewall.nft has no guest fence` | The rules file on the node has no `iifname "felucca0" drop` line — hand-edited, or written by a control-plane install on the same host. It was not applied | Put the line back into chain `input`, or let the installer write the file: re-run with `FELUCCA_CONTROL_PLANE_IP=<addresses>` (§8) |
@@ -1704,6 +2113,12 @@ ritual: `scripts/bench.sh <endpoint> <token>` and refresh `docs/BENCHMARKS.md`.
 | Installer aborts: `failed SHA-256 verification` | The pinned Firecracker or guest asset did not match its recorded digest | Do not bypass it. Re-download; if the upstream artifact genuinely changed, refresh the pin per the comment block in the script |
 | `GET /healthz` returns `connection refused` from another host | feluccad binds `127.0.0.1:8080` (the shipped default — Caddy fronts it) | Intended. Reach it through Caddy, or widen `bind` *and* the §8 rule if you really need direct access |
 | `GET /healthz` returns `connection refused` on the server itself | feluccad not listening | Check `bind` in config; `journalctl -u feluccad -n 50` |
+| `GET /healthz` returns `503 {"ok":false,"store":"failing"}`; changes answer `503 store unavailable` | feluccad cannot write its database (locked, full disk, read-only) | Fix the cause; the recovery loop picks it up within 2 s and logs `store recovered` — no restart needed (§12.1) |
+| Every sandbox URL answers `503 route table unavailable` | The gateway has had no fresh route table for `--max-stale`, or has not fetched one since it started | Make feluccad reachable from the gateway (URL, token, network); the next fetch ends it (§12.2) |
+| `felucca-gw` exits at start: `refresh … is above the maximum` / `max-stale … is below the minimum` | `--refresh` outside 1–60 s, or `--max-stale` outside `2 x refresh + 20s`–600 s | Fix the value (§12.2) |
+| Expose answers `429 expose churn limit reached` or `503 no free node port on this worker` | The node-port quarantine (§12.3) | Retry after `Retry-After` |
+| A sandbox that was running before a reboot is `stopped`, and wake answers 409 | Intended: a VM whose Firecracker is gone has lost its memory (§12.4) | `start` it |
+| `vmstate.bin.outrun` / `mem.bin.outrun` in an instance directory | A snapshot judged stale and set aside (§12.4) | Nothing; `start`, `stop`, the next sleep or `delete` removes them |
 | `GET /api/v1/nodes` returns `401` | Token mismatch or missing `Authorization` header | Verify `token` in feluccad config matches the `Bearer` value you're sending |
 | A request with a **wrong or missing** token returns `429 too many failed attempts` with a `Retry-After` | The brute-force guard (§6.2) has armed a backoff for **your source address** after >10 failed credentials. Behind a proxy, the failures may be someone else's — you share the key | Fix the credential. A correct token is served immediately regardless of the backoff, so this only ever replaces the `401` you would otherwise get. Then stop whatever is retrying a stale token; the record decays with quiet time (one failure per 15s) |
 | A request you believe is **correctly authenticated** returns `429 too many failed attempts` | Not possible from the throttle — feluccad authenticates first (§6.2). The token on that request is not the one feluccad holds | Compare the token actually being sent against `token` in `/etc/felucca/feluccad.json`; check for a stale value in a script, a shell history entry, or a `Bearer ` prefix that got mangled |
@@ -1756,4 +2171,261 @@ curl -s -H "Authorization: Bearer ${TOKEN}" \
 # Check a sleeping sandbox's wake latency
 curl -s -X POST -H "Authorization: Bearer ${TOKEN}" \
   https://felucca.example.com/api/v1/sandboxes/sb-abc123/wake | jq .wake_ms
+
+# Is feluccad's database keeping up? (200 {"ok":true} / 503 {"ok":false,"store":"failing"})
+curl -s -i http://127.0.0.1:8080/healthz
+
+# May the gateway route? (200 ok / 503 route table unavailable)
+curl -s -i http://127.0.0.1:8088/readyz
 ```
+
+---
+
+## 12. Running through failures: the store, the route table, node ports, snapshots
+
+Since stability wave 1 ([ADR-0012](adr/ADR-0012-data-safety.md)) each
+component says so when it cannot do what it is asked, instead of answering
+success. This section is what that looks like to an operator.
+
+### 12.1 When feluccad's database cannot be written
+
+feluccad answers a change with 2xx only once it is in its SQLite database.
+When a write fails — the file is locked by another process, the disk is full,
+the file or its mount is read-only — the **store is failing** until a save
+succeeds again.
+
+What you see:
+
+- The journal line `store failing: changes are refused until a save succeeds`
+  (once per outage, with the error), then `store still failing` every 2 s.
+- `GET /healthz` answers `503 {"ok":false,"store":"failing"}`;
+  `felucca_store_healthy` is 0; `felucca_persist_failures_total` grows.
+- Every request that would change the database is refused before anything is
+  done: `503 {"error":"store unavailable"}` with `Retry-After: 5`. That covers
+  create, delete, sleep, **wake**, stop, start, pause, resume, fork, expose,
+  unexpose, `routes/ensure`, tenants, keys, templates, join tokens and node
+  enrolment (API-V2.md §2a has the exact list).
+- A change whose worker call had already been made when the save failed
+  answers `503 {"error":"applied but not saved","applied":true}`: the worker
+  did it, feluccad holds it in memory, and the recovery loop will write it.
+  Clients may retry; the worker side is idempotent. A create or fork in that
+  position answers `503 store unavailable` instead, and its VM is deleted from
+  the worker right after the answer (the sandbox shows `error` until then, and
+  stays `error`, deletable, if that delete fails).
+- What keeps working: every read, exec, heartbeats and worker registration
+  without a join token, the route table the gateways fetch, `/metrics`. **Running
+  sandboxes keep serving.** Sleeping ones are not woken, by the API or by the
+  gateway, and the lifecycle sweep does nothing (no auto-sleep, no
+  auto-delete).
+- Exec metering rows wait in memory, at most 10 000; past that the oldest are
+  dropped, logged (`usage: exec rows dropped, the queue was full`) and counted
+  in `felucca_usage_rows_dropped_total`. Each failed write attempt is counted
+  in `felucca_usage_write_failures_total` (those rows are still queued).
+- A database that cannot be **read** shows in `felucca_store_read_errors_total`
+  (`/healthz` and `felucca_store_healthy` only describe writes); requests that
+  need the read answer `503 store unavailable`, listings `500 store error`.
+
+How it ends: a recovery loop retries every 2 s. Each attempt opens a fresh
+writer connection, writes the queued exec rows, then everything memory holds;
+when both succeed, the journal says `store recovered: the database has
+caught up with memory` (with the outage's length) and changes are accepted
+again. You do not need to restart feluccad. Fix the cause — free the disk,
+stop whatever holds the lock, make the file writable — and wait for the line.
+
+**A database that was read-only when feluccad started.** feluccad does not
+refuse to start on a database it cannot write. It logs `STORE NOT WRITABLE at
+start-up: serving reads and the route table, refusing changes, retrying the
+save until it succeeds`, starts with the store failing, and serves as above.
+Because every retry opens a fresh writer connection, making the file writable
+is enough; no restart is needed. A database that cannot be **read**, or a
+legacy `state.json` that is present but does not load, still ends the process
+(`refusing to start`).
+
+**What a restart does and does not do.** A restart does not repair a store
+that still cannot be written: feluccad comes back with the store failing.
+And it throws away what the recovery loop had not written yet: changes that
+were answered `applied but not saved` and the queued exec rows. After such a
+restart feluccad's records can be one transition behind the workers (a
+sandbox the worker put to sleep still listed `running`, say) until the next
+call for that sandbox; the worker's 409 with `state` then corrects it. Nothing
+corrects it before that call (FLU-13). So: prefer waiting for the recovery
+line to restarting.
+
+**A record left `creating`.** If feluccad stopped (or was killed) during a
+create's worker call, the record is set to `error` at the next start, with
+the warning `sandbox was being created when the previous control plane
+stopped: it is set to error; a VM may exist on its worker — start or delete
+settles it`. Look at the sandbox, then `start` it or `delete` it. Its first
+successful start, wake or resume takes its guest address from the worker's
+list of VMs, so that expose and routing work again; if the worker cannot be
+asked, the request still succeeds, a WARN says the address stays unset, and
+the next start or wake tries again.
+
+**Stopping feluccad.** On SIGTERM or SIGINT (`stopping: draining the requests
+in flight, then flushing the exec usage rows`) every listener stops accepting
+at once and the requests in flight get 10 s in all to finish, their saves
+included; connections still open after that are cut, and their clients get no
+answer and must treat the outcome as unknown. Then the background loops end,
+and the queued exec rows are written, retried once a second until just before
+the 20 s limit; if that never succeeds, one ERROR says how many were lost
+(`usage: final exec flush failed; the queued exec usage rows are lost`).
+feluccad then exits with status 0. A second signal (`second signal during the
+stop: exiting now`), or 20 s after the first (`stop did not finish in time:
+exiting now`), ends it at once with status 1, and systemd starts it again
+(`Restart=on-failure`). The unit's `TimeoutStopSec=30s` leaves 10 s beyond
+that before systemd sends SIGKILL.
+
+After a restart, the workers read `down` until their next heartbeat, and
+creates answer 503 until then. feluccad sets its database file to mode 0600
+itself when it opens it.
+
+The database is opened with `synchronous=FULL`: every acknowledged write
+survives a power cut. A read failure answers 503 too, and is not counted as a
+failed credential by the brute-force guard (§6.2).
+
+### 12.2 The gateway when feluccad is unreachable
+
+`felucca-gw` refreshes its route table every `--refresh` seconds (default 5).
+When feluccad cannot be reached it keeps serving from the table it has — for
+at most `--max-stale` (default 600 s, environment `FELUCCA_GW_MAX_STALE`). A
+table's age counts from the moment its fetch started, and keeps counting while
+the host is suspended.
+
+Past that, and between the gateway's start and its first successful fetch,
+every request for a sandbox hostname is answered `503 {"error":"route table
+unavailable"}` with `Retry-After: 5`. The first successful fetch ends it. The
+bound exists because an old table can name a node port that has since gone to
+another sandbox.
+
+Point load balancers and health checks at **`GET /readyz`**: 200 `ok` while
+the table is fresh enough, the 503 above otherwise. `GET /healthz` is liveness
+only and answers 200 as long as the process runs.
+
+Settings:
+
+| Setting | Default | Accepted | Outside the range |
+|---|---|---|---|
+| `--refresh` (flag only) | `5` (seconds) | 1 to 60 s | the gateway refuses to start |
+| `--max-stale` / `FELUCCA_GW_MAX_STALE` | `600` (seconds) | `2 x refresh + 20s` to 600 s | the gateway refuses to start |
+
+`--max-stale` takes whole seconds (`600`) or a duration (`10m`); the flag
+beats the environment. The admin token is read from `FELUCCA_TOKEN` (or
+`--token`) and no longer appears in `felucca-gw --help`.
+
+### 12.3 Node ports and their quarantine
+
+When a sandbox gives up a node port (unexpose, delete, the sweep), feluccad
+keeps that port away from every other sandbox on the same worker host for
+**900 s**: long enough for every gateway's table, every call to the worker
+already under way and every pooled upstream connection that could still send
+the old hostname's traffic to it. The same sandbox, exposing the same guest
+port again, gets the port back. `felucca_node_ports_quarantined` shows how many
+distinct (worker host, port) pairs are in quarantine.
+
+Each worker has 10 000 node ports (20000–29999), and the quarantine takes from
+them. An expose can therefore answer:
+
+| Answer | Why | What to do |
+|---|---|---|
+| 429 `{"error":"expose churn limit reached"}`, `Retry-After: <s>` | The tenant holds 512 quarantined ports on that worker host, or the sandbox holds 64 distinct (node port, guest port) pairs there (the admin tenant is exempt from the first). `Retry-After` is when the oldest one that counts is released, at most 900 s | Expose less churn-heavily: keep exposes rather than recreate them |
+| 503 `{"error":"no free node port on this worker"}`, `Retry-After: 30` | Every node port of the worker is in use or quarantined | Retry after the delay; quarantined ports come free 900 s after their release |
+| 503 `{"error":"node port conflict, retry"}`, `Retry-After: 5` | The worker handed out a port feluccad has recorded elsewhere (or a quarantined one); the mapping was removed again | Retry. Each one is logged as an ERROR starting `expose: the worker …` |
+| 503 `{"error":"node port conflict: the worker answered node port N, which this sandbox's expose \"<name>\" (guest port G) holds; removing that expose ends it"}`, `Retry-After: 5` | The worker answered with a port this same sandbox holds for another guest port | Unexpose the named expose; retrying alone does not help |
+
+For dynamic (port-in-hostname) exposes the gateway passes these on: 429
+`{"error":"too many new dynamic ports for this tenant"}` and 503 `{"error":"dynamic
+port temporarily unavailable"}`, each with a `Retry-After`.
+
+A sleeping sandbox keeps its dynamic exposes for 900 s; the sweep drops them
+after that (only on `ready` workers, at most 5 s per worker call and 5 s of
+worker time per pass), and the next request re-creates them. A drop that got
+no answer in time is repeated on later passes until the worker answers.
+
+Quarantines run on the wall clock: a clock stepped backwards lengthens them by
+at most the step; `Retry-After` never exceeds 900 s.
+
+At start-up feluccad logs one ERROR `start-up: route rows of different
+sandboxes name the same node port; one of them is stale (its hostname may
+reach the other sandbox): delete or unexpose the stale one` per worker host
+and port that rows of two sandboxes name. Such rows can be left from before
+this release. Nothing is repaired automatically: look at the sandboxes the
+line names, and unexpose or delete the stale one. (The next expose on that
+worker that receives the port also removes the stale row.) It also logs one
+ERROR per sandbox and guest port whose rows name several node ports: `start-up:
+route rows of one sandbox map one guest port to several node ports; all but one
+are stale. The next expose of a new name on that guest port repairs it (or
+unexpose the stale name)`.
+
+A worker whose agent predates this release does not read the avoid list: for
+that worker, feluccad accepts a quarantined port and logs `expose: an agent
+that does not honour avoid returned a quarantined node port; accepted (upgrade
+the agent)`. Upgrade that agent.
+
+### 12.4 Snapshots, forks and busy sandboxes
+
+**A sandbox is `sleeping` only if its record says so.** After a reboot, or a
+Firecracker that died while the agent was down, the sandbox is `stopped`;
+`start` it. Stopping a sleeping sandbox discards its snapshot.
+
+**A sleep that fails leaves the guest running.** Its snapshot files are
+removed and the guest is resumed; the API answers an error and the sandbox
+stays `running`. (If even the resume fails, it is `paused`.)
+
+**Snapshots set aside as `*.outrun`.** When the agent judges a snapshot stale —
+the disk was modified after `vmstate.bin` was written, the image a pre-release
+fork runs on was modified since, or a wake's resume got no answer and the guest
+may have run — the sandbox becomes `stopped` and the files are renamed
+`vmstate.bin.outrun` and `mem.bin.outrun` instead of being deleted, with a
+warning `a stale snapshot file was set aside`. Nothing ever wakes from them;
+they are kept in case the judgement was wrong (file times lost by a restore,
+say). They take as much disk as the guest's memory. `start`, `stop`, the next
+sleep and `delete` of that sandbox remove them; agent start-up leaves them.
+To keep one, copy it away before any of those.
+
+**A fork pauses a running parent for the snapshot and for the disk copy.** The
+copy is `cp --reflink=auto` of the parent's `rootfs.ext4`, made while the
+parent is paused so that the child's disk is of the same instant as its
+memory. On a file system that supports reflink — XFS made with reflink (the
+default of current `mkfs.xfs`) or Btrfs — the copy shares the parent's blocks
+and takes little time whatever the image holds. ext4 has no reflink: there
+`cp` copies the data, and the pause grows with the amount of data in the
+image. Measured on the lab on ext4 (a virtio disk): an image holding 472 MiB
+of data paused the parent 0.2 to 0.7 s, and the whole fork call took 1.0 to
+1.4 s; an image holding 7.4 GiB of data paused the parent 10 to 12 s, and the
+whole fork call took 12 to 14 s. That is about 0.6 to 0.75 GiB per second of
+pause on that disk. The agent logs nothing for a fork that succeeds, so the
+pause shows only as the latency of the fork call (FLU-89).
+Put `{data_dir}` on XFS or Btrfs if forks of large, full images matter
+to you. A stop or delete of the parent during the
+copy ends it and the fork. A sleeping parent is not paused (it has no VMM);
+its files are copied while it is held.
+
+**`409 {"error":"busy"}`.** A sandbox takes one lifecycle operation at a time.
+A repeat of the same request waits up to 25 s for the one in progress; any
+other answers busy at once. A fork of a parent that is busy answers busy with
+`Retry-After: 2` from feluccad; a busy or refused fork does not count as
+activity of the parent. Forks of a sleeping parent run side by side;
+forks of a running or paused parent do not. Stop and delete end what is in
+progress; if it has not let go within 15 s they answer 409 with
+`"state":"stopped"` and the sandbox is stopped. feluccad relays that delete
+refusal as 409 with `Retry-After: 2` and keeps the record — retry the delete.
+Lifecycle requests on a sandbox feluccad still has as `creating` answer
+`409 {"error":"InvalidState: creating (the sandbox is still being created)","state":"creating"}`.
+
+### 12.5 Workers that report their isolation down
+
+Each heartbeat carries `isolation_ok`, the agent's isolation verdict (§8.2). feluccad logs `node reports its
+isolation down: its sandboxes may not be fenced from each other or from the
+host` when a node turns false, and `node reports its isolation in place again`
+when it stops. `felucca_nodes_unfenced` counts the ready nodes whose last
+heartbeat said false; a node that goes silent drops out of it although its
+sandboxes may keep running, so alert on it together with `felucca_nodes_ready`.
+**Placement avoids them.** A create goes to the ready worker with the fewest
+sandboxes among those that do not report their isolation down (a worker that
+never sends `isolation_ok` counts as fine). Only when every ready worker
+reports it down does a create go to the one with the fewest, as before, and
+feluccad warns, at most once a minute, `creates are being placed on workers
+that report their isolation down: no other ready worker exists (such a worker
+refuses new guests until its fence is repaired)`. Fork, wake and start stay on
+the sandbox's own worker.
+

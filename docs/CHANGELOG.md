@@ -1012,6 +1012,417 @@ re-checks the rules while the agent runs (FLU-8).
       missing, when `FELUCCA_CONTROL_PLANE_IP` is refused, and when the
       existing rules file does not load or (worker) has no fence line.
 
+## Stability wave 1 — data safety (2026-11-27, Rust + Go)
+
+Second wave of the 2026-11 stability audit: the findings in which Felucca said
+something that was not true — a sandbox asleep that was not, a write saved that
+was not, a hostname that reached the wrong sandbox — and then acted on it.
+Decisions and the alternatives that lost:
+[ADR-0012](adr/ADR-0012-data-safety.md). Operator view: DEPLOYMENT.md §10
+"Upgrading to stability wave 1" and §12. API: API-V2.md §1, §2a, §3, §3d, §7.
+
+**A dead VM is no longer woken from a stale snapshot (FLU-4)**
+
+- Was: at start-up the agent called a sandbox `sleeping` whenever a
+  `vmstate.bin` lay in its directory. A sandbox that had once slept and been
+  woken came back `sleeping` after a reboot, and a wake restored old memory over
+  a newer disk.
+- A sandbox is asleep only when its record says so. A `running` or `paused`
+  record whose Firecracker is gone becomes `stopped` at start-up, written to
+  `meta.json`. `meta.json` gains the optional `snapshot_valid`, written only by
+  a sleep that finished; records of an older agent are kept `sleeping` only
+  when both snapshot files exist and `rootfs.ext4` is not newer than
+  `vmstate.bin`.
+- Stale snapshots are renamed `vmstate.bin.outrun` / `mem.bin.outrun`, not
+  deleted; `start`, `stop`, the next sleep and `delete` remove them.
+- One lifecycle operation at a time per sandbox: `409 {"error":"busy"}`.
+  Same-kind requests wait up to 25 s, a fork never waits, forks of a sleeping
+  parent run side by side, stop and delete pre-empt (and answer 409 with
+  `"state":"stopped"` if the operation does not let go within 15 s).
+- Sleep is accepted from `running`/`paused`, wake from `sleeping`; other states
+  answer 409 with a `state` key (they used to answer 500 or act anyway). The
+  409s of stop, start, pause and resume carry it too. feluccad records the state
+  a worker names and forwards the 409; the sweep does the same for its
+  auto-sleep.
+- feluccad answers lifecycle verbs on a record still `creating` with `409
+  {"error":"InvalidState: creating (the sandbox is still being created)","state":"creating"}`
+  (delete stays allowed). A record a stopped or killed feluccad left `creating`
+  comes back as `error` after the restart, with a WARN that a VM may exist on
+  its worker; its first successful start, wake or resume takes the guest
+  address from the worker, so expose and routing work again.
+- A delete the worker refuses as busy answers 409 with the worker's body and
+  `Retry-After: 2`, the record kept with the state the worker names; any other
+  worker refusal stays the 502 `agent delete failed …`. `?force=1` unchanged.
+- A wake loads the snapshot without resuming, writes `running`, then resumes,
+  and removes `vmstate.bin`. A missing or empty snapshot file makes the sandbox
+  `stopped` (409). A resume that got no answer stops the sandbox and sets the
+  snapshot aside.
+- Snapshot files exist only beside a `sleeping` record: stop, start, start-up
+  and a VMM that dies remove them (`mem.bin` is kept while a live VMM maps it).
+
+**A snapshot is complete before anything relies on it (FLU-70)**
+
+- Was: a failed `snapshot/create` left complete-looking files that a later
+  wake used, and the guest paused under a record saying `running`.
+- Sleep: pause, snapshot to `vmstate.bin.tmp`, fsync the disk image, rename,
+  fsync the directory, write `sleeping` + `snapshot_valid`, then kill the VMM.
+  Any failure before the kill removes the files and resumes the guest; the
+  record is unchanged (`paused` if the resume fails too).
+- Fork reserves the child id first (`409 {"error":"AlreadyExists"}` for a
+  taken id or directory, before anything is written) and writes the snapshot
+  into the child's directory; the parent's directory never gets snapshot
+  files. A failed fork leaves no directory, or an `error` child without
+  snapshot files.
+
+**A fork child runs on its own disk (FLU-72, found in this wave)**
+
+- Was: the snapshot names the drive's path and the load had no override, so
+  every fork child opened its parent's `rootfs.ext4`; the two guests wrote one
+  file system. The child's copy was made after the parent resumed.
+- The disk is copied (`cp --reflink=auto`) while the parent is paused; the
+  child is loaded without resuming, its drive is pointed at its own
+  `rootfs.ext4` (`PATCH /drives/rootfs`, checked with `GET /vm/config`), and
+  only then resumed.
+- A sandbox that does not run on its own disk (forked before this release) is
+  not forked — `409 {"error":"InvalidState: this sandbox was forked before this
+  release and runs on its parent's disk image, not on its own; it cannot be
+  forked","state":"<parent's state>"}`, running, paused or sleeping — and is
+  woken only if the image it runs on is unchanged since it slept. DEPLOYMENT.md
+  §10 says how to find such sandboxes.
+- feluccad relays a fork the worker refuses for good as 409 with the worker's
+  body and no `Retry-After` (it was a 502 with the child in `error`), removes
+  the child it had reserved, and records the parent's state; nothing is left
+  of the child on the worker either, whatever the parent's state. Busy and
+  refused forks do not count as activity of the parent.
+- A fork now pauses a running parent for the disk copy as well as the
+  snapshot.
+
+**A save that fails, fails the request (FLU-5, with FLU-74, FLU-82, FLU-83)**
+
+- Was: every save site logged a failed save and answered success; a database
+  that was locked, read-only or full lost acknowledged changes at the next
+  restart.
+- One save path; the database is written outside the state lock. While the
+  store is failing, changes are refused before anything is done: `503
+  {"error":"store unavailable"}`, `Retry-After: 5`. A change the worker already
+  carried out answers `503 {"error":"applied but not saved","applied":true}`,
+  `Retry-After: 5`. A create or fork whose last save fails answers 503 and its
+  VM is removed from the worker after the answer. Reads, exec, heartbeats, the
+  route table, `/metrics` and `/healthz` keep working; wake is refused; the
+  lifecycle sweep pauses.
+- A recovery loop retries every 2 s with a fresh writer connection, so a
+  database that was read-only when feluccad started recovers without a restart.
+  feluccad starts on a database it cannot write (store failing) and still
+  refuses to start on one it cannot read, or on a legacy state file that does
+  not load.
+- `/healthz`: `200 {"ok":true}` or `503 {"ok":false,"store":"failing"}`.
+- New metrics: `felucca_persist_failures_total`, `felucca_store_healthy`,
+  `felucca_usage_write_failures_total` (failed attempts; the rows stay queued),
+  `felucca_usage_rows_dropped_total` (rows lost from the full queue),
+  `felucca_store_read_errors_total`.
+- `synchronous=FULL`; a second, read-only database handle for reads. Exec
+  metering rows are queued (at most 10 000) and written once a second.
+- SIGTERM/SIGINT: every listener stops accepting and the requests in flight
+  get 10 s in all to finish; then the rest is cut, the exec rows are written
+  (retried once a second until just before the 20 s limit; one ERROR says how
+  many were lost if that never succeeds), and feluccad exits 0. A second
+  signal, or 20 s after the first, exits 1.
+- FLU-74: `mem_total_mib` / `mem_free_mib` above 2^40 answer 400; unsigned
+  values are clamped when bound. One heartbeat used to make every later save
+  fail.
+- FLU-82: a tenant and its first key, and a node credential and its join
+  token, are each one transaction.
+- FLU-83: read errors answer `503 store unavailable` — key lookup (not counted
+  by the brute-force guard), quota, template lookups, the tenant row of `POST
+  /api/v1/tenants/{id}/keys`, node join — and the sweep skips a tenant whose
+  policy it could not read; listings that cannot be read answer 500. They used to mean "no
+  limit" or "wrong key".
+
+**A hostname never reaches another sandbox (FLU-6)**
+
+- Was: the agent handed out the lowest free node port, so a deleted sandbox's
+  port went to the next expose at once while gateways still routed the old
+  hostname to it — indefinitely while feluccad was down.
+- Gateway: past `--max-stale` (`FELUCCA_GW_MAX_STALE`, default 600 s, range
+  `2 x refresh + 20s` to 600 s, a bare number is seconds), and before its first
+  fetch, sandbox requests answer `503 {"error":"route table unavailable"}`,
+  `Retry-After: 5`. New `/readyz`. `--refresh` outside 1 to 60 s refuses to
+  start. Upstream connections are pooled per sandbox and guest port.
+- feluccad quarantines a released node port for 900 s on that worker host,
+  sends each expose `avoid` and `prefer`, and checks the answer. New answers:
+  `429 {"error":"expose churn limit reached"}` (512 quarantined ports per tenant
+  per worker host, 64 distinct node port and guest port pairs per sandbox),
+  `503 {"error":"no free node port on this worker"}` (`Retry-After: 30`),
+  `503 {"error":"node port conflict, retry"}` (`Retry-After: 5`), and a 503
+  naming the expose that holds the port when the worker answers with a port
+  this sandbox holds for another guest port. A backward clock step lengthens a
+  quarantine by at most the step; `Retry-After` never exceeds 900 s. New gauge
+  `felucca_node_ports_quarantined`. Start-up logs an ERROR for each node port
+  that rows of two sandboxes name, and for each guest port of a sandbox whose
+  rows name several node ports.
+- Agent: round-robin allocation from a random start, never a port in `avoid`,
+  `prefer` when free, `"avoid_honored":true` in the answer; `500 {"error":"ingress
+  rule not installed"}` when the rule did not load; the ingress chain is one
+  nft transaction; delete rebuilds the rules before it frees the address.
+- The sweep keeps a sleeping sandbox's dynamic exposes for 900 s instead of
+  dropping them at once, drops them only on `ready` workers (5 s per call, 5 s
+  of worker time per pass), and repeats a drop that got no answer until the
+  worker answers. A worker 404 on unexpose means the mapping is gone. An agent
+  expose writes `meta.json` only once its rule is in; two overlapping deletes
+  free the address once (FLU-40).
+
+**Each wake waiter gets its own service (FLU-7)**
+
+- Was: requests coalesced on one wake all got the first request's route, so a
+  sandbox's second service was answered by its first.
+- Each waiter resolves its own hostname again after the wake. The gateway reads
+  the wake's answer (polls after 2xx, resends after a 503 with `Retry-After`,
+  holds off 5 s after 404/409). A `routes/ensure` 429 or 503 is passed on
+  instead of becoming 404.
+
+**A Firecracker is ready when its API socket accepts (FLU-86, found in this wave)**
+
+- Was: after starting a Firecracker the agent waited for its API socket's file
+  to exist; under load the first request arrived before Firecracker listened,
+  and a create failed with `FcError: send request: client error (Connect)`.
+- The agent now waits, at most 3000 ms, until the socket accepts a connection,
+  for create, start, wake and fork. When it does not: `SocketNeverAppeared:
+  the Firecracker API socket did not accept a connection within 3000 ms (its
+  file existed)` (or `did not exist`).
+
+**The gateway no longer prints the admin token (FLU-73)**
+
+- `--token` had `$FELUCCA_TOKEN` as its default, which `--help` prints. The
+  variable is now read after the flags are parsed.
+
+**Rules are checked in the kernel and put back (FLU-8)**
+
+- Was: the agent built its nft rules at start-up and on membership changes and
+  never looked again; after a ruleset flush tenants shared one network,
+  `/healthz` still said `"isolation":true`, and only an agent restart helped.
+- Every agent chain starts with a marker rule `counter comment
+  "felucca:<16 hex>"` (a hash of what was applied). Every 5 s the isolation
+  watch looks at the guest bridge, compares the markers in the kernel with what
+  the agent last applied, checks the `br_netfilter` and IPv6 switches and the
+  anti-spoof chain of every tap with carrier, and rebuilds what drifted,
+  including a table set dormant. Tools that hash `nft list` output must use
+  `nft -s` (the marker is a counter).
+- Before it runs, the agent reads back the chains start-up applied; if it
+  cannot read its own markers on this kernel the watch does not start
+  (`isolation watch NOT started: …`, ERROR and stderr). Per table, nothing is
+  taken down or refused until a marker has been read back there.
+- Something is taken down only on positive evidence twice: positively not in
+  place, and the repair refused by the kernel or applied and still not there.
+  A failed look or a repair with no answer takes nothing down. Then an
+  isolation chain, a switch or a table that stays dormant takes the guest
+  bridge down (`enforce`, the default) until a tick repairs it; a tap's chain
+  takes that tap down; NAT and ingress take nothing down and never enter
+  `isolation`. What the watch holds down and something else raises goes down
+  again. A route `unreachable <guest net> metric 4294967295` keeps guest
+  traffic on the worker while the bridge is down.
+- New guests are refused (`IsolationFailed`: create, fork, wake, start, pool
+  refill) while a fence is positively not in place or its repair has no
+  answer, while the guest bridge is gone, and while start-up could not settle
+  the ingress chain — in `enforce` and `report`. While the ingress chain is
+  unsettled, `isolation` and `isolation_ok` are false in every mode, `off`
+  included.
+- A deleted table or flushed chain is back within about 3 to 5 s; in that
+  window the fence is open. The watch shortens an exposure to seconds; it does
+  not prevent it.
+- New setting `isolation_watch` / `FELUCCA_ISOLATION_WATCH` /
+  `--isolation-watch <value>` or `--isolation-watch=<value>`: `enforce`
+  (default), `report`, `off`; any other value, or the flag without one,
+  refuses to start.
+- The host fence (`inet felucca_host`) is reported (WARN once a minute,
+  `isolation` false), never repaired: it is `felucca-firewall.service`'s. It
+  counts only if it was in place when the agent started.
+- `/healthz` `isolation` and the heartbeat's `isolation_ok` are the watch's
+  verdict: false when a fence, switch or tap pin is unrepaired, the guest
+  bridge is gone, the host fence is missing, the last completed tick is older
+  than 45 s, or none completed within 45 s of the watch's start.
+- Every `nft` and `ip` command is killed after 10 s (`wg`: 60 s) and is not run
+  a second time; at most 16 timed-out commands are outstanding. A tick waits
+  up to 15 s for the rule lock and works at most 15 s. NAT and the two
+  host-side fences are one nft transaction each.
+- Slots held after a failed rule rebuild are released once both rebuilds
+  succeed again (they used to stay reserved until a restart). A start-up that
+  can neither rebuild nor empty the ingress chain places no guest until it is
+  rebuilt (retried every 5 s, in every mode).
+- Taps start-up could not pin for adopted sandboxes are pinned and raised by
+  the watch later (FLU-65), and start-up says which failure happened.
+- feluccad keeps each node's `isolation_ok` in memory, logs when it changes,
+  and counts it in the new gauge `felucca_nodes_unfenced`.
+- Creates avoid a worker that reports its isolation down (FLU-78): they go to
+  the ready worker with the fewest sandboxes among those that do not, and fall
+  back to all ready workers, with a WARN at most once a minute, only when
+  every one reports it down. Such a worker refuses new guests, so it had the
+  fewest and drew every create.
+
+**Changed behaviour you may notice**
+
+- Sandboxes that were running at a worker reboot come back `stopped`, never
+  `sleeping`. `start` them.
+- Stopping a sleeping sandbox discards its snapshot.
+- Lifecycle requests can answer `409 {"error":"busy"}`; retry. Lifecycle
+  requests on a `creating` sandbox answer 409; a record a stopped feluccad left
+  `creating` comes back `error`.
+- A fork of a sandbox forked before this release answers 409, and a busy
+  delete answers 409 with `Retry-After: 2` (both were 502).
+- Stopping feluccad drains requests for up to 10 s. After a feluccad restart
+  the workers read `down` until their next heartbeat, and creates answer 503
+  until then.
+- Creates avoid workers that report their isolation down.
+- While feluccad's database cannot be written, every change answers 503 —
+  wake included.
+- feluccad's `/healthz` can answer 503, and is no longer counted in
+  `felucca_api_requests_total`.
+- The gateway answers 503 for sandbox URLs after `--max-stale` without a fresh
+  table, and before its first fetch.
+- `felucca-gw` refuses to start with `--refresh` outside 1 to 60 s.
+- Expose can answer 429 (churn limit) and 503 (no free node port, node port
+  conflict).
+- Dynamic exposes are kept across a sleep.
+- A fork pauses its parent for the disk copy as well.
+- Every Felucca chain in `nft list` starts with a marker counter rule.
+- A worker whose fences the agent cannot restore loses its guest network
+  (`enforce`) and refuses new guests (`enforce` and `report`); a create,
+  delete or expose behind a stuck `nft` fails after 10 s.
+- Parallel forks of a running parent answer `busy`.
+
+**Upgrading**
+
+- [ ] Agents first, then gateways, then feluccad. A new feluccad with an old
+      agent keeps the old hostname exposure for that worker, with a warning in
+      feluccad's log; see DEPLOYMENT.md §10 for every mixed state. A new
+      gateway works against the old feluccad, and a roll-back of feluccad
+      needs no database restore.
+- [ ] After the agent upgrade, the taps of sleeping and stopped sandboxes keep
+      the previous agent's anti-spoof chain (no marker, no final `drop`; policy
+      `drop`) until they are woken or started: listings show both forms.
+
+- [ ] No unit changes. Load balancers in front of `felucca-gw`: probe
+      `/readyz` instead of `/healthz`.
+- [ ] Agents: the isolation watch runs in `enforce` by default and can take a
+      worker's guest network down (DEPLOYMENT.md §8.2). Set `isolation_watch`
+      to `report` for a first roll-out if you want to see what it would do;
+      alert on the lines listed there, `isolation watch NOT started:` first.
+- [ ] Alert on `felucca_store_healthy` 0, on feluccad's `/healthz` 503, and on
+      `felucca_store_read_errors_total` and `felucca_usage_rows_dropped_total`
+      growing; alert on `felucca_nodes_unfenced` together with
+      `felucca_nodes_ready`.
+
+- [ ] Look for sandboxes forked before this release (DEPLOYMENT.md §10,
+      "Sandboxes forked before this release") and decide which data to keep.
+- [ ] Clients: treat `503` with `Retry-After` (`store unavailable`, `applied
+      but not saved`, `route table unavailable`, node-port answers) and `409
+      busy` as retryable.
+
+**What verified the wave on the lab**
+
+New lab gates, each run against the software of before the wave and against
+the final build:
+
+- `scripts/verify-snapshot.sh` (drives `test/lab/snapshot.sh`,
+  `test/lab/snapshot-pre.sh` and `test/lab/snapshot-post.sh`; FLU-4, FLU-70,
+  FLU-72). Before: 205 passed, 87 failed, 1 skipped. Final build: 301 passed, 0
+  failed for every case but the power cut, and 42 passed, 0 failed for the
+  power-cut case run by itself (343 in all). In the power-cut case the worker
+  VM's power was cut 0.05 s after a sleep was acknowledged; the sandboxes whose
+  sleep had been acknowledged woke with their memory intact, and the ones that
+  were running came back `stopped`.
+- `scripts/verify-persist.sh` (drives `test/lab/persist.sh` with
+  `test/lab/dblock.py`; FLU-5, FLU-74). Before: every case has failing checks;
+  a create under a database lock answered 201 after 15.7 s and left a VM on
+  the worker, `/healthz` answered 200 throughout, and 4 of 10 acknowledged
+  changes were gone after a restart. Final build: 94 passed, 0 failed, 3
+  skipped; under a write lock the first change was refused after 5.2 s and
+  every later one in under a millisecond, and the control plane was healthy
+  again 0.3 s after the lock was released.
+- `scripts/verify-ingress.sh` (drives `test/lab/ingress.sh`; FLU-6, FLU-7,
+  FLU-73). Before: 13 passed, 21 failed; 25 of 852 answers on a deleted
+  sandbox's hostname carried another sandbox's body; both hostnames of a woken
+  sandbox got the same body in 20 of 20 rounds. Final build: 47 passed, 1
+  failed; 0 of 855 such answers (0 of 4290 in a longer run of the case); 20 of
+  20 rounds right; with `--max-stale 40` a gateway cut off from the control
+  plane gave its last 200 at 38.4 s and its first 503 at 39.5 s. The one
+  failed check is the gate's own clean-up of a sandbox on the lab's second
+  worker VM, which hung during the run.
+- `scripts/verify-isolation.sh` (drives `test/lab/isolation.sh`; FLU-8). An
+  agent without the watch: every case from C2 to C8 fails, nothing is put
+  back. Final build: 305 passed, 0 failed. A deleted table or flushed chain was
+  back in 2.9 to 5.1 s; a repair the kernel refused took the guest bridge down
+  in 1.5 s, and it was back 1.6 s after the cause was removed; no false alarm
+  in 60 create-and-delete cycles (`/healthz` true in 21 of 21 samples); with
+  one of two workers reporting its isolation down, five creates all landed on
+  the other. While a table was missing, probes from one tenant's guest to
+  another's got through: 6 of 10 with table `ip` deleted, and 5 of 13 with the
+  whole ruleset flushed, all within 3.5 s of the break.
+
+The older gates on the final build, on one worker:
+
+- `scripts/verify-break.sh`: 66 passed, 1 failed. The failed check: one of 15
+  guests booted at once on 8 CPUs was not ready for exec within the gate's
+  limit; it answered later in the same case.
+- `scripts/verify-restart.sh`: 229 passed, 0 failed, 5 skipped (two warm-pool
+  checks, and three that the open FLU-68 decides on a worker without a pool).
+- `scripts/verify-reboot.sh`: passed. `scripts/verify-oom.sh`: 21 passed, 0
+  failed.
+- `scripts/verify-firewall.sh` with `FELUCCA_LAB_OTHER=none`: 130 passed, 0
+  failed, 1 skipped.
+- `scripts/conformance-lab.sh`: 423 passed, 0 failed, 2 skipped.
+  `scripts/verify-v2.sh`: 20 passed, 1 failed (it expects two ready workers
+  and found one).
+
+Changed expectations in the older gates:
+
+- `test/lab/restart.sh`: a sandbox whose Firecracker died while the agent was
+  down is `stopped` where the gate expected `sleeping` (FLU-4); rule listings
+  are compared with `nft -s`, because every Felucca chain now starts with a
+  counter.
+- `test/lab/break.sh`: B5 now requires the agent to put its own tables back
+  without a restart (FLU-8; observed 2.75 s); B8 expects a wake that cannot
+  write its record to fail and leave the sandbox asleep (FLU-4).
+- `scripts/verify-firewall.sh`: `FELUCCA_LAB_OTHER=none` leaves out the probe
+  from a VM that is not on the allow-list and counts it as skipped.
+- The gates hand the admin token over on standard input into a header file
+  that only the gate's own user can read (`test/lab/lib.sh`,
+  `test/lab/run-on-worker.sh`,
+  `scripts/verify-persist.sh`, `scripts/verify-isolation.sh`,
+  `scripts/verify-ingress.sh`, `scripts/verify-firewall.sh`);
+  `scripts/verify-snapshot.sh`, `scripts/conformance-lab.sh` and
+  `scripts/verify-v2.sh` still pass it on a command line (FLU-84).
+
+Measured besides the gates:
+
+- A fork's pause on ext4 (a virtio disk): an image holding 472 MiB of data
+  paused the parent 0.2 to 0.7 s, and the whole fork call took 1.0 to 1.4 s;
+  an image holding 7.4 GiB paused it 10 to 12 s, and the call took 12 to 14 s.
+  That is about 0.6 to 0.75 GiB per second of pause on that disk. The agent
+  logs nothing for a fork that succeeds (FLU-89).
+- A wake is not slowed by another sandbox's sleep on the same worker: 85 to
+  97 ms alone, 89 to 101 ms while a 2 GiB guest with 1500 MiB of memory in use
+  was being put to sleep.
+- A connection that stalls after the guest bridge has been down and up again:
+  DEPLOYMENT.md §8.2 and FLU-92.
+
+Not verified on the lab, because the lab's second worker VM hung during the
+last rounds:
+
+- `scripts/verify-ingress.sh` case I13 (one worker's agent stopped) and case
+  I9 (a hostname after a sleep longer than the quarantine; 16 minutes) were
+  not run.
+- `scripts/verify-restart.sh` was not rerun on the worker that has a warm
+  pool, so the warm-pool checks did not run on the final build.
+- The firewall gate's probe from a VM that is not on the allow-list was left
+  out.
+
+Found by the last lab round and left open (filed, not fixed in this wave):
+FLU-87 (an expose cut short by a control-plane crash leaves a forwarding rule
+on the worker that no route row names), FLU-88 (the gateway has no graceful
+stop: a restart cuts off requests in flight), FLU-89 (a fork that succeeds
+logs nothing), FLU-92 (the stall above), FLU-93 (the node list does not show a
+worker's isolation flag).
+
 ## Backlog (v3+, in order)
 
 branch (uffd CoW fork of running VMs) → cross-tenant nftables isolation →
