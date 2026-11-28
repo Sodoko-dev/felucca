@@ -199,6 +199,7 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		return srv.db.CheckJoinToken(tokenHash, now)
 	}()
 	if err != nil {
+		storeReadFailed()
 		// A read error is not a refusal of the token: 503, no throttle, and
 		// the store is not marked failing (nothing failed to be written).
 		slog.Error("check join token", "err", err)
@@ -212,6 +213,7 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 
 	var overlayIP string
 	if existing, err := srv.db.GetWgPeerByPubKey(req.PubKey); err != nil {
+		storeReadFailed()
 		slog.Error("wg peer lookup", "err", err)
 		refuseStoreUnavailable(w)
 		return
@@ -248,6 +250,7 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 	} else {
 		peers, err := srv.db.ListWgPeers()
 		if err != nil {
+			storeReadFailed()
 			slog.Error("list wg peers", "err", err)
 			refuseStoreUnavailable(w)
 			return

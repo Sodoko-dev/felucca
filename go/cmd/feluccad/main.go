@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -252,7 +254,7 @@ func main() {
 	servers = append(servers, httpSrv)
 	stopped := make(chan struct{})
 	go func() {
-		stopOnSignal(sigs, servers, srv, stop, flushed)
+		stopOnSignal(sigs, servers, srv, stop, flushed, os.Exit)
 		close(stopped)
 	}()
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -261,23 +263,69 @@ func main() {
 	}
 	<-stopped
 	slog.Info("feluccad stopped")
-	// Returning runs the deferred db.Close, which waits for a save that is
-	// still in its transaction; the exit status is 0.
+	// Returning runs the deferred db.Close and exits with status 0. db.Close
+	// does NOT wait for a transaction in flight; what makes the stop safe for
+	// one is the drain in stopOnSignal, which lets the requests finish (their
+	// saves included) before anything is closed.
 }
 
-// stopOnSignal waits for SIGTERM or SIGINT, then stops feluccad: every
-// listener is closed (no new request is accepted), the background loops end,
-// and the queued exec usage rows get their final flush (flushed closes after
-// it). Without it, the stop channels were never closed, the final flush was
-// dead code, and every restart dropped up to a second of exec rows.
+// The stop's limits. The drain gives requests in flight stopDrain to finish;
+// the whole stop, flush included, ends the process with status 1 at
+// stopHardLimit after the first signal (systemd's TimeoutStopSec, 30 s in
+// deploy/systemd/feluccad.service, then sends SIGKILL). Variables for tests.
+var (
+	stopDrain     = 10 * time.Second
+	stopHardLimit = 20 * time.Second
+)
+
+// stopOnSignal waits for SIGTERM or SIGINT, then stops feluccad:
 //
-// It does not drain. A request in flight has its connection closed under it:
-// its client gets no answer (a reset or an EOF) and must treat the outcome as
-// unknown — what such a request had already saved is in the database, what it
-// had not is lost with the process, as on any other stop.
-func stopOnSignal(sigs <-chan os.Signal, servers []*http.Server, srv *server.Server, stop chan<- struct{}, flushed <-chan struct{}) {
+//  1. Shutdown of every listener, all at once, for at most stopDrain: no new request is
+//     accepted, and the requests in flight finish, their saves and their exec
+//     rows included. A create cut between the worker's answer and its last
+//     save would leave a VM the database does not know.
+//  2. Close of whatever is left after stopDrain: those connections are cut
+//     under their requests, whose clients get no answer and must treat the
+//     outcome as unknown.
+//  3. The background loops end and the queued exec rows get their final flush
+//     (flushed closes after it) — after the drain, so the rows of the
+//     requests that finished in it are in it.
+//
+// A second signal, or stopHardLimit after the first, ends the process at once
+// with status 1 through exit: a flush that hangs on a locked database must not
+// keep the process until SIGKILL, and an operator's second Ctrl-C means now.
+func stopOnSignal(sigs <-chan os.Signal, servers []*http.Server, srv *server.Server, stop chan<- struct{}, flushed <-chan struct{}, exit func(int)) {
 	sig := <-sigs
-	slog.Info("stopping: closing the listeners and flushing the exec usage rows", "signal", sig.String())
+	slog.Info("stopping: draining the requests in flight, then flushing the exec usage rows",
+		"signal", sig.String(), "drain", stopDrain, "hard_limit", stopHardLimit)
+	hard := time.AfterFunc(stopHardLimit, func() {
+		slog.Error("stop did not finish in time: exiting now", "hard_limit", stopHardLimit)
+		exit(1)
+	})
+	defer hard.Stop()
+	go func() {
+		if sig, ok := <-sigs; ok {
+			slog.Error("second signal during the stop: exiting now", "signal", sig.String())
+			exit(1)
+		}
+	}()
+
+	// All listeners drain at once, on one deadline: one after the other, the
+	// later ones kept accepting while the first drained and then got an
+	// expired context, so their requests were cut with no drain at all.
+	ctx, cancel := context.WithTimeout(context.Background(), stopDrain)
+	defer cancel()
+	var drains sync.WaitGroup
+	for _, s := range servers {
+		drains.Add(1)
+		go func(s *http.Server) {
+			defer drains.Done()
+			if err := s.Shutdown(ctx); err != nil {
+				slog.Warn("drain did not finish: closing the connections left", "addr", s.Addr, "err", err)
+			}
+		}(s)
+	}
+	drains.Wait()
 	for _, s := range servers {
 		if err := s.Close(); err != nil {
 			slog.Warn("closing a listener", "addr", s.Addr, "err", err)
@@ -341,6 +389,12 @@ func boot(cfg *config.Config, db store.Store) (*server.Server, error) {
 	}
 
 	srv := server.New(cfg, st, db)
+	// Records a previous process left "creating" (it stopped, or was killed,
+	// during a create's worker call) become error before anything is served:
+	// no create of that process runs in this one, and a creating record
+	// refuses every lifecycle verb. Their change is part of the start-up
+	// write, which is then the whole snapshot.
+	settled := srv.SettleInterruptedCreates()
 	renameLegacy := func() {
 		if err := os.Rename(cfg.StatePath, cfg.StatePath+".imported"); err != nil {
 			slog.Warn("could not rename legacy state file", "err", err)
@@ -351,7 +405,7 @@ func boot(cfg *config.Config, db store.Store) (*server.Server, error) {
 	if imported {
 		srv.OnStoreRecovered(renameLegacy)
 	}
-	if err := srv.StartupWrite(empty); err != nil {
+	if err := srv.StartupWrite(empty || settled > 0); err != nil {
 		slog.Error("STORE NOT WRITABLE at start-up: serving reads and the route table, refusing changes, retrying the save until it succeeds",
 			"db", cfg.DBPath, "err", err)
 		return srv, nil

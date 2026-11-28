@@ -160,32 +160,42 @@ func TestQuarantineExpiresAndTheSnapshotDropsItAndCopiesDeep(t *testing.T) {
 	}
 }
 
-// RQ-11 / GF-4: a backward clock step cannot lengthen a quarantine: an entry
-// released "in the future" is set to the time it is first looked at, and its
-// quarantine ends 900 s after the step. A forward step that is corrected
-// within the margin, with a save in between, loses nothing.
+// RQ-11 / GF-4 / GG-2: a backward clock step clamps the REMAINING time to the
+// quarantine (so Retry-After never exceeds it) but never rewrites the release
+// time: looked at and saved during the step, the entry is unchanged, and once
+// the clock is corrected forward it is in quarantine until 900 s after its
+// real release. During the step it lasts longer, the safe direction. A forward
+// step corrected within the margin, with a save in between, loses nothing.
 func TestQuarantineSurvivesClockSteps(t *testing.T) {
 	q := model.ReleasedPort{Host: "h", Port: 20001, ReleasedAt: 10000}
 	if left := state.QuarantineExpiresIn(q, 10000-3600); left != 900 {
 		t.Errorf("an hour after a backward step: %d s left, want at most 900", left)
 	}
 
+	now := int64(10000 - 3600) // the clock stepped back an hour
 	back := state.New()
+	back.Clock = func() int64 { return now }
 	back.Quarantine = []model.ReleasedPort{q}
 	back.Lock()
-	step := int64(10000 - 3600) // the clock stepped back an hour
-	if got := back.QuarantineLocked(step); len(got) != 1 || got[0].ReleasedAt != step {
-		t.Errorf("after the step: %+v, want the entry released at the step (%d)", got, step)
+	if got := back.QuarantineLocked(now); len(got) != 1 || got[0].ReleasedAt != 10000 {
+		t.Errorf("during the step: %+v, want the entry with its real release time", got)
 	}
-	if got := back.QuarantineLocked(step + 899); len(got) != 1 {
-		t.Errorf("899 s after the step: %+v, want still in quarantine", got)
+	if snap := back.SnapshotLocked(); len(snap.Quarantine) != 1 || snap.Quarantine[0].ReleasedAt != 10000 {
+		t.Errorf("saved during the step: %+v, want the release time unchanged", snap.Quarantine)
 	}
-	if got := back.QuarantineLocked(step + 900); len(got) != 0 {
-		t.Errorf("900 s after the step: %+v, want the quarantine over (not an hour later)", got)
+	if got := back.QuarantineLocked(now + 900); len(got) != 1 {
+		t.Errorf("900 s into the step: %+v, want still in quarantine (lengthened by the step)", got)
+	}
+	now = 10000 + 899 // corrected forward
+	if got := back.QuarantineLocked(now); len(got) != 1 {
+		t.Errorf("899 s after the real release, clock corrected: %+v, want still in quarantine", got)
+	}
+	if got := back.QuarantineLocked(10000 + 900); len(got) != 0 {
+		t.Errorf("900 s after the real release: %+v, want the quarantine over", got)
 	}
 	back.Unlock()
 
-	now := int64(10000)
+	now = 10000
 	st := state.New()
 	st.Clock = func() int64 { return now }
 	st.Quarantine = []model.ReleasedPort{q}

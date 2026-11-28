@@ -105,6 +105,7 @@ type poolSpec struct {
 func (srv *Server) poolSpecs() ([]poolSpec, error) {
 	ts, err := srv.db.ListTemplates()
 	if err != nil {
+		storeReadFailed()
 		return nil, err
 	}
 	out := []poolSpec{}
@@ -226,6 +227,7 @@ func (srv *Server) createTemplate(w http.ResponseWriter, r *http.Request, tenant
 	if req.Tenant != "" {
 		owner, err := srv.db.GetTenant(req.Tenant)
 		if err != nil {
+			storeReadFailed()
 			// Read errors are 503 (store unavailable), as everywhere else.
 			slog.Error("create template: tenant read failed", "tenant", req.Tenant, "err", err)
 			refuseStoreUnavailable(w)
@@ -263,6 +265,7 @@ func (srv *Server) createTemplate(w http.ResponseWriter, r *http.Request, tenant
 	}
 
 	if existing, err := srv.db.GetTemplateByName(t.Name); err != nil {
+		storeReadFailed()
 		slog.Error("create template: template read failed", "template", t.Name, "err", err)
 		refuseStoreUnavailable(w)
 		return
@@ -335,6 +338,7 @@ func (srv *Server) createTemplate(w http.ResponseWriter, r *http.Request, tenant
 func (srv *Server) listTemplates(w http.ResponseWriter, tenant string) {
 	ts, err := srv.db.ListTemplates()
 	if err != nil {
+		storeReadFailed()
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
@@ -365,6 +369,7 @@ func (srv *Server) deleteTemplate(w http.ResponseWriter, name, tenant string) {
 	}
 	t, err := srv.db.GetTemplateByName(name)
 	if err != nil {
+		storeReadFailed()
 		slog.Error("delete template: template read failed", "template", name, "err", err)
 		refuseStoreUnavailable(w)
 		return

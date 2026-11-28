@@ -44,6 +44,8 @@ felucca_sandboxes_total{state="running"}
 felucca_sandboxes_total{state="sleeping"}
 felucca_sandboxes_total{state="stopped"}
 felucca_store_healthy
+felucca_store_read_errors_total
+felucca_usage_rows_dropped_total
 felucca_usage_write_failures_total
 felucca_wake_duration_ms_bucket{le="+Inf"}
 felucca_wake_duration_ms_bucket{le="10"}

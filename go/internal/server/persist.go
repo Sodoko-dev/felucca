@@ -54,9 +54,21 @@ var (
 	persistFailures atomic.Uint64
 	// usageWriteFailures counts failed write attempts that carried usage rows
 	// (one per attempt, snapshot save or exec flush, however many rows it
-	// carried), plus each exec row dropped from the full queue, once.
+	// carried): rows still queued and retried.
 	usageWriteFailures atomic.Uint64
+	// usageRowsDropped counts exec rows dropped from the full queue, each
+	// once: rows lost. Apart from usageWriteFailures so an alert can tell
+	// "retrying" from "lost".
+	usageRowsDropped atomic.Uint64
+	// storeReadErrors counts failed store reads (key lookups, quota and policy
+	// reads, credentials, listings). A read outage is otherwise invisible: the
+	// write health stays 1 and /healthz 200 while every keyed request is 503.
+	storeReadErrors atomic.Uint64
 )
+
+// storeReadFailed counts a failed store read. Every read-error branch calls
+// it, whatever it answers.
+func storeReadFailed() { storeReadErrors.Add(1) }
 
 // storeHealth is whether the database has caught up with memory. failing is set
 // by any failed write and cleared ONLY by the recovery loop, when one attempt
@@ -106,9 +118,25 @@ func (srv *Server) storeWriteFailed(err error) {
 		slog.Error("store failing: changes are refused until a save succeeds", "err", err)
 	}
 	if start {
-		go srv.storeRecoveryLoop()
+		srv.goBackground(srv.storeRecoveryLoop)
 	}
 }
+
+// goBackground runs fn on its own goroutine, counted in srv.bg so that
+// WaitBackground can wait for it: work that writes the database after the
+// response (the recovery loop, a clean-up, a registration's save) must not
+// outlive a test's database.
+func (srv *Server) goBackground(fn func()) {
+	srv.bg.Add(1)
+	go func() {
+		defer srv.bg.Done()
+		fn()
+	}()
+}
+
+// WaitBackground waits for the background work started so far (tests; call
+// StopBackground first, or a failing store's recovery loop never ends).
+func (srv *Server) WaitBackground() { srv.bg.Wait() }
 
 // storeSaved records a recovery: the snapshot and the exec rows are written.
 func (srv *Server) storeSaved() {
@@ -165,6 +193,11 @@ func (srv *Server) storeRecoveryLoop() {
 		if fn != nil {
 			fn()
 		}
+		// The legacy credential seed of a start whose database could not be
+		// written: run again now that it can.
+		if ok && srv.seedPending.Swap(false) {
+			srv.seedLegacyNodeCreds()
+		}
 		return ok
 	}
 	for {
@@ -196,24 +229,27 @@ func (srv *Server) storeRecoveryLoop() {
 }
 
 // recoverStore is one attempt of the recovery loop: a fresh writer connection,
-// then the snapshot save, then the exec flush. The store is healthy again only
-// when both writes succeeded; marked by either alone, health would flap
-// between the flusher and the loop while one of them still fails.
+// then the exec flush, then the snapshot save. The store is healthy again only
+// when both writes succeeded in this attempt; marked by either alone, health
+// would flap between the flusher and the loop while one of them still fails.
 //
-// All of it under saveMu, the healthy mark included. A request whose change
-// is in memory but not in this copy reaches saveMu only after the mark, so its
-// own save is a real write, not a refusal the loop has already stopped
-// retrying for.
+// The exec flush runs first and OUTSIDE saveMu: a request's save waits for
+// saveMu, and with a locked database every write here can take the whole busy
+// timeout, so holding saveMu across both made "a request's save fails at once"
+// a wait of two timeouts. The snapshot save and the healthy mark are under
+// saveMu together. A request whose change is in memory but not in this copy
+// reaches saveMu only after the mark, so its own save is a real write, not a
+// refusal the loop has already stopped retrying for.
 func (srv *Server) recoverStore() error {
-	srv.saveMu.Lock()
-	defer srv.saveMu.Unlock()
 	// Before each retry: a connection opened while the file could not be
 	// written stays read-only for its whole life (store.SQLite.ResetWriter).
 	srv.db.ResetWriter()
-	if err := srv.saveLocked(nil, nil); err != nil {
+	if err := srv.flushExecUsage(); err != nil {
 		return err
 	}
-	if err := srv.flushExecUsage(); err != nil {
+	srv.saveMu.Lock()
+	defer srv.saveMu.Unlock()
+	if err := srv.saveLocked(nil, nil); err != nil {
 		return err
 	}
 	srv.storeSaved()
@@ -247,10 +283,12 @@ func (srv *Server) StopBackground() {
 //     being undone.
 //   - While the store is ALREADY failing it does not ask the database (P16):
 //     mutate and undo run as for a failed write and errStoreFailing is
-//     returned at once. Each save would otherwise wait out its own busy
-//     timeout in turn, and a dozen changes in flight at the onset of a lock
-//     outlast the server's WriteTimeout. The recovery loop is the one that
-//     retries.
+//     returned at once — "at once" meaning as soon as it holds saveMu, which
+//     is after at most one snapshot attempt (the save ahead of it, or the
+//     recovery loop's, which holds saveMu for its snapshot write only). Each
+//     save would otherwise wait out its own busy timeout in turn, and a dozen
+//     changes in flight at the onset of a lock outlast the server's
+//     WriteTimeout. The recovery loop is the one that retries.
 //
 // mutate runs with the state lock held (it uses the *Locked state methods);
 // undo takes the state lock itself.
@@ -385,7 +423,7 @@ func appendBounded(q *execUsageQueue, dst []store.UsageEvent, rows ...store.Usag
 	if over := len(dst) - maxExecUsageQueue; over > 0 {
 		dst = dst[over:]
 		q.dropped += uint64(over)
-		usageWriteFailures.Add(uint64(over))
+		usageRowsDropped.Add(uint64(over))
 	}
 	return dst
 }

@@ -16,6 +16,7 @@ import (
 
 	"github.com/alpham/infra-saas/felucca/internal/config"
 	"github.com/alpham/infra-saas/felucca/internal/model"
+	"github.com/alpham/infra-saas/felucca/internal/server"
 	"github.com/alpham/infra-saas/felucca/internal/state"
 	"github.com/alpham/infra-saas/felucca/internal/store"
 )
@@ -65,6 +66,13 @@ func (u *unwritable) saveCount() int {
 	return u.saves
 }
 
+// stopAndWait ends a server's recovery loop and waits for its background
+// work, so none of it writes the database after the test's TempDir is gone.
+func stopAndWait(srv *server.Server) {
+	srv.StopBackground()
+	srv.WaitBackground()
+}
+
 func bootFixture(t *testing.T) (*config.Config, *store.SQLite) {
 	t.Helper()
 	tmp := t.TempDir()
@@ -105,7 +113,7 @@ func TestBootWithAnUnwritableStoreStartsFailing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("boot with an unwritable store: %v — it must start, failing", err)
 	}
-	t.Cleanup(srv.StopBackground)
+	t.Cleanup(func() { stopAndWait(srv) })
 	if srv.StoreHealthy() {
 		t.Fatal("store reported healthy after a failed start-up save")
 	}
@@ -163,7 +171,7 @@ func TestBootRenamesTheLegacyFileOnlyAfterItsImportIsSaved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("boot: %v", err)
 	}
-	t.Cleanup(srv.StopBackground)
+	t.Cleanup(func() { stopAndWait(srv) })
 	if _, err := os.Stat(cfg.StatePath); err != nil {
 		t.Fatalf("legacy file renamed although its import was not saved: %v", err)
 	}
@@ -192,7 +200,7 @@ func TestBootRenamesTheLegacyFileOnlyAfterItsImportIsSaved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("boot: %v", err)
 	}
-	t.Cleanup(srv2.StopBackground)
+	t.Cleanup(func() { stopAndWait(srv2) })
 	if _, err := os.Stat(cfg2.StatePath + ".imported"); err != nil {
 		t.Errorf("legacy file not renamed after a saved import: %v", err)
 	}
@@ -217,7 +225,7 @@ func TestBootDoesNotRewriteTheSnapshotOfALoadedDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("boot: %v", err)
 	}
-	t.Cleanup(srv.StopBackground)
+	t.Cleanup(func() { stopAndWait(srv) })
 	if !srv.StoreHealthy() {
 		t.Error("store failing after a successful start-up write")
 	}

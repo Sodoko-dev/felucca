@@ -315,7 +315,7 @@ func TestSplitGuestPortIsReportedAtStartUp(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Close() })
 	srv := New(&config.Config{Token: "admin-tok"}, st, db)
-	t.Cleanup(srv.StopBackground)
+	t.Cleanup(srv.stopAndWait)
 	l := logs()
 	if !strings.Contains(l, "level=ERROR") || !strings.Contains(l, "sandbox="+sb.ID) || !strings.Contains(l, "guest_port=8080") ||
 		!strings.Contains(l, "node_ports=20001,20002") || !strings.Contains(l, "repairs it") {

@@ -46,9 +46,16 @@ func TestIdenticalExposeBehindAFailedSaveIsRefused(t *testing.T) {
 	first := make(chan *httptest.ResponseRecorder, 1)
 	go func() { first <- p.do("POST", "/api/v1/sandboxes/"+id+"/expose", body) }()
 	<-held
+	// The first holds exposeMu, its save held in the store. The second is
+	// handed to the handler past the router's gate, as a request admitted while
+	// the store was healthy: the only refusal left is the check under
+	// exposeMu, and it runs after the first's failure whatever the timing.
 	second := make(chan *httptest.ResponseRecorder, 1)
-	go func() { second <- p.do("POST", "/api/v1/sandboxes/"+id+"/expose", body) }()
-	time.Sleep(100 * time.Millisecond) // past the gate, waiting on exposeMu
+	go func() {
+		w := httptest.NewRecorder()
+		p.srv.exposeCommon(w, httptest.NewRequest("POST", "/api/v1/sandboxes/"+id+"/expose", nil), id, adminTenant, "web", 8080, false)
+		second <- w
+	}()
 	close(release)
 	wantApplied(t, <-first, "first expose")
 	wantStoreUnavailable(t, <-second, "identical expose that waited behind the failed one")
@@ -72,9 +79,13 @@ func TestIdenticalUnexposeBehindAFailedSaveIsRefused(t *testing.T) {
 	first := make(chan *httptest.ResponseRecorder, 1)
 	go func() { first <- p.do("DELETE", "/api/v1/sandboxes/"+id+"/expose/web", "") }()
 	<-held
+	// Past the router's gate, as in the expose test above.
 	second := make(chan *httptest.ResponseRecorder, 1)
-	go func() { second <- p.do("DELETE", "/api/v1/sandboxes/"+id+"/expose/web", "") }()
-	time.Sleep(100 * time.Millisecond)
+	go func() {
+		w := httptest.NewRecorder()
+		p.srv.unexposeSandbox(w, httptest.NewRequest("DELETE", "/api/v1/sandboxes/"+id+"/expose/web", nil), id, "web", adminTenant)
+		second <- w
+	}()
 	close(release)
 	wantApplied(t, <-first, "first unexpose")
 	wantStoreUnavailable(t, <-second, "identical unexpose that waited behind the failed one")
@@ -381,17 +392,34 @@ func TestRequestSaveWhileFailingDoesNotAskTheDatabase(t *testing.T) {
 
 // ---- P5' (D-15a): the clean-up after a record its owner moved on ----
 
-// The create's last save failed and its caller was told so; meanwhile its
-// owner started the record (answered 200). When the worker delete succeeds, the
-// record is set back to error with a "stopped" event, not left running with
-// no VM.
+// The real sequence: the create's last save fails, its undo sets the record
+// to error and its caller is told the create failed; the clean-up's worker
+// delete is slow; meanwhile the store recovers and the owner starts the record
+// (answered 200). When the worker delete then succeeds, the record is set back
+// to error with a "stopped" event, not left running with no VM.
 func TestCleanupSetsARecordMovedOnBackToError(t *testing.T) {
 	p := newPersistFixture(t)
-	id := p.create(t, `{"name":"a"}`)
+	p.fw.set(func(f *fsWorker) { f.deleteDelay = 500 * time.Millisecond })
+	p.fs.failAfter(1, 1) // the create's first save passes, its last fails
 	n := p.fw.count()
-	p.srv.removeUnsavedVM(p.srv.st.Nodes[0].Addr, id, "req-test")
-	if calls := p.fw.since(n); len(calls) != 1 || calls[0] != "DELETE /v1/vms/"+id {
-		t.Fatalf("worker calls: %v, want the delete", calls)
+	wantStoreUnavailable(t, p.do("POST", "/api/v1/sandboxes", `{"name":"a"}`), "create whose last save failed")
+	var id string
+	for _, sb := range p.srv.st.Snapshot().Sandboxes {
+		id = sb.ID
+		if sb.State != model.StateError {
+			t.Fatalf("record after the undo: %s, want error", sb.State)
+		}
+	}
+	waitFor(t, "the recovery loop", 3*time.Second, func() bool { return !p.srv.storeFailing() })
+	if w := p.do("POST", "/api/v1/sandboxes/"+id+"/start", ""); w.Code != 200 {
+		t.Fatalf("the owner's start: %d %s", w.Code, w.Body)
+	}
+	if sb := p.mem(id); sb.State != model.StateRunning {
+		t.Fatalf("record after the start: %s, want running", sb.State)
+	}
+	p.srv.WaitBackground() // the clean-up's delete, then its save
+	if calls := p.fw.since(n); !hasPrefixCall(calls, "DELETE /v1/vms/"+id) {
+		t.Fatalf("worker calls: %v, want the clean-up's delete", calls)
 	}
 	sb := p.mem(id)
 	if sb == nil || sb.State != model.StateError {
@@ -400,8 +428,8 @@ func TestCleanupSetsARecordMovedOnBackToError(t *testing.T) {
 	if saved := p.savedSandbox(t, id); saved == nil || saved.State != model.StateError {
 		t.Errorf("database after the clean-up: %+v, want error", saved)
 	}
-	if evs := p.events(t, id); !equalStrings(evs, []string{"created", "stopped"}) {
-		t.Errorf("events: %v, want [created stopped]", evs)
+	if evs := p.events(t, id); !equalStrings(evs, []string{"created", "stopped", "started", "stopped"}) {
+		t.Errorf("events: %v, want [created stopped started stopped]", evs)
 	}
 }
 
@@ -485,7 +513,7 @@ func TestRecoveryLoopReopensAWriterThatWasOpenedReadOnly(t *testing.T) {
 	cfg := &config.Config{Token: "admin-tok", UIDir: tmp, StatePath: filepath.Join(tmp, "state.json"), DBPath: path}
 	srv := New(cfg, state.New(), db)
 	srv.retryInterval = 20 * time.Millisecond
-	t.Cleanup(srv.StopBackground)
+	t.Cleanup(srv.stopAndWait)
 	srv.st.RegisterNode("worker-1", "http://127.0.0.1:1", 4, 8192, time.Now().Unix())
 	if err := srv.saveState(); err == nil {
 		t.Fatal("save to a read-only database succeeded: the test did not make it read-only")
@@ -494,6 +522,13 @@ func TestRecoveryLoopReopensAWriterThatWasOpenedReadOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "the recovery loop to write once the file is writable", 3*time.Second, func() bool { return !srv.storeFailing() })
+	srv.stopAndWait()
+	// The legacy credential seed failed in New (the file was read-only) and
+	// ran again at the recovery: its once-per-database marker is set, so a
+	// later seed grandfathers nobody.
+	if n, err := db.SeedLegacyNodeCreds([]string{"198.51.100.7:9090"}, time.Now().Unix()); err != nil || n != 0 {
+		t.Errorf("seed after the recovery: %d rows (err %v), want 0 — the seed was not run again when the store recovered", n, err)
+	}
 	got := state.New()
 	if err := db.LoadInto(got); err != nil || len(got.Nodes) != 1 {
 		t.Errorf("database after recovery: %d nodes, err %v; want the registered node", len(got.Nodes), err)

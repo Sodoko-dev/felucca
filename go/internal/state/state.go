@@ -65,12 +65,16 @@ var (
 
 // The quarantine runs on the wall clock, which can step.
 //
-//   - Backward: an entry whose release time is in the future is set to "now"
-//     in the working set, under the lock, the first time it is looked at
-//     (QuarantineLocked, SnapshotLocked). Its quarantine then ends
-//     PortQuarantine after the step, not PortQuarantine after the clock has
-//     caught up with the old release time. QuarantineExpiresIn clamps as well,
-//     for an entry seen before that.
+//   - Backward: an entry released "in the future" keeps its release time;
+//     only the REMAINING time is clamped to PortQuarantine (QuarantineExpiresIn),
+//     so a Retry-After never exceeds the quarantine. Its quarantine therefore
+//     lasts until the clock has caught up with the release time again, longer
+//     by at most the step — the safe direction: a port held too long costs a
+//     port, a port handed out too early routes another sandbox's hostname.
+//     Rewriting the release time to "now" instead was permanent and saved: a
+//     backward step later corrected forward left the entry older by the step,
+//     and with a step of PortQuarantine or more it expired the moment the
+//     clock was right again while gateways could still route the old name.
 //   - Forward: shortens every quarantine; nothing can tell that from time
 //     passing. Entries are dropped for good only once PortQuarantine + Margin
 //     old, so a step within the margin that is corrected before then loses
@@ -754,21 +758,9 @@ func (s *State) releaseLocked(sb *model.Sandbox, e model.Expose) {
 	})
 }
 
-// clampFutureLocked sets the release time of every entry released "in the
-// future" (the clock stepped back) to now; see the clock note above
-// QuarantineExpiresIn. Caller holds the lock.
-func (s *State) clampFutureLocked(now int64) {
-	for i := range s.Quarantine {
-		if s.Quarantine[i].ReleasedAt > now {
-			s.Quarantine[i].ReleasedAt = now
-		}
-	}
-}
-
 // QuarantineLocked returns copies of the entries still in quarantine at now.
 // Caller holds the lock.
 func (s *State) QuarantineLocked(now int64) []model.ReleasedPort {
-	s.clampFutureLocked(now)
 	var out []model.ReleasedPort
 	for _, q := range s.Quarantine {
 		if QuarantineActive(q, now) {
@@ -846,7 +838,6 @@ type Snapshot struct {
 // corrected (see QuarantineExpiresIn). Caller must hold the lock.
 func (s *State) SnapshotLocked() *Snapshot {
 	now := s.Now()
-	s.clampFutureLocked(now)
 	kept := s.Quarantine[:0]
 	for _, q := range s.Quarantine {
 		if now-q.ReleasedAt < keepS {

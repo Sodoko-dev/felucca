@@ -88,7 +88,7 @@ func newRefusalFixture(t *testing.T) *refusalFixture {
 	t.Cleanup(func() { sqlite.Close() })
 	fs := &faultStore{Store: sqlite}
 	srv := New(cfg, state.New(), fs)
-	t.Cleanup(srv.StopBackground)
+	t.Cleanup(srv.stopAndWait)
 	rw := &refusingWorker{}
 	ts := httptest.NewServer(rw.handler())
 	t.Cleanup(ts.Close)

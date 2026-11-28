@@ -273,7 +273,7 @@ func TestDoubleBookedRowsAreReportedAtStartUp(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Close() })
 	srv := New(&config.Config{Token: "admin-tok"}, st, db)
-	t.Cleanup(srv.StopBackground)
+	t.Cleanup(srv.stopAndWait)
 	l := logs()
 	if !strings.Contains(l, "level=ERROR") || !strings.Contains(l, "node_port=20001") ||
 		!strings.Contains(l, a.ID) || !strings.Contains(l, b.ID) || !strings.Contains(l, "delete or unexpose") {

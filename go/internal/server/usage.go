@@ -113,6 +113,7 @@ func aggregateUsage(events []store.UsageEvent, tenantID string, from, to, now in
 func (srv *Server) tenantUsage(w http.ResponseWriter, r *http.Request, tenantID string) {
 	t, err := srv.db.GetTenant(tenantID)
 	if err != nil {
+		storeReadFailed()
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
@@ -146,6 +147,7 @@ func (srv *Server) tenantUsage(w http.ResponseWriter, r *http.Request, tenantID 
 
 	events, err := srv.db.ListUsage(tenantID, from, to)
 	if err != nil {
+		storeReadFailed()
 		slog.Error("usage", "tenant", tenantID, "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return

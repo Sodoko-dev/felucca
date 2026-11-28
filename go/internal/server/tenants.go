@@ -119,6 +119,7 @@ func (srv *Server) createTenant(w http.ResponseWriter, r *http.Request) {
 func (srv *Server) listTenants(w http.ResponseWriter) {
 	ts, err := srv.db.ListTenants()
 	if err != nil {
+		storeReadFailed()
 		slog.Error("list tenants", "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
@@ -149,8 +150,11 @@ func (srv *Server) createTenantKey(w http.ResponseWriter, r *http.Request, tenan
 	}
 	t, err := srv.db.GetTenant(tenantID)
 	if err != nil {
+		storeReadFailed()
 		slog.Error("get tenant", "tenant", tenantID, "err", err)
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
+		// A read error before a write, as createTemplate answers it: the store
+		// is unavailable, retry (the list GETs keep 500).
+		refuseStoreUnavailable(w)
 		return
 	}
 	if t == nil {
@@ -183,6 +187,7 @@ func (srv *Server) createTenantKey(w http.ResponseWriter, r *http.Request, tenan
 func (srv *Server) listTenantKeys(w http.ResponseWriter, tenantID string) {
 	t, err := srv.db.GetTenant(tenantID)
 	if err != nil {
+		storeReadFailed()
 		slog.Error("get tenant", "tenant", tenantID, "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
@@ -193,6 +198,7 @@ func (srv *Server) listTenantKeys(w http.ResponseWriter, tenantID string) {
 	}
 	keys, err := srv.db.ListKeys(tenantID)
 	if err != nil {
+		storeReadFailed()
 		slog.Error("list keys", "tenant", tenantID, "err", err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
@@ -242,6 +248,7 @@ func (srv *Server) revokeTenantKey(w http.ResponseWriter, keyID string) {
 func (srv *Server) quotaRow(tenantID string) (*store.Tenant, error) {
 	t, err := srv.db.GetTenant(tenantID)
 	if err != nil {
+		storeReadFailed()
 		slog.Error("quota lookup", "tenant", tenantID, "err", err)
 		return nil, err
 	}

@@ -45,6 +45,10 @@ type faultStore struct {
 	tenantErr    bool
 	batchErr     bool
 	createKeyErr bool
+	// batchHold, when set, makes the next exec batch write wait until it is
+	// closed; batchHeld closes once it waits.
+	batchHold    chan struct{}
+	batchHeld    chan struct{}
 	templateRace bool
 	saveCalls    int
 }
@@ -148,8 +152,13 @@ func (f *faultStore) GetTenant(id string) (*store.Tenant, error) {
 
 func (f *faultStore) AppendUsageBatch(events []store.UsageEvent) error {
 	f.mu.Lock()
-	fail := f.batchErr
+	fail, hold, held := f.batchErr, f.batchHold, f.batchHeld
+	f.batchHold, f.batchHeld = nil, nil
 	f.mu.Unlock()
+	if hold != nil {
+		close(held)
+		<-hold
+	}
 	if fail {
 		return errInjected
 	}
@@ -175,7 +184,11 @@ type fsWorker struct {
 	failFork    bool
 	forkBusy    bool // the fork answers 409 {"error":"busy"}
 	deleteDelay time.Duration
-	port        int
+	// forkRefusal / deleteRefusal, when not "", are the body of a 409 the
+	// fork / the VM delete answers.
+	forkRefusal   string
+	deleteRefusal string
+	port          int
 	// onCreate, when set, runs once before a create is answered.
 	onCreate func()
 }
@@ -186,6 +199,7 @@ func (f *fsWorker) handler() http.HandlerFunc {
 		f.mu.Lock()
 		f.calls = append(f.calls, r.Method+" "+p)
 		failCreate, failFork, forkBusy, delay := f.failCreate, f.failFork, f.forkBusy, f.deleteDelay
+		forkRefusal, deleteRefusal := f.forkRefusal, f.deleteRefusal
 		onCreate := f.onCreate
 		if r.Method == http.MethodPost && p == "/v1/vms" {
 			f.onCreate = nil
@@ -212,6 +226,11 @@ func (f *fsWorker) handler() http.HandlerFunc {
 				_, _ = w.Write([]byte(`{"error":"busy"}`))
 				return
 			}
+			if forkRefusal != "" {
+				w.WriteHeader(409)
+				_, _ = w.Write([]byte(forkRefusal))
+				return
+			}
 			if failFork {
 				w.WriteHeader(500)
 				return
@@ -223,6 +242,11 @@ func (f *fsWorker) handler() http.HandlerFunc {
 			ok(`{"exit_code":0,"stdout":"","stderr":""}`)
 		case r.Method == http.MethodDelete && !strings.HasSuffix(p, "/expose"):
 			time.Sleep(delay)
+			if deleteRefusal != "" {
+				w.WriteHeader(409)
+				_, _ = w.Write([]byte(deleteRefusal))
+				return
+			}
 			ok(`{"ok":true}`)
 		default:
 			ok(`{"ok":true,"wake_ms":7}`)
@@ -255,6 +279,28 @@ type persistFixture struct {
 	h      http.Handler
 }
 
+// stopAndWait ends the recovery loop and waits for the background work (the
+// loop, clean-ups, registration saves), so none of it writes the database
+// after the test's TempDir is removed.
+func (srv *Server) stopAndWait() {
+	srv.StopBackground()
+	srv.WaitBackground()
+}
+
+// noTestNetDial makes srv's agent hook refuse 203.0.113.9 (TEST-NET-3) at
+// once. Registrations in these tests use that address, and each pushes pool
+// specs to it: a real dial waits out the client's 30 s timeout, and the
+// sockets outlive the test.
+func noTestNetDial(srv *Server) {
+	agentCall := srv.agentCall
+	srv.agentCall = func(host string, port uint16, method, path string, body []byte, reqID string) (*agentclient.Response, error) {
+		if host == "203.0.113.9" || host == "203.0.113.10" {
+			return nil, errors.New("test: no worker at " + host)
+		}
+		return agentCall(host, port, method, path, body, reqID)
+	}
+}
+
 func newPersistFixture(t *testing.T) *persistFixture {
 	t.Helper()
 	tmp := t.TempDir()
@@ -274,7 +320,8 @@ func newPersistFixture(t *testing.T) *persistFixture {
 	// The recovery loop at test speed (the 2 s of production would make every
 	// recovery test wait for it).
 	srv.retryInterval = 20 * time.Millisecond
-	t.Cleanup(srv.StopBackground)
+	noTestNetDial(srv)
+	t.Cleanup(srv.stopAndWait)
 	fw := &fsWorker{}
 	ts := httptest.NewServer(fw.handler())
 	t.Cleanup(ts.Close)
@@ -800,7 +847,8 @@ func TestCreateWhoseLastSaveFailsLeavesNoGhost(t *testing.T) {
 	calls := p.fw.since(n)
 	id := strings.TrimPrefix(calls[len(calls)-1], "DELETE /v1/vms/")
 	waitFor(t, "the record to be removed", 3*time.Second, func() bool { return p.mem(id) == nil })
-	// The removal's own save healed the store.
+	// The recovery loop healed the store; the removal's save is a real write
+	// once it has (while failing it is refused at once).
 	waitFor(t, "the removal to be saved", 3*time.Second, func() bool { return p.savedSandbox(t, id) == nil && !p.srv.storeFailing() })
 
 	open := false
@@ -955,16 +1003,8 @@ func TestSavesRaceUnexposeHeartbeatAndRegistration(t *testing.T) {
 	p := newPersistFixture(t)
 	id := p.create(t, `{"name":"a"}`)
 	nodeID := p.srv.st.Nodes[0].ID
-	// Each registration below pushes pool specs to its address. 203.0.113.9 is
-	// TEST-NET-3: a real dial there waits out the client's 30 s timeout, one
-	// per iteration, and the sockets outlive the test. Refuse it at once.
-	agentCall := p.srv.agentCall
-	p.srv.agentCall = func(host string, port uint16, method, path string, body []byte, reqID string) (*agentclient.Response, error) {
-		if host == "203.0.113.9" {
-			return nil, errors.New("test: no worker at 203.0.113.9")
-		}
-		return agentCall(host, port, method, path, body, reqID)
-	}
+	// Each registration below pushes pool specs to 203.0.113.9; the fixture
+	// refuses that dial at once (noTestNetDial).
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	loop := func(fn func(i int)) {
@@ -1147,7 +1187,7 @@ func TestRecoveryLoopSurvivesAPanickingSave(t *testing.T) {
 	ps := &panicStore{Store: sqlite}
 	srv := newJoinServerStore(t, ps, tmp)
 	srv.retryInterval = 20 * time.Millisecond
-	t.Cleanup(srv.StopBackground)
+	t.Cleanup(srv.stopAndWait)
 	ps.armSave(2) // the first save and the first retry panic
 	if err := srv.saveState(); err == nil {
 		t.Fatal("a panicking save reported success")
@@ -1361,12 +1401,17 @@ func TestTenantReadErrorsAreNotNoLimit(t *testing.T) {
 
 func TestExecUsageQueueFlushesBoundsAndCountsDrops(t *testing.T) {
 	p := newPersistFixture(t)
-	before := usageWriteFailures.Load()
+	before, droppedBefore := usageWriteFailures.Load(), usageRowsDropped.Load()
 	for i := 0; i < maxExecUsageQueue+5; i++ {
 		p.srv.queueExecUsage(store.UsageEvent{SandboxID: "sb-x", Event: "exec", TS: int64(i + 1)})
 	}
-	if got := usageWriteFailures.Load() - before; got != 5 {
+	// Dropped rows are lost, and counted apart from the failed attempts
+	// (GF-8): an alert must tell "retrying" from "lost".
+	if got := usageRowsDropped.Load() - droppedBefore; got != 5 {
 		t.Errorf("dropped rows counted: %d, want 5", got)
+	}
+	if got := usageWriteFailures.Load() - before; got != 0 {
+		t.Errorf("dropped rows counted as failed write attempts: %d, want 0", got)
 	}
 
 	// A failed flush keeps the rows and counts ONE failure per attempt, not
@@ -1378,8 +1423,8 @@ func TestExecUsageQueueFlushesBoundsAndCountsDrops(t *testing.T) {
 		if err := p.srv.flushExecUsage(); err == nil {
 			t.Fatal("flush against a failing store reported success")
 		}
-		if got := usageWriteFailures.Load() - before; got != uint64(5+i) {
-			t.Errorf("failures counted after %d failed flushes of %d rows: %d, want %d", i, maxExecUsageQueue, got, 5+i)
+		if got := usageWriteFailures.Load() - before; got != uint64(i) {
+			t.Errorf("failures counted after %d failed flushes of %d rows: %d, want %d", i, maxExecUsageQueue, got, i)
 		}
 	}
 	p.fs.mu.Lock()

@@ -1222,7 +1222,10 @@ function renderSandboxRow(sb) {
   /* v3.1: start is a cold boot, only valid from stopped/error — a paused
      sandbox is resumed, never started (the agent 409s otherwise). */
   const canStart  = sb.state === 'stopped' || sb.state === 'error';
-  const canStop   = sb.state === 'running' || sb.state === 'creating';
+  /* A creating record refuses every lifecycle verb (409) until its create
+     ends; one left creating by a control plane that stopped mid-create comes
+     back as error after the restart, where start and delete settle it. */
+  const canStop   = sb.state === 'running';
   const canPause  = sb.state === 'running';
   const canResume = sb.state === 'paused';
   /* v2: sleep available when running or paused; wake when sleeping */

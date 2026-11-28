@@ -6,9 +6,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"net"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/alpham/infra-saas/felucca/internal/ingress"
@@ -34,9 +38,16 @@ const (
 	// time per pass — once a pass's drops have spent it, the rest wait for
 	// the next pass. A pass's drops therefore hold exposeMu for at most
 	// dropPassBudget + dropCallTimeout, well inside lifecycleInterval.
-	dropCallTimeout = 5 * time.Second
-	dropPassBudget  = 5 * time.Second
+	dropPassBudget = 5 * time.Second
 )
+
+// dropCallTimeout is the limit of one drop's worker call (see dropPassBudget).
+// A variable for tests.
+var dropCallTimeout = 5 * time.Second
+
+// dropKey names a dynamic expose whose drop got no answer in time
+// (srv.unansweredDrops).
+type dropKey struct{ sandbox, name string }
 
 // dropBudget is the worker time one pass's drops may still spend.
 type dropBudget struct{ left time.Duration }
@@ -138,6 +149,7 @@ func (srv *Server) lifecycleSweep(now int64) {
 	for _, id := range tenantIDs {
 		t, err := srv.db.GetTenant(id)
 		if err != nil {
+			storeReadFailed()
 			slog.Warn("lifecycle: tenant policy unreadable, skipping its sandboxes this sweep", "tenant", id, "err", err)
 			unreadable[id] = true
 			continue
@@ -247,6 +259,9 @@ func (srv *Server) lifecycleSweep(now int64) {
 		}
 	}
 	budget := &dropBudget{left: dropPassBudget}
+	// First the drops that got no answer in an earlier pass, whatever the
+	// sandbox's state now (see repeatUnansweredDrops).
+	srv.repeatUnansweredDrops(now, unreachable, budget)
 	for i := range acts {
 		if a := acts[(i+off)%len(acts)]; a.drop {
 			srv.dropDynamicExposes(a.id, a.tenant, now, unreachable, budget)
@@ -588,10 +603,14 @@ func (srv *Server) dropExpose(id string, e model.Expose, reqID string, now int64
 		err := srv.agentUnexposeWithin(agentAddr, id, row.GuestPort, reqID, dropCallTimeout)
 		budget.left -= time.Since(start)
 		if err != nil {
+			if noAnswerInTime(err) {
+				srv.rememberUnansweredDrop(id, row)
+			}
 			slog.Warn("lifecycle: drop expose failed", "sandbox", id, "expose", e.Name, "err", err)
 			return false, err
 		}
 	}
+	delete(srv.unansweredDrops, dropKey{id, row.Name})
 	woke := false
 	func() {
 		srv.st.Lock()
@@ -611,6 +630,134 @@ func (srv *Server) dropExpose(id string, e model.Expose, reqID string, now int64
 			"sandbox", id, "expose", e.Name, "request_id", reqID)
 	}
 	return true, nil
+}
+
+// noAnswerInTime reports whether a worker call ended at its time limit: the
+// request may have reached the worker, which carries an unexpose out on its
+// own task whether or not feluccad still waits for the answer.
+func noAnswerInTime(err error) bool {
+	var ne net.Error
+	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout())
+}
+
+// rememberUnansweredDrop records a drop whose worker call got no answer in
+// time. The row is kept (the rule may still be live), but the worker may have
+// removed the rule: if the sandbox then woke, its dynamic hostname would be
+// routed to a dead port until someone deleted that expose. The drop is
+// repeated on the next passes until the worker answers
+// (repeatUnansweredDrops). Caller holds exposeMu.
+func (srv *Server) rememberUnansweredDrop(id string, row model.Expose) {
+	if srv.unansweredDrops == nil {
+		srv.unansweredDrops = map[dropKey]uint16{}
+	}
+	srv.unansweredDrops[dropKey{id, row.Name}] = row.NodePort
+}
+
+// repeatUnansweredDrops repeats, once per pass, every drop that got no answer
+// in an earlier pass, whether or not the sandbox has woken since: unexpose
+// again, then remove the row and quarantine its port as a drop does. An entry
+// is forgotten when the worker answers — a refusal too, since then the rule is
+// still live and the row matches it — or when its sandbox or row is gone (the
+// row bounds the entries). It keeps to the pass's budget and unreachable set,
+// and dials only a ready node, like the drop.
+func (srv *Server) repeatUnansweredDrops(now int64, unreachable map[nodeTenant]bool, budget *dropBudget) {
+	var keys []dropKey
+	func() {
+		srv.exposeMu.Lock()
+		defer srv.exposeMu.Unlock()
+		for k := range srv.unansweredDrops {
+			keys = append(keys, k)
+		}
+	}()
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].sandbox != keys[j].sandbox {
+			return keys[i].sandbox < keys[j].sandbox
+		}
+		return keys[i].name < keys[j].name
+	})
+	removed := 0
+	for _, k := range keys {
+		if srv.storeFailing() || budget.left <= 0 {
+			break
+		}
+		if srv.repeatDrop(k, now, unreachable, budget) {
+			removed++
+		}
+	}
+	if removed == 0 {
+		return
+	}
+	if err := srv.saveState(); err != nil {
+		slog.Error("lifecycle: repeated drops of dynamic exposes not saved", "count", removed, "err", err)
+	}
+	slog.Info("lifecycle: repeated the drops of dynamic exposes that got no answer in time", "count", removed)
+}
+
+// repeatDrop is one entry of repeatUnansweredDrops; true when the row went.
+func (srv *Server) repeatDrop(k dropKey, now int64, unreachable map[nodeTenant]bool, budget *dropBudget) bool {
+	srv.exposeMu.Lock()
+	defer srv.exposeMu.Unlock()
+
+	var agentAddr, tenant string
+	var row model.Expose
+	shared, gone, dialable := false, false, true
+	func() {
+		srv.st.Lock()
+		defer srv.st.Unlock()
+		sb := srv.st.FindSandbox(k.sandbox)
+		if sb == nil {
+			gone = true
+			return
+		}
+		found := false
+		for _, o := range sb.Exposes {
+			if o.Name == k.name && o.NodePort == srv.unansweredDrops[k] {
+				row, found = o, true
+				break
+			}
+		}
+		if !found {
+			gone = true
+			return
+		}
+		tenant = sb.TenantID
+		dialable = srv.dropDialableLocked(sb, now)
+		if sb.NodeID != nil {
+			if node := srv.st.FindNode(*sb.NodeID); node != nil {
+				agentAddr = node.Addr
+			}
+		}
+		shared = state.GuestPortShared(sb, row)
+	}()
+	if gone {
+		delete(srv.unansweredDrops, k)
+		return false
+	}
+	if !dialable || (agentAddr != "" && unreachable[nodeTenant{agentAddr, tenant}]) {
+		return false // kept for a later pass
+	}
+	reqID := newTraceID("sweep")
+	if agentAddr != "" && !shared {
+		start := time.Now()
+		err := srv.agentUnexposeWithin(agentAddr, k.sandbox, row.GuestPort, reqID, dropCallTimeout)
+		budget.left -= time.Since(start)
+		if err != nil {
+			nodeUnreachable(unreachable, agentAddr, tenant, transportErr(err))
+			if !noAnswerInTime(err) && transportErr(err) == nil {
+				// Answered, refusing: the rule is live and the row matches it.
+				delete(srv.unansweredDrops, k)
+			}
+			slog.Warn("lifecycle: repeated drop of a dynamic expose failed", "sandbox", k.sandbox, "expose", k.name, "request_id", reqID, "err", err)
+			return false
+		}
+	}
+	func() {
+		srv.st.Lock()
+		defer srv.st.Unlock()
+		srv.st.RemoveExposeLocked(k.sandbox, k.name)
+	}()
+	delete(srv.unansweredDrops, k)
+	return true
 }
 
 // agentAddrAndState returns the sandbox's current state and its node's agent

@@ -236,7 +236,7 @@ func newQFixture(t *testing.T, honor bool) *qFixture {
 	}
 	fs := &faultStore{Store: sqlite}
 	srv := New(cfg, state.New(), fs)
-	t.Cleanup(srv.StopBackground)
+	t.Cleanup(srv.stopAndWait)
 	now := &atomic.Int64{}
 	now.Store(time.Now().Unix())
 	srv.st.Clock = now.Load
@@ -467,7 +467,7 @@ func TestQuarantineIsSavedWithTheRemovalAndSurvivesARestart(t *testing.T) {
 
 	// A restart: a new server on what the database holds.
 	srv2 := New(fx.cfg, saved, fx.sqlite)
-	t.Cleanup(srv2.StopBackground)
+	t.Cleanup(srv2.stopAndWait)
 	b := func() string {
 		srv2.st.Lock()
 		defer srv2.st.Unlock()

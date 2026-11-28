@@ -1806,7 +1806,7 @@ func TestAPanicUnderTheStateLockDoesNotDeadlockTheControlPlane(t *testing.T) {
 	t.Cleanup(func() { sqlite.Close() })
 	ps := &panicStore{Store: sqlite}
 	srv := newJoinServerStore(t, ps, tmp)
-	t.Cleanup(srv.StopBackground)
+	t.Cleanup(srv.stopAndWait)
 	h := srv.Handler()
 
 	// A running sandbox on an agent that says yes to everything, so the request
