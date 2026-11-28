@@ -755,28 +755,50 @@ fn ingress_rule_parts(node_port: u16, guest_ip: &str, guest_port: u16) -> Option
     Some((node_port.to_string(), format!("{}:{}", ip, guest_port)))
 }
 
-/// Rebuild the ingress DNAT ruleset from the full member list. Idempotent
-/// (flush + repopulate), mirroring `rebuild_isolation`.
+/// Render the whole ingress DNAT chain as one `nft -f -` file: creation, the
+/// flush and one rule per member in a single batch.
 ///
-/// `members` is `(node_port, guest_ip, guest_port)` for every expose of every
-/// VM that currently holds an IP. node_ports come from our own 20000-range
-/// allocator and guest IPs from ipalloc — never user strings.
-pub fn rebuild_ingress(members: &[(u16, String, u16)]) {
-    run(&["nft", "add", "table", "ip", "felucca"]);
-    run(&["nft", "add", "chain", "ip", "felucca", "ingress",
-          "{ type nat hook prerouting priority -100 ; }"]);
-    run(&["nft", "flush", "chain", "ip", "felucca", "ingress"]);
+/// It used to be a flush and then one `nft add rule` process per expose, with
+/// every result ignored: between the flush and the last add some node ports
+/// had no rule, and a rule that failed to load was simply missing while the
+/// expose that asked for it was answered with success. nft commits a file
+/// atomically, so the chain now goes from the old rules to the new ones in one
+/// step, or stays as it was. Pure for unit tests.
+fn ingress_ruleset(members: &[(u16, String, u16)]) -> String {
+    let mut s = String::new();
+    s.push_str("add table ip felucca\n");
+    s.push_str("add chain ip felucca ingress { type nat hook prerouting priority -100 ; }\n");
+    s.push_str("flush chain ip felucca ingress\n");
     for (node_port, guest_ip, guest_port) in members {
         match ingress_rule_parts(*node_port, guest_ip, *guest_port) {
-            Some((dport, target)) => {
-                run(&["nft", "add", "rule", "ip", "felucca", "ingress",
-                      "tcp", "dport", &dport, "dnat", "to", &target]);
-            }
+            Some((dport, target)) => s.push_str(&format!(
+                "add rule ip felucca ingress tcp dport {} dnat to {}\n",
+                dport, target
+            )),
             // Should be unreachable (IPs come from ipalloc); skipping is the
             // safe failure mode — never feed an unparsed string to nft.
             None => warn!(addr = %guest_ip, "ingress member with unparseable ip skipped"),
         }
     }
+    s
+}
+
+/// Rebuild the ingress DNAT ruleset from the full member list. Idempotent
+/// (flush + repopulate), applied as a single atomic nft transaction like
+/// `rebuild_isolation`.
+///
+/// `members` is `(node_port, guest_ip, guest_port)` for every expose of every
+/// VM that currently holds an IP. node_ports come from our own 20000-range
+/// allocator and guest IPs from ipalloc — never user strings.
+///
+/// Returns false when the transaction was rejected: the kernel then still has
+/// the chain as it was before this call.
+pub fn rebuild_ingress(members: &[(u16, String, u16)]) -> bool {
+    let ok = run_nft_file(&ingress_ruleset(members));
+    if !ok {
+        error!("the nft transaction for ingress DNAT was rejected — the node ports keep their previous rules");
+    }
+    ok
 }
 
 #[cfg(test)]
@@ -1106,6 +1128,65 @@ mod tests {
         assert!(ingress_rule_parts(20000, "evil.example.com", 80).is_none());
         assert!(ingress_rule_parts(20000, "", 80).is_none());
         assert!(ingress_rule_parts(20000, "fe80::1", 80).is_none());
+    }
+
+    #[test]
+    fn test_ingress_ruleset_with_no_members_is_one_transaction_that_empties_the_chain() {
+        // Was: `nft flush chain` and then one `nft add rule` process per
+        // expose, each result ignored. With nothing exposed the file must
+        // still create the chain and flush it, so stale rules go away.
+        assert_eq!(
+            ingress_ruleset(&[]),
+            "add table ip felucca\n\
+             add chain ip felucca ingress { type nat hook prerouting priority -100 ; }\n\
+             flush chain ip felucca ingress\n"
+        );
+    }
+
+    #[test]
+    fn test_ingress_ruleset_with_one_member() {
+        assert_eq!(
+            ingress_ruleset(&[(20000, "10.231.0.5".to_string(), 8069)]),
+            "add table ip felucca\n\
+             add chain ip felucca ingress { type nat hook prerouting priority -100 ; }\n\
+             flush chain ip felucca ingress\n\
+             add rule ip felucca ingress tcp dport 20000 dnat to 10.231.0.5:8069\n"
+        );
+    }
+
+    #[test]
+    fn test_ingress_ruleset_with_several_members_keeps_the_flush_inside_the_batch() {
+        let rs = ingress_ruleset(&[
+            (20000, "10.231.0.5".to_string(), 8069),
+            (24711, "10.231.0.6".to_string(), 80),
+            (29999, "10.231.0.5".to_string(), 65535),
+        ]);
+        assert_eq!(
+            rs,
+            "add table ip felucca\n\
+             add chain ip felucca ingress { type nat hook prerouting priority -100 ; }\n\
+             flush chain ip felucca ingress\n\
+             add rule ip felucca ingress tcp dport 20000 dnat to 10.231.0.5:8069\n\
+             add rule ip felucca ingress tcp dport 24711 dnat to 10.231.0.6:80\n\
+             add rule ip felucca ingress tcp dport 29999 dnat to 10.231.0.5:65535\n"
+        );
+        // One flush, ahead of every rule: the file is applied as one
+        // transaction, so no observer sees the chain flushed but not refilled.
+        assert_eq!(rs.matches("flush").count(), 1);
+        let flush = rs.find("flush chain ip felucca ingress").unwrap();
+        assert!(rs.match_indices("add rule").all(|(i, _)| i > flush));
+    }
+
+    #[test]
+    fn test_ingress_ruleset_skips_a_member_whose_ip_does_not_parse() {
+        // The text goes to `nft -f -`, where a newline starts a new command.
+        let rs = ingress_ruleset(&[
+            (20000, "10.231.0.5\nflush ruleset".to_string(), 80),
+            (20001, "10.231.0.6".to_string(), 80),
+        ]);
+        assert!(!rs.contains("flush ruleset"));
+        assert!(!rs.contains("dport 20000"));
+        assert!(rs.contains("add rule ip felucca ingress tcp dport 20001 dnat to 10.231.0.6:80\n"));
     }
 
     #[test]

@@ -774,17 +774,89 @@ pub enum ExposeError {
     NotFound,
     /// VM holds no IP, nothing to DNAT to (→ 409).
     NoIp,
-    /// Every node port in NODE_PORT_MIN..=NODE_PORT_MAX is taken (→ 409).
+    /// Every node port in NODE_PORT_MIN..=NODE_PORT_MAX is taken or to be
+    /// avoided (→ 409).
     Exhausted,
+    /// A new mapping's DNAT rule could not be installed; the mapping was
+    /// taken back out of the record (→ 500).
+    RuleFailed,
 }
 
 /// Worker-side ingress node-port range (inclusive).
 const NODE_PORT_MIN: u16 = 20000;
 const NODE_PORT_MAX: u16 = 29999;
 
-/// Lowest node port not in `used` (used spans every expose of every VM).
-fn lowest_free_node_port(used: &std::collections::HashSet<u16>) -> Option<u16> {
-    (NODE_PORT_MIN..=NODE_PORT_MAX).find(|p| !used.contains(p))
+/// Choose the node port for a new mapping (FLU-6, R3 and R4). Returns the
+/// port and where the cursor goes next, or None when nothing is left.
+///
+/// `in_use` spans every expose of every VM on this worker; `avoid` is what
+/// the control plane says must not be handed out (the ports it has recorded
+/// for this worker, and the ones released less than the quarantine ago).
+///
+/// `prefer` (the port this same sandbox and guest port held last) is
+/// returned whenever it is in the range and no sandbox here holds it, even
+/// though it is in `avoid`: it is in `avoid` BECAUSE it is quarantined for
+/// this mapping, and getting it back is what makes a sleep and wake release
+/// nothing. It leaves the cursor where it is.
+///
+/// Otherwise round-robin: the first port at or after `cursor` that is neither
+/// in use nor avoided, wrapping once around the range; the cursor moves to the
+/// port after it. Lowest-free, which this replaces, handed a port that had
+/// just been released to the very next expose — another tenant's — while the
+/// gateways still routed the old hostname to it. Pure for unit tests.
+fn pick_node_port(
+    in_use: &std::collections::HashSet<u16>,
+    avoid: &std::collections::HashSet<u16>,
+    prefer: Option<u16>,
+    cursor: u16,
+    range: std::ops::RangeInclusive<u16>,
+) -> Option<(u16, u16)> {
+    if range.is_empty() {
+        return None;
+    }
+    let (min, max) = (*range.start(), *range.end());
+    if let Some(p) = prefer {
+        if range.contains(&p) && !in_use.contains(&p) {
+            return Some((p, cursor));
+        }
+    }
+    let span = u32::from(max - min) + 1;
+    let start = if range.contains(&cursor) { cursor } else { min };
+    (0..span)
+        .map(|i| (u32::from(min) + (u32::from(start - min) + i) % span) as u16)
+        .find(|p| !in_use.contains(p) && !avoid.contains(p))
+        .map(|p| (p, if p == max { min } else { p + 1 }))
+}
+
+/// Where the node-port cursor starts when the agent starts: a random port of
+/// the range, so that an agent restart does not begin handing out the same
+/// ports again from one fixed place. Nothing about the allocator is kept on
+/// disk: the ports in use come back from the records, and the control
+/// plane's `avoid` covers the ones released before the restart.
+fn random_port_in(range: std::ops::RangeInclusive<u16>) -> u16 {
+    use std::io::Read;
+    let mut b = [0u8; 8];
+    let seed = match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)) {
+        Ok(()) => u64::from_ne_bytes(b),
+        // Not a secret, only a spread: the clock and the pid will do.
+        Err(_) => {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            nanos ^ (u64::from(std::process::id()) << 32)
+        }
+    };
+    port_from_seed(seed, range)
+}
+
+/// `seed` mapped onto `range` (non-empty).
+fn port_from_seed(seed: u64, range: std::ops::RangeInclusive<u16>) -> u16 {
+    let (min, max) = (*range.start(), *range.end());
+    if min >= max {
+        return min;
+    }
+    min + (seed % (u64::from(max - min) + 1)) as u16
 }
 
 /// Map an images-dir entry name to the cache image it belongs to, or None for
@@ -853,6 +925,9 @@ struct Inner {
     /// must not spawn an FC over the file mid-stream. Entries are removed by
     /// the capture stream's drop guard (covers client disconnects too).
     capturing: std::collections::HashSet<String>,
+    /// FLU-6 R4: where the next node-port search starts (`pick_node_port`).
+    /// In memory only; a random port of the range at start-up.
+    node_port_cursor: u16,
 }
 
 pub struct Manager {
@@ -899,6 +974,40 @@ pub struct Manager {
     // The Firecracker binary — always `firecracker` (from PATH) outside unit
     // tests, which start a stand-in.
     fc_bin: String,
+    // The rule rebuilds and delete's tap removal — always `HostRules` (nft
+    // and ip) outside unit tests, which put a stand-in here.
+    rules: Arc<dyn RuleOps>,
+}
+
+/// The host side of the rule rebuilds and of removing a sandbox's tap.
+trait RuleOps: Send + Sync {
+    /// Whether these touch anything at all on a node with the network
+    /// `net_on`.
+    fn active(&self, net_on: bool) -> bool;
+    fn rebuild_isolation(&self, members: &[(String, String)]) -> bool;
+    fn rebuild_ingress(&self, members: &[(u16, String, u16)]) -> bool;
+    fn remove_tap(&self, tap: &str);
+}
+
+/// `RuleOps` on the host: nft and ip.
+struct HostRules;
+
+impl RuleOps for HostRules {
+    fn active(&self, net_on: bool) -> bool {
+        net_on
+    }
+    fn rebuild_isolation(&self, members: &[(String, String)]) -> bool {
+        net::rebuild_isolation(members)
+    }
+    fn rebuild_ingress(&self, members: &[(u16, String, u16)]) -> bool {
+        net::rebuild_ingress(members)
+    }
+    fn remove_tap(&self, tap: &str) {
+        // Before the tap goes: the pin is keyed on the device name, which
+        // the next VM to claim this slot will reuse.
+        net::clear_tap_antispoof(tap);
+        net::delete_tap(tap);
+    }
 }
 
 impl Manager {
@@ -936,6 +1045,7 @@ impl Manager {
                 template_pools: Vec::new(),
                 pools_synced: false,
                 capturing: std::collections::HashSet::new(),
+                node_port_cursor: random_port_in(NODE_PORT_MIN..=NODE_PORT_MAX),
             }),
             ruleset_lock: Mutex::new(()),
             image_locks: Mutex::new(std::collections::HashMap::new()),
@@ -947,6 +1057,7 @@ impl Manager {
             busy: std::sync::Mutex::new(std::collections::HashMap::new()),
             proc_root,
             fc_bin: "firecracker".into(),
+            rules: Arc::new(HostRules),
         })
     }
 
@@ -1796,7 +1907,7 @@ impl Manager {
     /// that triggered the rebuild must not leave a VM running on a node where
     /// every sandbox shares one flat network.
     pub async fn refresh_isolation(&self) -> bool {
-        if !self.net_on { return true; }
+        if !self.rules_on() { return true; }
         let _guard = self.ruleset_lock.lock().await;
         let members: Vec<(String, String)> = {
             let g = self.inner.lock().await;
@@ -1806,15 +1917,19 @@ impl Manager {
                 })
                 .collect()
         };
-        net::rebuild_isolation(&members)
+        self.rules.rebuild_isolation(&members)
     }
 
     /// Rebuild the ingress DNAT ruleset from the current VM list (every expose
     /// of every VM holding an IP). Same discipline as `refresh_isolation`:
     /// snapshot membership under the state lock, release it, then shell out to
     /// nft under the ruleset lock so rebuilds never interleave.
-    pub async fn refresh_ingress(&self) {
-        if !self.net_on { return; }
+    ///
+    /// Returns false when the rules were not applied (the kernel keeps the
+    /// previous chain): an expose must not answer success for a rule that is
+    /// not there.
+    pub async fn refresh_ingress(&self) -> bool {
+        if !self.rules_on() { return true; }
         let _guard = self.ruleset_lock.lock().await;
         let members: Vec<(u16, String, u16)> = {
             let g = self.inner.lock().await;
@@ -1828,14 +1943,32 @@ impl Manager {
             }
             out
         };
-        net::rebuild_ingress(&members);
+        self.rules.rebuild_ingress(&members)
+    }
+
+    /// Whether the rule rebuilds and the tap removal touch anything.
+    fn rules_on(&self) -> bool {
+        self.rules.active(self.net_on)
     }
 
     // ---- ingress expose (v4 P3) ----
 
     /// Map a host node port to `id`'s ip:guest_port (TCP DNAT). Idempotent per
-    /// (vm, guest_port): an existing entry returns its node_port unchanged.
-    pub async fn expose(&self, id: &str, guest_port: u16) -> Result<u16, ExposeError> {
+    /// (vm, guest_port): an existing entry returns its node_port unchanged,
+    /// whatever `avoid` says (the control plane never lists that port in it).
+    ///
+    /// A new mapping gets `prefer` when no sandbox here holds it, and
+    /// otherwise the next port round-robin that is neither in use nor in
+    /// `avoid` (`pick_node_port`). The answer is success only once the DNAT
+    /// rule is in the kernel: a rebuild that fails takes the mapping back out
+    /// of the record and answers `RuleFailed`.
+    pub async fn expose(
+        &self,
+        id: &str,
+        guest_port: u16,
+        avoid: &std::collections::HashSet<u16>,
+        prefer: Option<u16>,
+    ) -> Result<u16, ExposeError> {
         let node_port = {
             let mut g = self.inner.lock().await;
             // node ports are unique across ALL VMs — collect before the
@@ -1843,28 +1976,59 @@ impl Manager {
             let used: std::collections::HashSet<u16> = g.vms.iter()
                 .flat_map(|v| v.exposes.iter().map(|e| e.node_port))
                 .collect();
+            let cursor = g.node_port_cursor;
             let v = g.vms.iter_mut().find(|v| v.id == id).ok_or(ExposeError::NotFound)?;
             if v.ip.is_none() { return Err(ExposeError::NoIp); }
             if let Some(e) = v.exposes.iter().find(|e| e.guest_port == guest_port) {
                 // Idempotent: mapping already live, nothing to persist or rebuild.
                 return Ok(e.node_port);
             }
-            let np = lowest_free_node_port(&used).ok_or(ExposeError::Exhausted)?;
+            let (np, next) = pick_node_port(&used, avoid, prefer, cursor, NODE_PORT_MIN..=NODE_PORT_MAX)
+                .ok_or(ExposeError::Exhausted)?;
             v.exposes.push(ExposeEntry { guest_port, node_port: np });
+            g.node_port_cursor = next;
             np
         };
         // Persist + rebuild outside the state lock (write_meta re-locks).
         // Persist is best-effort like other meta writes off the happy path:
-        // the in-memory entry and the nft rule are already authoritative.
+        // the in-memory entry is authoritative and a failed write is owed
+        // (`meta_owed`).
         if let Err(e) = self.write_meta(id).await {
             warn!(vm = %id, err = %e, "expose persist failed");
         }
-        self.refresh_ingress().await;
-        Ok(node_port)
+        if self.refresh_ingress().await {
+            return Ok(node_port);
+        }
+        // The rule is not there. Answering with the port would send the
+        // gateways to a node port nothing forwards — or, once the next
+        // rebuild succeeds, it would appear without anyone having been told
+        // it failed. Take this mapping back out, and say so. (A concurrent
+        // expose of the same guest port that arrived between the push above
+        // and this point was answered idempotently from this mapping; that
+        // caller has been told success for a rule that is not there.)
+        {
+            let mut g = self.inner.lock().await;
+            if let Some(v) = g.vms.iter_mut().find(|v| v.id == id) {
+                v.exposes.retain(|e| !(e.guest_port == guest_port && e.node_port == node_port));
+            }
+        }
+        if let Err(e) = self.write_meta(id).await {
+            warn!(vm = %id, err = %e, "expose roll-back persist failed");
+        }
+        error!(vm = %id, guest_port, node_port, "expose: the ingress rule could not be installed; mapping removed");
+        Err(ExposeError::RuleFailed)
     }
 
     /// Remove the (vm, guest_port) mapping. A missing entry is OK (idempotent);
     /// NotFound only when the VM itself is unknown.
+    ///
+    /// A rebuild that fails after the mapping left the record still answers
+    /// success: the mapping is gone, and a retry would find nothing to remove
+    /// and answer success anyway, so an error here could not be acted on. The
+    /// stale rule still forwards to this same guest, and the next successful
+    /// rebuild (any expose, unexpose or delete on this worker) removes it; the
+    /// port is not handed out again meanwhile unless the control plane, which
+    /// quarantines it, lets it.
     pub async fn unexpose(&self, id: &str, guest_port: u16) -> Result<(), ExposeError> {
         let changed = {
             let mut g = self.inner.lock().await;
@@ -1877,7 +2041,9 @@ impl Manager {
             if let Err(e) = self.write_meta(id).await {
                 warn!(vm = %id, err = %e, "unexpose persist failed");
             }
-            self.refresh_ingress().await;
+            if !self.refresh_ingress().await {
+                error!(vm = %id, guest_port, "unexpose: the ingress rules could not be rebuilt; the old rule stays until the next rebuild that succeeds");
+            }
         }
         Ok(())
     }
@@ -3817,15 +3983,54 @@ impl Manager {
             }
         }
 
-        if self.net_on {
+        // FLU-6 R7: the guest IP goes back to the pool only once no rule
+        // names it any more. It used to be freed first and the rules rebuilt
+        // last, so for that moment the next sandbox to take the address sat
+        // behind the previous owner's node ports and tenant pairs.
+        //
+        // (1) The sandbox leaves the membership, in one critical section.
+        // From here the record is on its way out: still in the list (its id
+        // and its directory stay taken until the directory is gone, and its
+        // slot stays reserved), marked closing (`begin_close`, so no
+        // operation commits to it), with no address and no exposes — it no
+        // longer counts for either rebuild, and an expose of it answers "no
+        // ip". Address and exposes go in the same section, so nothing reads
+        // the one without the other. (A listing taken meanwhile shows the
+        // record with `ip` null.)
+        {
+            let mut g = self.inner.lock().await;
+            if let Some(v) = g.vms.iter_mut().find(|v| v.id == id) {
+                v.ip = None;
+                v.exposes.clear();
+            }
+        }
+        // (2) Both rebuilds, each reporting whether it was applied.
+        let isolation_ok = self.refresh_isolation().await;
+        if !isolation_ok {
+            // Teardown goes on regardless: the VM is already gone, and
+            // returning an error here would only make delete non-idempotent.
+            warn!(vm = %id, "cross-tenant isolation not in force after delete");
+        }
+        let ingress_ok = self.refresh_ingress().await;
+        // (3) The tap, and only after rules that no longer name its address,
+        // the slot.
+        if self.rules_on() {
             if let Some(s) = slot {
-                let tap = net::tap_name(s);
-                // Before the tap goes: the pin is keyed on the device name,
-                // which the next VM to claim this slot will reuse.
-                net::clear_tap_antispoof(&tap);
-                net::delete_tap(&tap);
-                let mut g = self.inner.lock().await;
-                Self::free_slot(&mut g, s);
+                // The guest is gone: its tap goes either way.
+                self.rules.remove_tap(&net::tap_name(s));
+                if isolation_ok && ingress_ok {
+                    let mut g = self.inner.lock().await;
+                    Self::free_slot(&mut g, s);
+                } else {
+                    error!(
+                        vm = %id,
+                        slot = s,
+                        isolation_rebuilt = isolation_ok,
+                        ingress_rebuilt = ingress_ok,
+                        "delete: a rule rebuild failed, so the old rules may still name this sandbox's address; \
+                         its IP slot stays reserved until the agent restarts rather than go to the next sandbox"
+                    );
+                }
             }
         }
 
@@ -3851,13 +4056,6 @@ impl Manager {
         }
         // The record is gone, and with it anything still owed to its file.
         lock_std(&self.meta_owed).remove(id);
-        // Teardown does not fail on a broken ruleset: the VM is already gone,
-        // and returning an error here would only make delete non-idempotent.
-        if !self.refresh_isolation().await {
-            warn!(vm = %id, "cross-tenant isolation not in force after delete");
-        }
-        // The VM's exposes die with it: rebuild from the remaining members.
-        self.refresh_ingress().await;
         // Idempotent: unknown id is fine (no error).
         Ok(())
     }
@@ -4648,36 +4846,137 @@ mod tests {
         assert_eq!(mode, 0o600, "got {:o}", mode);
     }
 
+    // ---- FLU-6: node ports round-robin, avoid and prefer ----
+    //
+    // These replace four tests that pinned lowest-free on purpose: lowest-free
+    // handed the port a sandbox had just released to the very next expose,
+    // another tenant's, while the gateways still sent the old hostname there.
+
+    fn ports(p: &[u16]) -> HashSet<u16> {
+        p.iter().copied().collect()
+    }
+
+    const RANGE: std::ops::RangeInclusive<u16> = NODE_PORT_MIN..=NODE_PORT_MAX;
+
     #[test]
-    fn test_node_port_alloc_lowest_free() {
-        let used = HashSet::new();
-        assert_eq!(lowest_free_node_port(&used), Some(20000));
+    fn test_node_ports_go_round_robin_from_the_cursor() {
+        let none = HashSet::new();
+        let mut used = HashSet::new();
+        let mut cursor = 24000;
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            let (p, next) = pick_node_port(&used, &none, None, cursor, RANGE).unwrap();
+            got.push(p);
+            used.insert(p);
+            cursor = next;
+        }
+        assert_eq!(got, [24000, 24001, 24002, 24003]);
+        // The cursor is the port after the last one handed out.
+        assert_eq!(cursor, 24004);
+        // A port released behind the cursor is not the next one handed out.
+        used.remove(&24001);
+        assert_eq!(pick_node_port(&used, &none, None, cursor, RANGE), Some((24004, 24005)));
     }
 
     #[test]
-    fn test_node_port_alloc_skips_taken_across_vms() {
-        // `used` spans every expose of every VM — holes are filled lowest-first.
-        let used: HashSet<u16> = [20000, 20001, 20003].into_iter().collect();
-        assert_eq!(lowest_free_node_port(&used), Some(20002));
-        let used: HashSet<u16> = (20000..=20999).collect();
-        assert_eq!(lowest_free_node_port(&used), Some(21000));
+    fn test_node_ports_wrap_around_once() {
+        let none = HashSet::new();
+        // At the top of the range: the cursor wraps to the bottom.
+        assert_eq!(pick_node_port(&none, &none, None, NODE_PORT_MAX, RANGE), Some((NODE_PORT_MAX, NODE_PORT_MIN)));
+        // Everything from the cursor up is taken: the search wraps.
+        let used: HashSet<u16> = (29990..=NODE_PORT_MAX).collect();
+        assert_eq!(pick_node_port(&used, &none, None, 29990, RANGE), Some((NODE_PORT_MIN, NODE_PORT_MIN + 1)));
+        // Only a port below the cursor is free: found after the wrap.
+        let used: HashSet<u16> = RANGE.filter(|p| *p != 21000).collect();
+        assert_eq!(pick_node_port(&used, &none, None, 25000, RANGE), Some((21000, 21001)));
+        // A cursor outside the range starts at the bottom.
+        assert_eq!(pick_node_port(&none, &none, None, 80, RANGE), Some((NODE_PORT_MIN, NODE_PORT_MIN + 1)));
     }
 
     #[test]
-    fn test_node_port_alloc_exhaustion() {
-        let mut used: HashSet<u16> = (NODE_PORT_MIN..=NODE_PORT_MAX).collect();
-        assert_eq!(lowest_free_node_port(&used), None);
-        // Freeing any one port makes exactly that port allocatable again.
-        used.remove(&25555);
-        assert_eq!(lowest_free_node_port(&used), Some(25555));
+    fn test_node_ports_skip_ports_in_use_and_avoided() {
+        let used = ports(&[20000, 20002]);
+        let avoid = ports(&[20001, 20003]);
+        assert_eq!(pick_node_port(&used, &avoid, None, 20000, RANGE), Some((20004, 20005)));
+        // Exhaustively over a small range: never a port in use or avoided,
+        // always the first one after the cursor that is neither.
+        let small = 100..=109u16;
+        for mask in 0u32..(1 << 10) {
+            let used: HashSet<u16> = (0..10).filter(|i| mask & (1 << i) != 0).map(|i| 100 + i as u16).collect();
+            for avoid_mask in [0u32, 0b1010101010, 0b0000011111] {
+                let avoid: HashSet<u16> = (0..10).filter(|i| avoid_mask & (1 << i) != 0).map(|i| 100 + i as u16).collect();
+                for cursor in small.clone() {
+                    let want = (0..10u16)
+                        .map(|i| 100 + (cursor - 100 + i) % 10)
+                        .find(|p| !used.contains(p) && !avoid.contains(p));
+                    let got = pick_node_port(&used, &avoid, None, cursor, small.clone());
+                    assert_eq!(got.map(|g| g.0), want, "used {used:?} avoid {avoid:?} cursor {cursor}");
+                    if let Some((p, next)) = got {
+                        assert_eq!(next, if p == 109 { 100 } else { p + 1 });
+                    }
+                }
+            }
+        }
     }
 
     #[test]
-    fn test_node_port_alloc_ignores_out_of_range_used() {
-        // Ports outside the range never block allocation (can't occur from our
-        // allocator, but the set is just u16s).
-        let used: HashSet<u16> = [80, 8069, 30000].into_iter().collect();
-        assert_eq!(lowest_free_node_port(&used), Some(20000));
+    fn test_node_ports_prefer_is_honoured_only_when_free_and_in_range() {
+        let none = HashSet::new();
+        // Free: returned, even though it is in avoid (it is in avoid because
+        // it is quarantined for this very mapping), and the cursor stays.
+        assert_eq!(pick_node_port(&none, &ports(&[21000]), Some(21000), 24000, RANGE), Some((21000, 24000)));
+        // In use by a sandbox here: ignored, round-robin instead.
+        assert_eq!(pick_node_port(&ports(&[21000]), &none, Some(21000), 24000, RANGE), Some((24000, 24001)));
+        // Outside the node-port range: ignored.
+        assert_eq!(pick_node_port(&none, &none, Some(8080), 24000, RANGE), Some((24000, 24001)));
+        assert_eq!(pick_node_port(&none, &none, Some(30000), 24000, RANGE), Some((24000, 24001)));
+        // Nothing else left: prefer still wins when it is free.
+        let avoid: HashSet<u16> = RANGE.collect();
+        assert_eq!(pick_node_port(&none, &avoid, Some(29999), 20000, RANGE), Some((29999, 20000)));
+    }
+
+    #[test]
+    fn test_node_ports_exhausted_when_in_use_and_avoid_cover_the_range() {
+        let used: HashSet<u16> = (NODE_PORT_MIN..25000).collect();
+        let mut avoid: HashSet<u16> = (25000..=NODE_PORT_MAX).collect();
+        for cursor in [NODE_PORT_MIN, 24999, 25000, NODE_PORT_MAX] {
+            assert_eq!(pick_node_port(&used, &avoid, None, cursor, RANGE), None);
+            // A prefer that is in use does not help.
+            assert_eq!(pick_node_port(&used, &avoid, Some(20000), cursor, RANGE), None);
+        }
+        // Lifting any one port makes exactly that port allocatable again.
+        avoid.remove(&25555);
+        assert_eq!(pick_node_port(&used, &avoid, None, 20000, RANGE), Some((25555, 25556)));
+    }
+
+    #[test]
+    fn test_node_ports_avoid_entries_outside_the_range_are_harmless() {
+        let none = HashSet::new();
+        let avoid = ports(&[0, 80, 8069, 19999, 30000, 65535]);
+        assert_eq!(pick_node_port(&none, &avoid, None, 20000, RANGE), Some((20000, 20001)));
+        assert_eq!(pick_node_port(&none, &avoid, None, NODE_PORT_MAX, RANGE), Some((NODE_PORT_MAX, NODE_PORT_MIN)));
+        // Ports in use outside the range do not block either.
+        assert_eq!(pick_node_port(&ports(&[80, 30000]), &none, None, 20000, RANGE), Some((20000, 20001)));
+    }
+
+    #[test]
+    fn test_the_node_port_cursor_starts_at_a_random_port_of_the_range() {
+        for _ in 0..1000 {
+            assert!(RANGE.contains(&random_port_in(RANGE)));
+        }
+        // Not one fixed place (1000 draws from 10 000 ports, all equal: no).
+        let draws: HashSet<u16> = (0..1000).map(|_| random_port_in(RANGE)).collect();
+        assert!(draws.len() > 1);
+        // The fallback seed's mapping stays in the range at both ends.
+        for seed in [0u64, 1, 9_999, 10_000, u64::MAX, u64::MAX - 1] {
+            assert!(RANGE.contains(&port_from_seed(seed, RANGE)), "{seed}");
+        }
+        assert_eq!(port_from_seed(0, RANGE), NODE_PORT_MIN);
+        assert_eq!(port_from_seed(9_999, RANGE), NODE_PORT_MAX);
+        // A manager starts its cursor inside the range.
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = mgr_for(dir.path().to_str().unwrap().to_string());
+        assert!(RANGE.contains(&mgr.inner.try_lock().unwrap().node_port_cursor));
     }
 
     // ---- v4 P4: pool specs + matching ----
@@ -7294,5 +7593,384 @@ mod tests {
         for (major, minor) in [(0xfd, 0x01), (0x103, 0x12345), (0x1_2345, 0xab)] {
             assert_eq!(dev_major_minor(makedev(major, minor)), (major, minor));
         }
+    }
+}
+
+/// Unit tests: a stand-in for `HostRules`, so the rule rebuilds and delete's
+/// tap removal can be watched and made to fail without touching the host.
+/// Here, after `mod tests`, because several tests there read everything
+/// above the first `#[cfg(test)]` of this file as its production half.
+#[cfg(test)]
+pub(crate) mod rule_fake {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// One call the manager made, with the guest slots that were free at
+    /// that moment.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum RuleCall {
+        /// The isolation members' addresses, sorted.
+        Isolation { ips: Vec<String>, free_slots: Vec<u32> },
+        Ingress { members: Vec<(u16, String, u16)>, free_slots: Vec<u32> },
+        RemoveTap { tap: String, free_slots: Vec<u32> },
+    }
+
+    #[derive(Default)]
+    pub(crate) struct FakeRules {
+        calls: std::sync::Mutex<Vec<RuleCall>>,
+        pub(crate) fail_isolation: AtomicBool,
+        pub(crate) fail_ingress: AtomicBool,
+        mgr: std::sync::OnceLock<std::sync::Weak<Manager>>,
+    }
+
+    impl FakeRules {
+        pub(crate) fn calls(&self) -> Vec<RuleCall> {
+            lock_std(&self.calls).clone()
+        }
+
+        pub(crate) fn clear(&self) {
+            lock_std(&self.calls).clear();
+        }
+
+        /// The free guest slots, read off the manager's allocator. The
+        /// manager makes these calls with `inner` released; one made while
+        /// holding it panics here.
+        pub(crate) fn free_slots(&self) -> Vec<u32> {
+            let Some(mgr) = self.mgr.get().and_then(|w| w.upgrade()) else { return Vec::new() };
+            let mut g = mgr.inner.try_lock().expect("a rule call was made while holding `inner`");
+            let Some(a) = g.allocator.as_mut() else { return Vec::new() };
+            let mut free = Vec::new();
+            while let Some(s) = a.claim() {
+                free.push(s);
+            }
+            for s in &free {
+                a.free(*s);
+            }
+            free
+        }
+    }
+
+    impl RuleOps for FakeRules {
+        fn active(&self, _net_on: bool) -> bool {
+            true
+        }
+        fn rebuild_isolation(&self, members: &[(String, String)]) -> bool {
+            let mut ips: Vec<String> = members.iter().map(|m| m.1.clone()).collect();
+            ips.sort();
+            let free_slots = self.free_slots();
+            lock_std(&self.calls).push(RuleCall::Isolation { ips, free_slots });
+            !self.fail_isolation.load(Ordering::SeqCst)
+        }
+        fn rebuild_ingress(&self, members: &[(u16, String, u16)]) -> bool {
+            let mut members = members.to_vec();
+            members.sort();
+            let free_slots = self.free_slots();
+            lock_std(&self.calls).push(RuleCall::Ingress { members, free_slots });
+            !self.fail_ingress.load(Ordering::SeqCst)
+        }
+        fn remove_tap(&self, tap: &str) {
+            let free_slots = self.free_slots();
+            lock_std(&self.calls).push(RuleCall::RemoveTap { tap: tap.to_string(), free_slots });
+        }
+    }
+
+    /// Give a fresh `mgr` a `FakeRules` and the guest-slot allocator that
+    /// `setup_host` gives a node with the network on (nothing is brought up).
+    pub(crate) fn install(mgr: &mut Arc<Manager>) -> Arc<FakeRules> {
+        let fake = Arc::new(FakeRules::default());
+        let m = Arc::get_mut(mgr).expect("a fresh manager");
+        m.rules = fake.clone();
+        let cidr = m.cidr;
+        m.inner.get_mut().allocator = Some(Allocator::new(cidr));
+        fake.mgr.set(Arc::downgrade(mgr)).expect("installed once");
+        fake
+    }
+
+    /// Add a stopped sandbox holding guest slot `slot` (reserved, when there
+    /// is an allocator) and its address, with its directory, as start-up
+    /// leaves one. Returns the address.
+    pub(crate) async fn add_vm(mgr: &Manager, id: &str, slot: u32, tenant: &str) -> String {
+        std::fs::create_dir_all(format!("{}/instances/{}", mgr.data_dir, id)).unwrap();
+        let ip = crate::ipalloc::fmt_ip(mgr.cidr.host_at(slot));
+        let mut g = mgr.inner.lock().await;
+        Manager::reserve_slot(&mut g, slot);
+        g.vms.push(Vm {
+            id: id.into(),
+            name: id.into(),
+            dir_id: id.into(),
+            vcpus: 1,
+            mem_mib: 256,
+            state: VmState::Stopped,
+            pid: None,
+            slot: Some(slot),
+            ip: Some(ip.clone()),
+            vsock: false,
+            tenant_id: Some(tenant.into()),
+            exposes: Vec::new(),
+            image: DEFAULT_IMAGE.into(),
+            image_sha256: None,
+            disk_gb: 0,
+            snapshot_valid: false,
+        });
+        ip
+    }
+
+    /// Hold the lock every rule rebuild takes, so a rebuild waits.
+    pub(crate) async fn hold_rule_lock(mgr: &Manager) -> tokio::sync::MutexGuard<'_, ()> {
+        mgr.ruleset_lock.lock().await
+    }
+
+    /// `id`'s mappings, (guest port, node port).
+    pub(crate) async fn exposes_of(mgr: &Manager, id: &str) -> Vec<(u16, u16)> {
+        let g = mgr.inner.lock().await;
+        g.vms
+            .iter()
+            .find(|v| v.id == id)
+            .map(|v| v.exposes.iter().map(|e| (e.guest_port, e.node_port)).collect())
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::rule_fake::{add_vm, exposes_of, hold_rule_lock, install, FakeRules, RuleCall};
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::Ordering;
+
+    fn mgr_with_rules(data_dir: &str) -> (Arc<Manager>, Arc<FakeRules>) {
+        let mut mgr = Manager::new(
+            data_dir.to_string(),
+            false,
+            Cidr { base: 0x0AE7_0000, prefix: 24 },
+            0,
+            "http://cp".into(),
+            "tok".into(),
+        );
+        let fake = install(&mut mgr);
+        (mgr, fake)
+    }
+
+    fn exposes_on_disk(data_dir: &str, id: &str) -> Vec<(u16, u16)> {
+        let written = std::fs::read_to_string(format!("{}/instances/{}/meta.json", data_dir, id)).unwrap();
+        let m: Meta = serde_json::from_str(&written).expect("meta.json must parse");
+        m.exposes.iter().map(|e| (e.guest_port, e.node_port)).collect()
+    }
+
+    fn none() -> HashSet<u16> {
+        HashSet::new()
+    }
+
+    async fn set_cursor(mgr: &Manager, at: u16) {
+        mgr.inner.lock().await.node_port_cursor = at;
+    }
+
+    // ---- FLU-6: expose ----
+
+    #[tokio::test]
+    async fn test_the_idempotent_expose_answer_ignores_avoid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _rules) = mgr_with_rules(tmp.path().to_str().unwrap());
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        let p = mgr.expose("vm-a", 8080, &none(), None).await.unwrap();
+        // An avoid list that names it and every other port, and a prefer
+        // elsewhere: the mapping that exists is still the answer.
+        let all: HashSet<u16> = (NODE_PORT_MIN..=NODE_PORT_MAX).collect();
+        assert_eq!(mgr.expose("vm-a", 8080, &all, Some(20000)).await, Ok(p));
+        assert_eq!(exposes_of(&mgr, "vm-a").await, vec![(8080, p)]);
+    }
+
+    #[tokio::test]
+    async fn test_two_exposes_get_different_ports_and_a_released_one_is_not_next() {
+        // Was: lowest free — the port vm-a released went to vm-b at once.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _rules) = mgr_with_rules(tmp.path().to_str().unwrap());
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        add_vm(&mgr, "vm-b", 1, "t2").await;
+        let p1 = mgr.expose("vm-a", 80, &none(), None).await.unwrap();
+        let p2 = mgr.expose("vm-a", 81, &none(), None).await.unwrap();
+        assert_ne!(p1, p2);
+        mgr.unexpose("vm-a", 80).await.unwrap();
+        let p3 = mgr.expose("vm-b", 80, &none(), None).await.unwrap();
+        assert_ne!(p3, p1, "the port just released went straight to another sandbox");
+        assert_ne!(p3, p2);
+        // Round-robin: each one the port after the previous one.
+        let after = |p: u16| if p == NODE_PORT_MAX { NODE_PORT_MIN } else { p + 1 };
+        assert_eq!((p2, p3), (after(p1), after(p2)));
+    }
+
+    #[tokio::test]
+    async fn test_expose_respects_avoid_and_prefer_across_sandboxes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _rules) = mgr_with_rules(tmp.path().to_str().unwrap());
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        add_vm(&mgr, "vm-b", 1, "t2").await;
+        set_cursor(&mgr, 20000).await;
+        let avoid: HashSet<u16> = [20000, 20001].into_iter().collect();
+        assert_eq!(mgr.expose("vm-a", 80, &avoid, None).await, Ok(20002));
+        // vm-b does not get vm-a's port, avoided or not.
+        set_cursor(&mgr, 20002).await;
+        let avoid: HashSet<u16> = [20003].into_iter().collect();
+        assert_eq!(mgr.expose("vm-b", 80, &avoid, None).await, Ok(20004));
+        // A prefer that another sandbox here holds is not honoured...
+        assert_eq!(mgr.expose("vm-b", 81, &none(), Some(20002)).await, Ok(20005));
+        // ...one that is free is, although it is in avoid,
+        let avoid: HashSet<u16> = [21000].into_iter().collect();
+        assert_eq!(mgr.expose("vm-b", 82, &avoid, Some(21000)).await, Ok(21000));
+        // and the cursor did not move for it.
+        assert_eq!(mgr.expose("vm-b", 83, &none(), None).await, Ok(20006));
+        // Nothing left: 409 as before, and nothing recorded.
+        let all: HashSet<u16> = (NODE_PORT_MIN..=NODE_PORT_MAX).collect();
+        assert_eq!(mgr.expose("vm-a", 90, &all, None).await, Err(ExposeError::Exhausted));
+        assert_eq!(exposes_of(&mgr, "vm-a").await, vec![(80, 20002)]);
+    }
+
+    #[tokio::test]
+    async fn test_an_expose_whose_rule_is_not_installed_is_taken_back_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let (mgr, rules) = mgr_with_rules(&data_dir);
+        let ip = add_vm(&mgr, "vm-a", 0, "t1").await;
+        let p1 = mgr.expose("vm-a", 80, &none(), None).await.unwrap();
+        assert_eq!(exposes_on_disk(&data_dir, "vm-a"), vec![(80, p1)]);
+
+        // Was: the rule's result was ignored and the port answered anyway.
+        rules.fail_ingress.store(true, Ordering::SeqCst);
+        assert_eq!(mgr.expose("vm-a", 81, &none(), None).await, Err(ExposeError::RuleFailed));
+        assert_eq!(exposes_of(&mgr, "vm-a").await, vec![(80, p1)]);
+        assert_eq!(exposes_on_disk(&data_dir, "vm-a"), vec![(80, p1)]);
+        // The idempotent answer does not rebuild, so it is not affected.
+        assert_eq!(mgr.expose("vm-a", 80, &none(), None).await, Ok(p1));
+
+        rules.fail_ingress.store(false, Ordering::SeqCst);
+        let p2 = mgr.expose("vm-a", 81, &none(), None).await.unwrap();
+        assert_eq!(exposes_on_disk(&data_dir, "vm-a"), vec![(80, p1), (81, p2)]);
+        let mut want = vec![(p1, ip.clone(), 80), (p2, ip, 81)];
+        want.sort();
+        match rules.calls().last() {
+            Some(RuleCall::Ingress { members, .. }) => assert_eq!(members, &want),
+            other => panic!("the last call must be the ingress rebuild: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_an_unexpose_whose_rebuild_fails_still_answers_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let (mgr, rules) = mgr_with_rules(&data_dir);
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        mgr.expose("vm-a", 80, &none(), None).await.unwrap();
+        rules.fail_ingress.store(true, Ordering::SeqCst);
+        // The mapping is gone; a retry finds nothing and answers the same.
+        assert_eq!(mgr.unexpose("vm-a", 80).await, Ok(()));
+        assert_eq!(mgr.unexpose("vm-a", 80).await, Ok(()));
+        assert!(exposes_of(&mgr, "vm-a").await.is_empty());
+        assert!(exposes_on_disk(&data_dir, "vm-a").is_empty());
+        assert_eq!(mgr.unexpose("vm-nope", 80).await, Err(ExposeError::NotFound));
+    }
+
+    // ---- FLU-6 R7: the order of a delete ----
+
+    #[tokio::test]
+    async fn test_delete_takes_the_sandbox_out_of_the_rules_before_it_frees_its_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let (mgr, rules) = mgr_with_rules(&data_dir);
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        let ip_b = add_vm(&mgr, "vm-b", 1, "t1").await;
+        mgr.expose("vm-a", 80, &none(), None).await.unwrap();
+        let pb = mgr.expose("vm-b", 80, &none(), None).await.unwrap();
+        let reserved = rules.free_slots();
+        assert!(!reserved.contains(&0) && !reserved.contains(&1));
+        rules.clear();
+
+        mgr.delete("vm-a").await.unwrap();
+        // Was: tap and slot first, then the directory, the record, and the
+        // two rebuilds last — the address was free while rules still named
+        // it. Now: both rebuilds without vm-a while its slot is still
+        // reserved, then its tap,
+        assert_eq!(
+            rules.calls(),
+            vec![
+                RuleCall::Isolation { ips: vec![ip_b.clone()], free_slots: reserved.clone() },
+                RuleCall::Ingress { members: vec![(pb, ip_b, 80)], free_slots: reserved.clone() },
+                RuleCall::RemoveTap { tap: net::tap_name(0), free_slots: reserved },
+            ]
+        );
+        // then the slot.
+        let free = rules.free_slots();
+        assert!(free.contains(&0) && !free.contains(&1));
+        assert!(mgr.inner.lock().await.vms.iter().all(|v| v.id != "vm-a"));
+        assert!(!Path::new(&format!("{}/instances/vm-a", data_dir)).exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_keeps_the_slot_reserved_when_a_rebuild_fails() {
+        for which in ["isolation", "ingress"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().to_str().unwrap().to_string();
+            let (mgr, rules) = mgr_with_rules(&data_dir);
+            add_vm(&mgr, "vm-a", 0, "t1").await;
+            mgr.expose("vm-a", 80, &none(), None).await.unwrap();
+            let flag = if which == "isolation" { &rules.fail_isolation } else { &rules.fail_ingress };
+            flag.store(true, Ordering::SeqCst);
+            rules.clear();
+
+            mgr.delete("vm-a").await.unwrap();
+            let calls = rules.calls();
+            // Both rebuilds were made, without vm-a, whichever one failed,
+            // and the guest's tap went (the guest is gone)...
+            assert!(
+                matches!(
+                    calls.as_slice(),
+                    [
+                        RuleCall::Isolation { ips, .. },
+                        RuleCall::Ingress { members, .. },
+                        RuleCall::RemoveTap { tap, .. },
+                    ] if ips.is_empty() && members.is_empty() && *tap == net::tap_name(0)
+                ),
+                "{which}: {calls:?}"
+            );
+            // ...but its address does not go to the next sandbox.
+            assert!(!rules.free_slots().contains(&0), "{which}: slot 0 was freed");
+            // The record and the directory go as before.
+            assert!(mgr.inner.lock().await.vms.is_empty(), "{which}");
+            assert!(!Path::new(&format!("{}/instances/vm-a", data_dir)).exists(), "{which}");
+
+            // A second delete stays idempotent and touches no tap.
+            rules.clear();
+            mgr.delete("vm-a").await.unwrap();
+            let calls = rules.calls();
+            assert!(calls.iter().all(|c| !matches!(c, RuleCall::RemoveTap { .. })), "{which}: {calls:?}");
+            assert!(!rules.free_slots().contains(&0), "{which}: slot 0 was freed by the second delete");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_an_expose_of_a_sandbox_being_deleted_answers_no_ip() {
+        // While the rules are rebuilt the record is on its way out: no
+        // address, no exposes. An expose arriving then must not add a
+        // mapping (and a rule) for an address about to be freed.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _rules) = mgr_with_rules(tmp.path().to_str().unwrap());
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        let held = hold_rule_lock(&mgr).await;
+        let deleting = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.delete("vm-a").await })
+        };
+        let mut out = false;
+        for _ in 0..1000 {
+            if mgr.inner.lock().await.vms.iter().any(|v| v.id == "vm-a" && v.ip.is_none()) {
+                out = true;
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(out, "the delete never took the sandbox out of the membership");
+        assert_eq!(mgr.expose("vm-a", 80, &none(), None).await, Err(ExposeError::NoIp));
+        assert!(exposes_of(&mgr, "vm-a").await.is_empty());
+        drop(held);
+        deleting.await.unwrap().unwrap();
     }
 }

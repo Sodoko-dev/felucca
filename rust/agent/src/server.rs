@@ -492,6 +492,59 @@ async fn parse_guest_port(req: Request) -> Result<u16, Response> {
     }
 }
 
+/// Largest expose body accepted. `avoid` may name every port of the node-port
+/// range (10 000 entries of up to six bytes each); this leaves room for
+/// spacing around them.
+const EXPOSE_BODY_LIMIT: usize = 128 * 1024;
+
+/// Most `avoid` entries accepted: the size of the node-port range.
+const MAX_AVOID: usize = 10_000;
+
+/// A parsed expose request.
+#[derive(Debug, PartialEq, Eq)]
+struct ExposeBody {
+    guest_port: u16,
+    /// Node ports not to hand out (FLU-6 R3). Absent or null: none.
+    avoid: std::collections::HashSet<u16>,
+    /// The port this sandbox and guest port held last. Absent or null: none.
+    prefer: Option<u16>,
+}
+
+/// Parse `{"guest_port": n, "avoid": [n, ...], "prefer": n}`. Err carries the
+/// body of the 400 answer. guest_port as `parse_guest_port`. `avoid` and
+/// `prefer` are optional (null counts as absent); a value that is there but
+/// malformed — not an array of integers, an entry or `prefer` outside
+/// 0..=65535, more than `MAX_AVOID` entries — is refused, not ignored: an
+/// avoid list the agent half-read would hand out a port it was told not to.
+/// Other keys are ignored.
+fn parse_expose_body(body: &[u8]) -> Result<ExposeBody, &'static str> {
+    let body_str = std::str::from_utf8(body).map_err(|_| "{\"error\":\"bad request\"}")?;
+    let json: serde_json::Value =
+        serde_json::from_str(body_str).map_err(|_| "{\"error\":\"bad json\"}")?;
+    let guest_port = match json.get("guest_port").and_then(|v| v.as_u64()) {
+        Some(p) if (1..=65535).contains(&p) => p as u16,
+        _ => return Err("{\"error\":\"guest_port required\"}"),
+    };
+    let port = |v: &serde_json::Value| v.as_u64().filter(|p| *p <= 65535).map(|p| p as u16);
+    let avoid = match json.get("avoid") {
+        None | Some(serde_json::Value::Null) => std::collections::HashSet::new(),
+        Some(serde_json::Value::Array(arr)) if arr.len() > MAX_AVOID => {
+            return Err("{\"error\":\"avoid too long\"}")
+        }
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .map(port)
+            .collect::<Option<_>>()
+            .ok_or("{\"error\":\"invalid avoid\"}")?,
+        Some(_) => return Err("{\"error\":\"invalid avoid\"}"),
+    };
+    let prefer = match json.get("prefer") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(port(v).ok_or("{\"error\":\"invalid prefer\"}")?),
+    };
+    Ok(ExposeBody { guest_port, avoid, prefer })
+}
+
 async fn expose_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -503,22 +556,41 @@ async fn expose_vm(
     if let Some(resp) = reject_bad_id(&id) {
         return resp;
     }
-    let guest_port = match parse_guest_port(req).await {
-        Ok(p) => p,
-        Err(resp) => return resp,
+    let body_bytes = match axum::body::to_bytes(req.into_body(), EXPOSE_BODY_LIMIT).await {
+        Ok(b) => b,
+        Err(_) => return json_response(StatusCode::BAD_REQUEST, "{\"error\":\"bad request\"}"),
     };
-    match state.mgr.expose(&id, guest_port).await {
-        Ok(node_port) => {
-            let body = format!("{{\"node_port\":{}}}", node_port);
+    let ExposeBody { guest_port, avoid, prefer } = match parse_expose_body(&body_bytes) {
+        Ok(b) => b,
+        Err(body) => return json_response(StatusCode::BAD_REQUEST, body),
+    };
+    // Detached (FLU-6 R8): between "port recorded" and "rule installed" a
+    // dropped request left a mapping on the record with no rule behind it.
+    let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
+    let result = detached(async move {
+        Ok::<_, String>(mgr.expose(&vm, guest_port, &avoid, prefer).await)
+    })
+    .await;
+    match result {
+        // `avoid_honored` tells the control plane that this agent read
+        // `avoid` and `prefer` (an older one ignores them, and its answer
+        // lacks the key). Literals only, so the body is built by hand.
+        Ok(Ok(node_port)) => {
+            let body = format!("{{\"node_port\":{},\"avoid_honored\":true}}", node_port);
             json_response(StatusCode::OK, &body)
         }
-        Err(ExposeError::NotFound) => {
+        Ok(Err(ExposeError::NotFound)) => {
             json_response(StatusCode::NOT_FOUND, "{\"error\":\"not found\"}")
         }
-        Err(ExposeError::NoIp) => json_response(StatusCode::CONFLICT, "{\"error\":\"no ip\"}"),
-        Err(ExposeError::Exhausted) => {
+        Ok(Err(ExposeError::NoIp)) => json_response(StatusCode::CONFLICT, "{\"error\":\"no ip\"}"),
+        Ok(Err(ExposeError::Exhausted)) => {
             json_response(StatusCode::CONFLICT, "{\"error\":\"ports exhausted\"}")
         }
+        Ok(Err(ExposeError::RuleFailed)) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{\"error\":\"ingress rule not installed\"}",
+        ),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
 }
 
@@ -537,15 +609,19 @@ async fn unexpose_vm(
         Ok(p) => p,
         Err(resp) => return resp,
     };
-    match state.mgr.unexpose(&id, guest_port).await {
+    // Detached (FLU-6 R8), like expose: the mapping leaves the record before
+    // the rules are rebuilt.
+    let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
+    match detached(async move { Ok::<_, String>(mgr.unexpose(&vm, guest_port).await) }).await {
         // Missing entry is OK (idempotent) — only an unknown VM is 404.
-        Ok(()) => json_response(StatusCode::OK, "{\"ok\":true}"),
-        Err(ExposeError::NotFound) => {
+        Ok(Ok(())) => json_response(StatusCode::OK, "{\"ok\":true}"),
+        Ok(Err(ExposeError::NotFound)) => {
             json_response(StatusCode::NOT_FOUND, "{\"error\":\"not found\"}")
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{:?}", e))
         }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
 }
 
@@ -1175,5 +1251,191 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::CONFLICT, "{child}");
             assert_eq!(body_of(resp).await, serde_json::json!({ "error": "AlreadyExists" }), "{child}");
         }
+    }
+
+    // ---- FLU-6: the expose request and answer ----
+
+    fn parsed(body: &str) -> ExposeBody {
+        parse_expose_body(body.as_bytes()).unwrap_or_else(|_| panic!("{body} must parse"))
+    }
+
+    /// The answer the handler gives for a body the parser refuses.
+    async fn refused(body: &str) -> (StatusCode, String) {
+        let resp = json_response(StatusCode::BAD_REQUEST, parse_expose_body(body.as_bytes()).expect_err(body));
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn set(p: &[u16]) -> std::collections::HashSet<u16> {
+        p.iter().copied().collect()
+    }
+
+    #[test]
+    fn test_expose_body_avoid_and_prefer_are_optional() {
+        let none = ExposeBody { guest_port: 80, avoid: set(&[]), prefer: None };
+        // Absent, null (what Go sends for a nil slice or pointer) and empty.
+        assert_eq!(parsed(r#"{"guest_port":80}"#), none);
+        assert_eq!(parsed(r#"{"guest_port":80,"avoid":null,"prefer":null}"#), none);
+        assert_eq!(parsed(r#"{"guest_port":80,"avoid":[]}"#), none);
+        // Present; duplicates and ports outside the node-port range are
+        // accepted (they are harmless); other keys are ignored.
+        assert_eq!(
+            parsed(r#"{"guest_port":80,"avoid":[20000,20001,20000,80,0,65535],"prefer":21000,"other":"x"}"#),
+            ExposeBody { guest_port: 80, avoid: set(&[20000, 20001, 80, 0, 65535]), prefer: Some(21000) }
+        );
+        assert_eq!(parsed(r#"{"guest_port":80,"prefer":8080}"#).prefer, Some(8080));
+        // Exactly the most entries allowed.
+        let full: Vec<u16> = (20000..30000).collect();
+        let body = serde_json::json!({ "guest_port": 80, "avoid": full }).to_string();
+        assert_eq!(parsed(&body).avoid.len(), 10_000);
+    }
+
+    #[tokio::test]
+    async fn test_expose_body_malformed_fields_are_refused() {
+        let bad_avoid = (StatusCode::BAD_REQUEST, r#"{"error":"invalid avoid"}"#.to_string());
+        for body in [
+            r#"{"guest_port":80,"avoid":"20000"}"#,
+            r#"{"guest_port":80,"avoid":20000}"#,
+            r#"{"guest_port":80,"avoid":{}}"#,
+            r#"{"guest_port":80,"avoid":[20000,"20001"]}"#,
+            r#"{"guest_port":80,"avoid":[-1]}"#,
+            r#"{"guest_port":80,"avoid":[65536]}"#,
+            r#"{"guest_port":80,"avoid":[20000.5]}"#,
+            r#"{"guest_port":80,"avoid":[null]}"#,
+            r#"{"guest_port":80,"avoid":[true]}"#,
+        ] {
+            assert_eq!(refused(body).await, bad_avoid, "{body}");
+        }
+        let bad_prefer = (StatusCode::BAD_REQUEST, r#"{"error":"invalid prefer"}"#.to_string());
+        for body in [
+            r#"{"guest_port":80,"prefer":"21000"}"#,
+            r#"{"guest_port":80,"prefer":-1}"#,
+            r#"{"guest_port":80,"prefer":65536}"#,
+            r#"{"guest_port":80,"prefer":21000.5}"#,
+            r#"{"guest_port":80,"prefer":true}"#,
+            r#"{"guest_port":80,"prefer":[21000]}"#,
+        ] {
+            assert_eq!(refused(body).await, bad_prefer, "{body}");
+        }
+        // One entry more than the range holds.
+        let long: Vec<u32> = (20000..30001).collect();
+        let body = serde_json::json!({ "guest_port": 80, "avoid": long }).to_string();
+        assert_eq!(refused(&body).await, (StatusCode::BAD_REQUEST, r#"{"error":"avoid too long"}"#.to_string()));
+        // guest_port as before.
+        assert_eq!(
+            refused(r#"{"avoid":[]}"#).await,
+            (StatusCode::BAD_REQUEST, r#"{"error":"guest_port required"}"#.to_string())
+        );
+        assert_eq!(refused("not json").await, (StatusCode::BAD_REQUEST, r#"{"error":"bad json"}"#.to_string()));
+    }
+
+    /// An agent with one stopped sandbox `vm-1` that holds an address, and
+    /// rules made by a stand-in.
+    async fn expose_state() -> (tempfile::TempDir, AppState, Arc<crate::vm::rule_fake::FakeRules>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = Manager::new(
+            dir.path().to_str().unwrap().to_string(),
+            false,
+            crate::ipalloc::Cidr { base: 0x0AE7_0000, prefix: 24 },
+            0,
+            "http://cp".into(),
+            "t".into(),
+        );
+        let rules = crate::vm::rule_fake::install(&mut mgr);
+        crate::vm::rule_fake::add_vm(&mgr, "vm-1", 0, "t1").await;
+        let state = AppState { mgr, token: "t".into(), node_token: Arc::new(std::sync::RwLock::new(String::new())) };
+        (dir, state, rules)
+    }
+
+    fn authed_with(body: impl Into<Body>) -> Request {
+        Request::builder().header("authorization", "Bearer t").body(body.into()).unwrap()
+    }
+
+    async fn text_of(resp: Response) -> (StatusCode, String) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_expose_answer_bytes_and_body_limit() {
+        let (_dir, state, rules) = expose_state().await;
+        let expose = |body: String| expose_vm(State(state.clone()), Path("vm-1".to_string()), authed_with(body));
+        // Every port avoided but one: the answer is that one, byte for byte.
+        let avoid: Vec<u16> = (20000..30000).filter(|p| *p != 25000).collect();
+        let body = serde_json::json!({ "guest_port": 8080, "avoid": avoid }).to_string();
+        assert_eq!(text_of(expose(body).await).await, (StatusCode::OK, r#"{"node_port":25000,"avoid_honored":true}"#.to_string()));
+        // The idempotent answer, whatever avoid says.
+        let body = r#"{"guest_port":8080,"avoid":[25000]}"#.to_string();
+        assert_eq!(text_of(expose(body).await).await, (StatusCode::OK, r#"{"node_port":25000,"avoid_honored":true}"#.to_string()));
+        // Nothing left for a new mapping.
+        let all: Vec<u16> = (20000..30000).collect();
+        let body = serde_json::json!({ "guest_port": 8081, "avoid": all }).to_string();
+        assert_eq!(text_of(expose(body).await).await, (StatusCode::CONFLICT, r#"{"error":"ports exhausted"}"#.to_string()));
+        // A rule that is not installed.
+        rules.fail_ingress.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            text_of(expose(r#"{"guest_port":8082}"#.to_string()).await).await,
+            (StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"ingress rule not installed"}"#.to_string())
+        );
+        rules.fail_ingress.store(false, std::sync::atomic::Ordering::SeqCst);
+        // A full avoid list with generous spacing (about 100 KiB) is read...
+        let spaced: Vec<String> = (20000..30000u16).map(|p| p.to_string()).collect();
+        let body = format!(r#"{{"guest_port":8083,"prefer":21000,"avoid":[{}]}}"#, spaced.join(",     "));
+        assert!(body.len() > 100 * 1024 && body.len() <= EXPOSE_BODY_LIMIT, "{}", body.len());
+        assert_eq!(text_of(expose(body).await).await, (StatusCode::OK, r#"{"node_port":21000,"avoid_honored":true}"#.to_string()));
+        // ...a longer body is refused.
+        let body = format!(r#"{{"guest_port":8084,"avoid":[{}]}}{}"#, "20000", " ".repeat(EXPOSE_BODY_LIMIT));
+        assert_eq!(text_of(expose(body).await).await, (StatusCode::BAD_REQUEST, r#"{"error":"bad request"}"#.to_string()));
+        // A malformed field reaches the caller as 400 through the handler too.
+        let body = r#"{"guest_port":8085,"avoid":"x"}"#.to_string();
+        assert_eq!(text_of(expose(body).await).await, (StatusCode::BAD_REQUEST, r#"{"error":"invalid avoid"}"#.to_string()));
+    }
+
+    async fn ingress_rebuilt_with(rules: &crate::vm::rule_fake::FakeRules, has: impl Fn(&[(u16, String, u16)]) -> bool) -> bool {
+        for _ in 0..500 {
+            let found = rules.calls().iter().any(|c| {
+                matches!(c, crate::vm::rule_fake::RuleCall::Ingress { members, .. } if has(members))
+            });
+            if found {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn test_expose_and_unexpose_run_to_their_end_when_the_caller_hangs_up() {
+        // Was: the handler future did the work, so a caller that gave up
+        // between "port recorded" and "rule installed" left a mapping on the
+        // record with no rule (or, for unexpose, a rule with no mapping).
+        let (_dir, state, rules) = expose_state().await;
+        let id = || Path("vm-1".to_string());
+
+        let held = crate::vm::rule_fake::hold_rule_lock(&state.mgr).await;
+        let call = expose_vm(State(state.clone()), id(), authed_with(r#"{"guest_port":8080}"#));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), call).await.is_err(), "the rebuild was held");
+        drop(held);
+        assert!(
+            ingress_rebuilt_with(&rules, |m| m.iter().any(|e| e.2 == 8080)).await,
+            "the expose stopped when its caller hung up: {:?}",
+            rules.calls()
+        );
+        let mapped = crate::vm::rule_fake::exposes_of(&state.mgr, "vm-1").await;
+        assert_eq!(mapped.len(), 1, "{mapped:?}");
+
+        rules.clear();
+        let held = crate::vm::rule_fake::hold_rule_lock(&state.mgr).await;
+        let call = unexpose_vm(State(state.clone()), id(), authed_with(r#"{"guest_port":8080}"#));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), call).await.is_err(), "the rebuild was held");
+        drop(held);
+        assert!(
+            ingress_rebuilt_with(&rules, |m| m.is_empty()).await,
+            "the unexpose stopped when its caller hung up: {:?}",
+            rules.calls()
+        );
+        assert!(crate::vm::rule_fake::exposes_of(&state.mgr, "vm-1").await.is_empty());
     }
 }
