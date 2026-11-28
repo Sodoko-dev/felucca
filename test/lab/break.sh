@@ -160,22 +160,24 @@ if want B8; then
 say "== B8. the record cannot be written (immutable meta.json) =="
 cleanup_prefix bk-w
 eq "create bk-w" "$(mk bk-w 256)" 201; wait_exec bk-w 150 || bad "bk-w not exec-ready"
+BW="$(blob_make bk-w)"
 eq "sleep bk-w" "$(vm_act bk-w sleep)" 200
 DW="$(vm_dir bk-w)"; sudo chattr +i "$DW/meta.json"
+# FLU-4 (S7): a wake writes `running` to the record BEFORE the guest runs again.
+# When that write fails the Firecracker is killed and the sandbox stays asleep;
+# it used to wake anyway and leave a record on disk that said sleeping beside a
+# running guest (what this case then had the restart and the late write repair).
 C1=$(vm_act bk-w wake); C2=$(vm_act bk-w wake)
 say "  wake with an immutable record: first $C1, second $C2 (state $(vm_state bk-w), on disk $(sudo jq -r .state "$DW/meta.json"))"
-PW=$(vm_pid bk-w)
-# (a) the agent is restarted while the record still cannot be written
-T0=$(date '+%Y-%m-%d %H:%M:%S'); restart_agent; sleep 2
-say "  restart with the stale record on disk: $(took_over "$T0")"
-alive "$PW" && ok "the awake guest was not killed by the restart" || bad "the awake guest was killed (record said sleeping)"
-eq "it is adopted as running, same Firecracker" "$(vm_state bk-w) $(vm_pid bk-w)" "running $PW"
-# (b) the record becomes writable again: the agent catches up on its own
+case "$C1 $C2" in 5??\ 5??) ok "both wakes fail cleanly ($C1, $C2)";; *) bad "wake with an immutable record — got '$C1 $C2', want two 5xx";; esac
+i=0; while [ -n "$(fc_in_dir "$DW")" ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
+eq "no Firecracker is left in its directory (30 s limit)" "$(fc_in_dir "$DW" | wc -l | tr -d ' ')" 0
+eq "it is still asleep (API)" "$(vm_state bk-w)" sleeping
+eq "the record on disk still says asleep, with the marker" "$(meta_snap bk-w)" "sleeping true"
 sudo chattr -i "$DW/meta.json"
-i=0; until [ "$(sudo jq -r .state "$DW/meta.json")" = running ] || [ $i -ge 20 ]; do sleep 1; i=$((i+1)); done
-eq "writable again: the record on disk caught up by itself (after ${i}s)" "$(sudo jq -r '"\(.state) \(.pid)"' "$DW/meta.json")" "running $PW"
-journal_since "$T0" | grep -q 'meta.json written' && ok "journal: the owed write is reported" || bad "journal: no report of the late write"
+eq "writable again: wake" "$(vm_act bk-w wake)" 200
 wait_exec bk-w 60 && ok "bk-w answers" || bad "bk-w does not answer"
+eq "its memory is intact (blob sha256)" "$(blob_sum bk-w | cut -c1-16)" "${BW:0:16}"
 # the same for a cold start
 eq "stop bk-w" "$(vm_act bk-w stop)" 200
 sudo chattr +i "$DW/meta.json"

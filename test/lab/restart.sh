@@ -142,6 +142,8 @@ eq "delete rs-kid" "$(vm_del rs-kid)" 204
 # A stop is on disk at once, and it is still a stop after a restart — even with
 # an old snapshot lying in the directory (rs-sw slept and woke above). It used
 # to come back as "sleeping", which `start` refuses.
+# (FLU-4, S7/S8: a wake removes vmstate.bin and a stop removes the snapshot
+# files, so since then the "note:" branch below is the expected one.)
 eq "stop rs-sw" "$(vm_act rs-sw stop)" 200
 eq "stop rs-sw: the record on disk says so" "$(meta_field rs-sw '"\(.state) \(.pid)"')" "stopped null"
 sudo test -f "$(vm_dir rs-sw)/vmstate.bin" && ok "rs-sw has an old snapshot in its directory" || say "  note: no snapshot file in rs-sw's directory"
@@ -276,8 +278,10 @@ journal_since "$T0" | grep -q 'adopted as running' && ok "unrecorded wake: repor
 no_garbage "unrecorded wake"
 
 # The other half: a Firecracker whose guest is NOT running next to a record
-# that says asleep. Nothing has run since the state on disk was taken, so the
-# VMM is removed and the VM stays asleep.
+# that says asleep. The VMM is removed. The forged record has no
+# snapshot-valid marker and rs-big's vmstate.bin went with its last wake
+# (FLU-4, S3/S7/S9: a `sleeping` record whose snapshot files are not both there
+# becomes `stopped`), so the VM comes back stopped, not asleep.
 eq "pause rs-big" "$(vm_act rs-big pause)" 200
 sudo systemctl stop $UNIT
 sudo cp -p "$DIR_BIG/meta.json" /var/tmp/felucca-lab-meta.big
@@ -286,7 +290,7 @@ T0=$(date '+%Y-%m-%d %H:%M:%S'); sudo systemctl start $UNIT; wait_up; sleep 2
 say "  paused Firecracker beside a sleeping record; start-up: $(took_over "$T0")"
 i=0; until ! alive "$P_BIG" || [ $i -ge 30 ]; do sleep 1; i=$((i+1)); done
 alive "$P_BIG" && bad "a Firecracker whose guest never ran again was left beside a sleeping record" || ok "a Firecracker whose guest is not running is removed"
-eq "and the VM is still asleep" "$(vm_state rs-big) $(vm_pid rs-big)" "sleeping "
+eq "and the VM is stopped (its record had no complete snapshot behind it: FLU-4 S9)" "$(vm_state rs-big) $(vm_pid rs-big)" "stopped "
 no_garbage "paused Firecracker beside a sleeping record"
 sudo rm -f /var/tmp/felucca-lab-meta.big
 vm_del rs-big >/dev/null
@@ -401,7 +405,11 @@ AP=$(agent_pid)
 # Felucca's four tables, not the whole ruleset: a worker that also runs other
 # things (the lab workers run k3s) has iptables-nft rules with packet counters
 # in it, which never hash the same twice.
-rules() { for t in "inet felucca_host" "ip felucca" "bridge felucca" "netdev felucca"; do sudo nft list table $t 2>/dev/null; done | sha256sum | cut -c1-16; }
+# (`nft -s`: stateless, without counter values. Since FLU-8 every chain the
+# agent owns starts with a `counter comment "felucca:<hash>"` marker rule whose
+# counts move with traffic, so a listing with counters changes between two
+# looks although no rule changed.)
+rules() { for t in "inet felucca_host" "ip felucca" "bridge felucca" "netdev felucca"; do sudo nft -s list table $t 2>/dev/null; done | sha256sum | cut -c1-16; }
 states() { vms | jq -c '[.vms[]|{id,state,pid}]|sort_by(.id)'; }
 R0="$(rules)"; S0="$(states)"; TAPS0="$(ip -o link | grep 'hth-' | sed 's/^[0-9]*: //' | cut -d' ' -f1,2,3 | sort | sha256sum | cut -c1-16)"
 T0=$(date +%s)
