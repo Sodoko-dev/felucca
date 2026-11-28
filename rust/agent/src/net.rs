@@ -47,8 +47,10 @@ pub(crate) const COMMAND_LIMIT: Duration = Duration::from_secs(10);
 /// What became of one child process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Ran {
-    /// It exited by itself within the limit.
-    Done { ok: bool, stdout: String, stderr: String },
+    /// It exited by itself within the limit. `code` is its exit status (None
+    /// when a signal ended it). Output is decoded lossily: one non-UTF-8 byte
+    /// must not empty a listing.
+    Done { ok: bool, code: Option<i32>, stdout: String, stderr: String },
     /// It could not be started.
     Failed,
     /// It outran the limit and was killed. Kept apart from `Failed`: a
@@ -63,38 +65,118 @@ pub(crate) enum Ran {
 /// the real command is a grandchild, and killing sudo alone would leave it.
 /// Output is drained on threads of their own: a listing longer than a pipe
 /// buffer would otherwise block the child, and it would look hung.
+///
+/// It returns at the limit whatever the child does: a process asleep in the
+/// kernel does not die of SIGKILL at once, and `wait` on it used to block
+/// with the rule lock held — it is reaped by a detached thread instead. And
+/// the output is waited for `OUTPUT_GRACE` after the exit, no longer: a
+/// descendant that keeps a pipe open must not hang the call (that answer is
+/// `TimedOut`, never a partial listing). Every child runs with `LC_ALL=C`,
+/// because its messages are matched.
 pub(crate) fn run_limited(argv: &[&str], stdin: Option<&str>, limit: Duration) -> Ran {
+    run_limited_capped(argv, stdin, limit, MAX_OUTSTANDING)
+}
+
+/// Children that outran their limit (or left their output open) and are not
+/// reaped yet, with their threads (X10). During a long kernel stall every
+/// time-out used to leave one process and up to four threads, without a cap.
+static OUTSTANDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// With this many outstanding, a new command answers `TimedOut` at once.
+const MAX_OUTSTANDING: usize = 16;
+
+/// Commands a test build must never start (Y1): they change the host.
+const HOST_COMMANDS: &[&str] = &["nft", "ip", "sysctl", "wg", "modprobe", "conntrack", "sudo"];
+
+thread_local! {
+    /// Test builds: the argv of every attempt this thread made, in order.
+    static ATTEMPTS: std::cell::RefCell<Vec<Vec<String>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test builds only: record `argv`, and refuse a host command with a panic
+/// that names it, so the test that reached the host fails loudly.
+fn test_guard(argv: &[&str]) {
+    ATTEMPTS.with(|a| a.borrow_mut().push(argv.iter().map(|s| s.to_string()).collect()));
+    let name = std::path::Path::new(argv[0]).file_name().and_then(|n| n.to_str()).unwrap_or(argv[0]);
+    if HOST_COMMANDS.contains(&name) {
+        panic!("a test reached the host: it tried to run `{}`", argv.join(" "));
+    }
+}
+
+/// Test builds: the attempts this thread made since the last call (Y1).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn take_attempts() -> Vec<Vec<String>> {
+    ATTEMPTS.with(|a| std::mem::take(&mut *a.borrow_mut()))
+}
+
+/// `run_limited`, refusing to start a child while `cap` are outstanding (a
+/// seam for tests).
+fn run_limited_capped(argv: &[&str], stdin: Option<&str>, limit: Duration, cap: usize) -> Ran {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
+    use std::sync::atomic::Ordering as O;
+    use std::sync::mpsc;
     if argv.is_empty() { return Ran::Failed; }
+    // Y1: in a test build, nothing that can change the machine the tests run
+    // on is ever started — on the build VM, a developer's machine and the CI
+    // runner `sudo -n` works, and one unguarded rules call put a real DNAT
+    // rule on the build VM (r8). Every child goes through here.
+    if cfg!(test) {
+        test_guard(argv);
+    }
+    if OUTSTANDING.load(O::SeqCst) >= cap {
+        if state_changed_to("outstanding-cap", Some("full".into())) {
+            error!(outstanding = OUTSTANDING.load(O::SeqCst),
+                "too many commands that outran their time limit are still not reaped; new commands answer \
+                 \"timed out\" at once until they are");
+        }
+        return Ran::TimedOut;
+    }
+    state_changed_to("outstanding-cap", None);
     let mut cmd = Command::new(argv[0]);
     cmd.args(&argv[1..])
+        .env("LC_ALL", "C")
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
     let Ok(mut child) = cmd.spawn() else { return Ran::Failed; };
     let pid = child.id() as i32;
+    // Never pid 0 or 1: `kill(-0, …)` would signal the agent's own group.
+    let kill_group = move || {
+        if pid > 1 {
+            unsafe { libc::kill(-pid, libc::SIGKILL); }
+        }
+    };
     let drain = |r: Option<Box<dyn Read + Send>>| {
-        r.map(|mut r| {
+        let (tx, rx) = mpsc::channel::<String>();
+        if let Some(mut r) = r {
             std::thread::spawn(move || {
-                let mut s = String::new();
-                let _ = r.read_to_string(&mut s);
-                s
-            })
-        })
+                let mut b = Vec::new();
+                let _ = r.read_to_end(&mut b);
+                let _ = tx.send(String::from_utf8_lossy(&b).into_owned());
+            });
+        } else {
+            let _ = tx.send(String::new());
+        }
+        rx
     };
     let out = drain(child.stdout.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
     let err = drain(child.stderr.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
     // The writer drops the pipe when done, so the child sees EOF.
-    let writer = match (stdin, child.stdin.take()) {
+    let (wtx, wrx) = mpsc::channel::<bool>();
+    match (stdin, child.stdin.take()) {
         (Some(text), Some(mut w)) => {
             let text = text.to_string();
-            Some(std::thread::spawn(move || w.write_all(text.as_bytes()).is_ok()))
+            std::thread::spawn(move || {
+                let _ = wtx.send(w.write_all(text.as_bytes()).is_ok());
+            });
         }
-        _ => None,
-    };
+        _ => {
+            let _ = wtx.send(true);
+        }
+    }
     let deadline = Instant::now() + limit;
     let status = loop {
         match child.try_wait() {
@@ -104,20 +186,41 @@ pub(crate) fn run_limited(argv: &[&str], stdin: Option<&str>, limit: Duration) -
         }
     };
     let Some(status) = status else {
-        // Never pid 0 or 1: `kill(-0, …)` would signal the agent's own group.
-        if pid > 1 {
-            unsafe { libc::kill(-pid, libc::SIGKILL); }
-        }
+        kill_group();
         let _ = child.kill();
-        let _ = child.wait();
+        // Reaped off this thread: it may not die at once. Counted until it
+        // is (X10).
+        OUTSTANDING.fetch_add(1, O::SeqCst);
+        std::thread::spawn(move || {
+            let _ = child.wait();
+            OUTSTANDING.fetch_sub(1, O::SeqCst);
+        });
         warn!(cmd = %argv.join(" "), limit_ms = limit.as_millis() as u64, "command outran its time limit and was killed");
         return Ran::TimedOut;
     };
-    let wrote = writer.map(|w| w.join().unwrap_or(false)).unwrap_or(true);
-    let stdout = out.and_then(|t| t.join().ok()).unwrap_or_default();
-    let stderr = err.and_then(|t| t.join().ok()).unwrap_or_default();
-    Ran::Done { ok: status.success() && wrote, stdout, stderr }
+    let grace = Instant::now() + OUTPUT_GRACE;
+    let left = || grace.saturating_duration_since(Instant::now());
+    let (stdout, stderr, wrote) = match (out.recv_timeout(left()), err.recv_timeout(left()), wrx.recv_timeout(left())) {
+        (Ok(o), Ok(e), Ok(w)) => (o, e, w),
+        _ => {
+            // Something it left behind still holds a pipe; its readers stay
+            // counted until the pipes close (X10).
+            kill_group();
+            OUTSTANDING.fetch_add(1, O::SeqCst);
+            std::thread::spawn(move || {
+                let _ = out.recv();
+                let _ = err.recv();
+                OUTSTANDING.fetch_sub(1, O::SeqCst);
+            });
+            warn!(cmd = %argv.join(" "), "command exited but its output stayed open; counted as timed out");
+            return Ran::TimedOut;
+        }
+    };
+    Ran::Done { ok: status.success() && wrote, code: status.code(), stdout, stderr }
 }
+
+/// How long `run_limited` waits for a child's output after it exited.
+const OUTPUT_GRACE: Duration = Duration::from_secs(1);
 
 /// `argv` with the `sudo -n` prefix when `use_sudo`.
 fn with_sudo<'a>(argv: &[&'a str], use_sudo: bool) -> Vec<&'a str> {
@@ -132,14 +235,92 @@ pub(crate) fn run(argv: &[&str]) -> bool {
     run_escalating(argv, None, COMMAND_LIMIT)
 }
 
+/// `run`, with another time limit (`wg set … endpoint <name>` resolves the
+/// name and can take longer than `COMMAND_LIMIT`).
+pub(crate) fn run_within(argv: &[&str], limit: Duration) -> bool {
+    run_escalating(argv, None, limit)
+}
+
 /// `argv` bare, then with `sudo -n` — unless the bare run succeeded or
 /// outran `limit`: a hung command is not run again (see `Ran::TimedOut`).
 fn run_escalating(argv: &[&str], stdin: Option<&str>, limit: Duration) -> bool {
-    if argv.is_empty() { return false; }
-    match run_limited(argv, stdin, limit) {
-        Ran::Done { ok: true, .. } => true,
-        Ran::TimedOut => false,
-        _ => matches!(run_limited(&with_sudo(argv, true), stdin, limit), Ran::Done { ok: true, .. }),
+    matches!(run_escalating_ran(argv, stdin, limit), Ran::Done { ok: true, .. })
+}
+
+/// `run_escalating`, with what the deciding attempt said.
+///
+/// The BARE run decides (X1) when it succeeded, timed out, or was refused
+/// (`refusal_line`): a refusal is the kernel's answer, and asking `sudo`
+/// again used to replace it with sudo's own failure — under the unit
+/// `sudo: PERM_SUDOERS: setresuid(-1, 1, -1): Operation not permitted`, which
+/// reads as "unknown", so no repair was ever "refused" on a real worker. As
+/// root (effective uid 0, as under the unit) it never escalates at all.
+fn run_escalating_ran(argv: &[&str], stdin: Option<&str>, limit: Duration) -> Ran {
+    run_escalating_ran_as(argv, stdin, limit, is_root())
+}
+
+fn run_escalating_ran_as(argv: &[&str], stdin: Option<&str>, limit: Duration, root: bool) -> Ran {
+    if argv.is_empty() { return Ran::Failed; }
+    let bare = run_limited(argv, stdin, limit);
+    let decided = match &bare {
+        Ran::Done { ok: true, .. } | Ran::TimedOut => true,
+        // Y2: not root, a refusal for want of privilege (`netlink: Error:
+        // cache initialization failed: Operation not permitted`) is what the
+        // sudo fallback is for; as root every refusal is final.
+        Ran::Done { ok: false, code: Some(c), stderr, .. } => {
+            *c != 0
+                && refusal_line(stderr).is_some_and(|l| root || !l.contains("Operation not permitted"))
+        }
+        _ => false,
+    };
+    if decided || root {
+        return bare;
+    }
+    run_limited(&with_sudo(argv, true), stdin, limit)
+}
+
+/// Whether this process runs as root.
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// The kernel's refusal in an nft stderr, or None (X1). nft prints
+/// `Error: …` for a command line and, for `nft -f -`, the location first:
+/// `/dev/stdin:1:13-28: Error: Could not process rule: …` (lab, nftables
+/// 1.0.9). The first line, then.
+pub(crate) fn refusal_line(stderr: &str) -> Option<String> {
+    let first = stderr.lines().next()?;
+    (first.starts_with("Error:") || first.contains(": Error: ")).then(|| first.to_string())
+}
+
+/// What one transaction did (FLU-8 W2): applied; refused by the kernel —
+/// `nft` ran, exited non-zero and its first stderr line is an nft error
+/// (`refusal_line`; kept, it is what tells an operator what to do); or
+/// unknown — it could not start, timed out or was killed (it may have
+/// committed), or failed in some other way (a loader error, `sudo`). Only a
+/// refusal is evidence that it is not in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Applied {
+    Committed,
+    Refused(String),
+    Unknown,
+}
+
+impl Applied {
+    pub(crate) fn ok(&self) -> bool {
+        *self == Applied::Committed
+    }
+}
+
+/// Classify one `nft -f -` run.
+pub(crate) fn applied_of(ran: &Ran) -> Applied {
+    match ran {
+        Ran::Done { ok: true, .. } => Applied::Committed,
+        Ran::Done { ok: false, code: Some(c), stderr, .. } if *c != 0 => match refusal_line(stderr) {
+            Some(line) => Applied::Refused(line),
+            None => Applied::Unknown,
+        },
+        _ => Applied::Unknown,
     }
 }
 
@@ -153,7 +334,44 @@ fn run_once(argv: &[&str], use_sudo: bool) -> Ran {
 /// sees a chain that has been flushed but not yet repopulated. `run` cannot do
 /// this because it has no stdin; the bare-then-`sudo -n` fallback is the same.
 fn run_nft_file(ruleset: &str) -> bool {
-    run_escalating(&["nft", "-f", "-"], Some(ruleset), COMMAND_LIMIT)
+    apply_nft_file(ruleset).ok()
+}
+
+/// `run_nft_file`, with the outcome in its three kinds.
+fn apply_nft_file(ruleset: &str) -> Applied {
+    applied_of(&run_escalating_ran(&["nft", "-f", "-"], Some(ruleset), COMMAND_LIMIT))
+}
+
+/// What is failing now, by name, for logging on a change of state only
+/// (FLU-8 W12): a rebuild the watch retries every tick used to print its
+/// error every tick.
+static FAILING: std::sync::Mutex<std::collections::BTreeMap<&'static str, String>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Record whether `what` is failing; true when that is a change (the first
+/// failure, or the recovery) — the moment to log.
+pub(crate) fn state_changed(what: &'static str, failing: bool) -> bool {
+    state_changed_to(what, failing.then(|| "failing".to_string()))
+}
+
+/// Record how `what` is failing now (None: it is not); true when that is a
+/// change — also from one failure to ANOTHER (X11: a time-out followed by a
+/// real refusal used to keep the first text, and nft's line was never shown).
+pub(crate) fn state_changed_to(what: &'static str, failing: Option<String>) -> bool {
+    let mut f = FAILING.lock().unwrap_or_else(|e| e.into_inner());
+    match failing {
+        Some(text) => f.insert(what, text.clone()).as_deref() != Some(text.as_str()),
+        None => f.remove(what).is_some(),
+    }
+}
+
+/// The text to log a failing transaction under (`state_changed_to`).
+fn failure_text(outcome: &Applied) -> Option<String> {
+    match outcome {
+        Applied::Committed => None,
+        Applied::Refused(l) => Some(l.clone()),
+        Applied::Unknown => Some("no answer (timed out, killed or could not run)".into()),
+    }
 }
 
 // ---- FLU-8: markers, and what the watch looks at ----
@@ -261,16 +479,50 @@ pub(crate) enum Listing {
 /// What a listing shows for one chain: None when the chain is not there,
 /// Some(None) when its first rule is no marker, Some(Some(hash)) otherwise.
 pub(crate) fn chain_marker(listing: &str, chain: &str) -> Option<Option<String>> {
+    Some(first_rule(listing, chain)?.and_then(marker_in_rule))
+}
+
+/// A chain's first rule as the kernel printed it (None: no such chain;
+/// Some(None): no rule at all).
+pub(crate) fn first_rule<'a>(listing: &'a str, chain: &str) -> Option<Option<&'a str>> {
     let body = chain_body(listing, chain)?;
-    let first = body.iter().find(|l| !l.starts_with("type ") && !l.starts_with("policy "));
-    Some(first.and_then(|l| {
-        if !l.starts_with("counter ") { return None; }
-        let at = l.find("comment \"felucca:")? + "comment \"felucca:".len();
-        let rest = &l[at..];
-        let end = rest.find('"')?;
-        // Nothing after the comment: a marker is a counter and a comment.
-        if rest[end + 1..].trim().is_empty() { Some(rest[..end].to_string()) } else { None }
-    }))
+    Some(body.into_iter().find(|l| !l.starts_with("type ") && !l.starts_with("policy ")))
+}
+
+/// The hash of a marker rule, in either form nft prints it (W13): with the
+/// counter's values (`counter packets 0 bytes 0 comment "felucca:<h>"`,
+/// lab-2 E5) or without (`counter comment "felucca:<h>"`). Anything else is
+/// no marker.
+fn marker_in_rule(l: &str) -> Option<String> {
+    let rest = l.strip_prefix("counter ")?;
+    let rest = match rest.strip_prefix("packets ") {
+        Some(r) => {
+            let (n, r) = r.split_once(' ')?;
+            let r = r.strip_prefix("bytes ")?;
+            let (m, r) = r.split_once(' ')?;
+            if !n.bytes().all(|b| b.is_ascii_digit()) || !m.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            r
+        }
+        None => rest,
+    };
+    let hash = rest.strip_prefix("comment \"felucca:")?.strip_suffix('"')?;
+    (!hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit())).then(|| hash.to_string())
+}
+
+/// Whether a table listing says the table is dormant (`flags dormant`): its
+/// chains keep their rules and markers but are all unhooked (W7).
+pub(crate) fn table_dormant(listing: &str) -> bool {
+    let mut depth = 0i32;
+    for raw in listing.lines() {
+        let line = raw.trim();
+        if depth == 1 && line.starts_with("flags ") && line.contains("dormant") {
+            return true;
+        }
+        depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+    }
+    false
 }
 
 /// The lines of `chain <name> { … }` in an `nft list table` listing, trimmed,
@@ -322,6 +574,8 @@ pub(crate) fn host_fence_in(listing: &str) -> bool {
 pub(crate) struct Port {
     pub(crate) name: String,
     pub(crate) carrier: bool,
+    /// Administratively up (`UP` in its flags).
+    pub(crate) up: bool,
 }
 
 /// Whether a link whose `ip -o link` flags are `flags` has carrier — a
@@ -341,7 +595,7 @@ pub(crate) fn parse_bridge_ports(out: &str) -> Vec<Port> {
             let name = f.next()?.trim_end_matches(':');
             let name = name.split('@').next()?.to_string();
             let flags = f.next()?.trim_start_matches('<').trim_end_matches('>');
-            Some(Port { name, carrier: has_carrier(flags) })
+            Some(Port { name, carrier: has_carrier(flags), up: flags.split(',').any(|f| f == "UP") })
         })
         .collect()
 }
@@ -369,7 +623,7 @@ pub(crate) fn bridge_v6_switch() -> String {
 /// the real one; unit tests use an in-memory stand-in (`vm::rule_fake`).
 pub(crate) trait Kernel: Send + Sync {
     /// Apply one ruleset as one `nft -f -` transaction.
-    fn apply(&self, ruleset: &str) -> bool;
+    fn apply(&self, ruleset: &str) -> Applied;
     fn list_table(&self, family: &str, table: &str) -> Listing;
     /// The ports of the guest bridge, or None when they could not be listed.
     fn bridge_ports(&self) -> Option<Vec<Port>>;
@@ -379,9 +633,20 @@ pub(crate) trait Kernel: Send + Sync {
     fn set_link(&self, dev: &str, up: bool) -> bool;
     /// Whether `dev` exists; None when that could not be found out.
     fn link_exists(&self, dev: &str) -> Option<bool>;
-    /// The permanent blackhole route for the guest network, worst metric.
-    fn blackhole_route(&self, cidr: &str) -> bool;
+    /// Whether `dev` is administratively up; None when that could not be
+    /// found out (or it does not exist).
+    fn link_up(&self, dev: &str) -> Option<bool>;
+    /// The permanent route for the guest network that answers "unreachable",
+    /// worst metric (`GUEST_NET_ROUTE`).
+    fn guest_route(&self, cidr: &str) -> bool;
 }
+
+/// The route kept for the guest network (FLU-8 W9), as `ip route` words
+/// before the network and after it: `unreachable`, not `blackhole`, so a
+/// sender gets an answer at once instead of waiting for its time-out; the
+/// worst metric, so the bridge's own connected route always wins while the
+/// bridge is up. One place, because the lab checks it.
+pub(crate) const GUEST_NET_ROUTE: (&str, &str) = ("unreachable", "metric 4294967295");
 
 /// `Kernel` on the host: nft, ip and /proc, every child under `COMMAND_LIMIT`.
 pub(crate) struct HostKernel;
@@ -394,6 +659,8 @@ impl HostKernel {
         match &bare {
             Ran::Done { ok: true, .. } | Ran::TimedOut => return bare,
             Ran::Done { ok: false, stderr, .. } if definite(stderr) => return bare,
+            // As root `sudo -n` adds nothing but its own failure (X1).
+            _ if is_root() => return bare,
             _ => {}
         }
         run_limited(&with_sudo(argv, true), None, COMMAND_LIMIT)
@@ -401,28 +668,37 @@ impl HostKernel {
 }
 
 /// The answer nft gives for a table that does not exist (lab: exit 1,
-/// `Error: No such file or directory`).
+/// `Error: No such file or directory`). At the START of stderr: a loader
+/// error (`nft: error while loading shared libraries: …: No such file or
+/// directory`, a package upgrade in flight) must not read as "missing".
 fn no_such_table(stderr: &str) -> bool {
-    stderr.contains("No such file or directory")
+    stderr.starts_with("Error: No such file or directory")
 }
 
-/// What one `nft list table` run says. Only nft's own "no such table" is
-/// Missing; a command that could not run, timed out or failed any other way
-/// is Unknown — never taken for missing.
+/// What one `nft list table` run says. Only nft's own "no such table", with
+/// exit status 1, is Missing; a command that could not run, timed out or
+/// failed any other way is Unknown — never taken for missing.
 fn listing_of(ran: Ran) -> Listing {
     match ran {
         Ran::Done { ok: true, stdout, .. } => Listing::Listed(stdout),
-        Ran::Done { ok: false, stderr, .. } if no_such_table(&stderr) => Listing::Missing,
+        Ran::Done { ok: false, code: Some(1), stderr, .. } if no_such_table(&stderr) => Listing::Missing,
         _ => Listing::Unknown,
     }
 }
 
+/// `ip` on a device that does not exist: `Device "x" does not exist.`
+fn no_such_device(stderr: &str) -> bool {
+    stderr.starts_with("Device \"") && stderr.contains("does not exist")
+}
+
 impl Kernel for HostKernel {
-    fn apply(&self, ruleset: &str) -> bool {
-        run_nft_file(ruleset)
+    fn apply(&self, ruleset: &str) -> Applied {
+        apply_nft_file(ruleset)
     }
     fn list_table(&self, family: &str, table: &str) -> Listing {
-        listing_of(HostKernel::ask(&["nft", "list", "table", family, table], no_such_table))
+        // `-t`: no set contents — the pair set is N×(N−1) elements, and
+        // nothing here reads them (W13).
+        listing_of(HostKernel::ask(&["nft", "-t", "list", "table", family, table], no_such_table))
     }
     fn bridge_ports(&self) -> Option<Vec<Port>> {
         match HostKernel::ask(&["ip", "-o", "link", "show", "master", BRIDGE_NAME], |_| false) {
@@ -451,17 +727,25 @@ impl Kernel for HostKernel {
     }
     fn link_exists(&self, dev: &str) -> Option<bool> {
         if !valid_ifname(dev) { return Some(false); }
-        let gone = |e: &str| e.contains("does not exist");
-        match HostKernel::ask(&["ip", "link", "show", "dev", dev], gone) {
+        match HostKernel::ask(&["ip", "link", "show", "dev", dev], no_such_device) {
             Ran::Done { ok: true, .. } => Some(true),
-            Ran::Done { ok: false, stderr, .. } if gone(&stderr) => Some(false),
+            Ran::Done { ok: false, stderr, .. } if no_such_device(&stderr) => Some(false),
             _ => None,
         }
     }
-    fn blackhole_route(&self, cidr: &str) -> bool {
-        // `replace`, so a restart finds it in place. The worst metric: the
-        // bridge's own connected route always wins while the bridge is up.
-        run(&["ip", "route", "replace", "blackhole", cidr, "metric", "4294967295"])
+    fn link_up(&self, dev: &str) -> Option<bool> {
+        if !valid_ifname(dev) { return None; }
+        match HostKernel::ask(&["ip", "-o", "link", "show", "dev", dev], no_such_device) {
+            Ran::Done { ok: true, stdout, .. } => parse_bridge_ports(&stdout).first().map(|p| p.up),
+            _ => None,
+        }
+    }
+    fn guest_route(&self, cidr: &str) -> bool {
+        // `replace`, so a restart finds it in place.
+        let (kind, metric) = GUEST_NET_ROUTE;
+        let mut argv = vec!["ip", "route", "replace", kind, cidr];
+        argv.extend(metric.split(' '));
+        run(&argv)
     }
 }
 
@@ -535,21 +819,35 @@ pub(crate) fn host_chain_ruleset(chain: &Chain, cidr: Cidr) -> Option<String> {
     }
 }
 
-/// Say, loudly, that one of the host set-up chains was rejected.
-pub(crate) fn report_rejected(chain: &Chain) {
-    let what = match chain {
+/// Say, loudly, that one of the host set-up chains was not applied — once,
+/// when it starts failing (W12), with nft's own first line when it refused —
+/// and say when it is applied again.
+pub(crate) fn report_built(chain: &Chain, outcome: &Applied) {
+    let (key, what) = match chain {
         // Dual-emit: with this chain missing, the root control API is
         // reachable from inside every sandbox, and RUST_LOG can silence error!.
-        Chain::Input => "the nft guest input filter was rejected — HOST SERVICES ARE \
-                         REACHABLE FROM INSIDE EVERY SANDBOX on this node.",
-        Chain::L2 => "the nft bridge-family L2 fence was rejected — GUESTS CAN REACH \
-                      EACH OTHER OVER IPv6 AND OTHER NON-IPv4 PROTOCOLS on this node.",
-        Chain::Nat => "the nft transaction for egress NAT was rejected — guests have no \
-                       egress on this node.",
+        Chain::Input => ("input", "the nft guest input filter was rejected — HOST SERVICES ARE \
+                         REACHABLE FROM INSIDE EVERY SANDBOX on this node."),
+        Chain::L2 => ("l2", "the nft bridge-family L2 fence was rejected — GUESTS CAN REACH \
+                      EACH OTHER OVER IPv6 AND OTHER NON-IPv4 PROTOCOLS on this node."),
+        Chain::Nat => ("nat", "the nft transaction for egress NAT was rejected — guests have no \
+                       egress on this node."),
         _ => return,
     };
-    eprintln!("error: {}", what);
-    error!("{}", what);
+    if !state_changed_to(key, failure_text(outcome)) {
+        return;
+    }
+    match outcome {
+        Applied::Committed => tracing::info!(chain = key, "the nft chain is applied again"),
+        Applied::Refused(line) => {
+            eprintln!("error: {} nft said: {}", what, line);
+            error!(nft = %line, "{}", what);
+        }
+        Applied::Unknown => {
+            eprintln!("error: {} (nft did not answer: timed out, killed or could not run)", what);
+            error!("{} (nft did not answer: timed out, killed or could not run)", what);
+        }
+    }
 }
 
 fn enable_forwarding() {
@@ -588,6 +886,10 @@ fn nat_ruleset(cidr: Cidr) -> String {
 /// guest traffic only. No DHCP or DNS holes: guests get a static address from
 /// the kernel command line and resolve through NAT'd egress, never from the
 /// host. Pure for unit tests.
+/// The guest input chain's one permit for traffic towards the host beyond
+/// ICMP (W6): replies to connections the host opened, nothing a guest opened.
+pub(crate) const INPUT_REPLIES_RULE: &str = "ct state established,related ct direction reply accept";
+
 fn guest_input_ruleset(agent_port: Option<u16>) -> String {
     let mut s = String::new();
     s.push_str("add table ip felucca\n");
@@ -612,10 +914,12 @@ fn guest_input_ruleset(agent_port: Option<u16>) -> String {
         BRIDGE_NAME
     ));
     // Replies to flows the host itself opened. A guest cannot forge this: a
-    // dropped SYN never confirms a conntrack entry.
+    // dropped SYN never confirms a conntrack entry. `ct direction reply`
+    // (W6): without it a connection a guest opened to the host while this
+    // chain was missing stayed accepted as "established" after the repair.
     s.push_str(&format!(
-        "add rule ip felucca input iifname \"{}\" ct state established,related accept\n",
-        BRIDGE_NAME
+        "add rule ip felucca input iifname \"{}\" {}\n",
+        BRIDGE_NAME, INPUT_REPLIES_RULE
     ));
     s.push_str(&format!(
         "add rule ip felucca input iifname \"{}\" drop\n",
@@ -712,21 +1016,43 @@ pub fn tap_name(idx: u32) -> String {
     format!("hth-{}", idx)
 }
 
-/// Idempotently create a tap device named `tap`, enslave to bridge, bring up.
-/// Returns false on failure.
+/// Idempotently create a tap device named `tap` and enslave it to the
+/// bridge, IPv6 off on it. It is NOT brought up: `raise_tap` does that once
+/// the pin is in (W8: pin first, then raise). Returns false when any step
+/// failed (W14) — the final `up` used to be the only one checked, so a tap
+/// whose `set master` failed or was killed stayed off the bridge and the
+/// create succeeded anyway.
 pub fn ensure_tap(tap: &str) -> bool {
-    // tuntap add is not idempotent (errors if exists); ignore that error.
+    // tuntap add is not idempotent (errors if exists); whether the device
+    // is there is what the next step finds out.
     run(&["ip", "tuntap", "add", "dev", tap, "mode", "tap"]);
-    run(&["ip", "link", "set", tap, "master", BRIDGE_NAME]);
+    if !run(&["ip", "link", "set", tap, "master", BRIDGE_NAME]) {
+        error!(tap = %tap, "the tap could not be created or put on the guest bridge");
+        return false;
+    }
     // Before the link comes up, so the host never autoconfigures a link-local
     // address on a port a tenant's guest is on the other end of.
-    ensure_ipv6_disabled(tap);
-    run(&["ip", "link", "set", tap, "up"])
+    if !ensure_ipv6_disabled(tap) {
+        error!(tap = %tap, "IPv6 could not be turned off on the tap");
+        return false;
+    }
+    true
 }
 
-/// Tear down a tap device (best effort).
+/// Bring a pinned tap up.
+pub fn raise_tap(tap: &str) -> bool {
+    let ok = run(&["ip", "link", "set", tap, "up"]);
+    if !ok {
+        error!(tap = %tap, "the tap could not be brought up");
+    }
+    ok
+}
+
+/// Tear down a tap device (best effort; a failure is logged, W14).
 pub fn delete_tap(tap: &str) {
-    run(&["ip", "link", "del", tap]);
+    if !run(&["ip", "link", "del", tap]) {
+        error!(tap = %tap, "the tap could not be removed (ip link del failed or timed out)");
+    }
 }
 
 /// Take a link down without removing it (best effort). A down port forwards
@@ -882,6 +1208,9 @@ pub(crate) fn antispoof_ruleset(tap: &str, guest_ip: &str, guest_mac: &GuestMac)
     ));
     s.push_str(&format!("add rule netdev felucca {} ether type arp accept\n", chain));
     s.push_str(&format!("add rule netdev felucca {} ip saddr {} accept\n", chain, ip));
+    // W7: an explicit end, so that the chain's policy carries no meaning (a
+    // policy changed by hand is invisible to the marker; this rule is not).
+    s.push_str(&format!("add rule netdev felucca {} drop\n", chain));
     let at = format!("netdev felucca {}", chain);
     Some(with_marker(s, &at))
 }
@@ -955,7 +1284,9 @@ fn ensure_bridge_netfilter() -> bool {
         "net.bridge.bridge-nf-call-iptables",
         "/proc/sys/net/bridge/bridge-nf-call-iptables",
     );
-    if !confirmed {
+    // Once per failure (W12): the watch retries the forward chain, and with
+    // it this, every tick.
+    if state_changed("br_netfilter", !confirmed) && !confirmed {
         // Dual-emit ON PURPOSE: this is the security-critical diagnostic of
         // the whole agent, and tracing's RUST_LOG filter can silence error!
         // events. The raw stderr line cannot be filtered away.
@@ -1085,26 +1416,38 @@ pub fn netfilter_ready() -> bool {
 /// Returns false when isolation is NOT in force — either the transaction failed
 /// or br_netfilter is missing — so the caller can stop serving tenants instead
 /// of running an unisolated node. See `netfilter_ready`.
-pub fn rebuild_isolation(members: &[(String, String)]) -> bool {
+///
+/// The first value is what the nft transaction did (W2), the second whether
+/// isolation is in force (the transaction applied AND br_netfilter on).
+pub fn rebuild_isolation(members: &[(String, String)]) -> (Applied, bool) {
     let br_ok = ensure_bridge_netfilter();
-    let applied = run_nft_file(&isolation_ruleset(members));
-    if !applied {
+    let outcome = apply_nft_file(&isolation_ruleset(members));
+    let applied = outcome.ok();
+    // Once per failure (W12).
+    if state_changed_to("isolation", failure_text(&outcome)) && !applied {
+        let said = match &outcome {
+            Applied::Refused(l) => l.as_str(),
+            _ => "no answer (timed out, killed or could not run)",
+        };
         // Dual-emit for the same reason as the br_netfilter diagnostic: this
         // is the rule that separates tenants, and RUST_LOG can silence error!.
         eprintln!(
             "error: the nft transaction for cross-tenant isolation was rejected — \
-             CROSS-TENANT ISOLATION IS NOT ENFORCED on this node."
+             CROSS-TENANT ISOLATION IS NOT ENFORCED on this node. nft said: {}",
+            said
         );
         error!(
+            nft = %said,
             "the nft transaction for cross-tenant isolation was rejected — \
              CROSS-TENANT ISOLATION IS NOT ENFORCED on this node."
         );
-    } else {
+    }
+    if applied {
         flush_guest_conntrack();
     }
     let ok = br_ok && applied;
     ISOLATION_OK.store(ok, Ordering::Relaxed);
-    ok
+    (outcome, ok)
 }
 
 // ---- worker-side ingress DNAT (v4 P3.2) ----
@@ -1158,12 +1501,13 @@ pub(crate) fn ingress_ruleset(members: &[(u16, String, u16)]) -> String {
 ///
 /// Returns false when the transaction was rejected: the kernel then still has
 /// the chain as it was before this call.
-pub fn rebuild_ingress(members: &[(u16, String, u16)]) -> bool {
-    let ok = run_nft_file(&ingress_ruleset(members));
-    if !ok {
-        error!("the nft transaction for ingress DNAT was rejected — the node ports keep their previous rules");
+pub fn rebuild_ingress(members: &[(u16, String, u16)]) -> Applied {
+    let outcome = apply_nft_file(&ingress_ruleset(members));
+    // Once per failure (W12).
+    if state_changed_to("ingress", failure_text(&outcome)) && !outcome.ok() {
+        error!(outcome = ?outcome, "the nft transaction for ingress DNAT was rejected — the node ports keep their previous rules");
     }
-    ok
+    outcome
 }
 
 #[cfg(test)]
@@ -1706,9 +2050,9 @@ mod tests {
         assert_eq!(
             parse_bridge_ports(out),
             vec![
-                Port { name: "hth-0".into(), carrier: true },
-                Port { name: "hth-1".into(), carrier: false },
-                Port { name: "hth-2".into(), carrier: false },
+                Port { name: "hth-0".into(), carrier: true, up: true },
+                Port { name: "hth-1".into(), carrier: false, up: true },
+                Port { name: "hth-2".into(), carrier: false, up: false },
             ]
         );
         assert!(has_carrier("BROADCAST,MULTICAST,UP,LOWER_UP"));
@@ -1718,7 +2062,12 @@ mod tests {
 
     #[test]
     fn test_could_not_look_is_never_missing() {
-        let done = |ok: bool, out: &str, err: &str| Ran::Done { ok, stdout: out.into(), stderr: err.into() };
+        let done = |ok: bool, out: &str, err: &str| Ran::Done {
+            ok,
+            code: Some(if ok { 0 } else { 1 }),
+            stdout: out.into(),
+            stderr: err.into(),
+        };
         assert_eq!(listing_of(done(true, "table ip felucca {\n}\n", "")), Listing::Listed("table ip felucca {\n}\n".into()));
         // lab-3 G: a missing table answers exit 1 and this message.
         let missing = "Error: No such file or directory\nlist table ip felucca\n              ^^^^^^^\n";
@@ -1728,6 +2077,230 @@ mod tests {
         assert_eq!(listing_of(Ran::TimedOut), Listing::Unknown);
         assert_eq!(listing_of(done(false, "", "Error: Operation not permitted")), Listing::Unknown);
         assert_eq!(listing_of(done(false, "", "")), Listing::Unknown);
+        // W2: the message must START stderr, with exit status 1. A loader
+        // error mentioning the same words (a package upgrade in flight) is
+        // "could not look", not "missing".
+        let loader = "nft: error while loading shared libraries: libnftables.so.1: cannot open shared object file: No such file or directory\n";
+        assert_eq!(listing_of(done(false, "", loader)), Listing::Unknown);
+        let other_code = Ran::Done { ok: false, code: Some(2), stdout: String::new(), stderr: missing.into() };
+        assert_eq!(listing_of(other_code), Listing::Unknown);
+        let by_signal = Ran::Done { ok: false, code: None, stdout: String::new(), stderr: missing.into() };
+        assert_eq!(listing_of(by_signal), Listing::Unknown);
+    }
+
+    #[test]
+    fn test_a_repair_is_refused_only_when_nft_said_error() {
+        // W2: only a refusal is evidence that a repair is not in.
+        let done = |code: Option<i32>, err: &str| Ran::Done { ok: code == Some(0), code, stdout: String::new(), stderr: err.into() };
+        assert_eq!(applied_of(&done(Some(0), "")), Applied::Committed);
+        assert_eq!(
+            applied_of(&done(Some(1), "Error: Could not process rule: No such file or directory\nadd chain …\n")),
+            Applied::Refused("Error: Could not process rule: No such file or directory".into())
+        );
+        assert_eq!(applied_of(&Ran::TimedOut), Applied::Unknown);
+        assert_eq!(applied_of(&Ran::Failed), Applied::Unknown);
+        assert_eq!(applied_of(&done(None, "Error: x")), Applied::Unknown, "killed by a signal");
+        assert_eq!(applied_of(&done(Some(127), "nft: error while loading shared libraries: …")), Applied::Unknown);
+        assert_eq!(applied_of(&done(Some(1), "sudo: a password is required")), Applied::Unknown);
+    }
+
+    #[test]
+    fn test_children_run_with_lc_all_c() {
+        // W2: the messages are matched, so their language must not vary.
+        match run_limited(&["sh", "-c", "printf %s \"$LC_ALL\""], None, Duration::from_secs(5)) {
+            Ran::Done { ok: true, stdout, .. } => assert_eq!(stdout, "C"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_run_limited_returns_at_its_limit_and_reaches_grandchildren() {
+        // W5: the kill reaches the grandchild (`sh -c 'sleep 30 & wait'`),
+        // and the call returns at the limit.
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let t = Instant::now();
+        assert_eq!(run_limited(&["sh", "-c", &script], None, Duration::from_millis(300)), Ran::TimedOut);
+        assert!(t.elapsed() < Duration::from_secs(2), "took {:?}", t.elapsed());
+        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let mut gone = false;
+        for _ in 0..100 {
+            // A zombie still answers kill(0); it is gone once /proc says so
+            // or kill fails.
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            if unsafe { libc::kill(pid, 0) } == -1 || stat.split_whitespace().nth(2) == Some("Z") {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(gone, "the grandchild {pid} survived the kill");
+    }
+
+    #[test]
+    fn test_a_descendant_holding_stdout_open_does_not_hang_the_call() {
+        // W5: the child exits, something it started keeps the pipe open;
+        // the answer is `TimedOut` within the grace, never a partial listing.
+        let t = Instant::now();
+        let r = run_limited(&["sh", "-c", "echo partial; (sleep 30 &); exit 0"], None, Duration::from_secs(10));
+        assert_eq!(r, Ran::TimedOut);
+        assert!(t.elapsed() < Duration::from_secs(4), "took {:?}", t.elapsed());
+        // Output that is not UTF-8 is decoded lossily, not dropped.
+        match run_limited(&["printf", "a\\377b"], None, Duration::from_secs(5)) {
+            Ran::Done { ok: true, stdout, .. } => assert_eq!(stdout, "a\u{fffd}b"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_marker_reads_with_and_without_counter_values() {
+        // W13: listed with `-t` the counter may print either way.
+        let rule = |r: &str| format!("table ip felucca {{\n\tchain input {{\n\t\ttype filter hook input priority filter; policy accept;\n\t\t{}\n\t}}\n}}\n", r);
+        assert_eq!(chain_marker(&rule("counter packets 12 bytes 900 comment \"felucca:3f2a9c1e\""), "input"), Some(Some("3f2a9c1e".into())));
+        assert_eq!(chain_marker(&rule("counter comment \"felucca:3f2a9c1e\""), "input"), Some(Some("3f2a9c1e".into())));
+        for bad in [
+            "counter packets x bytes 0 comment \"felucca:3f2a\"",
+            "counter comment \"felucca:\"",
+            "counter comment \"felucca:3f2a\" accept",
+            "counter comment \"other:3f2a\"",
+            "comment \"felucca:3f2a\"",
+        ] {
+            assert_eq!(chain_marker(&rule(bad), "input"), Some(None), "{bad}");
+        }
+    }
+
+    #[test]
+    fn test_a_dormant_table_is_seen() {
+        // W7: its chains keep their markers, all unhooked.
+        let l = "table ip felucca {\n\tflags dormant\n\tchain input {\n\t\ttype filter hook input priority filter; policy accept;\n\t}\n}\n";
+        assert!(table_dormant(l));
+        assert!(!table_dormant(&l.replace("\tflags dormant\n", "")));
+        assert!(!table_dormant("table ip felucca {\n\tchain c {\n\t\tflags dormant\n\t}\n}\n"), "only the table's own flags");
+    }
+
+    // ---- r8: the real kernel's text (X1, X13; fixtures in `lab_text`) ----
+
+    #[test]
+    fn test_x1_the_classifier_on_what_the_lab_measured() {
+        use crate::lab_text::*;
+        let done = |code: i32, err: &str| Ran::Done { ok: code == 0, code: Some(code), stdout: String::new(), stderr: err.into() };
+        // `nft -f -` puts the location first: a refusal all the same.
+        assert_eq!(
+            applied_of(&done(1, REFUSED_FROM_STDIN)),
+            Applied::Refused("/dev/stdin:1:13-28: Error: Could not process rule: No such file or directory".into())
+        );
+        assert_eq!(
+            applied_of(&done(1, REFUSED_HOOK_CHANGE)),
+            Applied::Refused("/dev/stdin:2:39-71: Error: Chain of type \"filter\" is not supported, perhaps kernel support is missing?".into())
+        );
+        // The command-line form.
+        assert_eq!(applied_of(&done(1, MISSING_TABLE)), Applied::Refused("Error: No such file or directory".into()));
+        // sudo's own failure under the unit, a loader error, a password
+        // prompt, a time-out: not the kernel's answer.
+        assert_eq!(applied_of(&done(1, SUDO_UNDER_THE_UNIT)), Applied::Unknown);
+        assert_eq!(applied_of(&done(127, "nft: error while loading shared libraries: libnftables.so.1: cannot open shared object file: No such file or directory\n")), Applied::Unknown);
+        assert_eq!(applied_of(&done(1, "sudo: a password is required\n")), Applied::Unknown);
+        assert_eq!(applied_of(&Ran::TimedOut), Applied::Unknown);
+        // And a listing of a missing table is "missing".
+        assert_eq!(listing_of(done(1, MISSING_TABLE)), Listing::Missing);
+        assert_eq!(listing_of(done(1, SUDO_UNDER_THE_UNIT)), Listing::Unknown);
+    }
+
+    #[test]
+    fn test_x1_a_bare_refusal_is_final_and_as_root_nothing_escalates() {
+        // Was: any bare failure ran again under `sudo -n`, and only sudo's
+        // answer was kept — under the unit `sudo: PERM_SUDOERS: …`, unknown.
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let refused = format!(
+            "echo x >> {}; printf '%s\\n' '/dev/stdin:1:13-28: Error: Could not process rule: No such file or directory' >&2; exit 1",
+            runs.display()
+        );
+        let r = run_escalating_ran_as(&["sh", "-c", &refused], None, Duration::from_secs(5), false);
+        assert_eq!(applied_of(&r), Applied::Refused("/dev/stdin:1:13-28: Error: Could not process rule: No such file or directory".into()));
+        assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 1, "the refusal was asked again");
+        // Some other failure escalates when not root… (changed on purpose,
+        // Y1: the sudo attempt is seen in the recorded attempts — a test
+        // build refuses to start it — instead of being run)
+        let (_, sudo) = attempts_for("echo boom >&2; exit 1", false);
+        assert!(sudo, "a non-refusal failure must still try sudo when not root");
+        // …and never as root.
+        let (a, sudo) = attempts_for("echo boom >&2; exit 1", true);
+        assert!(!sudo && a.len() == 1, "escalated as root: {a:?}");
+    }
+
+    #[test]
+    fn test_x13_the_parser_on_what_the_lab_listed() {
+        use crate::lab_text::*;
+        assert_eq!(chain_marker(IP_TABLE_TERSE, "forward"), Some(Some("178b68f97cbedf3c".into())));
+        assert_eq!(chain_marker(IP_TABLE_TERSE, "input"), Some(Some("127f8a56fd7a7e89".into())));
+        assert_eq!(chain_marker(IP_TABLE_TERSE, "ingress"), Some(Some("1f9a0da00ef43aec".into())));
+        assert_eq!(chain_marker(IP_TABLE_TERSE, "tenant_pairs"), None, "a set is no chain");
+        assert_eq!(chain_marker(IP_TABLE_FULL, "forward"), Some(Some("178b68f97cbedf3c".into())), "with the set's elements");
+        assert_eq!(chain_marker(BRIDGE_TABLE, "forward"), Some(Some("082beb575e48a3b3".into())));
+        assert_eq!(chain_marker(NETDEV_TABLE, "as_hth_1"), Some(Some("2955b13811b4c826".into())));
+        assert_eq!(chain_marker(NETDEV_TABLE, "as_hth_10"), Some(Some("00000000000000aa".into())), "as_hth_1 and as_hth_10 apart");
+        assert_eq!(chain_marker(NETDEV_TABLE_STATELESS, "as_hth_1"), Some(Some("2955b13811b4c826".into())), "with -s");
+        assert!(table_dormant(DORMANT_HEAD));
+        assert!(!table_dormant(IP_TABLE_TERSE));
+        assert!(host_fence_in("table inet felucca_host {\n\tchain input {\n\t\ttype filter hook input priority filter; policy accept;\n\t\tiifname \"felucca0\" drop\n\t}\n}\n"));
+    }
+
+    #[test]
+    fn test_x10_no_new_child_while_too_many_are_outstanding() {
+        let t = Instant::now();
+        assert_eq!(run_limited_capped(&["true"], None, Duration::from_secs(5), 0), Ran::TimedOut);
+        assert!(t.elapsed() < Duration::from_millis(500));
+        assert!(matches!(run_limited_capped(&["true"], None, Duration::from_secs(5), MAX_OUTSTANDING), Ran::Done { ok: true, .. }));
+    }
+
+    #[test]
+    fn test_x11_a_new_failure_text_is_logged_again() {
+        let k = "test-x11-key";
+        assert!(state_changed_to(k, Some("no answer".into())));
+        assert!(!state_changed_to(k, Some("no answer".into())), "the same failure: once");
+        assert!(state_changed_to(k, Some("/dev/stdin:1:1: Error: x".into())), "a time-out, then a refusal: logged");
+        assert!(state_changed_to(k, None), "the recovery");
+        assert!(!state_changed_to(k, None));
+    }
+
+    #[test]
+    fn test_r7_what_only_the_source_can_show() {
+        // Points no unit test can reach without a kernel; structural on
+        // purpose, like the tap and bridge tests.
+        let prod = include_str!("net.rs").split("#[cfg(test)]").next().unwrap();
+        // W13: listed without set contents.
+        assert!(prod.contains(r#"["nft", "-t", "list", "table", family, table]"#));
+        // W14: every step of the tap set-up is checked, the removal logged.
+        assert!(prod.contains(r#"if !run(&["ip", "link", "set", tap, "master", BRIDGE_NAME])"#));
+        assert!(prod.contains(r#"if !run(&["ip", "link", "del", tap])"#));
+        // W5: past the limit the child is reaped off the calling thread (it
+        // may not die at once), and the output is waited for a bounded time.
+        let rl = prod.find("fn run_limited_capped(").unwrap();
+        let body = &prod[rl..rl + prod[rl..].find("\n}\n").unwrap()];
+        assert!(body.contains("std::thread::spawn(move || {\n            let _ = child.wait();"), "the reap must be detached");
+        assert!(!body.contains(".join()"), "an output join with no bound");
+        assert!(body.contains("recv_timeout"));
+        // W14: `wg` commands get a minute.
+        assert!(include_str!("wg.rs").contains("], WG_LIMIT)"));
+        assert_eq!(crate::wg::WG_LIMIT, Duration::from_secs(60));
+        // W18: a failed create is logged on the worker.
+        let vm = include_str!("vm/mod.rs").split("#[cfg(test)]").next().unwrap();
+        let create = vm.find("pub async fn create(").unwrap();
+        assert!(vm[create..create + 600].contains("\"create failed\""));
+    }
+
+    #[test]
+    fn test_the_rule_texts_this_round_changed() {
+        // W6: replies only, nothing a guest opened.
+        let rs = guest_input_ruleset(Some(9090));
+        assert!(rs.contains("add rule ip felucca input iifname \"felucca0\" ct state established,related ct direction reply accept\n"), "{rs}");
+        // W7: the anti-spoof chain ends in an explicit drop.
+        let rs = antispoof_ruleset("hth-3", "10.231.0.5", &guest_mac_for_slot(3)).unwrap();
+        assert!(rs.ends_with("add rule netdev felucca as_hth_3 drop\n"), "{rs}");
+        // W9: unreachable, the worst metric.
+        assert_eq!(GUEST_NET_ROUTE, ("unreachable", "metric 4294967295"));
     }
 
     #[test]
@@ -1739,12 +2312,23 @@ mod tests {
         assert_eq!(run_limited(&["sh", "-c", &script], None, Duration::from_millis(300)), Ran::TimedOut);
         assert!(t.elapsed() < Duration::from_secs(5), "took {:?}", t.elapsed());
         let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
-        // Killed and reaped: nothing answers to the pid any more.
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "pid {pid} is still alive");
+        // Killed and reaped: nothing answers to the pid any more. Changed on
+        // purpose (W5): the reap now runs on a detached thread — the call
+        // returns at the limit even when the child cannot die at once — so
+        // it is waited for here.
+        let mut reaped = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(reaped, "pid {pid} is still alive");
         // Within the limit: the answer, stdin and output included.
         assert_eq!(
             run_limited(&["cat"], Some("hello"), Duration::from_secs(5)),
-            Ran::Done { ok: true, stdout: "hello".into(), stderr: String::new() }
+            Ran::Done { ok: true, code: Some(0), stdout: "hello".into(), stderr: String::new() }
         );
         assert!(matches!(run_limited(&["false"], None, Duration::from_secs(5)), Ran::Done { ok: false, .. }));
         assert_eq!(run_limited(&["/nonexistent/felucca-test"], None, Duration::from_secs(5)), Ran::Failed);
@@ -1756,16 +2340,70 @@ mod tests {
         // time with `sudo -n` — as root the same command, so a hung `nft`
         // held the rule lock for two limits. (On the build VM `sudo -n`
         // works, so the second attempt would really hang a second time.)
-        let limit = Duration::from_secs(1);
+        //
+        // Changed on purpose (Y1): it no longer needs a working `sudo -n` —
+        // a test build refuses to start `sudo` at all — and asserts on the
+        // recorded attempts instead: exactly one, the bare one.
+        let limit = Duration::from_millis(300);
+        take_attempts();
         let t = Instant::now();
-        assert!(!run_escalating(&["sh", "-c", "sleep 30"], None, limit));
-        assert!(t.elapsed() < limit + limit / 2, "took {:?}: tried twice", t.elapsed());
-        let t = Instant::now();
-        assert!(!run_escalating(&["sh", "-c", "sleep 30"], Some("x"), limit));
-        assert!(t.elapsed() < limit + limit / 2, "took {:?}: tried twice", t.elapsed());
-        // A plain failure still escalates (and fails here too), quickly.
-        assert!(!run_escalating(&["false"], None, limit));
-        assert!(run_escalating(&["true"], None, limit));
+        let r = run_escalating_ran_as(&["sh", "-c", "sleep 30"], None, limit, false);
+        assert_eq!(r, Ran::TimedOut);
+        assert!(t.elapsed() < limit * 3, "took {:?}", t.elapsed());
+        assert_eq!(take_attempts(), vec![vec!["sh".to_string(), "-c".into(), "sleep 30".into()]], "tried again");
+        let r = run_escalating_ran_as(&["sh", "-c", "sleep 30"], Some("x"), limit, false);
+        assert_eq!(r, Ran::TimedOut);
+        assert_eq!(take_attempts().len(), 1, "tried again with stdin");
+        assert!(matches!(run_escalating_ran_as(&["true"], None, limit, false), Ran::Done { ok: true, .. }));
+        assert_eq!(take_attempts().len(), 1);
+    }
+
+    /// What `run_escalating_ran_as` tried for `script`: the attempts, and
+    /// whether it went on to `sudo` (which a test build refuses with a
+    /// panic, caught here).
+    fn attempts_for(script: &str, root: bool) -> (Vec<Vec<String>>, bool) {
+        take_attempts();
+        let s = script.to_string();
+        let r = std::panic::catch_unwind(move || run_escalating_ran_as(&["sh", "-c", &s], None, Duration::from_secs(5), root));
+        let attempts = take_attempts();
+        let sudo = attempts.iter().any(|a| a.first().map(String::as_str) == Some("sudo"));
+        assert_eq!(r.is_err(), sudo, "a panic for anything but sudo: {attempts:?}");
+        (attempts, sudo)
+    }
+
+    #[test]
+    fn test_y2_a_refusal_for_want_of_privilege_still_tries_sudo_when_not_root() {
+        let no_priv = "printf '%s\\n' 'netlink: Error: cache initialization failed: Operation not permitted' >&2; exit 1";
+        assert!(refusal_line("netlink: Error: cache initialization failed: Operation not permitted").is_some());
+        let (_, sudo) = attempts_for(no_priv, false);
+        assert!(sudo, "not root: the sudo fallback is what this case is for");
+        let (a, sudo) = attempts_for(no_priv, true);
+        assert!(!sudo && a.len() == 1, "as root every refusal is final: {a:?}");
+        // A refusal by the kernel stays final when not root (X1).
+        let refused = "printf '%s\\n' '/dev/stdin:1:13-28: Error: Could not process rule: No such file or directory' >&2; exit 1";
+        let (a, sudo) = attempts_for(refused, false);
+        assert!(!sudo && a.len() == 1, "{a:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "a test reached the host: it tried to run `nft list tables`")]
+    fn test_y1_a_test_build_never_starts_a_host_command() {
+        // Read-only on purpose: with the guard broken (a mutation run) this
+        // really runs.
+        let _ = run_limited(&["nft", "list", "tables"], None, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_y1_every_host_command_is_refused() {
+        for cmd in HOST_COMMANDS {
+            let c = cmd.to_string();
+            let r = std::panic::catch_unwind(move || run_limited(&[c.as_str(), "--version"], None, Duration::from_secs(1)));
+            assert!(r.is_err(), "{cmd} was started");
+        }
+        // With a path, too.
+        assert!(std::panic::catch_unwind(|| run_limited(&["/usr/sbin/nft", "list", "ruleset"], None, Duration::from_secs(1))).is_err());
+        // What tests need still runs.
+        assert!(matches!(run_limited(&["true"], None, Duration::from_secs(5)), Ran::Done { ok: true, .. }));
     }
 
     #[test]

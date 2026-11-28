@@ -232,6 +232,11 @@ pub fn load(args: &[String], env: &HashMap<String, String>) -> Result<Config, St
                     cfg.isolation_watch = parse_isolation_watch(&args[i+1])?;
                     i += 2; continue;
                 }
+                // W17: a mode flag with no mode refuses, it does not default.
+                return Err("--isolation-watch needs a value (enforce, report or off)".into());
+            }
+            a if a.starts_with("--isolation-watch=") => {
+                cfg.isolation_watch = parse_isolation_watch(&a["--isolation-watch=".len()..])?;
             }
             _ => {}
         }
@@ -632,6 +637,13 @@ mod tests {
         std::fs::write(&path, r#"{"isolation_watch":"report"}"#).unwrap();
         let args: Vec<String> = vec!["felucca-agent".into(), "--config".into(), path.to_str().unwrap().into()];
         assert_eq!(load(&args, &HashMap::new()).unwrap().isolation_watch, IsolationWatch::Report);
+        // W17: `--isolation-watch=<value>` too; the flag alone refuses.
+        let args: Vec<String> = vec!["felucca-agent".into(), "--isolation-watch=report".into()];
+        assert_eq!(load(&args, &HashMap::new()).unwrap().isolation_watch, IsolationWatch::Report);
+        let args: Vec<String> = vec!["felucca-agent".into(), "--isolation-watch=bogus".into()];
+        assert!(load(&args, &HashMap::new()).is_err());
+        let args: Vec<String> = vec!["felucca-agent".into(), "--isolation-watch".into()];
+        assert!(load(&args, &HashMap::new()).is_err(), "the flag without a value must refuse");
         // The flag wins over the env, as for every other key.
         let mut env = HashMap::new();
         env.insert("FELUCCA_ISOLATION_WATCH".into(), "off".into());

@@ -1065,12 +1065,16 @@ trait RuleOps: Send + Sync {
     /// Whether these touch anything at all on a node with the network
     /// `net_on`.
     fn active(&self, net_on: bool) -> bool;
-    fn rebuild_isolation(&self, members: &[(String, String)]) -> bool;
-    fn rebuild_ingress(&self, members: &[(u16, String, u16)]) -> bool;
+    /// What the transaction did, and whether isolation is in force.
+    fn rebuild_isolation(&self, members: &[(String, String)]) -> (net::Applied, bool);
+    fn rebuild_ingress(&self, members: &[(u16, String, u16)]) -> net::Applied;
     fn remove_tap(&self, tap: &str);
     /// Create `tap` if needed and pin it to `ip` and `mac`; false (and the
     /// tap removed) when it cannot be pinned. A fork's child.
     fn pin_tap(&self, tap: &str, ip: Option<&str>, mac: &net::GuestMac) -> bool;
+    /// Pin the tap of a guest adopted at start-up; a port that cannot be
+    /// pinned is taken down, not removed (`Unpinned::TakeDown`).
+    fn pin_adopted_tap(&self, tap: &str, ip: &str, mac: &net::GuestMac) -> Result<(), PinFailure>;
     /// Create the guest bridge, its address, forwarding, IPv6 off on it:
     /// (the bridge is usable, IPv6 is off on it).
     fn ensure_bridge(&self, cidr: Cidr) -> (bool, bool);
@@ -1101,10 +1105,10 @@ impl RuleOps for HostRules {
     fn kernel(&self) -> &dyn net::Kernel {
         &net::HostKernel
     }
-    fn rebuild_isolation(&self, members: &[(String, String)]) -> bool {
+    fn rebuild_isolation(&self, members: &[(String, String)]) -> (net::Applied, bool) {
         net::rebuild_isolation(members)
     }
-    fn rebuild_ingress(&self, members: &[(u16, String, u16)]) -> bool {
+    fn rebuild_ingress(&self, members: &[(u16, String, u16)]) -> net::Applied {
         net::rebuild_ingress(members)
     }
     fn remove_tap(&self, tap: &str) {
@@ -1114,7 +1118,10 @@ impl RuleOps for HostRules {
         net::delete_tap(tap);
     }
     fn pin_tap(&self, tap: &str, ip: Option<&str>, mac: &net::GuestMac) -> bool {
-        ensure_pinned_tap(tap, ip, mac, Unpinned::Remove)
+        ensure_pinned_tap(tap, ip, mac, Unpinned::Remove).is_ok()
+    }
+    fn pin_adopted_tap(&self, tap: &str, ip: &str, mac: &net::GuestMac) -> Result<(), PinFailure> {
+        ensure_pinned_tap(tap, Some(ip), mac, Unpinned::TakeDown)
     }
 }
 
@@ -1172,6 +1179,37 @@ impl Manager {
         })
     }
 
+    /// Re-pin the taps of guests adopted at start-up (`reconcile` step 3).
+    /// One that cannot be pinned is taken down, not removed, and handed to
+    /// the watch (W8), which pins and raises it on a later tick. Says what
+    /// happened (X12): a tap that could not even be set up was not taken
+    /// down. Returns how many did not come out pinned.
+    fn repin_adopted(&self, taps: &[(String, u32, String)]) -> usize {
+        let mut not_pinned = 0;
+        for (id, slot, ip) in taps {
+            let (tap, mac) = tap_pin_for_slot(*slot);
+            match self.rules.pin_adopted_tap(&tap, ip, &mac) {
+                Ok(()) => {}
+                Err(why) => {
+                    not_pinned += 1;
+                    lock_std(&self.watch).hold_tap_down(&tap);
+                    let what = match why {
+                        PinFailure::NotSetUp => "adopted VM's tap could not be set up (created, put on the guest bridge, \
+                                                 IPv6 off) — it may not be on the bridge at all; nothing was taken down; \
+                                                 the isolation watch pins it once it is a port of the bridge",
+                        PinFailure::Unpinned => "adopted VM's tap could not be pinned — the port has been taken down \
+                                                 (not removed), so this guest has no network until the isolation watch \
+                                                 (or an agent start) pins it",
+                        PinFailure::NotRaised => "adopted VM's tap was pinned but could not be brought up — this guest \
+                                                  has no network until the isolation watch (or an agent start) raises it",
+                    };
+                    error!(vm = %id, tap = %tap, "{}", what);
+                }
+            }
+        }
+        not_pinned
+    }
+
     /// The process table, scoped to this agent's data dir.
     fn procs(&self) -> ProcTable {
         ProcTable::at(&self.proc_root, &self.data_dir)
@@ -1197,10 +1235,9 @@ impl Manager {
         let rules = Arc::clone(&self.rules);
         let cidr = self.cidr;
         let built = tokio::task::spawn_blocking(move || {
-            if !rules.kernel().blackhole_route(&net::guest_net(cidr)) {
-                warn!(net = %net::guest_net(cidr), "the blackhole route for the guest network could not be installed: \
-                       while the guest bridge is down, traffic for guest addresses follows the default route");
-            }
+            // W9: `unreachable`, re-asserted by the watch whenever it holds the
+            // bridge down; a failure is an error (`watch::ensure_guest_route`).
+            watch::ensure_guest_route(rules.kernel(), cidr, None);
             let (usable, v6_ok) = rules.ensure_bridge(cidr);
             if !usable {
                 warn!("bridge setup failed; guests may lack networking");
@@ -1210,11 +1247,9 @@ impl Manager {
             let mut built = Vec::new();
             for chain in [net::Chain::Nat, net::Chain::Input, net::Chain::L2] {
                 let Some(rs) = net::host_chain_ruleset(&chain, cidr) else { continue };
-                let ok = rules.kernel().apply(&rs);
-                if !ok {
-                    net::report_rejected(&chain);
-                }
-                built.push((chain, ok.then(|| net::marker_of(&rs)).flatten()));
+                let outcome = rules.kernel().apply(&rs);
+                net::report_built(&chain, &outcome);
+                built.push((chain, outcome.ok().then(|| net::marker_of(&rs)).flatten()));
             }
             let fences_ok = built.iter().filter(|(c, _)| c.fences()).all(|(_, h)| h.is_some());
             rules.note_host_fences(fences_ok && v6_ok);
@@ -1286,18 +1321,7 @@ impl Manager {
                 taps_to_repin(&g.vms)
             };
             // Outside the state lock: these shell out to ip/nft.
-            for (id, slot, ip) in taps {
-                let (tap, mac) = tap_pin_for_slot(slot);
-                if !ensure_pinned_tap(&tap, Some(&ip), &mac, Unpinned::TakeDown) {
-                    taps_down += 1;
-                    error!(
-                        vm = %id,
-                        tap = %tap,
-                        "adopted VM's tap could not be pinned — the port has been taken down \
-                         (not removed), so this guest has no network until an agent start pins it"
-                    );
-                }
-            }
+            taps_down = self.repin_adopted(&taps);
         }
 
         // A VMM started by an agent that predates the OOM marking is still
@@ -2183,7 +2207,7 @@ impl Manager {
         let flushed = {
             let _rules = self.ruleset_lock.lock().await;
             let rules = Arc::clone(&self.rules);
-            tokio::task::spawn_blocking(move || rules.kernel().apply(&net::ingress_ruleset(&[])))
+            tokio::task::spawn_blocking(move || rules.kernel().apply(&net::ingress_ruleset(&[])).ok())
                 .await
                 .unwrap_or(false)
         };
@@ -2213,9 +2237,9 @@ impl Manager {
         if !self.rules_on() { return true; }
         let _guard = self.ruleset_lock.lock().await;
         let members = Self::isolation_members(&*self.inner.lock().await);
-        let ok = self.rules.rebuild_isolation(&members);
+        let (outcome, ok) = self.rules.rebuild_isolation(&members);
         // FLU-8: what the watch compares the kernel with, under this lock.
-        lock_std(&self.watch).built(net::Chain::Forward, ok.then(|| net::marker_of(&net::isolation_ruleset(&members))).flatten());
+        lock_std(&self.watch).built(net::Chain::Forward, outcome.ok().then(|| net::marker_of(&net::isolation_ruleset(&members))).flatten());
         self.settle_slots(&mut *self.inner.lock().await);
         ok
     }
@@ -2259,8 +2283,12 @@ impl Manager {
 
     /// `refresh_ingress` for a caller that holds the rule lock already.
     async fn rebuild_ingress_locked(&self) -> bool {
+        // As `refresh_ingress`: nothing to touch on a node without rules. The
+        // expose path called this unguarded from r6 on, and a `--net off`
+        // manager in a unit test applied a real DNAT rule to the host.
+        if !self.rules_on() { return true; }
         let members = Self::ingress_members(&*self.inner.lock().await);
-        let ok = self.rules.rebuild_ingress(&members);
+        let ok = self.rules.rebuild_ingress(&members).ok();
         lock_std(&self.watch).built(net::Chain::Ingress, ok.then(|| net::marker_of(&net::ingress_ruleset(&members))).flatten());
         self.settle_slots(&mut *self.inner.lock().await);
         ok
@@ -2360,6 +2388,12 @@ impl Manager {
                    the watch retries the ingress chain");
         }
         drop(rules);
+        // X9: another write of this record (a sleep, a stop) may have landed
+        // between the push and the roll-back, with the doomed mapping in it;
+        // the record on disk is the one without it again (best effort).
+        if let Err(e) = self.write_meta(id).await {
+            warn!(vm = %id, err = %e, "expose roll-back persist failed");
+        }
         error!(vm = %id, guest_port, node_port, "expose: the ingress rule could not be installed; mapping removed");
         Err(ExposeError::RuleFailed)
     }
@@ -2510,6 +2544,38 @@ impl Manager {
 
     // ---- slot allocation ----
 
+    /// Whether a new guest may be put on (or a guest brought back onto) this
+    /// node now. "IsolationFailed":
+    /// * W3: while a fence this agent owns (input, forward or L2 chain, a
+    ///   switch, a dormant table, the bridge gone) is POSITIVELY unrepaired —
+    ///   the condition that takes the bridge down in `enforce` — in
+    ///   `enforce` and in `report` alike (`watch::Record::refusal`). Not for
+    ///   the host fence, a stale verdict, NAT or ingress, or "unknown".
+    /// * W11: while start-up could not settle the ingress chain
+    ///   (`start_ingress`); checked before any work, not only at the slot.
+    async fn refuse_new_guest(&self, op: &str, id: &str) -> Result<(), String> {
+        match self.new_guest_refusal().await {
+            Some(why) => {
+                warn!(vm = %id, op = %op, reason = %why, "refused: no new guest on this node now");
+                Err("IsolationFailed".into())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Why no new guest may be put on this node now (`refuse_new_guest`),
+    /// without logging it.
+    async fn new_guest_refusal(&self) -> Option<&'static str> {
+        let why = lock_std(&self.watch).refusal();
+        if why.is_some() {
+            return why;
+        }
+        if self.inner.lock().await.slots_withheld {
+            return Some("the ingress DNAT chain has not been rebuilt since start-up");
+        }
+        None
+    }
+
     /// A free guest slot, or why there is none: "IsolationFailed" while
     /// start-up could not settle the ingress chain (`start_ingress`), the
     /// answer a create already gets when isolation is not in force.
@@ -2558,6 +2624,17 @@ impl Manager {
         if !valid_vm_id(&spec.id) {
             return Err("InvalidId".into());
         }
+        let r = self.create_checked(spec).await;
+        // W18: the worker's journal says why, not only the caller.
+        if let Err(e) = &r {
+            error!(vm = %spec.id, err = %e, "create failed");
+        }
+        r
+    }
+
+    async fn create_checked(self: &Arc<Self>, spec: &CreateSpec) -> Result<(), String> {
+        // Before any work: a refused create used to copy the image first.
+        self.refuse_new_guest("create", &spec.id).await?;
         // Try to claim a warm-pool VM of the exact requested shape
         // (image + vcpus + mem + disk); else cold boot.
         if self.claim_from_pool(spec).await? {
@@ -2574,7 +2651,9 @@ impl Manager {
     /// on either tenant's side would show it. Refusing the create is the only
     /// answer that fails closed; feluccad retries elsewhere.
     async fn commit_or_isolate(self: &Arc<Self>, id: &str) -> Result<(), String> {
-        if self.refresh_isolation().await {
+        // W3: checked again here, where the new VM is committed — a fence may
+        // have gone while it booted.
+        if self.refresh_isolation().await && self.refuse_new_guest("create", id).await.is_ok() {
             return Ok(());
         }
         warn!(vm = %id, "cross-tenant isolation is not in force; removing the new vm");
@@ -2652,7 +2731,9 @@ impl Manager {
         let mut ip_str: Option<String> = None;
         let mut slot: Option<u32> = None;
 
-        if self.net_on {
+        // `rules_on`, the same as `net_on` outside unit tests, which put the
+        // rule fake here and so run the slot claim and the pin.
+        if self.rules_on() {
             let s = {
                 let mut g = self.inner.lock().await;
                 if let Some(fs) = force_slot {
@@ -2670,11 +2751,13 @@ impl Manager {
                 self.tap_pin(&g, s)
             };
             ip_str = ip;
-            if !ensure_pinned_tap(&tap, ip_str.as_deref(), &mac, Unpinned::Remove) {
+            if !self.rules.pin_tap(&tap, ip_str.as_deref(), &mac) {
                 let mut g = self.inner.lock().await;
                 Self::free_slot(&mut g, s);
                 return Err("TapSetupFailed".into());
             }
+            // X4: pinned and up — not the watch's to hold down any more.
+            lock_std(&self.watch).release_tap(&tap);
         }
 
         let (pid, vsock_on) = self.spawn_and_configure(id, &dir_path, &rootfs_dst, vcpus, mem_mib, slot, ip_str.as_deref()).await?;
@@ -3343,6 +3426,8 @@ impl Manager {
             }
             (v.slot, v.snapshot_valid, v.pid, v.dir_id.clone())
         };
+        // W3: no guest back onto a network whose fences are positively gone.
+        self.refuse_new_guest("wake", id).await.map_err(OpError::Other)?;
 
         let start = Instant::now();
         let dir_path = instance_path(&self.data_dir, &dir_id).ok_or("InvalidId")?;
@@ -3408,15 +3493,18 @@ impl Manager {
         // A snapshot taken by a pre-pin agent carries a Firecracker-chosen MAC
         // instead and goes dark on wake until a stop/start cold-boots it onto
         // the derived one. Dark is the correct direction for that trade.
-        if self.net_on {
+        // Through the rule seam (`pin_tap`), so that unit tests run the pin.
+        if self.rules_on() {
             if let Some(s) = slot {
                 let (tap, pin_ip, mac) = {
                     let g = self.inner.lock().await;
                     self.tap_pin(&g, s)
                 };
-                if !ensure_pinned_tap(&tap, pin_ip.as_deref(), &mac, Unpinned::Remove) {
+                if !self.rules.pin_tap(&tap, pin_ip.as_deref(), &mac) {
                     return Err("TapSetupFailed".into());
                 }
+                // X4: pinned and up — not the watch's to hold down any more.
+                lock_std(&self.watch).release_tap(&tap);
             }
         }
 
@@ -3698,6 +3786,8 @@ impl Manager {
         // wake, stop or delete of the parent in between would move or remove
         // the parent's files under the copy, or kill the VMM being snapshot.
         // A parent that is busy answers busy at once, and nothing is reserved.
+        // W3, W11: before anything is reserved, and long before the pause.
+        self.refuse_new_guest("fork", child_id).await?;
         let mut parent_op = self.begin_fork(parent_id).map_err(|e| e.to_string())?;
         // Fork pauses, snapshots and resumes the parent itself.
         self.claim_unsettled(parent_id).await;
@@ -3915,6 +4005,8 @@ impl Manager {
             if !self.rules.pin_tap(&tap, pin_ip.as_deref(), &mac) {
                 return Err(self.fail_child(child_id, &child_dir, None, child_slot, "TapSetupFailed".into()).await);
             }
+            // X4: pinned and up — not the watch's to hold down any more.
+            lock_std(&self.watch).release_tap(&tap);
         }
 
         // 4) Spawn child FC and restore.
@@ -4363,6 +4455,21 @@ impl Manager {
             }
         }
 
+        // W3, W11: no new guest while a fence is positively gone or start-up
+        // could not settle the ingress chain — before any work.
+        if !specs.is_empty() {
+            let why = self.new_guest_refusal().await;
+            // X11: logged when it starts and when it ends, not every 5 s.
+            if net::state_changed_to("pool-refill-refused", why.map(str::to_string)) {
+                match why {
+                    Some(why) => warn!(reason = %why, "pool refill refused: no new guest on this node now"),
+                    None => info!("pool refill: new guests are allowed again"),
+                }
+            }
+            if why.is_some() {
+                return;
+            }
+        }
         for spec in specs {
             // Skip specs in failure backoff.
             {
@@ -4625,6 +4732,8 @@ impl Manager {
             }
             (v.vcpus, v.mem_mib, v.slot, v.ip.clone(), v.pid, v.dir_id.clone())
         };
+        // W3: no guest back onto a network whose fences are positively gone.
+        self.refuse_new_guest("start", id).await.map_err(OpError::Other)?;
 
         let dir_path = instance_path(&self.data_dir, &dir_id).ok_or("InvalidId")?;
         let rootfs_dst = format!("{}/rootfs.ext4", dir_path);
@@ -4637,15 +4746,18 @@ impl Manager {
 
         // Cold boot: configure_guest sets the NIC's MAC, so the full pin
         // (address, ARP and L2) applies from the first frame.
-        if self.net_on {
+        // Through the rule seam (`pin_tap`), so that unit tests run the pin.
+        if self.rules_on() {
             if let Some(s) = slot {
                 let (tap, pin_ip, mac) = {
                     let g = self.inner.lock().await;
                     self.tap_pin(&g, s)
                 };
-                if !ensure_pinned_tap(&tap, pin_ip.as_deref(), &mac, Unpinned::Remove) {
+                if !self.rules.pin_tap(&tap, pin_ip.as_deref(), &mac) {
                     return Err("TapSetupFailed".into());
                 }
+                // X4: pinned and up — not the watch's to hold down any more.
+                lock_std(&self.watch).release_tap(&tap);
             }
         }
 
@@ -5097,9 +5209,9 @@ fn ensure_pinned_tap(
     ip: Option<&str>,
     guest_mac: &net::GuestMac,
     unpinned: Unpinned,
-) -> bool {
+) -> Result<(), PinFailure> {
     if !net::ensure_tap(tap) {
-        return false;
+        return Err(PinFailure::NotSetUp);
     }
     // No allocated address means nothing to pin the port to, so the guest
     // behind it could claim any.
@@ -5109,7 +5221,7 @@ fn ensure_pinned_tap(
             Unpinned::Remove => net::delete_tap(tap),
             Unpinned::TakeDown => net::set_link_down(tap),
         }
-        return false;
+        return Err(PinFailure::Unpinned);
     };
     if !net::ensure_tap_antispoof(tap, ip, guest_mac) {
         match unpinned {
@@ -5120,9 +5232,33 @@ fn ensure_pinned_tap(
             // Whatever chain is already on the device stays; the link is down.
             Unpinned::TakeDown => net::set_link_down(tap),
         }
-        return false;
+        return Err(PinFailure::Unpinned);
     }
-    true
+    // Pinned first, raised after (W8): an adopted guest's tap found down
+    // used to come up before its pin was back.
+    if !net::raise_tap(tap) {
+        match unpinned {
+            Unpinned::Remove => {
+                net::clear_tap_antispoof(tap);
+                net::delete_tap(tap);
+            }
+            Unpinned::TakeDown => net::set_link_down(tap),
+        }
+        return Err(PinFailure::NotRaised);
+    }
+    Ok(())
+}
+
+/// Why `ensure_pinned_tap` did not pin a tap (X12: start-up says which).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinFailure {
+    /// The tap could not be created, put on the bridge or have IPv6 turned
+    /// off: nothing was taken down, there may be nothing on the bridge.
+    NotSetUp,
+    /// No address, or the pin was refused: the port is down (or removed).
+    Unpinned,
+    /// Pinned, but it could not be brought up.
+    NotRaised,
 }
 
 /// What `ensure_pinned_tap` does with a port it could not pin.
@@ -9274,6 +9410,133 @@ mod tests {
         assert!(gone_soon(pid).await);
     }
 
+    // ---- FLU-8 r7 W19: the lifecycle with networking ON, through the rule fake ----
+
+    /// The pin of `slot` in the fake kernel: its chain's rules, and whether
+    /// the tap is up.
+    fn pin_in(rules: &super::rule_fake::FakeRules, slot: u32) -> (Vec<String>, Option<bool>) {
+        let tap = net::tap_name(slot);
+        let chain = format!("as_{}", tap.replace('-', "_"));
+        let r = rules.k().chain_mut("netdev", "felucca", &chain).map(|c| c.rules.clone()).unwrap_or_default();
+        (r, rules.link_up(&tap))
+    }
+
+    #[tokio::test]
+    async fn test_start_pins_the_tap_with_networking_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        let _api = FakeApi::serve(&format!("{}/fc.sock.fake", dir), "Not started");
+        let mut mgr = mgr_with_fc(data_dir.clone(), &fake_fc_bin());
+        let rules = super::rule_fake::install(&mut mgr);
+        let mut v = running_vm("vm-1", 0);
+        v.state = VmState::Stopped;
+        v.pid = None;
+        v.slot = Some(3);
+        v.ip = Some("10.231.0.5".into());
+        {
+            let mut g = mgr.inner.lock().await;
+            Manager::reserve_slot(&mut g, 3);
+            g.vms.push(v);
+        }
+        mgr.start("vm-1").await.unwrap();
+        let pid = spawned_pid(&dir).await;
+        assert!(rules.calls().iter().any(|c| matches!(c, super::rule_fake::RuleCall::PinTap { tap } if tap == "hth-3")));
+        let (chain, up) = pin_in(&rules, 3);
+        assert!(chain.contains(&"ip saddr 10.231.0.5 accept".to_string()), "{chain:?}");
+        assert!(chain.contains(&format!("ether saddr != {} drop", net::guest_mac_for_slot(3))), "{chain:?}");
+        assert_eq!(up, Some(true), "pinned, then raised");
+        mgr.stop("vm-1").await.unwrap();
+        assert!(gone_soon(pid).await);
+    }
+
+    #[tokio::test]
+    async fn test_wake_pins_the_tap_with_networking_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        snapshot_files(&dir);
+        std::fs::write(format!("{}/meta.json", dir), sleeper_line("vm-1")).unwrap();
+        let _api = FakeApi::serve(&format!("{}/fc.sock.fake", dir), "Not started");
+        let mut mgr = mgr_with_fc(data_dir.clone(), &fake_fc_bin());
+        let rules = super::rule_fake::install(&mut mgr);
+        let mut v = sleeping_vm("vm-1");
+        v.snapshot_valid = true;
+        v.slot = Some(4);
+        v.ip = Some("10.231.0.6".into());
+        {
+            let mut g = mgr.inner.lock().await;
+            Manager::reserve_slot(&mut g, 4);
+            g.vms.push(v);
+        }
+        mgr.wake_vm("vm-1").await.unwrap();
+        let pid = spawned_pid(&dir).await;
+        let (chain, up) = pin_in(&rules, 4);
+        assert!(chain.contains(&"ip saddr 10.231.0.6 accept".to_string()), "{chain:?}");
+        assert_eq!(up, Some(true));
+        mgr.stop("vm-1").await.unwrap();
+        assert!(gone_soon(pid).await);
+    }
+
+    #[tokio::test]
+    async fn test_a_create_on_a_slot_a_delete_just_freed_gets_its_own_tap_and_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        std::fs::create_dir_all(format!("{}/images", data_dir)).unwrap();
+        std::fs::write(format!("{}/images/{}.ext4", data_dir, DEFAULT_IMAGE), b"image").unwrap();
+        let mut mgr = mgr_with_fc(data_dir.clone(), &fake_fc_bin());
+        let rules = super::rule_fake::install(&mut mgr);
+        // The sandbox that held slot 0, with its tap and pin, deleted.
+        let old_ip = super::rule_fake::add_vm(&mgr, "vm-old", 0, "t1").await;
+        assert!(rules.pin_tap("hth-0", Some(&old_ip), &net::guest_mac_for_slot(0)));
+        mgr.delete("vm-old").await.unwrap();
+        assert!(!rules.k().links.contains_key("hth-0"));
+        assert!(rules.free_slots().contains(&0));
+        // A create right after claims it, and pins its own tap.
+        let _api = FakeApi::serve(&format!("{}/instances/vm-new.fake.sock", data_dir), "Not started");
+        let spec = CreateSpec {
+            id: "vm-new".into(),
+            name: "vm-new".into(),
+            vcpus: 1,
+            mem_mib: 256,
+            tenant_id: Some("t2".into()),
+            image: DEFAULT_IMAGE.into(),
+            image_sha256: None,
+            disk_gb: 0,
+        };
+        mgr.create(&spec).await.unwrap();
+        let pid = spawned_pid(&format!("{}/instances/vm-new", data_dir)).await;
+        assert_eq!(mgr.inner.lock().await.vms.iter().find(|v| v.id == "vm-new").unwrap().slot, Some(0));
+        let (chain, up) = pin_in(&rules, 0);
+        assert!(chain.contains(&format!("ip saddr {} accept", old_ip)), "{chain:?}");
+        assert_eq!(up, Some(true));
+        assert!(!rules.free_slots().contains(&0));
+        mgr.delete("vm-new").await.unwrap();
+        assert!(gone_soon(pid).await);
+    }
+
+    #[test]
+    fn test_an_adopted_tap_is_pinned_before_it_is_raised() {
+        // W8: `ensure_pinned_tap` brought the tap up first and pinned it
+        // after; a guest's port found down came up before its pin was back.
+        let src = include_str!("mod.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let start = prod.find("fn ensure_pinned_tap(").unwrap();
+        let end = start + prod[start..].find("\n}\n").unwrap();
+        let body = &prod[start..end];
+        let pin = body.find("net::ensure_tap_antispoof(").expect("the pin");
+        let raise = body.find("net::raise_tap(").expect("the raise");
+        assert!(pin < raise, "raised before pinned");
+        let net_src = include_str!("../net.rs");
+        let et = net_src.find("pub fn ensure_tap(").unwrap();
+        let et_end = et + net_src[et..].find("\n}\n").unwrap();
+        assert!(!net_src[et..et_end].contains("\"up\""), "ensure_tap must not bring the tap up");
+    }
+
     #[tokio::test]
     async fn test_a_vmm_that_dies_takes_its_snapshot_files_unless_an_operation_holds_them() {
         for held in [false, true] {
@@ -9434,6 +9697,34 @@ pub(crate) mod rule_fake {
         /// anything (two overlapping deletes).
         #[allow(clippy::type_complexity)]
         pub(crate) on_second_remove_tap: std::sync::Mutex<Option<Box<dyn FnOnce(&FakeRules, &Manager) + Send>>>,
+        /// FLU-8 r7. A ruleset containing one of these gets no answer (the
+        /// repair's outcome is unknown); nothing is applied.
+        pub(crate) no_answer: std::sync::Mutex<Vec<String>>,
+        /// Once an apply has been made, every look answers "could not look"
+        /// (a second look that cannot be made).
+        pub(crate) looks_fail_after_apply: AtomicBool,
+        applied_once: AtomicBool,
+        /// Every listing takes this long (the tick's budget).
+        pub(crate) slow_list_ms: std::sync::atomic::AtomicU64,
+        /// The next listing panics (a tick that panics).
+        pub(crate) panic_on_list: AtomicBool,
+        /// Rewrites every listing (a kernel that prints differently).
+        #[allow(clippy::type_complexity)]
+        pub(crate) rewrite_listing: std::sync::Mutex<Option<Box<dyn Fn(String) -> String + Send>>>,
+        /// Tables listed as `flags dormant`. A transaction with a plain `add
+        /// table` clears the flag, as on the lab (X14) — unless
+        /// `dormant_sticky`.
+        pub(crate) dormant: std::sync::Mutex<std::collections::BTreeSet<(String, String)>>,
+        pub(crate) dormant_sticky: AtomicBool,
+        /// What `pin_adopted_tap` answers (None: it pins).
+        pub(crate) adopted_pin_fails: std::sync::Mutex<Option<PinFailure>>,
+        /// Tables whose listing answers "could not look" (one table only).
+        pub(crate) unknown_tables: std::sync::Mutex<std::collections::BTreeSet<(String, String)>>,
+        /// Routes installed while the watch's mutex was held (X8).
+        pub(crate) route_under_watch_lock: std::sync::atomic::AtomicUsize,
+        /// Run once inside the next ingress rebuild (X9).
+        #[allow(clippy::type_complexity)]
+        pub(crate) on_ingress_rebuild: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     /// One chain: its spec, its rules as `nft list` prints them.
@@ -9573,6 +9864,11 @@ pub(crate) mod rule_fake {
         pub(crate) fn link_up(&self, dev: &str) -> Option<bool> {
             self.k().links.get(dev).map(|l| l.up)
         }
+
+        /// Forget the applies made so far (`looks_fail_after_apply`).
+        pub(crate) fn reset_applied(&self) {
+            self.applied_once.store(false, Ordering::SeqCst);
+        }
         pub(crate) fn calls(&self) -> Vec<RuleCall> {
             lock_std(&self.calls).clone()
         }
@@ -9613,20 +9909,33 @@ pub(crate) mod rule_fake {
         fn active(&self, _net_on: bool) -> bool {
             true
         }
-        fn rebuild_isolation(&self, members: &[(String, String)]) -> bool {
+        fn rebuild_isolation(&self, members: &[(String, String)]) -> (net::Applied, bool) {
             let mut ips: Vec<String> = members.iter().map(|m| m.1.clone()).collect();
             ips.sort();
             let free_slots = self.free_slots();
             lock_std(&self.calls).push(RuleCall::Isolation { ips, free_slots });
-            !self.fail_isolation.load(Ordering::SeqCst) && net::Kernel::apply(self, &net::isolation_ruleset(members))
+            let outcome = if self.fail_isolation.load(Ordering::SeqCst) {
+                net::Applied::Refused("Error: the fake refuses isolation".into())
+            } else {
+                net::Kernel::apply(self, &net::isolation_ruleset(members))
+            };
+            let ok = outcome.ok();
+            (outcome, ok)
         }
-        fn rebuild_ingress(&self, members: &[(u16, String, u16)]) -> bool {
+        fn rebuild_ingress(&self, members: &[(u16, String, u16)]) -> net::Applied {
             let mut sorted = members.to_vec();
             sorted.sort();
             let free_slots = self.free_slots();
             lock_std(&self.calls).push(RuleCall::Ingress { members: sorted, free_slots });
+            let hook = lock_std(&self.on_ingress_rebuild).take();
+            if let Some(hook) = hook {
+                hook();
+            }
             let fail = lock_std(&self.ingress_script).pop_front().unwrap_or(self.fail_ingress.load(Ordering::SeqCst));
-            !fail && net::Kernel::apply(self, &net::ingress_ruleset(members))
+            if fail {
+                return net::Applied::Refused("Error: the fake refuses ingress".into());
+            }
+            net::Kernel::apply(self, &net::ingress_ruleset(members))
         }
         fn remove_tap(&self, tap: &str) {
             let free_slots = self.free_slots();
@@ -9655,11 +9964,32 @@ pub(crate) mod rule_fake {
                 return false;
             }
             // As `ensure_pinned_tap`: the tap first (no VMM holds it yet),
-            // then its chain.
-            self.k().links.entry(tap.to_string()).or_insert(FakeLink { up: true, held: false, port: true });
-            match ip.and_then(|ip| net::antispoof_ruleset(tap, ip, mac)) {
-                Some(rs) => net::Kernel::apply(self, &rs),
+            // then its chain, then up.
+            self.k().links.entry(tap.to_string()).or_insert(FakeLink { up: false, held: false, port: true });
+            let pinned = match ip.and_then(|ip| net::antispoof_ruleset(tap, ip, mac)) {
+                Some(rs) => net::Kernel::apply(self, &rs).ok(),
                 None => false,
+            };
+            if pinned {
+                if let Some(l) = self.k().links.get_mut(tap) {
+                    l.up = true;
+                }
+            }
+            pinned
+        }
+        fn pin_adopted_tap(&self, tap: &str, ip: &str, mac: &net::GuestMac) -> Result<(), PinFailure> {
+            lock_std(&self.calls).push(RuleCall::PinTap { tap: tap.to_string() });
+            if let Some(why) = *lock_std(&self.adopted_pin_fails) {
+                if why == PinFailure::Unpinned {
+                    if let Some(l) = self.k().links.get_mut(tap) {
+                        l.up = false;
+                    }
+                }
+                return Err(why);
+            }
+            match net::antispoof_ruleset(tap, ip, mac).map(|rs| net::Kernel::apply(self, &rs).ok()) {
+                Some(true) => Ok(()),
+                _ => Err(PinFailure::Unpinned),
             }
         }
         fn ensure_bridge(&self, _cidr: Cidr) -> (bool, bool) {
@@ -9676,28 +10006,67 @@ pub(crate) mod rule_fake {
     }
 
     impl net::Kernel for FakeRules {
-        fn apply(&self, ruleset: &str) -> bool {
+        fn apply(&self, ruleset: &str) -> net::Applied {
             let what = ruleset
                 .lines()
                 .find(|l| l.starts_with("add chain "))
                 .map(|l| l.split_whitespace().take(5).skip(2).collect::<Vec<_>>().join(" "))
                 .unwrap_or_default();
             self.op(format!("apply {}", what));
+            self.applied_once.store(true, Ordering::SeqCst);
             if let Some(dev) = lock_std(&self.vanish_before_apply).take() {
                 self.k().links.remove(&dev);
             }
-            if lock_std(&self.reject).iter().any(|r| ruleset.contains(r.as_str())) {
-                return false;
+            if lock_std(&self.no_answer).iter().any(|r| ruleset.contains(r.as_str())) {
+                return net::Applied::Unknown;
             }
-            self.k().apply(ruleset)
+            if lock_std(&self.reject).iter().any(|r| ruleset.contains(r.as_str())) {
+                return net::Applied::Refused("Error: Could not process rule: the fake refuses it".into());
+            }
+            if self.k().apply(ruleset) {
+                // X14: a plain `add table` clears a table's dormant flag.
+                if !self.dormant_sticky.load(Ordering::SeqCst) {
+                    let mut d = lock_std(&self.dormant);
+                    for l in ruleset.lines() {
+                        let w: Vec<&str> = l.split_whitespace().collect();
+                        if w.len() == 4 && w[0] == "add" && w[1] == "table" {
+                            d.remove(&(w[2].to_string(), w[3].to_string()));
+                        }
+                    }
+                }
+                net::Applied::Committed
+            } else {
+                // nft's answer for a device that does not exist, a rule for a
+                // missing chain, and the like.
+                net::Applied::Refused("Error: No such file or directory".into())
+            }
         }
         fn list_table(&self, family: &str, table: &str) -> net::Listing {
             self.op(format!("list {} {}", family, table));
-            if self.fail_looks.load(Ordering::SeqCst) {
+            if self.panic_on_list.swap(false, Ordering::SeqCst) {
+                panic!("the fake kernel panics in a listing");
+            }
+            let ms = self.slow_list_ms.load(Ordering::SeqCst);
+            if ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+            if self.fail_looks.load(Ordering::SeqCst)
+                || (self.looks_fail_after_apply.load(Ordering::SeqCst) && self.applied_once.load(Ordering::SeqCst))
+                || lock_std(&self.unknown_tables).contains(&(family.to_string(), table.to_string()))
+            {
                 return net::Listing::Unknown;
             }
-            match self.k().listing(family, table) {
-                Some(l) => net::Listing::Listed(l),
+            let listed = self.k().listing(family, table);
+            match listed {
+                Some(mut l) => {
+                    if lock_std(&self.dormant).contains(&(family.to_string(), table.to_string())) {
+                        l = l.replacen(" {\n", " {\n\tflags dormant\n", 1);
+                    }
+                    if let Some(f) = lock_std(&self.rewrite_listing).as_ref() {
+                        l = f(l);
+                    }
+                    net::Listing::Listed(l)
+                }
                 None => net::Listing::Missing,
             }
         }
@@ -9710,7 +10079,7 @@ pub(crate) mod rule_fake {
                     .links
                     .iter()
                     .filter(|(_, l)| l.port)
-                    .map(|(n, l)| net::Port { name: n.clone(), carrier: l.up && l.held })
+                    .map(|(n, l)| net::Port { name: n.clone(), carrier: l.up && l.held, up: l.up })
                     .collect(),
             )
         }
@@ -9750,9 +10119,20 @@ pub(crate) mod rule_fake {
             }
         }
         fn link_exists(&self, dev: &str) -> Option<bool> {
+            if self.fail_looks.load(Ordering::SeqCst) {
+                return None;
+            }
             Some(self.k().links.contains_key(dev))
         }
-        fn blackhole_route(&self, cidr: &str) -> bool {
+        fn link_up(&self, dev: &str) -> Option<bool> {
+            self.k().links.get(dev).map(|l| l.up)
+        }
+        fn guest_route(&self, cidr: &str) -> bool {
+            if let Some(mgr) = self.mgr.get().and_then(|w| w.upgrade()) {
+                if mgr.watch.try_lock().is_err() {
+                    self.route_under_watch_lock.fetch_add(1, Ordering::SeqCst);
+                }
+            }
             self.op(format!("route {}", cidr));
             self.k().routes.push(cidr.to_string());
             true
@@ -10077,7 +10457,7 @@ mod rule_tests {
         }
         let (tap, mac) = tap_pin_for_slot(slot);
         rules.k().links.insert(tap.clone(), super::rule_fake::FakeLink { up: true, held: true, port: true });
-        assert!(net::Kernel::apply(rules, &net::antispoof_ruleset(&tap, &ip, &mac).unwrap()));
+        assert!(net::Kernel::apply(rules, &net::antispoof_ruleset(&tap, &ip, &mac).unwrap()).ok());
     }
 
     #[tokio::test]
