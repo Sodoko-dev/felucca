@@ -1,5 +1,5 @@
 // Tests for the lifecycle policies (lifecycle.go, v4 P5.2): policy
-// validation/resolution, the idle/TTL sweep, dynamic-expose GC on auto-sleep,
+// validation/resolution, the idle/TTL sweep, dynamic-expose GC after a long sleep,
 // and the gateway activity report. Internal package (like exec_stream_test.go)
 // so the fake agent can be registered as a real node address — autoSleep and
 // autoDelete speak real HTTP to it — and so the sweep can be driven directly
@@ -20,6 +20,7 @@ import (
 
 	"github.com/alpham/infra-saas/felucca/internal/agentclient"
 	"github.com/alpham/infra-saas/felucca/internal/config"
+	"github.com/alpham/infra-saas/felucca/internal/ingress"
 	"github.com/alpham/infra-saas/felucca/internal/model"
 	"github.com/alpham/infra-saas/felucca/internal/state"
 	"github.com/alpham/infra-saas/felucca/internal/store"
@@ -32,11 +33,11 @@ func TestValidPolicy(t *testing.T) {
 		v    int64
 		want bool
 	}{
-		{0, true},                 // inherit
-		{-1, true},                // explicitly disabled
-		{minIdleSleepS, true},     // lower bound
+		{0, true},             // inherit
+		{-1, true},            // explicitly disabled
+		{minIdleSleepS, true}, // lower bound
 		{minIdleSleepS - 1, false},
-		{maxPolicyS, true},        // upper bound (one year)
+		{maxPolicyS, true}, // upper bound (one year)
 		{maxPolicyS + 1, false},
 		{-2, false}, // only -1 is a valid negative
 	}
@@ -796,7 +797,7 @@ func TestSweepNeverSendsTheAdminTokenToANode(t *testing.T) {
 	// Enroll the node the way a join does: its own feluccad→agent bearer.
 	const nodeTok = "felucca_nt_lifecycle"
 	host, port := nodeHostOf(t, srv)
-	if err := srv.putNodeCred(host, port, nodeTok, now); err != nil {
+	if err := putNodeCred(srv, host, port, nodeTok, now); err != nil {
 		t.Fatalf("put node cred: %v", err)
 	}
 
@@ -870,9 +871,11 @@ func TestSweepStampsPreP5Sleeper(t *testing.T) {
 	}
 }
 
-func TestSweepDropsDynamicExposes(t *testing.T) {
-	// Auto-sleep GCs the dynamic (all-digit-named) exposes — the ADR-0007
-	// deferral — and keeps the named ones.
+// FLU-6 R12: auto-sleep no longer drops the dynamic exposes. Dropping them
+// releases their node ports into quarantine, and a sandbox that wakes within
+// it would get fresh ports and quarantine more. (This test used to pin the
+// drop at the moment of sleep.)
+func TestSweepKeepsDynamicExposesWhenItSleeps(t *testing.T) {
 	fa := &lcAgent{}
 	srv, id := newLifecycleTestServer(t, fa)
 	now := time.Now().Unix()
@@ -893,19 +896,90 @@ func TestSweepDropsDynamicExposes(t *testing.T) {
 	sb = srv.st.FindSandbox(id)
 	gotState := sb.State
 	exposes := append([]model.Expose(nil), sb.Exposes...)
+	nq := len(srv.st.Quarantine)
 	srv.st.Unlock()
 	if gotState != model.StateSleeping {
 		t.Fatalf("state after sweep: %q, want sleeping", gotState)
 	}
-	if len(exposes) != 1 || exposes[0].Name != "web" {
-		t.Errorf("exposes after sweep: %+v, want only \"web\"", exposes)
+	if len(exposes) != 2 || nq != 0 {
+		t.Errorf("after the sleep: exposes %+v quarantine %d, want both rows and nothing quarantined", exposes, nq)
 	}
-	// The agent was told to drop exactly the dynamic row's DNAT rule.
+	if fa.saw(fmt.Sprintf("DELETE /v1/vms/%s/expose:8069", id)) {
+		t.Errorf("agent unexpose at sleep time; calls: %v", fa.snapshot())
+	}
+}
+
+// sleepingWithExposes puts the lifecycle fixture's sandbox to sleep at
+// sleptAt with one dynamic and one named row.
+func sleepingWithExposes(srv *Server, id string, sleptAt int64) {
+	srv.st.Lock()
+	defer srv.st.Unlock()
+	sb := srv.st.FindSandbox(id)
+	sb.State = model.StateSleeping
+	sb.SleptAt = sleptAt
+	sb.Exposes = []model.Expose{
+		{Name: "8069", GuestPort: 8069, NodePort: 20001}, // dynamic
+		{Name: "web", GuestPort: 80, NodePort: 20002},    // named
+	}
+}
+
+// Once the sandbox has slept for the port quarantine the sweep drops its
+// dynamic rows (quarantining their ports, saving the change) and keeps the
+// named ones; not a second earlier.
+func TestSweepDropsDynamicExposesAfterThePortQuarantine(t *testing.T) {
+	fa := &lcAgent{}
+	srv, id := newLifecycleTestServer(t, fa)
+	now := time.Now().Unix()
+	quarantine := int64(ingress.PortQuarantine / time.Second)
+
+	sleepingWithExposes(srv, id, now-quarantine+1)
+	srv.lifecycleSweep(now)
+	if fa.saw(fmt.Sprintf("DELETE /v1/vms/%s/expose:8069", id)) {
+		t.Fatalf("dropped before the quarantine had passed; calls: %v", fa.snapshot())
+	}
+
+	sleepingWithExposes(srv, id, now-quarantine)
+	srv.lifecycleSweep(now)
+	srv.st.Lock()
+	exposes := append([]model.Expose(nil), srv.st.FindSandbox(id).Exposes...)
+	q := append([]model.ReleasedPort(nil), srv.st.Quarantine...)
+	srv.st.Unlock()
+	if len(exposes) != 1 || exposes[0].Name != "web" {
+		t.Errorf("exposes after the drop: %+v, want only \"web\"", exposes)
+	}
 	if !fa.saw(fmt.Sprintf("DELETE /v1/vms/%s/expose:8069", id)) {
 		t.Errorf("agent unexpose for 8069 not seen; calls: %v", fa.snapshot())
 	}
 	if fa.saw(fmt.Sprintf("DELETE /v1/vms/%s/expose:80", id)) {
 		t.Errorf("agent unexpose dropped the named expose; calls: %v", fa.snapshot())
+	}
+	if len(q) != 1 || q[0].Port != 20001 || q[0].SandboxID != id || q[0].GuestPort != 8069 {
+		t.Errorf("quarantine: %+v, want the dynamic row's port", q)
+	}
+	saved := state.New()
+	if err := srv.db.LoadInto(saved); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if sb := saved.FindSandbox(id); sb == nil || len(sb.Exposes) != 1 || len(saved.Quarantine) != 1 {
+		t.Errorf("the drop was not saved: %+v %+v", sb, saved.Quarantine)
+	}
+}
+
+// A sandbox that sleeps and wakes within the quarantine keeps its rows.
+func TestSweepKeepsDynamicExposesAcrossAWake(t *testing.T) {
+	fa := &lcAgent{}
+	srv, id := newLifecycleTestServer(t, fa)
+	now := time.Now().Unix()
+	sleepingWithExposes(srv, id, now-100)
+	if w := doRequest(srv.Handler(), "POST", "/api/v1/sandboxes/"+id+"/wake", "", adminAuth); w.Code != 200 {
+		t.Fatalf("wake: %d %s", w.Code, w.Body)
+	}
+	srv.lifecycleSweep(now + int64(ingress.PortQuarantine/time.Second))
+	srv.st.Lock()
+	n := len(srv.st.FindSandbox(id).Exposes)
+	srv.st.Unlock()
+	if n != 2 || fa.saw(fmt.Sprintf("DELETE /v1/vms/%s/expose:8069", id)) {
+		t.Errorf("after a wake: %d rows, calls %v; want both rows kept", n, fa.snapshot())
 	}
 }
 

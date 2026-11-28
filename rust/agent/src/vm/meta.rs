@@ -114,6 +114,14 @@ pub struct Meta {
     /// Serialized only when Some (after disk_gb) — pre-P4 bytes stay identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_sha256: Option<String>,
+    /// FLU-4: the snapshot files beside a `sleeping` record are complete and
+    /// are the guest this record describes. Only a sleep that finished writes
+    /// it (true), and every transition out of `sleeping` clears it. Absent =
+    /// false, and serialized only when true, LAST: every record that is not a
+    /// valid sleeper keeps today's bytes, and an older agent, which ignores
+    /// keys it does not know, reads this one as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub snapshot_valid: bool,
 }
 
 impl Meta {
@@ -156,8 +164,9 @@ impl Meta {
             Some(s) => format!(",\"image_sha256\":{}", json_str(s)),
             None => String::new(),
         };
+        let snapshot_suffix = if self.snapshot_valid { ",\"snapshot_valid\":true" } else { "" };
         format!(
-            "{{\"id\":{},\"name\":{},\"dir_id\":{},\"vcpus\":{},\"mem_mib\":{},\"pid\":{},\"slot\":{},\"ip\":{},\"state\":{},\"vsock\":{}{}{}{}{}{}}}",
+            "{{\"id\":{},\"name\":{},\"dir_id\":{},\"vcpus\":{},\"mem_mib\":{},\"pid\":{},\"slot\":{},\"ip\":{},\"state\":{},\"vsock\":{}{}{}{}{}{}{}}}",
             json_str(&self.id),
             json_str(&self.name),
             json_str(&self.dir_id),
@@ -173,6 +182,7 @@ impl Meta {
             image_suffix,
             disk_suffix,
             sha_suffix,
+            snapshot_suffix,
         )
     }
 }
@@ -264,6 +274,7 @@ mod tests {
             image: None,
             disk_gb: None,
             image_sha256: None,
+            snapshot_valid: false,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -292,6 +303,7 @@ mod tests {
             image: None,
             disk_gb: None,
             image_sha256: None,
+            snapshot_valid: false,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -336,6 +348,7 @@ mod tests {
             image: None,
             disk_gb: None,
             image_sha256: None,
+            snapshot_valid: false,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -395,6 +408,7 @@ mod tests {
             image: None,
             disk_gb: None,
             image_sha256: None,
+            snapshot_valid: false,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -422,6 +436,7 @@ mod tests {
             image: None,
             disk_gb: None,
             image_sha256: None,
+            snapshot_valid: false,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -447,6 +462,7 @@ mod tests {
             image: None,
             disk_gb: None,
             image_sha256: None,
+            snapshot_valid: false,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -472,6 +488,7 @@ mod tests {
             image: None,
             disk_gb: None,
             image_sha256: None,
+            snapshot_valid: false,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -504,6 +521,7 @@ mod tests {
             image: None,
             disk_gb: None,
             image_sha256: None,
+            snapshot_valid: false,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -538,6 +556,7 @@ mod tests {
             image: None,
             disk_gb: None,
             image_sha256: None,
+            snapshot_valid: false,
             exposes: vec![],
         };
         let json = meta.to_json();
@@ -561,6 +580,7 @@ mod tests {
             image: None,
             disk_gb: None,
             image_sha256: None,
+            snapshot_valid: false,
             exposes: vec![
                 ExposeEntry { guest_port: 8069, node_port: 20000 },
                 ExposeEntry { guest_port: 443, node_port: 20001 },
@@ -605,6 +625,7 @@ mod tests {
             image: None,
             disk_gb: None,
             image_sha256: None,
+            snapshot_valid: false,
         };
         assert_eq!(
             meta.to_json(),
@@ -630,6 +651,7 @@ mod tests {
             image: Some("odoo-v18".into()),
             disk_gb: Some(8),
             image_sha256: None,
+            snapshot_valid: false,
         };
         let json = meta.to_json();
         // image and disk_gb serialize AFTER exposes, in that order.
@@ -665,6 +687,7 @@ mod tests {
             image: Some("odoo-v18".into()),
             disk_gb: Some(8),
             image_sha256: Some(sha.clone()),
+            snapshot_valid: false,
         };
         let json = meta.to_json();
         // image_sha256 serializes LAST, after disk_gb.
@@ -680,6 +703,67 @@ mod tests {
         let meta: Meta = serde_json::from_str(fixture).expect("parse pre-P4 fixture");
         assert_eq!(meta.image_sha256, None);
         // And a None field must not appear in the output (bytes stay pre-P4).
+        assert_eq!(meta.to_json(), fixture);
+    }
+
+    // ---- FLU-4: the snapshot-valid marker ----
+
+    fn sleeper(snapshot_valid: bool) -> Meta {
+        Meta {
+            id: "vm-z".into(),
+            name: "vm-z".into(),
+            dir_id: "vm-z".into(),
+            vcpus: 1,
+            mem_mib: 256,
+            pid: None,
+            slot: Some(0),
+            ip: Some("10.231.0.2".into()),
+            state: VmState::Sleeping,
+            vsock: true,
+            tenant_id: Some("acme".into()),
+            exposes: vec![],
+            image: Some("odoo-v18".into()),
+            disk_gb: Some(8),
+            image_sha256: Some("a".repeat(64)),
+            snapshot_valid,
+        }
+    }
+
+    #[test]
+    fn test_snapshot_marker_false_keeps_todays_bytes() {
+        // Exactly what an agent without the marker writes for the same record:
+        // every record that is not a valid sleeper is byte-identical.
+        let want = format!(
+            r#"{{"id":"vm-z","name":"vm-z","dir_id":"vm-z","vcpus":1,"mem_mib":256,"pid":null,"slot":0,"ip":"10.231.0.2","state":"sleeping","vsock":true,"tenant_id":"acme","image":"odoo-v18","disk_gb":8,"image_sha256":"{}"}}"#,
+            "a".repeat(64)
+        );
+        assert_eq!(sleeper(false).to_json(), want);
+        assert!(!sleeper(false).to_json().contains("snapshot_valid"));
+    }
+
+    #[test]
+    fn test_snapshot_marker_true_is_the_last_key_and_round_trips() {
+        let json = sleeper(true).to_json();
+        let without = sleeper(false).to_json();
+        // The same bytes with one key added at the very end.
+        assert_eq!(json, format!("{},\"snapshot_valid\":true}}", &without[..without.len() - 1]));
+        let back: Meta = serde_json::from_str(&json).expect("round-trip parse");
+        assert!(back.snapshot_valid);
+        assert_eq!(back.state, VmState::Sleeping);
+        assert_eq!(back.to_json(), json);
+    }
+
+    #[test]
+    fn test_a_record_without_the_marker_loads_as_false() {
+        // Every record an older agent wrote.
+        let fixture = r#"{"id":"vm-o","name":"vm-o","dir_id":"vm-o","vcpus":1,"mem_mib":256,"pid":null,"slot":0,"ip":"10.231.0.2","state":"sleeping","vsock":true}"#;
+        let meta: Meta = serde_json::from_str(fixture).expect("parse");
+        assert!(!meta.snapshot_valid);
+        assert_eq!(meta.to_json(), fixture);
+        // And an explicit false is accepted too (and not written back).
+        let explicit = r#"{"id":"vm-o","name":"vm-o","dir_id":"vm-o","vcpus":1,"mem_mib":256,"pid":null,"slot":0,"ip":"10.231.0.2","state":"sleeping","vsock":true,"snapshot_valid":false}"#;
+        let meta: Meta = serde_json::from_str(explicit).expect("parse");
+        assert!(!meta.snapshot_valid);
         assert_eq!(meta.to_json(), fixture);
     }
 }

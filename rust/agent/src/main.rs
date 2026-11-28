@@ -8,6 +8,8 @@ mod config;
 mod fc;
 mod guestclient;
 mod ipalloc;
+#[cfg(test)]
+mod lab_text;
 mod net;
 mod registration;
 mod server;
@@ -284,8 +286,55 @@ async fn main() {
         warn!("the guest bridge could not be brought up; guests have no network");
     }
     // Ingress DNAT rules don't survive a host reboot either; rebuild them
-    // from the exposes persisted in meta.json.
-    mgr.refresh_ingress().await;
+    // from the exposes persisted in meta.json. A failure no longer passes
+    // silently: the chain is emptied instead, or — when even that fails —
+    // no guest address is handed out until it is rebuilt (the watch retries
+    // it every tick, like any chain whose last rebuild failed).
+    if !mgr.start_ingress().await {
+        error!("the ingress DNAT rules could not be rebuilt at start-up; exposed node ports do not answer until a rebuild succeeds");
+    }
+
+    // FLU-8: look at the kernel every 5 s and put back what is missing.
+    // `report` and `off` change the watch only: everything above still
+    // refused to serve, and took the bridge down, exactly as before.
+    if cfg.net {
+        // W11: in every mode, `off` included.
+        {
+            let mgr6 = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                vm::watch::withheld_retry_loop(mgr6).await;
+            });
+        }
+        // W1: read back what start-up just applied. If this build cannot
+        // read the marker the kernel prints, the watch would take the bridge
+        // and every tap down on its first tick: it does not run (as `off`).
+        let check = if cfg.isolation_watch == config::IsolationWatch::Off {
+            vm::watch::SelfCheck::Readable
+        } else {
+            mgr.watch_self_check().await
+        };
+        if let vm::watch::SelfCheck::Unreadable { chain, line } = &check {
+            eprintln!(
+                "error: isolation watch NOT started: the chain {} was applied at start-up, but the kernel lists \
+                 it without a marker this agent can read; its first rule reads: {}",
+                chain, line
+            );
+            error!(chain = %chain, first_rule = %line,
+                "isolation watch NOT started: a chain applied at start-up is listed without a marker this agent \
+                 can read; nothing is watched or taken down in this process");
+        }
+        let mode = vm::watch::mode_after_self_check(cfg.isolation_watch, &check);
+        match mode {
+            config::IsolationWatch::Off => warn!("isolation watch is off: nothing notices rules that vanish while the agent runs"),
+            mode => {
+                info!(mode = ?mode, "isolation watch started");
+                let mgr5 = Arc::clone(&mgr);
+                tokio::spawn(async move {
+                    vm::watch::watch_loop(mgr5, mode).await;
+                });
+            }
+        }
+    }
 
     // Background registration + heartbeat loop.
     let node_id: NodeId = Arc::new(RwLock::new(String::new()));

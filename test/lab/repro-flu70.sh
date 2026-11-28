@@ -2,14 +2,19 @@
 # Reproduction of FLU-70 (and the full-disk half of FLU-11) — runs ON a lab worker:
 #   bash test/lab/run-on-worker.sh repro-flu70 [worker-vm]
 #
-# A sleep that fails part-way (the disk fills up) leaves the guest paused under
-# a record that says running, and leaves snapshot files that look complete.
-# When that sandbox's Firecracker later dies, the agent lists it as sleeping
-# and a wake restores it from the half-written memory file.
+# Before the fix, a sleep that failed part-way (the disk fills up) left the
+# guest paused under a record that said running, and left snapshot files that
+# looked complete; when that sandbox's Firecracker later died, the agent listed
+# it as sleeping and a wake restored it from the half-written memory file.
 #
-# This script only shows what happens; it asserts nothing about the bug, so it
-# keeps passing until the fix changes what it prints. It fills the data disk
-# for a few seconds.
+# Since FLU-70 and FLU-4 (F2, S1) it prints: after the failed sleep the record
+# says `running`, the Firecracker says `Running`, and for a guest that never
+# slept no vmstate.bin or mem.bin is listed; the sandbox whose Firecracker is
+# killed while the agent is stopped comes back `stopped`, and its wake answers
+# 409 with "state":"stopped". test/lab/snapshot.sh (S5, S3) asserts the same.
+#
+# This script only shows what happens; it asserts nothing about the bug. It
+# fills the data disk for a few seconds.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${HERE}/lib.sh"
@@ -28,6 +33,7 @@ say "  the caller retries the sleep with the disk free again: $(api -m 60 -X POS
 eq "wake sf-1" "$(vm_act sf-1 wake)" 200
 wait_exec sf-1 60 && ok "sf-1 answers after sleep + wake" || bad "sf-1 does not answer"
 # The other path: nobody retries, and the Firecracker dies later (power-off, host reboot, OOM).
+# (Since FLU-4: that sandbox comes back `stopped` and its wake is refused with 409.)
 eq "create sf-2" "$(vm_create sf-2 256)" 201; wait_exec sf-2 150 || bad "sf-2 never became exec-ready"
 D2="$(vm_dir sf-2)"; P2="$(vm_pid sf-2)"
 FREE_KB=$(df --output=avail "$DATA_DIR" | tail -1 | tr -d ' ')

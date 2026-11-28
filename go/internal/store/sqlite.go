@@ -3,15 +3,18 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"strings"
 
 	"github.com/alpham/infra-saas/felucca/internal/model"
 	"github.com/alpham/infra-saas/felucca/internal/state"
 
-	_ "modernc.org/sqlite" // pure-Go driver: feluccad stays CGO_ENABLED=0
+	"modernc.org/sqlite" // pure-Go driver: feluccad stays CGO_ENABLED=0
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const schema = `
@@ -116,32 +119,70 @@ CREATE TABLE IF NOT EXISTS wg_peers (
   hostname   TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
+-- FLU-6: node ports released less than the port quarantine ago. Part of the
+-- snapshot (rewritten with it), so no key: two sandboxes may have released
+-- the same port of one host within the quarantine.
+CREATE TABLE IF NOT EXISTS released_ports (
+  host        TEXT NOT NULL,
+  port        INTEGER NOT NULL,
+  sandbox_id  TEXT NOT NULL,
+  guest_port  INTEGER NOT NULL,
+  tenant_id   TEXT NOT NULL DEFAULT '',
+  released_at INTEGER NOT NULL
+);
 `
 
 // SQLite implements Store on a single SQLite database (WAL mode).
+//
+// It holds TWO handles on the file. db is the writer: one connection, every
+// INSERT/UPDATE/DELETE and every transaction. ro is read-only and serves every
+// plain SELECT. In WAL mode readers do not wait for a writer, so a save that is
+// slow, or that is stuck in the busy wait because another process holds the
+// write lock, no longer queues key lookups, tenant reads and listings behind it
+// on the single writer connection.
 type SQLite struct {
 	db *sql.DB
+	ro *sql.DB
 }
 
+// Connection-string pragmas. They are set through the DSN rather than with
+// db.Exec because database/sql may replace a connection at any time (an error,
+// an idle timeout): a pragma Exec'd once applies to the connection it happened
+// to run on, a DSN pragma to every connection the pool ever opens.
+//
+// synchronous=FULL: in WAL mode NORMAL can lose the last commits on a power cut
+// (the WAL is not synced at each commit). feluccad acknowledges a create, a
+// delete or a key only after the commit, so an acknowledged write must survive
+// one.
+const dsnPragmas = "_pragma=busy_timeout(5000)&_pragma=synchronous(FULL)&_pragma=foreign_keys(ON)"
+
+// maxReadConns bounds the read-only pool. Readers in WAL mode run concurrently;
+// a handful is plenty for the authentication and listing traffic.
+const maxReadConns = 4
+
 // OpenSQLite opens (creating if needed) the database at path and applies the
-// schema. The connection pool is capped at one writer — correct for SQLite
-// and for feluccad's single-process write pattern (ADR-0002).
+// schema. The writer pool is capped at one connection — correct for SQLite
+// and for feluccad's single-process write pattern (ADR-0002) — and a second,
+// read-only handle serves the reads (see SQLite).
 func OpenSQLite(path string) (*SQLite, error) {
-	db, err := sql.Open("sqlite", path)
+	// An in-memory database is private to the connection that opened it: the
+	// writer and the read handle would be two unrelated, empty databases, and
+	// every read would miss every write.
+	if path == ":memory:" || strings.HasPrefix(path, "file::memory:") || strings.Contains(path, "mode=memory") {
+		return nil, fmt.Errorf("open %s: an in-memory database is not supported (the writer and the read handle would be two different databases)", path)
+	}
+	// journal_mode is a property of the database file; it is set on the writer
+	// only (a read-only connection cannot change it, and does not need to).
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&"+dsnPragmas)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
 	db.SetMaxOpenConns(1)
-	for _, pragma := range []string{
-		"PRAGMA journal_mode=WAL;",
-		"PRAGMA busy_timeout=5000;",
-		"PRAGMA synchronous=NORMAL;",
-		"PRAGMA foreign_keys=ON;",
-	} {
-		if _, err := db.Exec(pragma); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("pragma %q: %w", pragma, err)
-		}
+	// The pragmas run when the first connection opens; surface their errors
+	// here rather than at the first query.
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
@@ -181,27 +222,90 @@ func OpenSQLite(path string) (*SQLite, error) {
 	if err := os.Chmod(path, 0o600); err != nil {
 		slog.Warn("chmod db file", "path", path, "err", err)
 	}
-	return &SQLite{db: db}, nil
+	// The read handle is opened only now, after the writer has created the
+	// file, the schema and the WAL. query_only makes every connection of this
+	// pool refuse writes while it opens the file as a normal WAL reader (it can
+	// use, and create, the -shm file like any other connection); a mode=ro URI
+	// cannot always do the latter. TestReadHandleIsReadOnlyAndCarriesThePragmas
+	// pins the refusal and the pragmas.
+	ro, err := sql.Open("sqlite", path+"?"+dsnPragmas+"&_pragma=query_only(1)")
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open read handle %s: %w", path, err)
+	}
+	ro.SetMaxOpenConns(maxReadConns)
+	if err := ro.Ping(); err != nil {
+		ro.Close()
+		db.Close()
+		return nil, fmt.Errorf("open read handle %s: %w", path, err)
+	}
+	return &SQLite{db: db, ro: ro}, nil
 }
 
-func (s *SQLite) Close() error { return s.db.Close() }
+// ResetWriter closes the writer's idle connection, so the next write opens a
+// fresh one. SQLite opens a file it cannot write read-only, without an error,
+// and the writer pool keeps its one connection for ever: a database that was
+// read-only when feluccad opened it (a read-only mount, an immutable file)
+// stays read-only to this process after the operator has made it writable,
+// until a restart. A connection in use is not affected; it is closed by a
+// later call.
+func (s *SQLite) ResetWriter() {
+	s.db.SetMaxIdleConns(0)
+	s.db.SetMaxIdleConns(1)
+}
+
+// MarkStarted records the start time in meta: one small real write, the
+// start-up's "can this database be written" check. Rewriting the whole
+// snapshot instead would make whatever the start loaded permanent before the
+// first request.
+func (s *SQLite) MarkStarted(now int64) error {
+	_, err := s.db.Exec(
+		`INSERT INTO meta (k, v) VALUES ('started_at', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`,
+		fmt.Sprintf("%d", now),
+	)
+	return err
+}
+
+// IsConstraint reports whether err is SQLite refusing a write that breaks a
+// constraint (a UNIQUE name, a duplicate key): the request's conflict, not a
+// database that cannot be written. Classified by the result code, not by
+// the message text.
+func IsConstraint(err error) bool {
+	var e *sqlite.Error
+	return errors.As(err, &e) && e.Code()&0xff == sqlite3.SQLITE_CONSTRAINT
+}
+
+func (s *SQLite) Close() error {
+	rerr := s.ro.Close()
+	if err := s.db.Close(); err != nil {
+		return err
+	}
+	return rerr
+}
 
 // Empty reports whether a snapshot has ever been saved.
 func (s *SQLite) Empty() (bool, error) {
 	var v string
-	err := s.db.QueryRow(`SELECT v FROM meta WHERE k='snapshot'`).Scan(&v)
+	err := s.ro.QueryRow(`SELECT v FROM meta WHERE k='snapshot'`).Scan(&v)
 	if err == sql.ErrNoRows {
 		return true, nil
 	}
 	return false, err
 }
 
-// SaveSnapshot writes the full working set in one transaction. Same
-// granularity as the legacy state.json Persist, just transactional.
-func (s *SQLite) SaveSnapshot(st *state.State) error {
-	st.Lock()
-	defer st.Unlock()
-
+// SaveSnapshot writes the full working set, and the usage events that describe
+// the transitions in it, in one transaction. Same granularity as the legacy
+// state.json Persist, just transactional.
+//
+// It takes a Snapshot, not the State: the copy is made under the state lock by
+// the caller, and the lock is NOT held here, so a save waiting out the busy
+// timeout (another process holding the write lock) no longer stalls every
+// request that needs the working set.
+//
+// The events are in the same transaction as the rows on purpose: a "slept"
+// event without the sleeping row (or the reverse) would bill a sandbox for a
+// state the control plane does not have.
+func (s *SQLite) SaveSnapshot(snap *state.Snapshot, usage []UsageEvent) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -214,16 +318,33 @@ func (s *SQLite) SaveSnapshot(st *state.State) error {
 	if _, err := tx.Exec(`DELETE FROM sandboxes`); err != nil {
 		return err
 	}
-	for _, n := range st.Nodes {
+	if _, err := tx.Exec(`DELETE FROM released_ports`); err != nil {
+		return err
+	}
+	// The quarantined ports in the same transaction as the rows: a removed
+	// route row whose port is not quarantined after a restart would hand that
+	// port to the next sandbox while gateways still route the old hostname.
+	for i := range snap.Quarantine {
+		q := &snap.Quarantine[i]
 		if _, err := tx.Exec(
-			`INSERT INTO nodes (id, hostname, addr, cpus, mem_total_mib, mem_free_mib, vm_count, pool_size, last_heartbeat)
-			 VALUES (?,?,?,?,?,?,?,?,?)`,
-			n.ID, n.Hostname, n.Addr, n.CPUs, n.MemTotalMiB, n.MemFreeMiB, n.VMCount, n.PoolSize, n.LastHB,
+			`INSERT INTO released_ports (host, port, sandbox_id, guest_port, tenant_id, released_at) VALUES (?,?,?,?,?,?)`,
+			q.Host, q.Port, q.SandboxID, q.GuestPort, q.TenantID, q.ReleasedAt,
 		); err != nil {
 			return err
 		}
 	}
-	for _, sb := range st.Sandboxes {
+	for i := range snap.Nodes {
+		n := &snap.Nodes[i]
+		if _, err := tx.Exec(
+			`INSERT INTO nodes (id, hostname, addr, cpus, mem_total_mib, mem_free_mib, vm_count, pool_size, last_heartbeat)
+			 VALUES (?,?,?,?,?,?,?,?,?)`,
+			n.ID, n.Hostname, n.Addr, n.CPUs, clampU64(n.MemTotalMiB), clampU64(n.MemFreeMiB), n.VMCount, n.PoolSize, n.LastHB,
+		); err != nil {
+			return err
+		}
+	}
+	for i := range snap.Sandboxes {
+		sb := &snap.Sandboxes[i]
 		exposes := ""
 		if len(sb.Exposes) > 0 {
 			b, err := json.Marshal(sb.Exposes)
@@ -236,7 +357,7 @@ func (s *SQLite) SaveSnapshot(st *state.State) error {
 			`INSERT INTO sandboxes (id, name, namespace, node_id, state, vcpus, mem_mib, ip, created_at, parent_id, tenant_id, exposes, allow_dynamic_ports, template, disk_gb, idle_sleep_s, asleep_delete_s, last_activity, slept_at)
 			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			sb.ID, sb.Name, sb.Namespace, nullable(sb.NodeID), string(sb.State),
-			sb.VCPUs, sb.MemMiB, nullable(sb.IP), sb.CreatedAt, nullable(sb.ParentID), sb.TenantID,
+			sb.VCPUs, clampU64(sb.MemMiB), nullable(sb.IP), sb.CreatedAt, nullable(sb.ParentID), sb.TenantID,
 			exposes, sb.AllowDynamicPorts, sb.Template, sb.DiskGB,
 			sb.IdleSleepS, sb.AsleepDeleteS, sb.LastActivity, sb.SleptAt,
 		); err != nil {
@@ -246,8 +367,11 @@ func (s *SQLite) SaveSnapshot(st *state.State) error {
 	if _, err := tx.Exec(
 		`INSERT INTO meta (k, v) VALUES ('seq', ?), ('request_count', ?), ('snapshot', '1')
 		 ON CONFLICT(k) DO UPDATE SET v=excluded.v`,
-		fmt.Sprintf("%d", st.Seq), fmt.Sprintf("%d", st.RequestCount),
+		fmt.Sprintf("%d", snap.Seq), fmt.Sprintf("%d", snap.RequestCount),
 	); err != nil {
+		return err
+	}
+	if err := appendUsageTx(tx, usage); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -262,7 +386,7 @@ func (s *SQLite) LoadInto(st *state.State) error {
 	defer st.Unlock()
 
 	var seq, reqCount uint64
-	rows, err := s.db.Query(`SELECT k, v FROM meta WHERE k IN ('seq','request_count')`)
+	rows, err := s.ro.Query(`SELECT k, v FROM meta WHERE k IN ('seq','request_count')`)
 	if err != nil {
 		return err
 	}
@@ -287,7 +411,7 @@ func (s *SQLite) LoadInto(st *state.State) error {
 	st.Seq = seq
 	st.RequestCount = reqCount
 
-	rows, err = s.db.Query(`SELECT id, hostname, addr, cpus, mem_total_mib, mem_free_mib, vm_count, pool_size, last_heartbeat FROM nodes`)
+	rows, err = s.ro.Query(`SELECT id, hostname, addr, cpus, mem_total_mib, mem_free_mib, vm_count, pool_size, last_heartbeat FROM nodes`)
 	if err != nil {
 		return err
 	}
@@ -304,7 +428,7 @@ func (s *SQLite) LoadInto(st *state.State) error {
 		return err
 	}
 
-	rows, err = s.db.Query(`SELECT id, name, namespace, node_id, state, vcpus, mem_mib, ip, created_at, parent_id, tenant_id, exposes, allow_dynamic_ports, template, disk_gb, idle_sleep_s, asleep_delete_s, last_activity, slept_at FROM sandboxes`)
+	rows, err = s.ro.Query(`SELECT id, name, namespace, node_id, state, vcpus, mem_mib, ip, created_at, parent_id, tenant_id, exposes, allow_dynamic_ports, template, disk_gb, idle_sleep_s, asleep_delete_s, last_activity, slept_at FROM sandboxes`)
 	if err != nil {
 		return err
 	}
@@ -329,22 +453,66 @@ func (s *SQLite) LoadInto(st *state.State) error {
 		st.Sandboxes = append(st.Sandboxes, sb)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	rows, err = s.ro.Query(`SELECT host, port, sandbox_id, guest_port, tenant_id, released_at FROM released_ports`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var q model.ReleasedPort
+		if err := rows.Scan(&q.Host, &q.Port, &q.SandboxID, &q.GuestPort, &q.TenantID, &q.ReleasedAt); err != nil {
+			rows.Close()
+			return err
+		}
+		st.Quarantine = append(st.Quarantine, q)
+	}
+	rows.Close()
 	return rows.Err()
 }
 
 // ---- Tenants ----
 
-func (s *SQLite) CreateTenant(t *Tenant) error {
-	_, err := s.db.Exec(
+// execer is what *sql.DB and *sql.Tx have in common for a write, so a row
+// insert can run alone or as one step of a transaction.
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func (s *SQLite) CreateTenant(t *Tenant) error { return createTenant(s.db, t) }
+
+func createTenant(e execer, t *Tenant) error {
+	_, err := e.Exec(
 		`INSERT INTO tenants (id, name, max_sandboxes, max_vcpus, max_mem_mib, max_disk_gb, default_idle_sleep_s, default_asleep_delete_s, created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
 		t.ID, t.Name, t.MaxSandboxes, t.MaxVcpus, t.MaxMemMiB, t.MaxDiskGb, t.DefaultIdleSleepS, t.DefaultAsleepDeleteS, t.CreatedAt,
 	)
 	return err
 }
 
+// CreateTenantWithKey inserts a tenant and its first API key in one
+// transaction. As two separate inserts, a failure of the second left a tenant
+// whose only key was never stored: the name is taken, and nobody holds a
+// credential for it.
+func (s *SQLite) CreateTenantWithKey(t *Tenant, k *APIKey) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := createTenant(tx, t); err != nil {
+		return err
+	}
+	if err := createKey(tx, k); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *SQLite) GetTenant(id string) (*Tenant, error) {
 	t := &Tenant{}
-	err := s.db.QueryRow(
+	err := s.ro.QueryRow(
 		`SELECT id, name, max_sandboxes, max_vcpus, max_mem_mib, max_disk_gb, default_idle_sleep_s, default_asleep_delete_s, created_at FROM tenants WHERE id=?`, id,
 	).Scan(&t.ID, &t.Name, &t.MaxSandboxes, &t.MaxVcpus, &t.MaxMemMiB, &t.MaxDiskGb, &t.DefaultIdleSleepS, &t.DefaultAsleepDeleteS, &t.CreatedAt)
 	if err == sql.ErrNoRows {
@@ -357,7 +525,7 @@ func (s *SQLite) GetTenant(id string) (*Tenant, error) {
 }
 
 func (s *SQLite) ListTenants() ([]*Tenant, error) {
-	rows, err := s.db.Query(`SELECT id, name, max_sandboxes, max_vcpus, max_mem_mib, max_disk_gb, default_idle_sleep_s, default_asleep_delete_s, created_at FROM tenants ORDER BY created_at`)
+	rows, err := s.ro.Query(`SELECT id, name, max_sandboxes, max_vcpus, max_mem_mib, max_disk_gb, default_idle_sleep_s, default_asleep_delete_s, created_at FROM tenants ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -375,8 +543,10 @@ func (s *SQLite) ListTenants() ([]*Tenant, error) {
 
 // ---- API keys ----
 
-func (s *SQLite) CreateKey(k *APIKey) error {
-	_, err := s.db.Exec(
+func (s *SQLite) CreateKey(k *APIKey) error { return createKey(s.db, k) }
+
+func createKey(e execer, k *APIKey) error {
+	_, err := e.Exec(
 		`INSERT INTO api_keys (id, tenant_id, key_hash, prefix, created_at, expires_at, revoked_at) VALUES (?,?,?,?,?,?,NULL)`,
 		k.ID, k.TenantID, k.KeyHash, k.Prefix, k.CreatedAt, k.ExpiresAt,
 	)
@@ -388,7 +558,7 @@ func (s *SQLite) CreateKey(k *APIKey) error {
 // clock, so every authentication path gets it without a call-site change.
 func (s *SQLite) LookupKeyByHash(hash string) (string, error) {
 	var tenantID string
-	err := s.db.QueryRow(
+	err := s.ro.QueryRow(
 		`SELECT tenant_id FROM api_keys
 		 WHERE key_hash=? AND revoked_at IS NULL AND (expires_at = 0 OR expires_at > unixepoch())`, hash,
 	).Scan(&tenantID)
@@ -405,7 +575,7 @@ func (s *SQLite) LookupKeyByHash(hash string) (string, error) {
 // selected: the listing exists so an operator can find a key to revoke, and it
 // must not be able to hand back the verifier even by accident.
 func (s *SQLite) ListKeys(tenantID string) ([]*APIKey, error) {
-	rows, err := s.db.Query(
+	rows, err := s.ro.Query(
 		`SELECT id, tenant_id, prefix, created_at, expires_at, revoked_at FROM api_keys WHERE tenant_id=? ORDER BY created_at DESC, id DESC`,
 		tenantID,
 	)
@@ -478,7 +648,7 @@ func (s *SQLite) CreateJoinToken(t *JoinToken) error {
 // failed enrollment doesn't burn the one-time token.
 func (s *SQLite) CheckJoinToken(hash string, now int64) (bool, error) {
 	var one int
-	err := s.db.QueryRow(
+	err := s.ro.QueryRow(
 		`SELECT 1 FROM join_tokens WHERE token_hash=? AND used_at IS NULL AND created_at > ?`,
 		hash, now-JoinTokenTTL,
 	).Scan(&one)
@@ -495,7 +665,11 @@ func (s *SQLite) CheckJoinToken(hash string, now int64) (bool, error) {
 // UPDATE is the race-free check-and-set (SQLite single writer, ADR-0002).
 // Expired tokens (older than JoinTokenTTL) are never consumable.
 func (s *SQLite) ConsumeJoinToken(hash string, now int64) (bool, error) {
-	res, err := s.db.Exec(
+	return consumeJoinToken(s.db, hash, now)
+}
+
+func consumeJoinToken(e execer, hash string, now int64) (bool, error) {
+	res, err := e.Exec(
 		`UPDATE join_tokens SET used_at=? WHERE token_hash=? AND used_at IS NULL AND created_at > ?`,
 		now, hash, now-JoinTokenTTL,
 	)
@@ -506,11 +680,36 @@ func (s *SQLite) ConsumeJoinToken(hash string, now int64) (bool, error) {
 	return n > 0, nil
 }
 
+// EnrollNodeCred consumes a join token and stores the node credential it buys
+// in one transaction. Done as two writes, either order loses something: a
+// credential stored before the consume fails leaves a rotated credential and a
+// token still redeemable; a token consumed before the credential write fails
+// burns the operator's one-time token for nothing. consumed is false (and
+// nothing is written) when the token is unknown, used or expired.
+func (s *SQLite) EnrollNodeCred(c *NodeCred, tokenHash string, now int64) (consumed bool, err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	ok, err := consumeJoinToken(tx, tokenHash, now)
+	if err != nil || !ok {
+		return false, err
+	}
+	if err := putNodeCred(tx, c); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ---- Node credentials ----
 
 func (s *SQLite) GetNodeCred(host string) (*NodeCred, error) {
 	c := &NodeCred{}
-	err := s.db.QueryRow(
+	err := s.ro.QueryRow(
 		`SELECT host, token, legacy, created_at FROM node_creds WHERE host=?`, host,
 	).Scan(&c.Host, &c.Token, &c.Legacy, &c.CreatedAt)
 	if err == sql.ErrNoRows {
@@ -523,8 +722,10 @@ func (s *SQLite) GetNodeCred(host string) (*NodeCred, error) {
 }
 
 // PutNodeCred upserts by host: a re-enrollment rotates the node's token.
-func (s *SQLite) PutNodeCred(c *NodeCred) error {
-	_, err := s.db.Exec(
+func (s *SQLite) PutNodeCred(c *NodeCred) error { return putNodeCred(s.db, c) }
+
+func putNodeCred(e execer, c *NodeCred) error {
+	_, err := e.Exec(
 		`INSERT INTO node_creds (host, token, legacy, created_at) VALUES (?,?,?,?)
 		 ON CONFLICT(host) DO UPDATE SET token=excluded.token, legacy=excluded.legacy, created_at=excluded.created_at`,
 		c.Host, c.Token, c.Legacy, c.CreatedAt,
@@ -544,7 +745,7 @@ func (s *SQLite) DeleteNodeCred(host string) (bool, error) {
 
 // ListNodeCreds returns every credential row, oldest first.
 func (s *SQLite) ListNodeCreds() ([]*NodeCred, error) {
-	rows, err := s.db.Query(`SELECT host, token, legacy, created_at FROM node_creds ORDER BY created_at, host`)
+	rows, err := s.ro.Query(`SELECT host, token, legacy, created_at FROM node_creds ORDER BY created_at, host`)
 	if err != nil {
 		return nil, err
 	}
@@ -565,7 +766,7 @@ func (s *SQLite) ListNodeCreds() ([]*NodeCred, error) {
 // nobody and every node it ever enrolls needs its own credential.
 func (s *SQLite) SeedLegacyNodeCreds(hosts []string, now int64) (int, error) {
 	var marker string
-	err := s.db.QueryRow(`SELECT v FROM meta WHERE k='node_creds_seeded'`).Scan(&marker)
+	err := s.ro.QueryRow(`SELECT v FROM meta WHERE k='node_creds_seeded'`).Scan(&marker)
 	if err == nil {
 		return 0, nil // already ran; a second pass would re-grandfather
 	}
@@ -621,7 +822,7 @@ func (s *SQLite) CreateWgPeer(p *WgPeer) error {
 
 func (s *SQLite) GetWgPeerByPubKey(pub string) (*WgPeer, error) {
 	p := &WgPeer{}
-	err := s.db.QueryRow(
+	err := s.ro.QueryRow(
 		`SELECT pubkey, overlay_ip, hostname, created_at FROM wg_peers WHERE pubkey=?`, pub,
 	).Scan(&p.PubKey, &p.OverlayIP, &p.Hostname, &p.CreatedAt)
 	if err == sql.ErrNoRows {
@@ -634,7 +835,7 @@ func (s *SQLite) GetWgPeerByPubKey(pub string) (*WgPeer, error) {
 }
 
 func (s *SQLite) ListWgPeers() ([]*WgPeer, error) {
-	rows, err := s.db.Query(`SELECT pubkey, overlay_ip, hostname, created_at FROM wg_peers ORDER BY created_at, pubkey`)
+	rows, err := s.ro.Query(`SELECT pubkey, overlay_ip, hostname, created_at FROM wg_peers ORDER BY created_at, pubkey`)
 	if err != nil {
 		return nil, err
 	}
@@ -655,14 +856,14 @@ func (s *SQLite) ListWgPeers() ([]*WgPeer, error) {
 func (s *SQLite) CreateTemplate(t *Template) error {
 	_, err := s.db.Exec(
 		`INSERT INTO templates (id, name, image, image_sha256, vcpus, mem_mib, disk_gb, image_size_gb, pool_size, tenant_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-		t.ID, t.Name, t.Image, t.ImageSHA256, t.Vcpus, t.MemMiB, t.DiskGB, t.ImageSizeGB, t.PoolSize, t.TenantID, t.CreatedAt,
+		t.ID, t.Name, t.Image, t.ImageSHA256, t.Vcpus, clampU64(t.MemMiB), t.DiskGB, t.ImageSizeGB, t.PoolSize, t.TenantID, t.CreatedAt,
 	)
 	return err
 }
 
 func (s *SQLite) GetTemplateByName(name string) (*Template, error) {
 	t := &Template{}
-	err := s.db.QueryRow(
+	err := s.ro.QueryRow(
 		`SELECT id, name, image, image_sha256, vcpus, mem_mib, disk_gb, image_size_gb, pool_size, tenant_id, created_at FROM templates WHERE name=?`, name,
 	).Scan(&t.ID, &t.Name, &t.Image, &t.ImageSHA256, &t.Vcpus, &t.MemMiB, &t.DiskGB, &t.ImageSizeGB, &t.PoolSize, &t.TenantID, &t.CreatedAt)
 	if err == sql.ErrNoRows {
@@ -675,7 +876,7 @@ func (s *SQLite) GetTemplateByName(name string) (*Template, error) {
 }
 
 func (s *SQLite) ListTemplates() ([]*Template, error) {
-	rows, err := s.db.Query(`SELECT id, name, image, image_sha256, vcpus, mem_mib, disk_gb, image_size_gb, pool_size, tenant_id, created_at FROM templates ORDER BY created_at, name`)
+	rows, err := s.ro.Query(`SELECT id, name, image, image_sha256, vcpus, mem_mib, disk_gb, image_size_gb, pool_size, tenant_id, created_at FROM templates ORDER BY created_at, name`)
 	if err != nil {
 		return nil, err
 	}
@@ -702,12 +903,42 @@ func (s *SQLite) DeleteTemplate(name string) (bool, error) {
 
 // ---- Usage events ----
 
-func (s *SQLite) AppendUsage(e UsageEvent) error {
-	_, err := s.db.Exec(
+func (s *SQLite) AppendUsage(e UsageEvent) error { return appendUsage(s.db, e) }
+
+func appendUsage(x execer, e UsageEvent) error {
+	_, err := x.Exec(
 		`INSERT INTO usage_events (tenant_id, sandbox_id, event, vcpus, mem_mib, ts, disk_gb) VALUES (?,?,?,?,?,?,?)`,
-		e.TenantID, e.SandboxID, e.Event, e.Vcpus, e.MemMiB, e.TS, e.DiskGB,
+		e.TenantID, e.SandboxID, e.Event, e.Vcpus, clampU64(e.MemMiB), e.TS, e.DiskGB,
 	)
 	return err
+}
+
+// appendUsageTx inserts events in order inside the caller's transaction.
+func appendUsageTx(tx *sql.Tx, events []UsageEvent) error {
+	for _, e := range events {
+		if err := appendUsage(tx, e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// AppendUsageBatch writes events in one transaction: all of them or none.
+// It is how queued exec rows reach the database — one commit per flush
+// instead of one synchronous write per exec request.
+func (s *SQLite) AppendUsageBatch(events []UsageEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := appendUsageTx(tx, events); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *SQLite) ListUsage(tenantID string, from, upTo int64) ([]UsageEvent, error) {
@@ -715,7 +946,7 @@ func (s *SQLite) ListUsage(tenantID string, from, upTo int64) ([]UsageEvent, err
 	// must replay in insert order or the interval folding misorders them).
 	// Pre-window 'exec' rows are excluded — they only ever feed an in-window
 	// counter, so loading the tenant's whole exec history would be wasteful.
-	rows, err := s.db.Query(
+	rows, err := s.ro.Query(
 		`SELECT tenant_id, sandbox_id, event, vcpus, mem_mib, ts, disk_gb
 		 FROM usage_events
 		 WHERE tenant_id=? AND ts<=? AND (event != 'exec' OR ts >= ?)
@@ -753,6 +984,19 @@ func (s *SQLite) PruneUsage(before int64) (int64, error) {
 }
 
 // ---- helpers ----
+
+// clampU64 binds an unsigned value into SQLite's signed 64-bit INTEGER.
+// database/sql refuses a uint64 with the high bit set outright, and one such
+// value in memory (a heartbeat's mem_free_mib, say) would then fail every
+// snapshot save that rewrites it — forever, since the value stays in memory.
+// Clamping keeps a nonsensical value from taking the store down; the handlers
+// bound these fields long before they get this large.
+func clampU64(v uint64) int64 {
+	if v > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(v)
+}
 
 func nullable(p *string) any {
 	if p == nil {

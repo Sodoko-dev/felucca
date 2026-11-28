@@ -16,6 +16,10 @@
 
 use crate::config::split_host_port;
 use crate::net::run;
+
+/// The time limit of a `wg` command (FLU-8 W14): `wg set … endpoint <name>`
+/// resolves the name.
+pub(crate) const WG_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -362,14 +366,17 @@ pub fn ensure_interface(info: &JoinInfo, key_path: &str) -> Result<(), String> {
     // Key + hub peer (re-applying the same config is a no-op for wg).
     let allowed = allowed_ips(info);
     let keepalive = info.keepalive_s.to_string();
-    if !run(&[
+    // 60 s, not `COMMAND_LIMIT`: `endpoint <name>` resolves the name, which
+    // can take longer than 10 s — killed, start-up is fatal and the unit
+    // loops (FLU-8 W14).
+    if !crate::net::run_within(&[
         "wg", "set", WG_IFACE,
         "private-key", key_path,
         "peer", &info.server_pubkey,
         "endpoint", &info.server_endpoint,
         "allowed-ips", &allowed,
         "persistent-keepalive", &keepalive,
-    ]) {
+    ], WG_LIMIT) {
         return Err(format!(
             "wg set {} failed (missing wireguard kernel module / interface not created / sudo -n denied?)",
             WG_IFACE

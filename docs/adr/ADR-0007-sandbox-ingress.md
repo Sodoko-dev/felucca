@@ -1,5 +1,19 @@
 # ADR-0007 — Sandbox ingress: named exposes, worker DNAT, felucca-gw
 
+> **Superseded in part by [ADR-0012](ADR-0012-data-safety.md) (2026-11-27).**
+> Decision 3 said a feluccad outage keeps the gateway serving from its last
+> route table. That is now bounded: past `--max-stale` (default and maximum
+> 600 s), and before its first successful fetch, the gateway answers every
+> sandbox request `503 {"error":"route table unavailable"}` with
+> `Retry-After: 5`, and `/readyz` says the same. Decision 2's "lowest free"
+> node port is replaced by round-robin allocation that avoids the ports
+> feluccad names, and feluccad keeps every released node port away from other
+> sandboxes for 900 s. Decision 3's upstream connections are pooled per
+> sandbox and guest port, not per `node:port`. The deferred "Dynamic-expose
+> GC" now drops a sleeping sandbox's dynamic exposes only once it has slept
+> for 900 s. The deferred "feluccad↔agent expose reconciliation" stays open
+> (FLU-13); node ports reachable without the gateway are FLU-75.
+
 - Status: Accepted
 - Date: 2026-06-12
 - Context: fourth phase (P3, "the Sodoko unlock") of the v4 plan. Services

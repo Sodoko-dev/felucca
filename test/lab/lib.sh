@@ -7,11 +7,19 @@
 # conformance suite (plain HTTP from another VM) can do. `scripts/verify-*.sh`
 # on the macOS host ship them into the VM and run them.
 #
-# Needs: FELUCCA_TOKEN (the lab token). Optional: AGENT_API, AGENT_DATA_DIR.
+# Needs: FELUCCA_AUTH_FILE (a file, readable only by the user running the gate,
+# holding the line `Authorization: Bearer <lab token>`; curl reads it with
+# `-H @file`, so the token is on no command line and in no process listing),
+# or else FELUCCA_TOKEN (the token itself: then $H puts it on every curl
+# command line). Optional: AGENT_API, AGENT_DATA_DIR.
 
 A="${AGENT_API:-http://127.0.0.1:9090}"
-: "${FELUCCA_TOKEN:?FELUCCA_TOKEN is not set}"
-H="Authorization: Bearer ${FELUCCA_TOKEN}"
+if [ -n "${FELUCCA_AUTH_FILE:-}" ] && [ -r "${FELUCCA_AUTH_FILE}" ]; then
+  H="@${FELUCCA_AUTH_FILE}"
+else
+  : "${FELUCCA_TOKEN:?neither FELUCCA_AUTH_FILE nor FELUCCA_TOKEN is set}"
+  H="Authorization: Bearer ${FELUCCA_TOKEN}"
+fi
 DATA_DIR="${AGENT_DATA_DIR:-$(sudo sed -n 's/.*"data_dir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/felucca/felucca-agent.json 2>/dev/null | head -1)}"
 DATA_DIR="${DATA_DIR:-/srv/felucca}"
 D="${DATA_DIR%/}/instances"
@@ -100,3 +108,26 @@ preflight_unit() {
   case "$d" in *w0-*|*lab-test*|*zz-*) bad "left-over test drop-in on $UNIT: $d"; return 1;; esac
   return 0
 }
+
+# ---- snapshots, disks and Firecrackers (added for test/lab/snapshot*.sh) -----
+# <id> <action> -> "<http code> <body>" (the body on one line)
+vm_act_body() { local r; r="$(api -m 120 -w '\n%{http_code}' -X POST "$A/v1/vms/$1/$2")"; printf '%s %s' "$(printf '%s' "$r" | tail -n 1)" "$(printf '%s' "$r" | sed '$d' | tr -d '\n')"; }
+vm_fork_body() { local r; r="$(api -m 120 -w '\n%{http_code}' -X POST -d "{\"id\":\"$2\",\"name\":\"lab\"}" "$A/v1/vms/$1/fork")"; printf '%s %s' "$(printf '%s' "$r" | tail -n 1)" "$(printf '%s' "$r" | sed '$d' | tr -d '\n')"; }
+# <id> -> "<state> <snapshot_valid>" of the record ON DISK (absent marker = false)
+meta_snap() { meta_field "$1" '"\(.state) \(.snapshot_valid // false)"'; }
+# <dir> -> "vmstate=yes|no mem=yes|no tmp=yes|no"
+snap_files() { sudo sh -c "cd '$1' 2>/dev/null || exit 0; for f in vmstate.bin mem.bin vmstate.bin.tmp; do if [ -e \$f ]; then r=yes; else r=no; fi; case \$f in vmstate.bin) printf 'vmstate=%s ' \$r;; mem.bin) printf 'mem=%s ' \$r;; *) printf 'tmp=%s' \$r;; esac; done"; }
+# <dir> -> pids of the Firecrackers whose API socket is in that directory (live ones only)
+fc_in_dir() { local p; for p in $(pgrep -x firecracker); do alive "$p" && sudo cat "/proc/$p/cmdline" 2>/dev/null | tr '\0' ' ' | grep -qF -- "--api-sock $1/fc.sock" && echo "$p"; done; }
+# <dir> [timeout-s] — wait until no Firecracker of that directory is alive
+wait_no_fc() { local i=0 t="${2:-30}"; while [ -n "$(fc_in_dir "$1")" ] && [ "$i" -lt $((t*4)) ]; do sleep 0.25; i=$((i+1)); done; [ -z "$(fc_in_dir "$1")" ]; }
+# <pid> -> the rootfs.ext4 files that process has open, sorted, space-separated
+rootfs_open() { sudo ls -l "/proc/$1/fd" 2>/dev/null | grep -o '/[^ ]*rootfs\.ext4' | sort -u | tr '\n' ' ' | sed 's/ $//'; }
+# <dir> -> path_on_host of the drive "rootfs" as that directory's Firecracker reports it
+fc_drive() { sudo curl -s -m 5 --unix-socket "$1/fc.sock" http://localhost/vm/config | jq -r '.drives[]?|select(.drive_id=="rootfs")|.path_on_host'; }
+# <image> <path> -> the file's content read out of an ext4 image with debugfs ("" when it is not there)
+img_cat() { sudo debugfs -R "cat $2" "$1" 2>/dev/null; }
+img_has() { sudo debugfs -R "stat $2" "$1" 2>&1 | grep -q '^Inode:'; }
+# The memory witness: a 50 MB blob in the guest's tmpfs, and its sha256.
+blob_make() { guest "$1" 'head -c 50000000 /dev/urandom > /dev/shm/blob && sha256sum /dev/shm/blob | cut -c1-64' | tr -d '\n'; }
+blob_sum()  { guest "$1" 'sha256sum /dev/shm/blob 2>/dev/null | cut -c1-64' | tr -d '\n'; }

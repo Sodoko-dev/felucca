@@ -105,6 +105,7 @@ type poolSpec struct {
 func (srv *Server) poolSpecs() ([]poolSpec, error) {
 	ts, err := srv.db.ListTemplates()
 	if err != nil {
+		storeReadFailed()
 		return nil, err
 	}
 	out := []poolSpec{}
@@ -226,7 +227,10 @@ func (srv *Server) createTemplate(w http.ResponseWriter, r *http.Request, tenant
 	if req.Tenant != "" {
 		owner, err := srv.db.GetTenant(req.Tenant)
 		if err != nil {
-			writeJSON(w, 500, []byte(`{"error":"store error"}`))
+			storeReadFailed()
+			// Read errors are 503 (store unavailable), as everywhere else.
+			slog.Error("create template: tenant read failed", "tenant", req.Tenant, "err", err)
+			refuseStoreUnavailable(w)
 			return
 		}
 		if owner == nil {
@@ -261,7 +265,9 @@ func (srv *Server) createTemplate(w http.ResponseWriter, r *http.Request, tenant
 	}
 
 	if existing, err := srv.db.GetTemplateByName(t.Name); err != nil {
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
+		storeReadFailed()
+		slog.Error("create template: template read failed", "template", t.Name, "err", err)
+		refuseStoreUnavailable(w)
 		return
 	} else if existing != nil {
 		writeJSON(w, 409, []byte(`{"error":"template exists"}`))
@@ -310,7 +316,8 @@ func (srv *Server) createTemplate(w http.ResponseWriter, r *http.Request, tenant
 		// A captured image file without a row is harmless (re-capture
 		// refuses; delete cleans) but don't leave it silently.
 		slog.Error("create template", "template", t.Name, "err", err)
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
+		// A constraint is a concurrent create of the same name that won.
+		srv.rowWriteFailed(w, err, `{"error":"template exists"}`)
 		return
 	}
 
@@ -331,6 +338,7 @@ func (srv *Server) createTemplate(w http.ResponseWriter, r *http.Request, tenant
 func (srv *Server) listTemplates(w http.ResponseWriter, tenant string) {
 	ts, err := srv.db.ListTemplates()
 	if err != nil {
+		storeReadFailed()
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}
@@ -361,7 +369,9 @@ func (srv *Server) deleteTemplate(w http.ResponseWriter, name, tenant string) {
 	}
 	t, err := srv.db.GetTemplateByName(name)
 	if err != nil {
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
+		storeReadFailed()
+		slog.Error("delete template: template read failed", "template", name, "err", err)
+		refuseStoreUnavailable(w)
 		return
 	}
 	if t == nil {
@@ -369,6 +379,8 @@ func (srv *Server) deleteTemplate(w http.ResponseWriter, name, tenant string) {
 		return
 	}
 	if _, err := srv.db.DeleteTemplate(name); err != nil {
+		slog.Error("delete template", "template", name, "err", err)
+		srv.storeWriteFailed(err)
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}

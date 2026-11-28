@@ -140,6 +140,46 @@ pub async fn put_drive_rootfs(sock: &str, rootfs_path: &str) -> Result<()> {
     put(sock, "/drives/rootfs", &body).await
 }
 
+/// PATCH /drives/rootfs — point the root drive of a loaded, not yet resumed
+/// VM at another image (fork: the child's own copy).
+///
+/// A snapshot records the drive's absolute path, and `snapshot/load` has no
+/// override for it: without this a fork child opens its PARENT's image, and
+/// the two guests write over each other. Lab-verified on FC 1.16: 204 on a
+/// paused, loaded VM; Firecracker closes the old image and opens the new one;
+/// the guest sees one `virtio_blk ... new size` line at the resume.
+pub async fn patch_drive_rootfs(sock: &str, rootfs_path: &str) -> Result<()> {
+    patch(sock, "/drives/rootfs", &build_drive_rootfs_patch(rootfs_path)).await
+}
+
+/// Build the PATCH /drives/rootfs JSON body — used in tests too.
+pub fn build_drive_rootfs_patch(rootfs_path: &str) -> String {
+    format!("{{\"drive_id\":\"rootfs\",\"path_on_host\":{}}}", json_str(rootfs_path))
+}
+
+/// GET /vm/config — the image the root drive is open on now.
+pub async fn get_root_drive_path(sock: &str) -> Result<String> {
+    let (status, body) = request_uds(sock, Method::GET, "/vm/config", "").await?;
+    if status != 200 {
+        return Err(FcError(format!("GET /vm/config -> {}: {}", status, body)));
+    }
+    parse_root_drive_path(&body).ok_or_else(|| FcError(format!("GET /vm/config: no rootfs drive path in {}", body)))
+}
+
+/// `path_on_host` of the drive `rootfs` in a `GET /vm/config` body, wherever
+/// it is in the list. `None` when there is no such drive or it has no path.
+pub fn parse_root_drive_path(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("drives")?
+        .as_array()?
+        .iter()
+        .find(|d| d.get("drive_id").and_then(|v| v.as_str()) == Some("rootfs"))?
+        .get("path_on_host")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// PUT /network-interfaces/eth0 (only when networking on).
 ///
 /// `guest_mac` pins the NIC's L2 identity to the address the host's per-tap
@@ -193,6 +233,16 @@ pub async fn patch_vm_state(sock: &str, state: &str) -> Result<()> {
     patch(sock, "/vm", &body).await
 }
 
+/// PATCH /vm, with Firecracker's answer whatever its status: `Ok((status,
+/// body))` whenever an HTTP answer came back, `Err` when none did (the VMM
+/// died or the reply was lost). A wake tells the two apart (FLU-4 S7'): only a
+/// resume Firecracker answered with a refusal is proof that the guest did not
+/// run.
+pub async fn patch_vm_state_answer(sock: &str, state: &str) -> Result<(u16, String)> {
+    let body = format!("{{\"state\":\"{}\"}}", state);
+    request_uds(sock, Method::PATCH, "/vm", &body).await
+}
+
 /// PUT /snapshot/create {snapshot_type:"Full", snapshot_path, mem_file_path}
 pub async fn put_snapshot_create(sock: &str, vmstate_path: &str, mem_path: &str) -> Result<()> {
     let body = build_snapshot_create(vmstate_path, mem_path);
@@ -212,13 +262,19 @@ pub fn build_snapshot_create(vmstate_path: &str, mem_path: &str) -> String {
     )
 }
 
-/// PUT /snapshot/load {snapshot_path, mem_backend, resume_vm:true, network_overrides?, vsock_override?}
+/// PUT /snapshot/load {snapshot_path, mem_backend, network_overrides?, vsock_override?, resume_vm}
 ///
 /// `vsock_uds` (v3 fork): when the snapshotted VM had a vsock device, the
 /// baked uds_path is the PARENT's absolute path. FC v1.16 re-binds that path on
 /// restore, which collides with a still-running parent (EADDRINUSE). Passing a
 /// `vsock_override` rebinds the device to the child's own UDS path. (Validated
 /// on FC v1.16: load+vsock_override -> 204, child binds its own v.sock.)
+///
+/// `resume_vm` false leaves the restored guest `Paused` until a
+/// `PATCH /vm {"state":"Resumed"}` (wake: the record must say `running` on
+/// disk before the guest executes again). Lab-verified on FC 1.16: the load
+/// answers 204 with no network or vsock activity, and after the resume both
+/// work at once.
 pub async fn put_snapshot_load(
     sock: &str,
     vmstate_path: &str,
@@ -226,8 +282,9 @@ pub async fn put_snapshot_load(
     net_on: bool,
     slot: Option<u32>,
     vsock_uds: Option<&str>,
+    resume_vm: bool,
 ) -> Result<()> {
-    let body = build_snapshot_load(vmstate_path, mem_path, net_on, slot, vsock_uds);
+    let body = build_snapshot_load(vmstate_path, mem_path, net_on, slot, vsock_uds, resume_vm);
     let (status, resp_body) = request_uds(sock, Method::PUT, "/snapshot/load", &body).await?;
     if status >= 300 {
         return Err(FcError(format!("snapshot/load -> {}: {}", status, resp_body)));
@@ -242,6 +299,7 @@ pub fn build_snapshot_load(
     net_on: bool,
     slot: Option<u32>,
     vsock_uds: Option<&str>,
+    resume_vm: bool,
 ) -> String {
     let mut body = format!(
         "{{\"snapshot_path\":{},\"mem_backend\":{{\"backend_path\":{},\"backend_type\":\"File\"}}",
@@ -263,7 +321,7 @@ pub fn build_snapshot_load(
             json_str(uds)
         ));
     }
-    body.push_str(",\"resume_vm\":true}");
+    body.push_str(&format!(",\"resume_vm\":{}}}", resume_vm));
     body
 }
 
@@ -389,6 +447,7 @@ mod tests {
             true,
             Some(3),
             None,
+            true,
         );
         assert_eq!(
             body,
@@ -404,6 +463,7 @@ mod tests {
             false,
             None,
             None,
+            true,
         );
         assert_eq!(
             body,
@@ -420,6 +480,7 @@ mod tests {
             true,
             None,
             None,
+            true,
         );
         assert_eq!(
             body,
@@ -446,6 +507,7 @@ mod tests {
             true,
             Some(3),
             Some("/srv/ignis/instances/child-1/v.sock"),
+            true,
         );
         assert_eq!(
             body,
@@ -461,10 +523,60 @@ mod tests {
             false,
             None,
             Some("/a/v.sock"),
+            true,
         );
         assert_eq!(
             body,
             r#"{"snapshot_path":"/a/vmstate.bin","mem_backend":{"backend_path":"/a/mem.bin","backend_type":"File"},"vsock_override":{"guest_cid":3,"uds_path":"/a/v.sock"},"resume_vm":true}"#
+        );
+    }
+
+    #[test]
+    fn test_build_drive_rootfs_patch() {
+        // Fork: the child's drive is pointed at its own image before it runs.
+        assert_eq!(
+            build_drive_rootfs_patch("/srv/ignis/instances/child-1/rootfs.ext4"),
+            r#"{"drive_id":"rootfs","path_on_host":"/srv/ignis/instances/child-1/rootfs.ext4"}"#
+        );
+        // The path is escaped, not pasted.
+        assert_eq!(
+            build_drive_rootfs_patch("/a \"b\"\\c/rootfs.ext4"),
+            r#"{"drive_id":"rootfs","path_on_host":"/a \"b\"\\c/rootfs.ext4"}"#
+        );
+    }
+
+    #[test]
+    fn test_parse_root_drive_path() {
+        // As Firecracker 1.16 answers (lab, round 4), trimmed.
+        let one = r#"{"balloon":null,"drives":[{"drive_id":"rootfs","partuuid":null,"is_root_device":true,"cache_type":"Unsafe","is_read_only":false,"path_on_host":"/srv/ignis/instances/kid/rootfs.ext4","rate_limiter":null,"io_engine":"Sync","socket":null}],"machine-config":{"vcpu_count":1,"mem_size_mib":256}}"#;
+        assert_eq!(parse_root_drive_path(one).as_deref(), Some("/srv/ignis/instances/kid/rootfs.ext4"));
+        // More than one drive, the root drive not first: found by its id.
+        let two = r#"{"drives":[{"drive_id":"data","path_on_host":"/d.img"},{"drive_id":"rootfs","path_on_host":"/r.img"}]}"#;
+        assert_eq!(parse_root_drive_path(two).as_deref(), Some("/r.img"));
+        // Escaped characters come back as the path they stand for.
+        let esc = r#"{"drives":[{"drive_id":"rootfs","path_on_host":"/a \"b\"\\c\u00e9/rootfs.ext4"}]}"#;
+        assert_eq!(parse_root_drive_path(esc).as_deref(), Some("/a \"b\"\\c\u{e9}/rootfs.ext4"));
+        // Nothing to compare: no path, no rootfs drive, no drives, not JSON.
+        for body in [
+            r#"{"drives":[{"drive_id":"rootfs"}]}"#,
+            r#"{"drives":[{"drive_id":"rootfs","path_on_host":null}]}"#,
+            r#"{"drives":[{"drive_id":"data","path_on_host":"/d.img"}]}"#,
+            r#"{"drives":[]}"#,
+            r#"{"machine-config":{}}"#,
+            "not json",
+            "",
+        ] {
+            assert_eq!(parse_root_drive_path(body), None, "{body}");
+        }
+    }
+
+    #[test]
+    fn test_build_snapshot_load_without_resume() {
+        // Wake loads paused and resumes only once the record says `running`.
+        let body = build_snapshot_load("/a/vmstate.bin", "/a/mem.bin", true, Some(3), None, false);
+        assert_eq!(
+            body,
+            r#"{"snapshot_path":"/a/vmstate.bin","mem_backend":{"backend_path":"/a/mem.bin","backend_type":"File"},"network_overrides":[{"iface_id":"eth0","host_dev_name":"hth-3"}],"resume_vm":false}"#
         );
     }
 }

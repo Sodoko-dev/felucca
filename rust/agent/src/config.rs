@@ -6,7 +6,8 @@
 //! token/FELUCCA_TOKEN/--token, pool_size/FELUCCA_POOL_SIZE/--pool-size,
 //! net/FELUCCA_NET/--net (on/off/true/false/1/0), net_cidr/FELUCCA_NET_CIDR/--net-cidr,
 //! join_url/FELUCCA_JOIN_URL/--join, join_token/FELUCCA_JOIN_TOKEN/--join-token,
-//! bind_any/FELUCCA_BIND_ANY/--bind-any (on/off).
+//! bind_any/FELUCCA_BIND_ANY/--bind-any (on/off),
+//! isolation_watch/FELUCCA_ISOLATION_WATCH/--isolation-watch (enforce/report/off).
 //! bind→port quirk: trailing :N in bind overrides port.
 
 use crate::ipalloc::Cidr;
@@ -32,6 +33,32 @@ pub struct Config {
     /// the bridge gateway, which every guest has as its default route, so a
     /// wildcard bind hands the root control API to every tenant's sandbox.
     pub bind_any: bool,
+    /// FLU-8: what the isolation watch may do (`vm::watch`).
+    pub isolation_watch: IsolationWatch,
+}
+
+/// isolation_watch/FELUCCA_ISOLATION_WATCH/--isolation-watch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IsolationWatch {
+    /// Look, repair, and take the guest bridge or a tap down when a fence
+    /// cannot be put back.
+    #[default]
+    Enforce,
+    /// Look, repair, count and log; never take anything down.
+    Report,
+    /// No watch. Start-up still refuses to serve without the fences.
+    Off,
+}
+
+/// Parse an isolation-watch mode. Unknown is an error, not a default: a typo
+/// in `report` must not silently leave a node in `enforce`, nor the reverse.
+fn parse_isolation_watch(v: &str) -> Result<IsolationWatch, String> {
+    match v.to_ascii_lowercase().as_str() {
+        "enforce" => Ok(IsolationWatch::Enforce),
+        "report" => Ok(IsolationWatch::Report),
+        "off" => Ok(IsolationWatch::Off),
+        _ => Err(format!("isolation_watch: unknown value {:?} (want enforce, report or off)", v)),
+    }
 }
 
 impl Default for Config {
@@ -49,6 +76,7 @@ impl Default for Config {
             pool_size: 0,
             port: 9090,
             bind_any: false,
+            isolation_watch: IsolationWatch::Enforce,
         }
     }
 }
@@ -68,6 +96,7 @@ struct FileConfig {
     pool_size: Option<u64>,
     port: Option<u64>,
     bind_any: Option<serde_json::Value>,
+    isolation_watch: Option<String>,
 }
 
 fn parse_bool(v: &str) -> Option<bool> {
@@ -134,6 +163,7 @@ pub fn load(args: &[String], env: &HashMap<String, String>) -> Result<Config, St
                 _ => {}
             }
         }
+        if let Some(v) = fc.isolation_watch { cfg.isolation_watch = parse_isolation_watch(&v)?; }
     }
 
     // --- 2) Env layer ---
@@ -156,6 +186,9 @@ pub fn load(args: &[String], env: &HashMap<String, String>) -> Result<Config, St
     }
     if let Some(v) = env.get("FELUCCA_BIND_ANY") {
         if let Some(b) = parse_bool(v) { cfg.bind_any = b; }
+    }
+    if let Some(v) = env.get("FELUCCA_ISOLATION_WATCH") {
+        cfg.isolation_watch = parse_isolation_watch(v)?;
     }
 
     // --- 3) Flag layer (highest precedence) ---
@@ -193,6 +226,17 @@ pub fn load(args: &[String], env: &HashMap<String, String>) -> Result<Config, St
                     if let Ok(n) = args[i+1].parse::<u16>() { cfg.port = n; }
                     i += 2; continue;
                 }
+            }
+            "--isolation-watch" => {
+                if i + 1 < args.len() {
+                    cfg.isolation_watch = parse_isolation_watch(&args[i+1])?;
+                    i += 2; continue;
+                }
+                // W17: a mode flag with no mode refuses, it does not default.
+                return Err("--isolation-watch needs a value (enforce, report or off)".into());
+            }
+            a if a.starts_with("--isolation-watch=") => {
+                cfg.isolation_watch = parse_isolation_watch(&a["--isolation-watch=".len()..])?;
             }
             _ => {}
         }
@@ -570,6 +614,41 @@ mod tests {
         let args2: Vec<String> = vec!["felucca-agent".into(), "--net".into(), "1".into()];
         let cfg2 = load(&args2, &HashMap::new()).expect("no config file");
         assert!(cfg2.net);
+    }
+
+    #[test]
+    fn test_isolation_watch_modes() {
+        let cfg = load(&["felucca-agent".into()], &HashMap::new()).expect("no config file");
+        assert_eq!(cfg.isolation_watch, IsolationWatch::Enforce, "enforce is the default");
+        for (v, want) in [("enforce", IsolationWatch::Enforce), ("report", IsolationWatch::Report), ("OFF", IsolationWatch::Off)] {
+            let mut env = HashMap::new();
+            env.insert("FELUCCA_ISOLATION_WATCH".into(), v.into());
+            assert_eq!(load(&["felucca-agent".into()], &env).unwrap().isolation_watch, want, "{v}");
+        }
+        // An unknown value refuses to start, from every layer.
+        let mut env = HashMap::new();
+        env.insert("FELUCCA_ISOLATION_WATCH".into(), "repot".into());
+        let e = load(&["felucca-agent".into()], &env).unwrap_err();
+        assert!(e.contains("isolation_watch") && e.contains("repot"), "{e}");
+        let args: Vec<String> = vec!["felucca-agent".into(), "--isolation-watch".into(), "".into()];
+        assert!(load(&args, &HashMap::new()).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        std::fs::write(&path, r#"{"isolation_watch":"report"}"#).unwrap();
+        let args: Vec<String> = vec!["felucca-agent".into(), "--config".into(), path.to_str().unwrap().into()];
+        assert_eq!(load(&args, &HashMap::new()).unwrap().isolation_watch, IsolationWatch::Report);
+        // W17: `--isolation-watch=<value>` too; the flag alone refuses.
+        let args: Vec<String> = vec!["felucca-agent".into(), "--isolation-watch=report".into()];
+        assert_eq!(load(&args, &HashMap::new()).unwrap().isolation_watch, IsolationWatch::Report);
+        let args: Vec<String> = vec!["felucca-agent".into(), "--isolation-watch=bogus".into()];
+        assert!(load(&args, &HashMap::new()).is_err());
+        let args: Vec<String> = vec!["felucca-agent".into(), "--isolation-watch".into()];
+        assert!(load(&args, &HashMap::new()).is_err(), "the flag without a value must refuse");
+        // The flag wins over the env, as for every other key.
+        let mut env = HashMap::new();
+        env.insert("FELUCCA_ISOLATION_WATCH".into(), "off".into());
+        let args: Vec<String> = vec!["felucca-agent".into(), "--isolation-watch".into(), "report".into()];
+        assert_eq!(load(&args, &env).unwrap().isolation_watch, IsolationWatch::Report);
     }
 
     #[test]

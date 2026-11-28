@@ -104,18 +104,43 @@ type Expose struct {
 	NodePort  uint16 `json:"node_port"`
 }
 
+// ReleasedPort is a node port feluccad gave up (FLU-6): the last route row of
+// a sandbox that mapped a guest port to it was removed. Until it is
+// ingress.PortQuarantine old it is kept away from every other sandbox on the
+// same worker host, because a gateway's route table, a call to the worker
+// already under way, or a pooled upstream connection can still send the old
+// sandbox's traffic to it. Saved with the snapshot (one transaction with the
+// row's removal).
+type ReleasedPort struct {
+	// Host is the host part of the address feluccad dials the worker's agent
+	// on: what route rows carry as node_host. Two node records with the same
+	// host share one port range, so the host is the key, not the node id.
+	Host       string
+	Port       uint16
+	SandboxID  string
+	GuestPort  uint16
+	TenantID   string
+	ReleasedAt int64 // unix seconds
+}
+
 // Node is the in-memory representation of an agent node.
 // Status is computed at marshal time via a view struct.
 type Node struct {
-	ID           string `json:"id"`
-	Hostname     string `json:"hostname"`
-	Addr         string `json:"addr"`
-	CPUs         uint32 `json:"cpus"`
-	MemTotalMiB  uint64 `json:"mem_total_mib"`
-	MemFreeMiB   uint64 `json:"mem_free_mib"`
-	VMCount      uint32 `json:"vm_count"`
-	PoolSize     uint32 `json:"pool_size"`
-	LastHB       int64  `json:"last_heartbeat"`
+	ID          string `json:"id"`
+	Hostname    string `json:"hostname"`
+	Addr        string `json:"addr"`
+	CPUs        uint32 `json:"cpus"`
+	MemTotalMiB uint64 `json:"mem_total_mib"`
+	MemFreeMiB  uint64 `json:"mem_free_mib"`
+	VMCount     uint32 `json:"vm_count"`
+	PoolSize    uint32 `json:"pool_size"`
+	LastHB      int64  `json:"last_heartbeat"`
+	// IsolationOK is the isolation_ok of the node's last heartbeat (FLU-8
+	// N10): nil when that heartbeat did not carry it (an older agent), or none
+	// has arrived since feluccad started. In memory only: not in the wire
+	// shape (nodeView), not in the snapshot copy, not in the database.
+	// Replaced on each heartbeat, never written through.
+	IsolationOK *bool `json:"-"`
 }
 
 // NodeStatus computes whether the node is ready based on the supplied now (unix secs).

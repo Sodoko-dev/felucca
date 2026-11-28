@@ -27,6 +27,23 @@ metaless_dirs() { sudo sh -c "for d in $D/*/; do [ -e \"\$d\" ] || continue; [ -
 took_over() { journal_since "$1" | grep 'reconcile: took over' | tail -1 | sed 's/\x1b\[[0-9;]*m//g; s/.*took over what the previous agent left *//'; }
 no_garbage() { eq "$1: no Firecracker without a record" "$(orphans | wc -l | tr -d ' ')" 0; eq "$1: no directory without meta.json" "$(metaless_dirs)" ""; }
 mk() { api -o /dev/null -w '%{http_code}' -m 180 -X POST -d "{\"id\":\"$1\",\"name\":\"bk\",\"vcpus\":1,\"mem_mib\":${2:-256}${3:+,\"tenant_id\":\"$3\"}}" "$A/v1/vms"; }
+# The same create, keeping what the agent answered: appends "<id> <code> <secs> <body>"
+# to <file>. For the sections that create in bulk: a create that fails must
+# never be silent (the agent logs nothing for a failed create; its answer is
+# the only account of what went wrong).
+mkr() { # <id> <mem> <file>
+  local out tail body
+  out="$(api -w '\n%{http_code} %{time_total}' -m 180 -X POST -d "{\"id\":\"$1\",\"name\":\"bk\",\"vcpus\":1,\"mem_mib\":${2:-256}}" "$A/v1/vms")"
+  tail="${out##*$'\n'}"; body="${out%$'\n'*}"; [ "$tail" = "$out" ] && body=""
+  printf '%s %s %s %s\n' "$1" "${tail%% *}" "${tail#* }" "$(printf '%s' "$body" | tr '\n' ' ' | cut -c1-400)" >> "$3"
+}
+# <file> — print every create that did not answer 201, with its body
+report_creates() {
+  local n; n="$(awk '$2!="201"' "$1" | wc -l | tr -d ' ')"
+  say "  creates: $(awk '{print $2}' "$1" | sort | uniq -c | awk '{printf "%sx%s ", $1, $2}')"
+  [ "$n" -gt 0 ] && awk '$2!="201" {id=$1; c=$2; t=$3; $1=$2=$3=""; sub(/^ +/, ""); printf "  create %s answered %s after %ss: %s\n", id, c, t, ($0==""?"(no body)":$0)}' "$1"
+  return 0
+}
 gping() { guest "$1" "ping -c2 -W1 $2 >/dev/null 2>&1 && echo yes || echo no" | tr -d '\n'; }
 cleanup_prefix bk-
 
@@ -54,13 +71,14 @@ fi
 
 if want B2; then
 say "== B2. agent killed every 3 s while sandboxes are being created =="
-rm -f /tmp/felucca-lab-bk-create.out
-( for i in $(seq 1 12); do c=$(mk bk-s$i 256); echo "$i $c" >> /tmp/felucca-lab-bk-create.out; sleep 0.5; done ) &
+rm -f /tmp/felucca-lab-bk-create.out /tmp/felucca-lab-bk-create.body
+( for i in $(seq 1 12); do mkr bk-s$i 256 /tmp/felucca-lab-bk-create.body; c="$(tail -1 /tmp/felucca-lab-bk-create.body | cut -d' ' -f2)"; echo "$i $c" >> /tmp/felucca-lab-bk-create.out; sleep 0.5; done ) &
 CRE=$!
 # MainPID is 0 between two starts, and `kill -9 0` would be this script's own process group.
 for _ in 1 2 3 4 5 6; do sleep 3; AP="$(agent_pid)"; [ "${AP:-0}" -gt 1 ] && sudo kill -9 "$AP" 2>/dev/null; done
 wait $CRE; wait_up; sleep 8
 OKS=$(grep -c ' 201$' /tmp/felucca-lab-bk-create.out); say "  creates: $(sort -n /tmp/felucca-lab-bk-create.out | awk '{printf "%s ", $2}')"
+report_creates /tmp/felucca-lab-bk-create.body   # 000 is expected here: the agent was killed under the request
 DEAD=0
 for i in $(sort -n /tmp/felucca-lab-bk-create.out | awk '$2==201{print $1}'); do
   if [ "$(vm_state bk-s$i)" = running ] && wait_exec bk-s$i 150; then :; else DEAD=$((DEAD+1)); say "  bk-s$i: 201 but state=$(vm_state bk-s$i)"; fi
@@ -69,13 +87,16 @@ done
 eq "sandboxes that answered 201 and are not running and answering" "$DEAD" 0
 no_garbage "kill storm"
 say "  records now: $(vms | jq -c '[.vms[]|select(.id|startswith("bk-s"))|.state]|group_by(.)|map({(.[0]):length})|add')"
-cleanup_prefix bk-; rm -f /tmp/felucca-lab-bk-create.out
+cleanup_prefix bk-; rm -f /tmp/felucca-lab-bk-create.out /tmp/felucca-lab-bk-create.body
 fi
 
 if want B3; then
 say "== B3. 15 sandboxes: how long a restart takes, and a double restart =="
-for i in $(seq 1 15); do mk bk-m$i 256 >/dev/null & [ $((i % 5)) -eq 0 ] && wait; done; wait
-for i in $(seq 1 15); do wait_exec bk-m$i 240 || bad "bk-m$i not exec-ready"; done
+rm -f /tmp/felucca-lab-bk-m.body
+for i in $(seq 1 15); do mkr bk-m$i 256 /tmp/felucca-lab-bk-m.body & [ $((i % 5)) -eq 0 ] && wait; done; wait
+report_creates /tmp/felucca-lab-bk-m.body
+for i in $(seq 1 15); do wait_exec bk-m$i 240 || bad "bk-m$i not exec-ready (create answered: $(awk -v i=bk-m$i '$1==i {$1=""; print}' /tmp/felucca-lab-bk-m.body | cut -c2-200); record: $(vms | jq -c --arg i bk-m$i '.vms[]|select(.id==$i)|{state,pid}'))"; done
+rm -f /tmp/felucca-lab-bk-m.body
 FC0="$(fcs)"; N0=$(fc_count)
 T0=$(date '+%Y-%m-%d %H:%M:%S'); S=$(date +%s.%N); sudo systemctl restart $UNIT; wait_up; E=$(date +%s.%N)
 say "  restart -> /healthz with $N0 Firecrackers: $(echo "$E - $S" | bc | cut -c1-5) s; start-up: $(took_over "$T0")"
@@ -108,9 +129,24 @@ fi
 if want B5; then
 say "== B5. the agent's and the host's nft tables are deleted while sandboxes run =="
 [ -n "$(vm_state bk-m1)" ] || { mk bk-m1 256 >/dev/null; wait_exec bk-m1 150; }
-FC0="$(fcs)"
+FC0="$(fcs)"; AP0="$(agent_pid)"
+# The agent's three tables, stateless (every chain starts with a counter marker since FLU-8), one line per chain, sorted.
+b5_fp() { local f; for f in ip bridge netdev; do sudo nft -s -t list table $f felucca 2>/dev/null | awk -v f=$f '
+  /^\tchain /{c=$0; body=""; inb=1; next} inb && /^\t}/{print f" "c" |"body; inb=0; next} inb{body=body" "$0; next}
+  /^\tset /{print f" "$0}'; done | tr -s '\t' ' ' | sort; }
+b5_agent_tables() { for t in "ip felucca" "bridge felucca" "netdev felucca"; do sudo nft list table $t >/dev/null 2>&1 || return 1; done; }
+FP0="$(b5_fp)"
 for t in "inet felucca_host" "ip felucca" "bridge felucca" "netdev felucca"; do sudo nft delete table $t 2>/dev/null; done
-say "  tables gone; agent still $(systemctl is-active $UNIT) (nothing re-checks at runtime: FLU-8)"
+# FLU-8: the isolation watch looks every 5 s and puts the agent's own tables back without a restart; the host
+# table belongs to felucca-firewall.service and is not put back by the agent, and /healthz says so.
+i=0; until b5_agent_tables || [ $i -ge 60 ]; do sleep 0.25; i=$((i+1)); done
+b5_agent_tables && ok "without a restart: the isolation watch put the agent's three tables back ($(awk -v i=$i 'BEGIN{printf "%.2f", i/4}') s; limit 15 s)" || bad "without a restart: the agent's tables are not back within 15 s"
+eq "without a restart: the agent kept its pid" "$(agent_pid)" "$AP0"
+sleep 6
+eq "without a restart: the rebuilt tables are the ones before (nft -s, per chain)" "$(b5_fp | md5sum | cut -c1-12)" "$(printf '%s\n' "$FP0" | md5sum | cut -c1-12)"
+eq "without a restart: the host table stays gone (the agent does not own it)" "$(sudo nft list table inet felucca_host >/dev/null 2>&1 && echo present || echo absent)" absent
+eq "/healthz isolation while the host table is missing" "$(curl -s -m 2 "$A/healthz" | jq -r '.isolation')" false
+say "  while the host table is missing: felucca0 $(link_admin_up felucca0 && echo up || echo down), exec $(exec_ok bk-m1 && echo works || echo FAILS)"
 sudo systemctl restart $UNIT
 i=0; until [ "$(systemctl is-active $UNIT)" = active ] && wait_up 2 || [ $i -ge 20 ]; do sleep 1; i=$((i+1)); done
 eq "tables deleted, agent restarted: it is back by itself (the unit reloads the host firewall)" "$(systemctl is-active $UNIT)" active
@@ -119,6 +155,8 @@ eq "sandboxes kept their pids" "$(fcs)" "$FC0"
 link_admin_up felucca0 && ok "felucca0 is up" || bad "felucca0 is down"
 for t in "ip felucca" "bridge felucca" "netdev felucca"; do sudo nft list table $t >/dev/null 2>&1 && ok "agent rebuilt table $t" || bad "table $t missing"; done
 eq "one anti-spoof chain per tap again" "$(chain_count)" "$(tap_count)"
+i=0; until [ "$(curl -s -m 2 "$A/healthz" | jq -r '.isolation')" = true ] || [ $i -ge 30 ]; do sleep 1; i=$((i+1)); done
+eq "/healthz isolation after the restart (30 s limit)" "$(curl -s -m 2 "$A/healthz" | jq -r '.isolation')" true
 check "exec works" exec_ok bk-m1
 fi
 
@@ -160,22 +198,24 @@ if want B8; then
 say "== B8. the record cannot be written (immutable meta.json) =="
 cleanup_prefix bk-w
 eq "create bk-w" "$(mk bk-w 256)" 201; wait_exec bk-w 150 || bad "bk-w not exec-ready"
+BW="$(blob_make bk-w)"
 eq "sleep bk-w" "$(vm_act bk-w sleep)" 200
 DW="$(vm_dir bk-w)"; sudo chattr +i "$DW/meta.json"
+# FLU-4 (S7): a wake writes `running` to the record BEFORE the guest runs again.
+# When that write fails the Firecracker is killed and the sandbox stays asleep;
+# it used to wake anyway and leave a record on disk that said sleeping beside a
+# running guest (what this case then had the restart and the late write repair).
 C1=$(vm_act bk-w wake); C2=$(vm_act bk-w wake)
 say "  wake with an immutable record: first $C1, second $C2 (state $(vm_state bk-w), on disk $(sudo jq -r .state "$DW/meta.json"))"
-PW=$(vm_pid bk-w)
-# (a) the agent is restarted while the record still cannot be written
-T0=$(date '+%Y-%m-%d %H:%M:%S'); restart_agent; sleep 2
-say "  restart with the stale record on disk: $(took_over "$T0")"
-alive "$PW" && ok "the awake guest was not killed by the restart" || bad "the awake guest was killed (record said sleeping)"
-eq "it is adopted as running, same Firecracker" "$(vm_state bk-w) $(vm_pid bk-w)" "running $PW"
-# (b) the record becomes writable again: the agent catches up on its own
+case "$C1 $C2" in 5??\ 5??) ok "both wakes fail cleanly ($C1, $C2)";; *) bad "wake with an immutable record — got '$C1 $C2', want two 5xx";; esac
+i=0; while [ -n "$(fc_in_dir "$DW")" ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
+eq "no Firecracker is left in its directory (30 s limit)" "$(fc_in_dir "$DW" | wc -l | tr -d ' ')" 0
+eq "it is still asleep (API)" "$(vm_state bk-w)" sleeping
+eq "the record on disk still says asleep, with the marker" "$(meta_snap bk-w)" "sleeping true"
 sudo chattr -i "$DW/meta.json"
-i=0; until [ "$(sudo jq -r .state "$DW/meta.json")" = running ] || [ $i -ge 20 ]; do sleep 1; i=$((i+1)); done
-eq "writable again: the record on disk caught up by itself (after ${i}s)" "$(sudo jq -r '"\(.state) \(.pid)"' "$DW/meta.json")" "running $PW"
-journal_since "$T0" | grep -q 'meta.json written' && ok "journal: the owed write is reported" || bad "journal: no report of the late write"
+eq "writable again: wake" "$(vm_act bk-w wake)" 200
 wait_exec bk-w 60 && ok "bk-w answers" || bad "bk-w does not answer"
+eq "its memory is intact (blob sha256)" "$(blob_sum bk-w | cut -c1-16)" "${BW:0:16}"
 # the same for a cold start
 eq "stop bk-w" "$(vm_act bk-w stop)" 200
 sudo chattr +i "$DW/meta.json"

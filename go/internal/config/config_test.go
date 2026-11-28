@@ -869,7 +869,7 @@ func TestFeluccadRefusesToServeAPartiallyLoadedState(t *testing.T) {
 		&model.Sandbox{ID: "sb1", Name: "keepme", Namespace: "default", State: model.StateRunning, VCPUs: 1, MemMiB: 512, CreatedAt: 1},
 		&model.Sandbox{ID: "sb2", Name: "keepmetoo", Namespace: "default", State: model.StateRunning, VCPUs: 1, MemMiB: 512, CreatedAt: 2},
 	)
-	if err := db.SaveSnapshot(st); err != nil {
+	if err := db.SaveSnapshot(st.Snapshot(), nil); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()

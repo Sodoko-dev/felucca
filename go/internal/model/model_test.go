@@ -188,6 +188,36 @@ func TestSandboxJSONKeyOrder(t *testing.T) {
 	}
 }
 
+// The isolation a node reports (FLU-8 N10) is in memory only: the node's wire
+// shape is byte-identical whatever it holds.
+func TestNodeJSONIgnoresIsolation(t *testing.T) {
+	f, tr := false, true
+	var views, plain []string
+	for _, v := range []*bool{nil, &tr, &f} {
+		n := &model.Node{ID: "node-1", Hostname: "h", Addr: "a:1", CPUs: 2, MemTotalMiB: 3, MemFreeMiB: 4,
+			VMCount: 5, PoolSize: 6, LastHB: 100, IsolationOK: v}
+		b, err := n.MarshalWithNow(105)
+		if err != nil {
+			t.Fatal(err)
+		}
+		views = append(views, string(b))
+		b, err = json.Marshal(n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plain = append(plain, string(b))
+	}
+	want := `{"id":"node-1","hostname":"h","addr":"a:1","cpus":2,"mem_total_mib":3,"mem_free_mib":4,"vm_count":5,"pool_size":6,"status":"ready","last_heartbeat":100}`
+	for i := range views {
+		if views[i] != want {
+			t.Errorf("MarshalWithNow #%d: %s, want %s", i, views[i], want)
+		}
+		if plain[i] != plain[0] {
+			t.Errorf("json.Marshal #%d differs: %s vs %s", i, plain[i], plain[0])
+		}
+	}
+}
+
 func indexOf(s, sub string) int {
 	for i := range s {
 		if len(s[i:]) >= len(sub) && s[i:i+len(sub)] == sub {

@@ -46,22 +46,27 @@ import (
 // possession check OFF, and a join-token holder can rotate another node's
 // credential again. Anything short of credAbsent therefore refuses: a re-join is
 // retryable, an evicted worker is not.
-func (srv *Server) rejoinAuthorized(overlayIP, presented string) bool {
+//
+// unreadable is true when the refusal is the store's (credUnknown), not the
+// caller's: the caller answers 503 and does not count it as a failed
+// credential, or a worker holding the right token would collect failures
+// during a read outage and then 429s that outlive it.
+func (srv *Server) rejoinAuthorized(overlayIP, presented string) (ok, unreadable bool) {
 	current, state := srv.resolveNodeCred(overlayIP, agentPort)
 	switch state {
 	case credAbsent:
-		return true
+		return true, false
 	case credResolved:
 		// An empty credential proves nothing and must never match an empty
 		// (or any) presented token.
 		if current == "" || presented == "" {
-			return false
+			return false, false
 		}
-		return subtle.ConstantTimeCompare([]byte(current), []byte(presented)) == 1
+		return subtle.ConstantTimeCompare([]byte(current), []byte(presented)) == 1, false
 	default: // credUnknown
 		slog.Error("re-join refused: the node credential store could not be read, so possession of this node's credential cannot be checked",
 			"overlay_ip", overlayIP)
-		return false
+		return false, true
 	}
 }
 
@@ -91,7 +96,7 @@ func (srv *Server) createJoinToken(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := srv.db.CreateJoinToken(jt); err != nil {
 		slog.Error("create join token", "err", err)
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
+		srv.rowWriteFailed(w, err, `{"error":"join token id collision, retry"}`)
 		return
 	}
 	body, _ := json.Marshal(struct {
@@ -126,6 +131,13 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tokenHash := hashSecret(auth[len(prefix):])
+
+	// An enrollment is a durable change (a wg peer row, a credential, a spent
+	// token): refused while the store is failing, before the token is even
+	// looked up, so an outage can never burn one.
+	if srv.refusedWhileStoreFailing(w) {
+		return
+	}
 
 	if srv.cfg.WgIP == "" {
 		writeJSON(w, 503, []byte(`{"error":"wireguard overlay not configured"}`))
@@ -187,8 +199,11 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		return srv.db.CheckJoinToken(tokenHash, now)
 	}()
 	if err != nil {
+		storeReadFailed()
+		// A read error is not a refusal of the token: 503, no throttle, and
+		// the store is not marked failing (nothing failed to be written).
 		slog.Error("check join token", "err", err)
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
+		refuseStoreUnavailable(w)
 		return
 	}
 	if !tokenOK {
@@ -198,8 +213,9 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 
 	var overlayIP string
 	if existing, err := srv.db.GetWgPeerByPubKey(req.PubKey); err != nil {
+		storeReadFailed()
 		slog.Error("wg peer lookup", "err", err)
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
+		refuseStoreUnavailable(w)
 		return
 	} else if existing != nil && ipnet.Contains(net.ParseIP(existing.OverlayIP)) {
 		// Re-join keeps its address — but only while it's still inside the
@@ -220,7 +236,12 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		// A worker that lost its credential re-enrolls under a FRESH wireguard
 		// key, which is a first join and needs no proof. That is the recovery
 		// path, and it costs the attacker the one thing they cannot forge.
-		if !srv.rejoinAuthorized(overlayIP, req.NodeToken) {
+		ok, unreadable := srv.rejoinAuthorized(overlayIP, req.NodeToken)
+		if unreadable {
+			refuseStoreUnavailable(w)
+			return
+		}
+		if !ok {
 			slog.Warn("re-join refused: no proof of possession for an already-enrolled pubkey",
 				"overlay_ip", overlayIP, "hostname", req.Hostname)
 			srv.refuse(w, src, 409, `{"error":"pubkey already enrolled: re-join must present the node's current agent token as node_token, or enroll with a fresh wireguard key"}`)
@@ -229,8 +250,9 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 	} else {
 		peers, err := srv.db.ListWgPeers()
 		if err != nil {
+			storeReadFailed()
 			slog.Error("list wg peers", "err", err)
-			writeJSON(w, 500, []byte(`{"error":"store error"}`))
+			refuseStoreUnavailable(w)
 			return
 		}
 		taken := make([]string, 0, len(peers))
@@ -251,7 +273,7 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: now,
 	}); err != nil {
 		slog.Error("persist wg peer", "err", err)
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
+		srv.rowWriteFailed(w, err, `{"error":"overlay address taken, retry"}`)
 		return
 	}
 	if err := srv.addPeer(req.PubKey, overlayIP); err != nil {
@@ -272,18 +294,19 @@ func (srv *Server) nodeJoin(w http.ResponseWriter, r *http.Request) {
 	// The address is keyed with the agent's own port: validNodeAddr accepts a
 	// new node address on no other, so this is the endpoint this worker will
 	// register and the one feluccad will dial.
+	//
+	// The credential is stored and the token burned in ONE transaction. As two
+	// writes, a failed consume left the node's credential rotated by a token
+	// that was still redeemable. A consume race is excluded by joinMu; a false
+	// result here means the token was somehow redeemed elsewhere, which must
+	// fail the request — and then no credential was written either, so the
+	// worker can retry.
 	agentToken := newNodeToken()
-	if err := srv.putNodeCred(overlayIP, agentPort, agentToken, now); err != nil {
-		// Before the token is burned, so the worker can retry.
-		slog.Error("persist node credential", "overlay_ip", overlayIP, "err", err)
-		writeJSON(w, 500, []byte(`{"error":"store error"}`))
-		return
-	}
-	// Enrollment fully succeeded — burn the token now. A consume race is
-	// excluded by joinMu; a false result here means the token was somehow
-	// redeemed elsewhere, which must fail the request.
-	if ok, err := srv.db.ConsumeJoinToken(tokenHash, now); err != nil || !ok {
-		slog.Error("consume join token", "ok", ok, "err", err)
+	if ok, err := srv.enrollNodeCred(overlayIP, agentPort, agentToken, tokenHash, now); err != nil || !ok {
+		slog.Error("enroll node credential", "overlay_ip", overlayIP, "consumed", ok, "err", err)
+		if err != nil {
+			srv.storeWriteFailed(err)
+		}
 		writeJSON(w, 500, []byte(`{"error":"store error"}`))
 		return
 	}

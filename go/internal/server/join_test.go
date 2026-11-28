@@ -1211,6 +1211,18 @@ func TestRotatedNodeTokenStopsAuthenticating(t *testing.T) {
 
 // ---- Credential keying ----
 
+// putNodeCred records (or rotates) a node's own credential the way an
+// enrollment does, without a join token: the row, then the in-memory views.
+// Production stores one only through enrollNodeCred.
+func putNodeCred(srv *Server, host string, port uint16, token string, now int64) error {
+	key := nodeCredKey(host, port)
+	if err := srv.db.PutNodeCred(&store.NodeCred{Host: key, Token: token, CreatedAt: now}); err != nil {
+		return err
+	}
+	srv.noteNodeCred(key, token)
+	return nil
+}
+
 // A credential stands for an agent ENDPOINT. Keyed on the host alone, one
 // credential covered every agent on an address — narrower than the identity it
 // authorizes, and "worth one worker" has to mean one worker.
@@ -1218,10 +1230,10 @@ func TestNodeCredentialsAreKeyedOnHostAndPort(t *testing.T) {
 	srv := newJoinServerWgIP(t, "")
 	now := time.Now().Unix()
 
-	if err := srv.putNodeCred("203.0.113.9", 9090, "felucca_nt_first", now); err != nil {
+	if err := putNodeCred(srv, "203.0.113.9", 9090, "felucca_nt_first", now); err != nil {
 		t.Fatalf("put first: %v", err)
 	}
-	if err := srv.putNodeCred("203.0.113.9", 9191, "felucca_nt_second", now); err != nil {
+	if err := putNodeCred(srv, "203.0.113.9", 9191, "felucca_nt_second", now); err != nil {
 		t.Fatalf("put second: %v", err)
 	}
 	if got := srv.agentTokenFor("203.0.113.9", 9090); got != "felucca_nt_first" {
@@ -1280,7 +1292,7 @@ func TestLegacyFleetIsGrandfatheredOnceOnly(t *testing.T) {
 	}
 	st1 := state.New()
 	st1.RegisterNode("worker-legacy", "198.51.100.7:9090", 4, 8192, 1000)
-	if err := db1.SaveSnapshot(st1); err != nil {
+	if err := db1.SaveSnapshot(st1.Snapshot(), nil); err != nil {
 		t.Fatalf("save snapshot: %v", err)
 	}
 	db1.Close()
@@ -1418,9 +1430,21 @@ func TestRejoinFailsClosedWhenTheCredentialStoreCannotBeRead(t *testing.T) {
 	srv.credMu.Unlock()
 	flaky.setFail(true)
 
-	if w := joinWith(srv, attack, validPubKeyA, "attacker"); w.Code != 409 {
-		t.Fatalf("re-join while the credential store is unreadable: got %d %s, want 409 — an unreadable store is not evidence that a node has no credential",
-			w.Code, w.Body)
+	// Refused as the store's failure (503), not the caller's: a 409 through
+	// srv.refuse fed the failed-credential throttle, so during a read outage a
+	// worker holding the RIGHT token collected failures and then 429s that
+	// outlived the outage.
+	for i := 0; i < authFailThreshold+2; i++ {
+		if w := joinWith(srv, attack, validPubKeyA, "attacker"); w.Code != 503 || w.Body.String() != `{"error":"store unavailable"}` {
+			t.Fatalf("re-join while the credential store is unreadable: got %d %s, want 503 store unavailable — an unreadable store is not evidence that a node has no credential",
+				w.Code, w.Body)
+		}
+	}
+	srv.authFails.mu.Lock()
+	recorded := len(srv.authFails.fail)
+	srv.authFails.mu.Unlock()
+	if recorded != 0 {
+		t.Errorf("credential read errors were fed to the failed-credential throttle (%d records)", recorded)
 	}
 
 	// The store recovers: the victim still holds exactly the credential it was
@@ -1472,29 +1496,28 @@ func TestRejoinWithNoCredentialYetIsStillAuthorized(t *testing.T) {
 // inside a wrapper, an assertion in the sqlite shim.
 type panicStore struct {
 	store.Store
-	mu         sync.Mutex
-	keyPanics  int
-	joinPanic  int
-	usagePanic int
+	mu        sync.Mutex
+	keyPanics int
+	joinPanic int
+	savePanic int
 }
 
-func (p *panicStore) armKey(n int)   { p.mu.Lock(); p.keyPanics = n; p.mu.Unlock() }
-func (p *panicStore) armJoin(n int)  { p.mu.Lock(); p.joinPanic = n; p.mu.Unlock() }
-func (p *panicStore) armUsage(n int) { p.mu.Lock(); p.usagePanic = n; p.mu.Unlock() }
+func (p *panicStore) armKey(n int)  { p.mu.Lock(); p.keyPanics = n; p.mu.Unlock() }
+func (p *panicStore) armJoin(n int) { p.mu.Lock(); p.joinPanic = n; p.mu.Unlock() }
+func (p *panicStore) armSave(n int) { p.mu.Lock(); p.savePanic = n; p.mu.Unlock() }
 
-// AppendUsage is reached from recordUsage, which several handlers call WHILE
-// HOLDING the state lock (the metering event is built from the sandbox's live
-// fields). It is therefore the store call that can panic inside a state-lock
-// region — see TestAPanicUnderTheStateLockDoesNotDeadlockTheControlPlane.
-func (p *panicStore) AppendUsage(e store.UsageEvent) error {
+// SaveSnapshot is reached from save, which holds saveMu around it and takes the
+// state lock on either side of it — see
+// TestAPanicUnderTheStateLockDoesNotDeadlockTheControlPlane.
+func (p *panicStore) SaveSnapshot(snap *state.Snapshot, usage []store.UsageEvent) error {
 	p.mu.Lock()
-	if p.usagePanic > 0 {
-		p.usagePanic--
+	if p.savePanic > 0 {
+		p.savePanic--
 		p.mu.Unlock()
-		panic("store: usage append blew up")
+		panic("store: snapshot save blew up")
 	}
 	p.mu.Unlock()
-	return p.Store.AppendUsage(e)
+	return p.Store.SaveSnapshot(snap, usage)
 }
 
 func (p *panicStore) LookupKeyByHash(hash string) (string, error) {
@@ -1592,7 +1615,7 @@ func TestPanickingCredentialLookupDoesNotStrandItsGateSlot(t *testing.T) {
 	// rather than as a hung test.)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, ok := srv.authenticate(ctx, "Bearer "+created.APIKey); !ok {
+	if _, ok, _ := srv.authenticate(ctx, "Bearer "+created.APIKey); !ok {
 		t.Fatal("a valid tenant key could not be authenticated after the panics: the credential gate is full of stranded slots")
 	}
 }
@@ -1764,10 +1787,13 @@ func TestAgentRegisterBoundsTheHostname(t *testing.T) {
 // forever: no create, no exec, no delete, no sweep, no /metrics. A silent total
 // control-plane outage from one panic in one request.
 //
-// The panic here is induced where a real one could land: recordUsage is called
-// UNDER the state lock (it builds the event from the sandbox's live fields), so a
-// store that blows up inside AppendUsage panics inside the critical section — the
-// same class of thing as the driver bug the credGate test stands in for.
+// The panic here is induced where a real one could land on the path that holds
+// the locks: the snapshot save. No store call runs under the state lock any more
+// (FLU-5: lifecycle usage events are queued, not written, under it), but the save
+// holds saveMu around the store call and takes the state lock on either side of
+// it — the same class of thing as the driver bug the credGate test stands in for.
+// A panic there is turned into a failed save (applied but not saved), and neither
+// lock may stay held.
 //
 // lockaudit_test.go is the structural half of this: it keeps new bare regions out.
 // This is the behavioural half — it shows what such a region actually costs.
@@ -1780,6 +1806,7 @@ func TestAPanicUnderTheStateLockDoesNotDeadlockTheControlPlane(t *testing.T) {
 	t.Cleanup(func() { sqlite.Close() })
 	ps := &panicStore{Store: sqlite}
 	srv := newJoinServerStore(t, ps, tmp)
+	t.Cleanup(srv.stopAndWait)
 	h := srv.Handler()
 
 	// A running sandbox on an agent that says yes to everything, so the request
@@ -1797,33 +1824,40 @@ func TestAPanicUnderTheStateLockDoesNotDeadlockTheControlPlane(t *testing.T) {
 	srv.st.Unlock()
 	srv.st.SetSandboxState(id, model.StateRunning)
 
-	// Sleep stamps SleptAt and records the "slept" event under the lock.
-	ps.armUsage(1)
-	blew := false
-	func() {
-		defer func() {
-			if recover() != nil {
-				blew = true
-			}
-		}()
-		doRequest(h, "POST", "/api/v1/sandboxes/"+id+"/sleep", "", adminAuth)
-	}()
-	if !blew {
+	// The sleep's save panics inside the store. It is a failed save: the worker
+	// slept the VM, so the answer is "applied but not saved".
+	ps.armSave(1)
+	w := doRequest(h, "POST", "/api/v1/sandboxes/"+id+"/sleep", "", adminAuth)
+	if w.Code != 503 || !strings.Contains(w.Body.String(), `"applied":true`) {
+		t.Fatalf("sleep whose save panicked: %d %s, want 503 applied", w.Code, w.Body)
+	}
+	if ps.savePanic != 0 {
 		t.Fatal("the store call never panicked: this test is not exercising the path it claims to")
 	}
 
-	// The control plane must still be able to take the state lock. Run it off
-	// the test goroutine so a deadlock is a FAILURE and not a hung test binary.
-	done := make(chan int, 1)
+	// The control plane must still be able to take the state lock, and the save
+	// path its own mutex. Run both off the test goroutine so a deadlock is a
+	// FAILURE and not a hung test binary.
+	done := make(chan error, 1)
 	go func() {
-		done <- doRequest(h, "GET", "/api/v1/sandboxes", "", adminAuth).Code
+		if code := doRequest(h, "GET", "/api/v1/sandboxes", "", adminAuth).Code; code != 200 {
+			done <- fmt.Errorf("list sandboxes after the panic: %d, want 200", code)
+			return
+		}
+		// The store is failing, so a request's save is refused at once (P16)
+		// — but only after it took the save mutex, which is what this checks.
+		if err := srv.saveState(); !errors.Is(err, errStoreFailing) {
+			done <- fmt.Errorf("save after the panic: %v, want errStoreFailing", err)
+			return
+		}
+		done <- nil
 	}()
 	select {
-	case code := <-done:
-		if code != 200 {
-			t.Fatalf("list sandboxes after the panic: %d, want 200", code)
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("a request that needs the state lock never completed after a panic inside a locked region: srv.st is still held, and every request from here on blocks forever while the process stays up and healthy-looking")
+		t.Fatal("a request that needs the state lock (or a save) never completed after a panic inside the save: a lock is still held, and every request from here on blocks forever while the process stays up and healthy-looking")
 	}
 }

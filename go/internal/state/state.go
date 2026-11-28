@@ -9,8 +9,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
+	"time"
 
+	"github.com/alpham/infra-saas/felucca/internal/agentclient"
+	"github.com/alpham/infra-saas/felucca/internal/ingress"
 	"github.com/alpham/infra-saas/felucca/internal/model"
 )
 
@@ -31,6 +35,65 @@ type State struct {
 	WakeMsSum  uint64
 	ForksTotal uint64
 	ExecsTotal uint64
+
+	// Quarantine lists the node ports released less than
+	// ingress.PortQuarantine ago (FLU-6), plus expired entries not yet dropped
+	// (SnapshotLocked drops them). Entries are created ONLY by the removal
+	// methods below, in the same critical section as the row they describe, so
+	// no caller can remove a route row and forget its port.
+	Quarantine []model.ReleasedPort
+
+	// Clock returns unix seconds; nil means the wall clock. Tests set it to
+	// age quarantine entries.
+	Clock func() int64
+}
+
+// Now is the state's clock (unix seconds). Caller need not hold the lock.
+func (s *State) Now() int64 {
+	if s.Clock != nil {
+		return s.Clock()
+	}
+	return time.Now().Unix()
+}
+
+// quarantineS is ingress.PortQuarantine in the unit the entries carry;
+// keepS is how long an entry is kept at all (see SnapshotLocked).
+var (
+	quarantineS = int64(ingress.PortQuarantine / time.Second)
+	keepS       = int64((ingress.PortQuarantine + ingress.Margin) / time.Second)
+)
+
+// The quarantine runs on the wall clock, which can step.
+//
+//   - Backward: an entry released "in the future" keeps its release time;
+//     only the REMAINING time is clamped to PortQuarantine (QuarantineExpiresIn),
+//     so a Retry-After never exceeds the quarantine. Its quarantine therefore
+//     lasts until the clock has caught up with the release time again, longer
+//     by at most the step — the safe direction: a port held too long costs a
+//     port, a port handed out too early routes another sandbox's hostname.
+//     Rewriting the release time to "now" instead was permanent and saved: a
+//     backward step later corrected forward left the entry older by the step,
+//     and with a step of PortQuarantine or more it expired the moment the
+//     clock was right again while gateways could still route the old name.
+//   - Forward: shortens every quarantine; nothing can tell that from time
+//     passing. Entries are dropped for good only once PortQuarantine + Margin
+//     old, so a step within the margin that is corrected before then loses
+//     nothing.
+
+// QuarantineExpiresIn is the number of seconds until q's quarantine ends
+// (<= 0: ended), at most PortQuarantine.
+func QuarantineExpiresIn(q model.ReleasedPort, now int64) int64 {
+	left := q.ReleasedAt + quarantineS - now
+	if left > quarantineS {
+		left = quarantineS
+	}
+	return left
+}
+
+// QuarantineActive reports whether an entry is still within its quarantine
+// at now.
+func QuarantineActive(q model.ReleasedPort, now int64) bool {
+	return QuarantineExpiresIn(q, now) > 0
 }
 
 // New creates an empty State.
@@ -185,7 +248,9 @@ func (s *State) RegisterNodeGuarded(hostname, addr string, cpus uint32, memTotal
 	}
 
 	if n := s.findNodeByHostname(hostname); n != nil {
-		// Update mutable fields, keep id.
+		// Update mutable fields, keep id. A new address moves the node's
+		// quarantined ports with it, in this critical section.
+		s.rehostQuarantineLocked(n, addr)
 		n.Addr = addr
 		n.CPUs = cpus
 		n.MemTotalMiB = memTotal
@@ -215,6 +280,47 @@ func (s *State) RegisterNodeGuarded(hostname, addr string, cpus uint32, memTotal
 	}
 	s.Nodes = append(s.Nodes, n)
 	return NodeRegistration{ID: id, Reclaimed: reclaimed}
+}
+
+// rehostQuarantineLocked is the quarantine's half of a node's address change:
+// the entries are keyed on the worker host (what route rows carry), so a
+// re-registration under a new host would orphan them while gateways still
+// route the old host to this worker's ports. They are rewritten to the new
+// host; when another node record still has the old host (two records, one
+// worker), they are copied instead, so both keys stay protected.
+//
+// The key is the host STRING: two spellings of one IPv6 address (or a name
+// and its address) are two keys, and nothing here joins them.
+// Caller holds the lock.
+func (s *State) rehostQuarantineLocked(n *model.Node, addr string) {
+	oldHost, _ := agentclient.SplitHostPort(n.Addr)
+	newHost, _ := agentclient.SplitHostPort(addr)
+	if oldHost == newHost {
+		return
+	}
+	shared := false
+	for _, o := range s.Nodes {
+		if o != n {
+			if h, _ := agentclient.SplitHostPort(o.Addr); h == oldHost {
+				shared = true
+				break
+			}
+		}
+	}
+	var copies []model.ReleasedPort
+	for i := range s.Quarantine {
+		if s.Quarantine[i].Host != oldHost {
+			continue
+		}
+		if shared {
+			c := s.Quarantine[i]
+			c.Host = newHost
+			copies = append(copies, c)
+		} else {
+			s.Quarantine[i].Host = newHost
+		}
+	}
+	s.Quarantine = append(s.Quarantine, copies...)
 }
 
 // reclaimStaleNodesLocked drops node records that are PROVABLY dead, to make
@@ -261,25 +367,40 @@ func (s *State) reclaimStaleNodesLocked(now int64) []string {
 	return reclaimed
 }
 
-// Heartbeat updates a node's live stats. Returns false if the node is unknown.
-func (s *State) Heartbeat(id string, memFree uint64, vmCount, poolSize uint32, now int64) bool {
+// Heartbeat updates a node's live stats and the isolation it reports
+// (isolationOK nil: the heartbeat did not carry it). It returns a copy of the
+// node as updated and the isolation value it held before, so the caller can
+// tell a change from a repeat; ok is false if the node is unknown.
+func (s *State) Heartbeat(id string, memFree uint64, vmCount, poolSize uint32, isolationOK *bool, now int64) (node model.Node, wasIsolationOK *bool, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := s.FindNode(id)
 	if n == nil {
-		return false
+		return model.Node{}, nil, false
 	}
+	wasIsolationOK = n.IsolationOK
 	n.MemFreeMiB = memFree
 	n.VMCount = vmCount
 	n.PoolSize = poolSize
 	n.LastHB = now
-	return true
+	n.IsolationOK = isolationOK
+	return *n, wasIsolationOK, true
 }
 
-// PickNode picks the ready node with the lowest vm_count.
-// Caller must hold the lock.
+// PickNode picks the ready node with the lowest vm_count, preferring nodes
+// that do not report their isolation down (IsolationOK nil, from an agent
+// that does not send it, or true).
+//
+// A worker that reports its isolation down refuses new guests (create, fork,
+// wake and start answer IsolationFailed), so it gains no sandboxes and stays
+// the lowest: without the preference every create in the fleet went to that
+// one worker and failed for as long as it was unfenced. The preference is
+// soft: when NO ready node is fine, the lowest of all ready nodes is picked,
+// as before, so a fleet whose every worker reports isolation down keeps the
+// placement it had. The caller can tell that case from the picked node's
+// IsolationOK (IsolationDown). Caller must hold the lock.
 func (s *State) PickNode(now int64) *model.Node {
-	var best *model.Node
+	var best, bestFine *model.Node
 	for _, n := range s.Nodes {
 		if n.NodeStatus(now) != "ready" {
 			continue
@@ -287,8 +408,20 @@ func (s *State) PickNode(now int64) *model.Node {
 		if best == nil || n.VMCount < best.VMCount {
 			best = n
 		}
+		if !IsolationDown(n) && (bestFine == nil || n.VMCount < bestFine.VMCount) {
+			bestFine = n
+		}
+	}
+	if bestFine != nil {
+		return bestFine
 	}
 	return best
+}
+
+// IsolationDown reports whether n's last heartbeat said isolation_ok false.
+// A node that never sent the flag counts as fine.
+func IsolationDown(n *model.Node) bool {
+	return n != nil && n.IsolationOK != nil && !*n.IsolationOK
 }
 
 // ---- Sandboxes ----
@@ -376,12 +509,302 @@ func (s *State) SetSandboxIP(id, ip string) {
 func (s *State) RemoveSandbox(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.RemoveSandboxLocked(id)
+}
+
+// RemoveSandboxLocked is RemoveSandbox for a caller that holds the lock — one
+// that has to remove the record in the same critical section as something
+// else (the usage event describing the removal).
+//
+// Every node port the sandbox's route rows held is quarantined here (FLU-6),
+// once per port: two names on one guest port share one node port.
+func (s *State) RemoveSandboxLocked(id string) {
 	for i, sb := range s.Sandboxes {
 		if sb.ID == id {
+			released := map[uint16]bool{}
+			for _, e := range sb.Exposes {
+				if !released[e.NodePort] {
+					released[e.NodePort] = true
+					s.releaseLocked(sb, e)
+				}
+			}
 			s.Sandboxes = append(s.Sandboxes[:i], s.Sandboxes[i+1:]...)
 			return
 		}
 	}
+}
+
+// Two questions about removing a row, with two answers, because the worker
+// and the quarantine key on different things:
+//
+//   - GuestPortShared: may the worker's mapping be removed? The worker keeps
+//     one mapping per (VM, guest port) and removes BY GUEST PORT, so the call
+//     is skipped while another row of the sandbox has the same guest port —
+//     whatever node port that row names. Rows written before this release can
+//     hold one guest port on two node ports (a stale one and the live one);
+//     removing the stale name must not take the live mapping with it.
+//   - NodePortNamed: is the node port released? Only when no remaining row of
+//     the sandbox names it; then it is quarantined.
+
+// GuestPortShared reports whether another row of sb (another name) has e's
+// guest port: the worker's mapping for that guest port is still needed.
+func GuestPortShared(sb *model.Sandbox, e model.Expose) bool {
+	for _, o := range sb.Exposes {
+		if o.Name != e.Name && o.GuestPort == e.GuestPort {
+			return true
+		}
+	}
+	return false
+}
+
+// NodePortNamed reports whether a row of sb other than the one named except
+// names nodePort.
+func NodePortNamed(sb *model.Sandbox, nodePort uint16, except string) bool {
+	for _, o := range sb.Exposes {
+		if o.Name != except && o.NodePort == nodePort {
+			return true
+		}
+	}
+	return false
+}
+
+// RemoveExposeLocked removes the route row name of sandbox id and reports
+// whether there was one. Its node port is quarantined when no remaining row
+// of the sandbox names it (NodePortNamed). Caller holds the lock.
+func (s *State) RemoveExposeLocked(id, name string) bool {
+	sb := s.FindSandbox(id)
+	if sb == nil {
+		return false
+	}
+	var gone *model.Expose
+	kept := sb.Exposes[:0]
+	for _, e := range sb.Exposes {
+		if e.Name == name && gone == nil {
+			c := e
+			gone = &c
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if gone == nil {
+		return false
+	}
+	sb.Exposes = kept
+	if !NodePortNamed(sb, gone.NodePort, gone.Name) {
+		s.releaseLocked(sb, *gone)
+	}
+	if len(sb.Exposes) == 0 {
+		sb.Exposes = nil
+	}
+	return true
+}
+
+// RemoveExposesOnPortLocked removes every route row of sandbox id that maps
+// nodePort, quarantining the port once, and returns how many rows went. It is
+// for a row the worker has proved stale (it handed the port to another
+// sandbox). Caller holds the lock.
+func (s *State) RemoveExposesOnPortLocked(id string, nodePort uint16) int {
+	sb := s.FindSandbox(id)
+	if sb == nil {
+		return 0
+	}
+	var first *model.Expose
+	n := 0
+	kept := sb.Exposes[:0]
+	for _, e := range sb.Exposes {
+		if e.NodePort == nodePort {
+			if first == nil {
+				c := e
+				first = &c
+			}
+			n++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	sb.Exposes = kept
+	if len(sb.Exposes) == 0 {
+		sb.Exposes = nil
+	}
+	if first != nil {
+		s.releaseLocked(sb, *first)
+	}
+	return n
+}
+
+// RepointGuestPortLocked moves every row of sandbox id on guestPort to
+// nodePort and quarantines each node port they held before (once per port).
+// It is for a worker that answered an expose of that guest port with a
+// different port than the rows name: the worker is the authority, its old
+// mapping is gone, and a port left in a row it no longer has would otherwise
+// leave the rows later without being quarantined. Returns the old ports.
+// Caller holds the lock.
+func (s *State) RepointGuestPortLocked(id string, guestPort, nodePort uint16) []uint16 {
+	sb := s.FindSandbox(id)
+	if sb == nil {
+		return nil
+	}
+	var old []uint16
+	seen := map[uint16]bool{}
+	for i := range sb.Exposes {
+		e := &sb.Exposes[i]
+		if e.GuestPort != guestPort || e.NodePort == nodePort {
+			continue
+		}
+		if !seen[e.NodePort] {
+			seen[e.NodePort] = true
+			old = append(old, e.NodePort)
+			s.releaseLocked(sb, *e)
+		}
+		e.NodePort = nodePort
+	}
+	return old
+}
+
+// DoubleBooking is one worker host's node port that route rows of more than
+// one sandbox name.
+type DoubleBooking struct {
+	Host       string
+	Port       uint16
+	SandboxIDs []string
+}
+
+// DoubleBookedLocked lists the (host, node port) pairs that rows of two or
+// more different sandboxes name: rows written before FLU-6, when a delete
+// that timed out in feluccad left a row whose port the worker then gave to
+// another sandbox. Sorted by host, then port. Caller holds the lock.
+func (s *State) DoubleBookedLocked() []DoubleBooking {
+	type key struct {
+		host string
+		port uint16
+	}
+	owners := map[key][]string{}
+	var keys []key
+	for _, sb := range s.Sandboxes {
+		host, ok := s.NodeHostLocked(sb)
+		if !ok {
+			continue
+		}
+		for _, e := range sb.Exposes {
+			k := key{host, e.NodePort}
+			ids := owners[k]
+			if len(ids) == 0 {
+				keys = append(keys, k)
+			}
+			if len(ids) == 0 || ids[len(ids)-1] != sb.ID {
+				owners[k] = append(ids, sb.ID)
+			}
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].host != keys[j].host {
+			return keys[i].host < keys[j].host
+		}
+		return keys[i].port < keys[j].port
+	})
+	var out []DoubleBooking
+	for _, k := range keys {
+		if ids := owners[k]; len(ids) > 1 {
+			out = append(out, DoubleBooking{Host: k.host, Port: k.port, SandboxIDs: ids})
+		}
+	}
+	return out
+}
+
+// SplitGuestPort is one guest port of a sandbox that its rows map to more
+// than one node port.
+type SplitGuestPort struct {
+	SandboxID string
+	GuestPort uint16
+	NodePorts []uint16
+}
+
+// SplitGuestPortsLocked lists the guest ports that rows of one sandbox map to
+// two or more node ports: rows written before this release (an unexpose that
+// timed out in feluccad, then a fresh mapping). The worker holds one mapping
+// per guest port, so all but one of those ports are stale. Ordered as the
+// sandboxes and their rows are. Caller holds the lock.
+func (s *State) SplitGuestPortsLocked() []SplitGuestPort {
+	var out []SplitGuestPort
+	for _, sb := range s.Sandboxes {
+		var order []uint16
+		ports := map[uint16][]uint16{}
+		for _, e := range sb.Exposes {
+			ps := ports[e.GuestPort]
+			if len(ps) == 0 {
+				order = append(order, e.GuestPort)
+			}
+			dup := false
+			for _, p := range ps {
+				dup = dup || p == e.NodePort
+			}
+			if !dup {
+				ports[e.GuestPort] = append(ps, e.NodePort)
+			}
+		}
+		for _, g := range order {
+			if len(ports[g]) > 1 {
+				out = append(out, SplitGuestPort{SandboxID: sb.ID, GuestPort: g, NodePorts: ports[g]})
+			}
+		}
+	}
+	return out
+}
+
+// NodeHostLocked is the worker host of a sandbox: the host part of its node's
+// agent address, as route rows carry it. ok is false when the sandbox has no
+// node record (a port there is not reachable through any route). Caller holds
+// the lock.
+func (s *State) NodeHostLocked(sb *model.Sandbox) (host string, ok bool) {
+	if sb == nil || sb.NodeID == nil {
+		return "", false
+	}
+	n := s.FindNode(*sb.NodeID)
+	if n == nil {
+		return "", false
+	}
+	host, _ = agentclient.SplitHostPort(n.Addr)
+	return host, true
+}
+
+// releaseLocked quarantines e's node port. A sandbox without a node record
+// releases nothing that can be routed: no entry. Caller holds the lock.
+func (s *State) releaseLocked(sb *model.Sandbox, e model.Expose) {
+	host, ok := s.NodeHostLocked(sb)
+	if !ok || e.NodePort == 0 {
+		return
+	}
+	s.Quarantine = append(s.Quarantine, model.ReleasedPort{
+		Host: host, Port: e.NodePort, SandboxID: sb.ID, GuestPort: e.GuestPort,
+		TenantID: sb.TenantID, ReleasedAt: s.Now(),
+	})
+}
+
+// QuarantineLocked returns copies of the entries still in quarantine at now.
+// Caller holds the lock.
+func (s *State) QuarantineLocked(now int64) []model.ReleasedPort {
+	var out []model.ReleasedPort
+	for _, q := range s.Quarantine {
+		if QuarantineActive(q, now) {
+			out = append(out, q)
+		}
+	}
+	return out
+}
+
+// UnquarantineLocked drops the entries of (host, port) that sandbox sbID
+// released for guestPort: the worker handed the port back to its last owner
+// for the same service, so its old hostname reaches the same service again.
+// Entries other sandboxes left on the same port stay. Caller holds the lock.
+func (s *State) UnquarantineLocked(host string, port uint16, sbID string, guestPort uint16) {
+	kept := s.Quarantine[:0]
+	for _, q := range s.Quarantine {
+		if q.Host == host && q.Port == port && q.SandboxID == sbID && q.GuestPort == guestPort {
+			continue
+		}
+		kept = append(kept, q)
+	}
+	s.Quarantine = kept
 }
 
 // RecordWake updates wake metrics.
@@ -408,6 +831,82 @@ func (s *State) RecordExec() {
 }
 
 // ---- Persistence ----
+
+// Snapshot is a point-in-time copy of everything the store persists from the
+// working set. It shares no memory with the State it was taken from, so it can
+// be written to the database after the lock is released while handlers keep
+// changing the live records.
+//
+// The copy has to be DEEP. Records are changed in place under the lock (state
+// and activity clocks, a heartbeat's stats), and slices are compacted in place
+// (expose removal does `kept := sb.Exposes[:0]`, node reclamation does the same
+// to Nodes), so a copy of the pointers, or of a slice header, would be read by
+// the database writer while a handler rewrites the same memory.
+type Snapshot struct {
+	Nodes        []model.Node
+	Sandboxes    []model.Sandbox
+	Seq          uint64
+	RequestCount uint64
+	// Quarantine is the released node ports still in quarantine (FLU-6). It
+	// is in the snapshot, not written on its own, so a route row's removal and
+	// its port's quarantine reach the database in one transaction.
+	Quarantine []model.ReleasedPort
+}
+
+// SnapshotLocked deep-copies the persisted part of the working set. Quarantine
+// entries older than PortQuarantine + Margin are dropped from the working set
+// here: this is the one place that runs after every change. The margin keeps
+// an entry a forward clock step expired early until the step can have been
+// corrected (see QuarantineExpiresIn). Caller must hold the lock.
+func (s *State) SnapshotLocked() *Snapshot {
+	now := s.Now()
+	kept := s.Quarantine[:0]
+	for _, q := range s.Quarantine {
+		if now-q.ReleasedAt < keepS {
+			kept = append(kept, q)
+		}
+	}
+	s.Quarantine = kept
+	snap := &Snapshot{
+		Nodes:        make([]model.Node, len(s.Nodes)),
+		Sandboxes:    make([]model.Sandbox, len(s.Sandboxes)),
+		Seq:          s.Seq,
+		RequestCount: s.RequestCount,
+		Quarantine:   append([]model.ReleasedPort(nil), s.Quarantine...),
+	}
+	for i, n := range s.Nodes {
+		snap.Nodes[i] = *n
+		// Not part of the persisted set: a reported value is only true until
+		// the next heartbeat (FLU-8 N10).
+		snap.Nodes[i].IsolationOK = nil
+	}
+	for i, sb := range s.Sandboxes {
+		c := *sb
+		c.NodeID = copyStr(sb.NodeID)
+		c.IP = copyStr(sb.IP)
+		c.ParentID = copyStr(sb.ParentID)
+		if sb.Exposes != nil {
+			c.Exposes = append([]model.Expose(nil), sb.Exposes...)
+		}
+		snap.Sandboxes[i] = c
+	}
+	return snap
+}
+
+// Snapshot is SnapshotLocked for a caller that does not hold the lock.
+func (s *State) Snapshot() *Snapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.SnapshotLocked()
+}
+
+func copyStr(p *string) *string {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
 
 // persistState is the on-disk JSON format, mirroring Zig's output exactly.
 type persistState struct {
@@ -571,16 +1070,16 @@ func (s *State) Load(path string) error {
 			memMiB = 256
 		}
 		sb := &model.Sandbox{
-			ID:        ls.ID,
-			Name:      ls.Name,
-			Namespace: ns,
-			NodeID:    ls.NodeID,
-			State:     model.ParseSandboxState(ls.State),
-			VCPUs:     vcpus,
-			MemMiB:    memMiB,
-			IP:        ls.IP,
-			CreatedAt: ls.CreatedAt,
-			ParentID:  ls.ParentID,
+			ID:                ls.ID,
+			Name:              ls.Name,
+			Namespace:         ns,
+			NodeID:            ls.NodeID,
+			State:             model.ParseSandboxState(ls.State),
+			VCPUs:             vcpus,
+			MemMiB:            memMiB,
+			IP:                ls.IP,
+			CreatedAt:         ls.CreatedAt,
+			ParentID:          ls.ParentID,
 			Exposes:           ls.Exposes,
 			AllowDynamicPorts: ls.AllowDynamicPorts,
 			Template:          ls.Template,

@@ -44,12 +44,20 @@ limactl cp "$HERE/lib.sh" "$WORKER:$REMOTE/lib.sh" >/dev/null || exit 2
 limactl cp "$HERE/$GATE.sh" "$WORKER:$REMOTE/$GATE.sh" >/dev/null || exit 2
 
 ARGS=""; for a in "$@"; do ARGS="$ARGS $(printf '%q' "$a")"; done
-ENVS="FELUCCA_TOKEN=$(printf '%q' "$TOKEN")"
+# The token goes over standard input into a header file (0700 dir, 0600 file)
+# that lib.sh hands to curl with -H @file; it is on no command line, here or in
+# the VM (the detached shell's command line shows in process listings for the
+# whole run). The detached shell removes the file when the gate ends.
+AUTHD=/tmp/felucca-lab-auth; AUTH="$AUTHD/auth.hdr"
+printf '%s' "$TOKEN" | limactl shell "$WORKER" -- bash -c "umask 077; mkdir -p $AUTHD && chmod 700 $AUTHD && { printf 'Authorization: Bearer '; tr -d ' \t\r\n'; printf '\n'; } > $AUTH && chmod 600 $AUTH" \
+  || { echo "ERROR: could not put the auth header file into $WORKER" >&2; exit 2; }
+TOKEN=""
+ENVS="FELUCCA_AUTH_FILE=$AUTH"
 [ -n "${INSTALLER_BUNDLE:-}" ] && ENVS="$ENVS INSTALLER_BUNDLE=$(printf '%q' "$INSTALLER_BUNDLE")"
 [ -n "${PREV_AGENT_BIN:-}" ] && ENVS="$ENVS PREV_AGENT_BIN=$(printf '%q' "$PREV_AGENT_BIN")"
 
 echo "== $GATE gate on $WORKER (log in the VM: $OUT) =="
-limactl shell "$WORKER" -- bash -c ": > $OUT; ( $ENVS setsid nohup bash $REMOTE/$GATE.sh$ARGS >> $OUT 2>&1 < /dev/null; echo \"GATE-EXIT \$?\" >> $OUT ) >/dev/null 2>&1 &" || exit 2
+limactl shell "$WORKER" -- bash -c ": > $OUT; ( $ENVS setsid nohup bash $REMOTE/$GATE.sh$ARGS >> $OUT 2>&1 < /dev/null; rc=\$?; rm -f $AUTH; echo \"GATE-EXIT \$rc\" >> $OUT ) >/dev/null 2>&1 &" || exit 2
 
 seen=0
 while :; do
@@ -60,7 +68,11 @@ while :; do
     seen="$total"
   fi
   rc="$(limactl shell "$WORKER" -- bash -c "sed -n 's/^GATE-EXIT //p' $OUT | tail -1" 2>/dev/null | tr -d ' \r\n')"
-  [ -n "$rc" ] && break
+  if [ -n "$rc" ]; then
+    # the gate may have ended between the line count and this look: read what came after the last count
+    limactl shell "$WORKER" -- bash -c "sed -n '$((seen+1)),\$p' $OUT" 2>/dev/null | grep -v '^GATE-EXIT '
+    break
+  fi
   sleep 5
 done
 [ "$rc" = 0 ]

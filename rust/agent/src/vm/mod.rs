@@ -9,6 +9,7 @@ pub mod meta;
 pub mod pool;
 pub mod procscan;
 pub mod reconcile;
+pub mod watch;
 
 use crate::fc;
 use crate::ipalloc::{Allocator, Cidr};
@@ -51,6 +52,11 @@ pub struct Vm {
     /// (None = trusted local file). Part of the pool match shape, so a pooled
     /// VM prewarmed from an old capture is never claimed for a new sha.
     pub image_sha256: Option<String>,
+    /// FLU-4: the snapshot files are complete and belong to this `sleeping`
+    /// record (`Meta::snapshot_valid`). Kept here because meta.json is
+    /// rebuilt from this record on every write — an expose of a sleeping VM
+    /// must not drop it.
+    pub snapshot_valid: bool,
 }
 
 /// Default template image; pre-P4 metas and requests without `image` map here.
@@ -517,6 +523,287 @@ fn replace_file_durably(dir: &str, name: &str, bytes: &[u8]) -> std::io::Result<
     std::fs::File::open(dir)?.sync_all()
 }
 
+/// Why a lifecycle operation (sleep, wake, start, stop, pause, resume) did not
+/// do what it was asked. The handlers map each to a status; `Display` gives
+/// the text they have always answered with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpError {
+    /// Another lifecycle operation holds this sandbox, or it is being stopped
+    /// or deleted (→ 409 `{"error":"busy"}`, no `state`: try again).
+    Busy,
+    /// The operation does not apply to the state the record is in
+    /// (→ 409 `{"error": msg, "state": state}`). `state` is what the record
+    /// says at the moment of the refusal; the control plane reads it.
+    InvalidState { msg: String, state: VmState },
+    /// Everything else, verbatim.
+    Other(String),
+}
+
+impl OpError {
+    fn invalid(state: &VmState, msg: impl Into<String>) -> Self {
+        OpError::InvalidState { msg: msg.into(), state: state.clone() }
+    }
+}
+
+/// What an operation answers when, at its commit point, the sandbox turns
+/// out to be stopped or deleted meanwhile, or no longer to hold the VMM the
+/// operation was talking to. It has then undone what was its own and
+/// written nothing.
+fn aborted(id: &str) -> OpError {
+    OpError::Other(format!("Aborted: {} was stopped, deleted or lost its VMM while the operation ran", id))
+}
+
+impl std::fmt::Display for OpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpError::Busy => f.write_str(BUSY),
+            OpError::InvalidState { msg, .. } => f.write_str(msg),
+            OpError::Other(s) => f.write_str(s),
+        }
+    }
+}
+
+impl From<String> for OpError {
+    fn from(s: String) -> Self {
+        OpError::Other(s)
+    }
+}
+
+impl From<&str> for OpError {
+    fn from(s: &str) -> Self {
+        OpError::Other(s.to_string())
+    }
+}
+
+/// The error text of a busy sandbox. `delete` and `fork`, which answer with a
+/// plain string, use it too.
+pub const BUSY: &str = "busy";
+
+/// The refusal of a fork whose parent was itself forked before this release
+/// (FLU-72 K5), running, paused or sleeping. No path, no other sandbox: the
+/// control plane relays it to the tenant word for word; the log has both.
+pub const FORK_REFUSED_FORKED_BEFORE: &str = "InvalidState: this sandbox was forked before this release and runs on \
+    its parent's disk image, not on its own; it cannot be forked";
+
+/// The refusal of a wake of such a sandbox whose parent's image moved on
+/// (FLU-72 K6). Same reasoning.
+pub const WAKE_REFUSED_FORKED_BEFORE: &str = "InvalidState: this sandbox was forked before this release and runs on \
+    its parent's disk image, which has changed since it slept; it cannot be woken and is now stopped (use start)";
+
+/// What stop and delete answer when the operation they pre-empted has not
+/// let go within `CLOSE_WAIT` (409, with `"state":"stopped"`: stop has
+/// written that record). The caller retries.
+pub const STOP_GAVE_UP: &str = "busy: the VM is stopped, but an operation in progress has not let go of it yet; try again";
+
+/// The lifecycle operations that hold a sandbox while they run (FLU-4). At
+/// most one is in progress per sandbox: each of them reads the record, talks
+/// to the VMM and writes the record back, and two of them interleaved on one
+/// sandbox — a wake spawning a VMM while a sleep is killing one, a start
+/// cold-booting over a snapshot a sleep is still writing — leave a record and
+/// files that describe neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpKind {
+    Sleep,
+    Wake,
+    /// On the parent, until its snapshot files have been written or read.
+    Fork,
+    Start,
+    Pause,
+    Resume,
+}
+
+/// What holds one sandbox right now. An entry exists only while something
+/// does.
+#[derive(Debug, Default)]
+struct BusyMark {
+    op: Option<OpKind>,
+    /// Forks of this sandbox while it is asleep (S4'). They only read its
+    /// snapshot files and its disk, so any number of them run side by side;
+    /// to everything else they are an operation in progress.
+    readers: usize,
+    /// Stops and deletes in progress (delete stops first, so two can nest).
+    /// While any runs, no operation starts and none commits.
+    closing: usize,
+}
+
+impl BusyMark {
+    fn idle(&self) -> bool {
+        self.op.is_none() && self.readers == 0 && self.closing == 0
+    }
+}
+
+type BusyMap = std::sync::Mutex<std::collections::HashMap<String, BusyMark>>;
+
+/// The longest a second request of the same kind waits for the one in
+/// progress (S4'); then it answers 409 `busy`. Within it, it answers from
+/// the state the first one left: a retried sleep finds the sandbox asleep and
+/// says so, instead of a 409 its caller would have to interpret. Below the
+/// control plane's 30 s worker-call timeout: a waiter that outlived its
+/// caller would carry the operation out for nobody (it used to wait 120 s).
+const SAME_OP_LIMIT: Duration = Duration::from_secs(25);
+const SAME_OP_WAIT: Duration = if cfg!(test) { Duration::from_secs(3) } else { SAME_OP_LIMIT };
+
+/// How long stop and delete wait for an operation in progress to let go
+/// after they have ended its VMM. There is no timeout on a Firecracker API
+/// call, so they cannot wait for ever: a hung call would make the sandbox
+/// impossible to stop or delete. Shorter under test, so the tests of the
+/// limit itself do not take 15 s each.
+const CLOSE_WAIT: Duration = if cfg!(test) { Duration::from_secs(2) } else { Duration::from_secs(15) };
+
+/// How often a waiting request looks again.
+const BUSY_POLL: Duration = Duration::from_millis(20);
+
+/// Holds a sandbox for one lifecycle operation; letting go is in `Drop`, so
+/// every exit path releases it — an early return, a `?`, a panic, and the
+/// caller of the future going away. (`inner` is a tokio mutex and cannot be
+/// taken in `Drop`, hence the std map.)
+struct OpGuard<'a> {
+    busy: &'a BusyMap,
+    id: String,
+    /// One of the `readers` of a sleeping parent, not its `op`.
+    shared: bool,
+}
+
+impl OpGuard<'_> {
+    /// Turn a fork's hold on its parent into a shared one: the parent is
+    /// asleep, so other forks of it may read its files alongside this one.
+    /// Called inside the `inner` section that read the parent's state, which
+    /// cannot change while the parent is held.
+    fn share(&mut self) {
+        let mut map = lock_std(self.busy);
+        if let Some(m) = map.get_mut(&self.id) {
+            if !self.shared && m.op == Some(OpKind::Fork) {
+                m.op = None;
+                m.readers += 1;
+                self.shared = true;
+            }
+        }
+    }
+}
+
+impl Drop for OpGuard<'_> {
+    fn drop(&mut self) {
+        let mut map = lock_std(self.busy);
+        if let Some(m) = map.get_mut(&self.id) {
+            if self.shared {
+                m.readers = m.readers.saturating_sub(1);
+            } else {
+                m.op = None;
+            }
+            if m.idle() {
+                map.remove(&self.id);
+            }
+        }
+    }
+}
+
+/// Marks a sandbox as being stopped or deleted for as long as it lives.
+struct CloseGuard<'a> {
+    busy: &'a BusyMap,
+    id: String,
+}
+
+impl Drop for CloseGuard<'_> {
+    fn drop(&mut self) {
+        let mut map = lock_std(self.busy);
+        if let Some(m) = map.get_mut(&self.id) {
+            m.closing = m.closing.saturating_sub(1);
+            if m.idle() {
+                map.remove(&self.id);
+            }
+        }
+    }
+}
+
+/// File names of a sleeping sandbox's snapshot, in its instance directory.
+const VMSTATE: &str = "vmstate.bin";
+const VMSTATE_TMP: &str = "vmstate.bin.tmp";
+const MEM: &str = "mem.bin";
+/// The suffix of a snapshot file set aside as stale (S3', `set_snapshot_aside`).
+const OUTRUN: &str = ".outrun";
+
+/// Are `a` and `b` the same file (device and inode)?
+fn same_file(a: &str, b: &str) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let (a, b) = (std::fs::metadata(a)?, std::fs::metadata(b)?);
+    Ok((a.dev(), a.ino()) == (b.dev(), b.ino()))
+}
+
+/// Was `image` modified after `vmstate` was written (strictly later, at the
+/// file system's own precision)? The guest of that snapshot ran since (S3).
+fn modified_after(image: &str, vmstate: &str) -> std::io::Result<bool> {
+    let disk = std::fs::metadata(image)?.modified()?;
+    let snapshot = std::fs::metadata(vmstate)?.modified()?;
+    Ok(disk > snapshot)
+}
+
+/// What looking at one file found. "Could not look" is its own answer: a
+/// failed `stat` is not a missing file, and acting on it as one would discard
+/// a good snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileCheck {
+    /// There, with this many bytes.
+    There(u64),
+    Missing,
+    Unknown(String),
+}
+
+fn check_file(path: &str) -> FileCheck {
+    match std::fs::metadata(path) {
+        Ok(m) => FileCheck::There(m.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileCheck::Missing,
+        Err(e) => FileCheck::Unknown(e.to_string()),
+    }
+}
+
+/// Remove one file that may or may not be there. Returns false only when it
+/// is there and could not be removed (logged).
+fn remove_if_present(id: &str, path: &str) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            info!(vm = %id, file = %path, "removed a snapshot file that can no longer be used");
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            warn!(vm = %id, file = %path, err = %e, "could not remove a snapshot file");
+            false
+        }
+    }
+}
+
+/// (major, minor) of a `st_dev`, in the encoding glibc and the kernel's
+/// `new_encode_dev` use — the one `/proc/<pid>/maps` prints as `MM:mm` hex.
+fn dev_major_minor(dev: u64) -> (u64, u64) {
+    let major = ((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0x0fff);
+    let minor = ((dev >> 12) & 0xffff_ff00) | (dev & 0x00ff);
+    (major, minor)
+}
+
+/// Does this `/proc/<pid>/maps` text map the file with device `major:minor`
+/// and inode `ino`? `None` when a line does not parse: "cannot tell".
+///
+/// A line is `start-end perms offset MM:mm inode [path]`. Only the device and
+/// the inode are read — the path may contain spaces or end in " (deleted)",
+/// and a mapping of a file that was replaced since is not this file.
+fn maps_contain(maps: &str, major: u64, minor: u64, ino: u64) -> Option<bool> {
+    for line in maps.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let dev = fields.nth(3)?;
+        let inode = fields.next()?.parse::<u64>().ok()?;
+        let (ma, mi) = dev.split_once(':')?;
+        let ma = u64::from_str_radix(ma, 16).ok()?;
+        let mi = u64::from_str_radix(mi, 16).ok()?;
+        if (ma, mi, inode) == (major, minor, ino) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettleAction {
     None,
@@ -557,17 +844,89 @@ pub enum ExposeError {
     NotFound,
     /// VM holds no IP, nothing to DNAT to (→ 409).
     NoIp,
-    /// Every node port in NODE_PORT_MIN..=NODE_PORT_MAX is taken (→ 409).
+    /// Every node port in NODE_PORT_MIN..=NODE_PORT_MAX is taken or to be
+    /// avoided (→ 409).
     Exhausted,
+    /// A new mapping's DNAT rule could not be installed; the mapping was
+    /// taken back out of the record (→ 500).
+    RuleFailed,
 }
 
 /// Worker-side ingress node-port range (inclusive).
 const NODE_PORT_MIN: u16 = 20000;
 const NODE_PORT_MAX: u16 = 29999;
 
-/// Lowest node port not in `used` (used spans every expose of every VM).
-fn lowest_free_node_port(used: &std::collections::HashSet<u16>) -> Option<u16> {
-    (NODE_PORT_MIN..=NODE_PORT_MAX).find(|p| !used.contains(p))
+/// Choose the node port for a new mapping (FLU-6, R3 and R4). Returns the
+/// port and where the cursor goes next, or None when nothing is left.
+///
+/// `in_use` spans every expose of every VM on this worker; `avoid` is what
+/// the control plane says must not be handed out (the ports it has recorded
+/// for this worker, and the ones released less than the quarantine ago).
+///
+/// `prefer` (the port this same sandbox and guest port held last) is
+/// returned whenever it is in the range and no sandbox here holds it, even
+/// though it is in `avoid`: it is in `avoid` BECAUSE it is quarantined for
+/// this mapping, and getting it back is what makes a sleep and wake release
+/// nothing. It leaves the cursor where it is.
+///
+/// Otherwise round-robin: the first port at or after `cursor` that is neither
+/// in use nor avoided, wrapping once around the range; the cursor moves to the
+/// port after it. Lowest-free, which this replaces, handed a port that had
+/// just been released to the very next expose — another tenant's — while the
+/// gateways still routed the old hostname to it. Pure for unit tests.
+fn pick_node_port(
+    in_use: &std::collections::HashSet<u16>,
+    avoid: &std::collections::HashSet<u16>,
+    prefer: Option<u16>,
+    cursor: u16,
+    range: std::ops::RangeInclusive<u16>,
+) -> Option<(u16, u16)> {
+    if range.is_empty() {
+        return None;
+    }
+    let (min, max) = (*range.start(), *range.end());
+    if let Some(p) = prefer {
+        if range.contains(&p) && !in_use.contains(&p) {
+            return Some((p, cursor));
+        }
+    }
+    let span = u32::from(max - min) + 1;
+    let start = if range.contains(&cursor) { cursor } else { min };
+    (0..span)
+        .map(|i| (u32::from(min) + (u32::from(start - min) + i) % span) as u16)
+        .find(|p| !in_use.contains(p) && !avoid.contains(p))
+        .map(|p| (p, if p == max { min } else { p + 1 }))
+}
+
+/// Where the node-port cursor starts when the agent starts: a random port of
+/// the range, so that an agent restart does not begin handing out the same
+/// ports again from one fixed place. Nothing about the allocator is kept on
+/// disk: the ports in use come back from the records, and the control
+/// plane's `avoid` covers the ones released before the restart.
+fn random_port_in(range: std::ops::RangeInclusive<u16>) -> u16 {
+    use std::io::Read;
+    let mut b = [0u8; 8];
+    let seed = match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)) {
+        Ok(()) => u64::from_ne_bytes(b),
+        // Not a secret, only a spread: the clock and the pid will do.
+        Err(_) => {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            nanos ^ (u64::from(std::process::id()) << 32)
+        }
+    };
+    port_from_seed(seed, range)
+}
+
+/// `seed` mapped onto `range` (non-empty).
+fn port_from_seed(seed: u64, range: std::ops::RangeInclusive<u16>) -> u16 {
+    let (min, max) = (*range.start(), *range.end());
+    if min >= max {
+        return min;
+    }
+    min + (seed % (u64::from(max - min) + 1)) as u16
 }
 
 /// Map an images-dir entry name to the cache image it belongs to, or None for
@@ -636,6 +995,14 @@ struct Inner {
     /// must not spawn an FC over the file mid-stream. Entries are removed by
     /// the capture stream's drop guard (covers client disconnects too).
     capturing: std::collections::HashSet<String>,
+    /// FLU-6 R4: where the next node-port search starts (`pick_node_port`).
+    /// In memory only; a random port of the range at start-up.
+    node_port_cursor: u16,
+    /// Slots of deleted sandboxes whose rule rebuilds failed: reserved in
+    /// the allocator, released by `settle_slots` (FLU-8, A).
+    held_slots: std::collections::BTreeSet<u32>,
+    /// No slot is handed out (FLU-8, B): see `start_ingress`.
+    slots_withheld: bool,
 }
 
 pub struct Manager {
@@ -673,8 +1040,89 @@ pub struct Manager {
     // Ids whose meta.json is behind the in-memory record: a write failed or was
     // interrupted. The liveness loop writes them (`flush_unwritten_meta`).
     meta_owed: std::sync::Mutex<std::collections::HashSet<String>>,
+    // Sandboxes a lifecycle operation, a stop or a delete holds right now
+    // (FLU-4, see `OpKind`). Keyed by VM id. Taken while holding `inner` at
+    // a commit point, never the other way round, and never across an await.
+    busy: BusyMap,
     // procfs root — always /proc outside unit tests.
     proc_root: std::path::PathBuf,
+    // The Firecracker binary — always `firecracker` (from PATH) outside unit
+    // tests, which start a stand-in.
+    fc_bin: String,
+    // The rule rebuilds and delete's tap removal — always `HostRules` (nft
+    // and ip) outside unit tests, which put a stand-in here.
+    rules: Arc<dyn RuleOps>,
+    // FLU-8: per chain, the hash last applied (or that its last rebuild
+    // failed), and what the isolation watch last saw. Written only while
+    // holding `ruleset_lock`; read by `isolation_ok` at any time. A std
+    // mutex: never held across an await, and never while taking `inner`.
+    watch: std::sync::Mutex<watch::Record>,
+}
+
+/// The host side of the rule rebuilds, of removing a sandbox's tap, and of
+/// everything the isolation watch looks at and repairs (`kernel`).
+trait RuleOps: Send + Sync {
+    /// Whether these touch anything at all on a node with the network
+    /// `net_on`.
+    fn active(&self, net_on: bool) -> bool;
+    /// What the transaction did, and whether isolation is in force.
+    fn rebuild_isolation(&self, members: &[(String, String)]) -> (net::Applied, bool);
+    fn rebuild_ingress(&self, members: &[(u16, String, u16)]) -> net::Applied;
+    fn remove_tap(&self, tap: &str);
+    /// Create `tap` if needed and pin it to `ip` and `mac`; false (and the
+    /// tap removed) when it cannot be pinned. A fork's child.
+    fn pin_tap(&self, tap: &str, ip: Option<&str>, mac: &net::GuestMac) -> bool;
+    /// Pin the tap of a guest adopted at start-up; a port that cannot be
+    /// pinned is taken down, not removed (`Unpinned::TakeDown`).
+    fn pin_adopted_tap(&self, tap: &str, ip: &str, mac: &net::GuestMac) -> Result<(), PinFailure>;
+    /// Create the guest bridge, its address, forwarding, IPv6 off on it:
+    /// (the bridge is usable, IPv6 is off on it).
+    fn ensure_bridge(&self, cidr: Cidr) -> (bool, bool);
+    /// Record start-up's verdict on the host-side fences.
+    fn note_host_fences(&self, ok: bool);
+    /// Start-up's and the last rule change's verdict (`net::netfilter_ready`).
+    fn fences_ready(&self) -> bool;
+    /// Rulesets, listings, switches, links and the route.
+    fn kernel(&self) -> &dyn net::Kernel;
+}
+
+/// `RuleOps` on the host: nft and ip.
+struct HostRules;
+
+impl RuleOps for HostRules {
+    fn active(&self, net_on: bool) -> bool {
+        net_on
+    }
+    fn ensure_bridge(&self, cidr: Cidr) -> (bool, bool) {
+        net::ensure_bridge(cidr)
+    }
+    fn note_host_fences(&self, ok: bool) {
+        net::set_host_filter_ok(ok);
+    }
+    fn fences_ready(&self) -> bool {
+        net::netfilter_ready()
+    }
+    fn kernel(&self) -> &dyn net::Kernel {
+        &net::HostKernel
+    }
+    fn rebuild_isolation(&self, members: &[(String, String)]) -> (net::Applied, bool) {
+        net::rebuild_isolation(members)
+    }
+    fn rebuild_ingress(&self, members: &[(u16, String, u16)]) -> net::Applied {
+        net::rebuild_ingress(members)
+    }
+    fn remove_tap(&self, tap: &str) {
+        // Before the tap goes: the pin is keyed on the device name, which
+        // the next VM to claim this slot will reuse.
+        net::clear_tap_antispoof(tap);
+        net::delete_tap(tap);
+    }
+    fn pin_tap(&self, tap: &str, ip: Option<&str>, mac: &net::GuestMac) -> bool {
+        ensure_pinned_tap(tap, ip, mac, Unpinned::Remove).is_ok()
+    }
+    fn pin_adopted_tap(&self, tap: &str, ip: &str, mac: &net::GuestMac) -> Result<(), PinFailure> {
+        ensure_pinned_tap(tap, Some(ip), mac, Unpinned::TakeDown)
+    }
 }
 
 impl Manager {
@@ -712,6 +1160,9 @@ impl Manager {
                 template_pools: Vec::new(),
                 pools_synced: false,
                 capturing: std::collections::HashSet::new(),
+                node_port_cursor: random_port_in(NODE_PORT_MIN..=NODE_PORT_MAX),
+                held_slots: std::collections::BTreeSet::new(),
+                slots_withheld: false,
             }),
             ruleset_lock: Mutex::new(()),
             image_locks: Mutex::new(std::collections::HashMap::new()),
@@ -720,8 +1171,43 @@ impl Manager {
             data_dir_lock: std::sync::OnceLock::new(),
             unsettled: std::sync::Mutex::new(std::collections::HashMap::new()),
             meta_owed: std::sync::Mutex::new(std::collections::HashSet::new()),
+            busy: std::sync::Mutex::new(std::collections::HashMap::new()),
             proc_root,
+            fc_bin: "firecracker".into(),
+            rules: Arc::new(HostRules),
+            watch: std::sync::Mutex::new(watch::Record::default()),
         })
+    }
+
+    /// Re-pin the taps of guests adopted at start-up (`reconcile` step 3).
+    /// One that cannot be pinned is taken down, not removed, and handed to
+    /// the watch (W8), which pins and raises it on a later tick. Says what
+    /// happened (X12): a tap that could not even be set up was not taken
+    /// down. Returns how many did not come out pinned.
+    fn repin_adopted(&self, taps: &[(String, u32, String)]) -> usize {
+        let mut not_pinned = 0;
+        for (id, slot, ip) in taps {
+            let (tap, mac) = tap_pin_for_slot(*slot);
+            match self.rules.pin_adopted_tap(&tap, ip, &mac) {
+                Ok(()) => {}
+                Err(why) => {
+                    not_pinned += 1;
+                    lock_std(&self.watch).hold_tap_down(&tap);
+                    let what = match why {
+                        PinFailure::NotSetUp => "adopted VM's tap could not be set up (created, put on the guest bridge, \
+                                                 IPv6 off) — it may not be on the bridge at all; nothing was taken down; \
+                                                 the isolation watch pins it once it is a port of the bridge",
+                        PinFailure::Unpinned => "adopted VM's tap could not be pinned — the port has been taken down \
+                                                 (not removed), so this guest has no network until the isolation watch \
+                                                 (or an agent start) pins it",
+                        PinFailure::NotRaised => "adopted VM's tap was pinned but could not be brought up — this guest \
+                                                  has no network until the isolation watch (or an agent start) raises it",
+                    };
+                    error!(vm = %id, tap = %tap, "{}", what);
+                }
+            }
+        }
+        not_pinned
     }
 
     /// The process table, scoped to this agent's data dir.
@@ -730,15 +1216,50 @@ impl Manager {
     }
 
     /// Bring up bridge/NAT (if net on) and init the IP allocator. Call once before serving.
+    ///
+    /// In order: the blackhole route for the guest network (FLU-8 N6': before
+    /// anything that may take the bridge down, so guest addresses are dropped
+    /// here rather than sent out by the default route whenever the bridge
+    /// and its connected route are gone), the bridge, then NAT and the two
+    /// host-side fences, one transaction each, each remembered with its
+    /// marker for the isolation watch. Off the runtime threads, under the
+    /// rule lock.
     pub async fn setup_host(&self) {
-        if !self.net_on { return; }
-        let alloc = Allocator::new(self.cidr);
-        {
+        if self.net_on {
+            let alloc = Allocator::new(self.cidr);
             let mut g = self.inner.lock().await;
             g.allocator = Some(alloc);
         }
-        if !net::ensure_bridge(self.cidr) {
-            warn!("bridge setup failed; guests may lack networking");
+        if !self.rules_on() { return; }
+        let _rules = self.ruleset_lock.lock().await;
+        let rules = Arc::clone(&self.rules);
+        let cidr = self.cidr;
+        let built = tokio::task::spawn_blocking(move || {
+            // W9: `unreachable`, re-asserted by the watch whenever it holds the
+            // bridge down; a failure is an error (`watch::ensure_guest_route`).
+            watch::ensure_guest_route(rules.kernel(), cidr, None);
+            let (usable, v6_ok) = rules.ensure_bridge(cidr);
+            if !usable {
+                warn!("bridge setup failed; guests may lack networking");
+            }
+            // Each is evaluated, none short-circuited — a partial failure
+            // must still install everything else it can.
+            let mut built = Vec::new();
+            for chain in [net::Chain::Nat, net::Chain::Input, net::Chain::L2] {
+                let Some(rs) = net::host_chain_ruleset(&chain, cidr) else { continue };
+                let outcome = rules.kernel().apply(&rs);
+                net::report_built(&chain, &outcome);
+                built.push((chain, outcome.ok().then(|| net::marker_of(&rs)).flatten()));
+            }
+            let fences_ok = built.iter().filter(|(c, _)| c.fences()).all(|(_, h)| h.is_some());
+            rules.note_host_fences(fences_ok && v6_ok);
+            built
+        })
+        .await
+        .unwrap_or_default();
+        let mut w = lock_std(&self.watch);
+        for (chain, hash) in built {
+            w.built(chain, hash);
         }
     }
 
@@ -777,16 +1298,19 @@ impl Manager {
     /// start brings the port up again as soon as the pin holds.
     pub async fn reconcile(&self) {
         let procs = self.procs();
-        let (unreadable, metaless, dead_pool, adopted) = {
+        let (unreadable, metaless, dead_pool, rewrite, undecided, outrun, adopted) = {
             let mut g = self.inner.lock().await;
             let rec = reconcile::reconcile(&self.data_dir, g.allocator.as_mut(), &procs);
             g.vms = rec.vms;
             let adopted = g.vms.iter().filter(|v| v.pid.is_some()).count();
-            (rec.unreadable, rec.metaless, rec.dead_pool, adopted)
+            (rec.unreadable, rec.metaless, rec.dead_pool, rec.rewrite, rec.undecided, rec.outrun, adopted)
         };
 
         let mut swept = self.sweep_orphans(&procs, &unreadable, &metaless, &dead_pool).await;
         swept.pool_removed = self.remove_dead_pool_vms(&procs, &dead_pool).await;
+        // After the sweep: whether a VMM was adopted for a sandbox decides
+        // what of its snapshot may go.
+        self.settle_snapshot_files_at_start(&rewrite, &undecided, &outrun).await;
         // Counted after the sweep: it may have adopted a VMM itself.
         let adopted = adopted + swept.rolled_forward;
 
@@ -797,18 +1321,7 @@ impl Manager {
                 taps_to_repin(&g.vms)
             };
             // Outside the state lock: these shell out to ip/nft.
-            for (id, slot, ip) in taps {
-                let (tap, mac) = tap_pin_for_slot(slot);
-                if !ensure_pinned_tap(&tap, Some(&ip), &mac, Unpinned::TakeDown) {
-                    taps_down += 1;
-                    error!(
-                        vm = %id,
-                        tap = %tap,
-                        "adopted VM's tap could not be pinned — the port has been taken down \
-                         (not removed), so this guest has no network until an agent start pins it"
-                    );
-                }
-            }
+            taps_down = self.repin_adopted(&taps);
         }
 
         // A VMM started by an agent that predates the OOM marking is still
@@ -1035,6 +1548,8 @@ impl Manager {
                     let was = v.state.clone();
                     v.pid = Some(pid);
                     v.state = VmState::Running;
+                    // The guest has run since the snapshot was taken.
+                    v.snapshot_valid = false;
                     (v.id.clone(), was)
                 }
                 _ => return false,
@@ -1049,6 +1564,12 @@ impl Manager {
         );
         if let Err(e) = self.write_meta(&id).await {
             warn!(vm = %id, err = %e, "reconcile: could not write the adopted VM's record yet");
+        }
+        if was == VmState::Sleeping {
+            // What the wake did not get to: the state file goes, so that no
+            // later reading (an older agent's, after a rollback) takes this
+            // running guest for one asleep. mem.bin stays: the guest runs on it.
+            remove_if_present(&id, &format!("{}/{}", dir, VMSTATE));
         }
         true
     }
@@ -1312,6 +1833,264 @@ impl Manager {
         }
     }
 
+    /// Hold `id` for one lifecycle operation of `kind` (FLU-4). The guard
+    /// lets go when it is dropped, on every exit path.
+    ///
+    /// * Nothing holds the sandbox: it is this operation's.
+    /// * An operation of the same kind holds it: wait for that one (at most
+    ///   `SAME_OP_WAIT`, then `Busy`), then go on — the caller then answers
+    ///   from the state the first one left, so a retried sleep says "already
+    ///   asleep".
+    /// * An operation of another kind holds it, forks of it read its files
+    ///   while it sleeps, or it is being stopped or deleted: `Busy`, at once.
+    ///   Carrying out a wake queued behind a sleep, or anything queued behind
+    ///   a stop, would act on a state its caller never saw.
+    ///
+    /// Fork does not come through here (`begin_fork`).
+    ///
+    /// Composes with `claim_unsettled`, which every operation still calls
+    /// after this: the mark keeps operations apart from each other, the
+    /// unsettled list keeps them apart from the start-up probe.
+    async fn begin_op(&self, id: &str, kind: OpKind) -> Result<OpGuard<'_>, OpError> {
+        let deadline = Instant::now() + SAME_OP_WAIT;
+        loop {
+            {
+                let mut map = lock_std(&self.busy);
+                let m = map.entry(id.to_string()).or_default();
+                if m.closing > 0 {
+                    return Err(OpError::Busy);
+                }
+                match m.op {
+                    None if m.readers == 0 => {
+                        m.op = Some(kind);
+                        return Ok(OpGuard { busy: &self.busy, id: id.to_string(), shared: false });
+                    }
+                    Some(k) if k == kind && Instant::now() < deadline => {}
+                    _ => return Err(OpError::Busy),
+                }
+            }
+            sleep(BUSY_POLL).await;
+        }
+    }
+
+    /// Hold `id` for a fork (S4'), without waiting: a fork queued behind
+    /// another operation would act on a state its caller never saw, and its
+    /// caller (the control plane) gives up after 30 s anyway. Anything that
+    /// holds the sandbox answers `Busy`, except forks of it while it sleeps:
+    /// this one joins them (`readers`). Otherwise the hold is exclusive; the
+    /// fork shares it (`OpGuard::share`) once it has read that the sandbox is
+    /// asleep.
+    ///
+    /// Also the mark of a fork's CHILD, from its reservation to the end of
+    /// the fork: no record has that id before, so nothing else holds it.
+    fn begin_fork(&self, id: &str) -> Result<OpGuard<'_>, OpError> {
+        let mut map = lock_std(&self.busy);
+        let m = map.entry(id.to_string()).or_default();
+        if m.closing > 0 || m.op.is_some() {
+            return Err(OpError::Busy);
+        }
+        if m.readers > 0 {
+            m.readers += 1;
+            return Ok(OpGuard { busy: &self.busy, id: id.to_string(), shared: true });
+        }
+        m.op = Some(OpKind::Fork);
+        Ok(OpGuard { busy: &self.busy, id: id.to_string(), shared: false })
+    }
+
+    /// Mark `id` as being stopped or deleted, until the guard drops: from now
+    /// on no operation starts on it and none in progress commits.
+    ///
+    /// Stop and delete do not queue behind an operation. There is no timeout
+    /// on a Firecracker API call, so an operation stuck in one would make the
+    /// sandbox impossible to stop or delete; instead they end the VMM (which
+    /// fails the call in progress) and then wait for the operation to let go
+    /// (`wait_op_released`).
+    fn begin_close(&self, id: &str) -> CloseGuard<'_> {
+        lock_std(&self.busy).entry(id.to_string()).or_default().closing += 1;
+        CloseGuard { busy: &self.busy, id: id.to_string() }
+    }
+
+    /// Wait, at most `CLOSE_WAIT`, until no operation holds `id`. False when
+    /// one still does.
+    async fn wait_op_released(&self, id: &str) -> bool {
+        let deadline = Instant::now() + CLOSE_WAIT;
+        loop {
+            if !self.op_in_progress(id) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            sleep(BUSY_POLL).await;
+        }
+    }
+
+    /// Does a lifecycle operation, or a fork reading its files, hold `id`
+    /// right now?
+    fn op_in_progress(&self, id: &str) -> bool {
+        matches!(lock_std(&self.busy).get(id), Some(m) if m.op.is_some() || m.readers > 0)
+    }
+
+    /// Is `id` being stopped or deleted right now?
+    fn closing(&self, id: &str) -> bool {
+        matches!(lock_std(&self.busy).get(id), Some(m) if m.closing > 0)
+    }
+
+    /// May an operation that started out from VMM `pid` commit to this
+    /// record? Called inside the `inner` critical section that commits. Not
+    /// when the sandbox is being stopped or deleted (that has ended or is
+    /// ending the VMM, and its record is not the operation's to write any
+    /// more), and not when the record no longer holds the VMM the operation
+    /// was talking to (the exit reaper recorded its death, or a stop took it).
+    fn may_commit(&self, v: &Vm, pid: Option<i32>) -> bool {
+        v.pid == pid && !self.closing(&v.id)
+    }
+
+    /// Is `mem` mapped by a Firecracker of the instance `dir_id` (one of the
+    /// processes `scan` listed), by device and inode in `/proc/<pid>/maps`?
+    /// `None` when that cannot be told.
+    ///
+    /// A guest that was woken runs on a private mapping of its `mem.bin` for
+    /// the rest of its life. Unlinking the file under it is harmless (the lab
+    /// showed it: the mapping keeps its pages); what this check is for is
+    /// keeping the file a running guest was loaded from in its directory, as
+    /// long as that guest runs. A wrong "not mapped" is harmless for the same
+    /// reason — btrfs subvolumes, for one, print another device number in
+    /// `maps` than `stat` reports.
+    fn mem_mapped(&self, dir_id: &str, mem: &str, scan: &[FcProc]) -> Option<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let st = match std::fs::metadata(mem) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
+            Err(_) => return None,
+        };
+        let (major, minor) = dev_major_minor(st.dev());
+        for p in scan.iter().filter(|p| p.dir_name == dir_id) {
+            match std::fs::read_to_string(self.proc_root.join(p.pid.to_string()).join("maps")) {
+                Ok(text) => match maps_contain(&text, major, minor, st.ino()) {
+                    Some(false) => {}
+                    other => return other,
+                },
+                // Exited since the scan.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(_) => return None,
+            }
+        }
+        Some(false)
+    }
+
+    /// Remove the snapshot files of an instance whose snapshot can no longer
+    /// be used (S8, S9): `vmstate.bin`, its temp file, and `mem.bin` unless a
+    /// live VMM of the instance maps it (or that cannot be told).
+    ///
+    /// `vmstate.bin` goes first: it is what an older agent takes as "asleep",
+    /// so it must not outlive the `sleeping` record (S11).
+    fn discard_snapshot_files(&self, id: &str, dir_id: &str) {
+        self.discard_snapshot_files_in(id, dir_id, &self.procs().scan());
+    }
+
+    /// `discard_snapshot_files`, with the Firecrackers of this data dir
+    /// already listed (`scan`).
+    fn discard_snapshot_files_in(&self, id: &str, dir_id: &str, scan: &[FcProc]) {
+        let Some(dir) = instance_path(&self.data_dir, dir_id) else {
+            return;
+        };
+        remove_if_present(id, &format!("{}/{}", dir, VMSTATE_TMP));
+        remove_if_present(id, &format!("{}/{}", dir, VMSTATE));
+        let mem = format!("{}/{}", dir, MEM);
+        match self.mem_mapped(dir_id, &mem, scan) {
+            Some(false) => {
+                remove_if_present(id, &mem);
+            }
+            Some(true) => info!(vm = %id, "mem.bin kept: a live Firecracker of this instance maps it"),
+            None => warn!(vm = %id, "mem.bin kept: could not tell whether a live Firecracker maps it"),
+        }
+    }
+
+    /// Set a stale snapshot aside (S3'): `vmstate.bin` and `mem.bin` are
+    /// renamed to `*.outrun`, not removed. The verdict that the guest ran
+    /// after the snapshot rests on file times (or, for a wake, on a reply
+    /// that never came), and a wrong one — a restore that lost the times, say
+    /// — must not destroy every old snapshot on a node at once. Nothing takes
+    /// a `*.outrun` file for a snapshot. Only `start`, `stop` and the next
+    /// sleep of the sandbox remove them (`remove_outrun`), and delete with the
+    /// directory; start-up leaves them. The temporary state file goes: it is
+    /// never a snapshot.
+    fn set_snapshot_aside(&self, id: &str, dir_id: &str) {
+        let Some(dir) = instance_path(&self.data_dir, dir_id) else {
+            return;
+        };
+        remove_if_present(id, &format!("{}/{}", dir, VMSTATE_TMP));
+        // The state file first: it is what an older agent takes as "asleep".
+        for name in [VMSTATE, MEM] {
+            let (from, to) = (format!("{}/{}", dir, name), format!("{}/{}{}", dir, name, OUTRUN));
+            match std::fs::rename(&from, &to) {
+                Ok(()) => warn!(vm = %id, file = %from, to = %to, "a stale snapshot file was set aside"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(vm = %id, file = %from, err = %e, "could not set a stale snapshot file aside"),
+            }
+        }
+    }
+
+    /// Remove what `set_snapshot_aside` kept.
+    fn remove_outrun(&self, id: &str, dir_id: &str) {
+        let Some(dir) = instance_path(&self.data_dir, dir_id) else {
+            return;
+        };
+        for name in [VMSTATE, MEM] {
+            remove_if_present(id, &format!("{}/{}{}", dir, name, OUTRUN));
+        }
+    }
+
+    /// Start-up, after the sweep (S1, S3, S9): write the records whose state
+    /// start-up changed, and remove the snapshot files nothing can use any
+    /// more — or, for a sleeper whose disk outran its snapshot (`outrun`),
+    /// set them aside (S3'). Only by the agent that holds the data-dir lock,
+    /// and only for records that loaded — a directory whose `meta.json` does
+    /// not load is not touched. Of a record whose files could not be
+    /// examined (`undecided`) only the temporary state file goes.
+    async fn settle_snapshot_files_at_start(&self, rewrite: &[String], undecided: &[String], outrun: &[String]) {
+        if !self.hold_data_dir_lock() {
+            return;
+        }
+        for id in rewrite {
+            if let Err(e) = self.write_meta(id).await {
+                warn!(vm = %id, err = %e, "reconcile: could not write the record start-up corrected yet");
+            }
+        }
+        let vms: Vec<(String, String, VmState, bool)> = {
+            let g = self.inner.lock().await;
+            g.vms
+                .iter()
+                .map(|v| (v.id.clone(), v.dir_id.clone(), v.state.clone(), v.pid.is_some()))
+                .collect()
+        };
+        // One look at the process table for all of them (it used to be one
+        // per stopped record).
+        let scan = self.procs().scan();
+        for (id, dir_id, state, has_vmm) in vms {
+            let Some(dir) = instance_path(&self.data_dir, &dir_id) else {
+                continue;
+            };
+            // A sleep the previous agent did not finish: never part of a
+            // snapshot anything relies on, whatever else is undecided (S9).
+            remove_if_present(&id, &format!("{}/{}", dir, VMSTATE_TMP));
+            if state == VmState::Sleeping || undecided.contains(&id) {
+                continue;
+            }
+            if outrun.contains(&id) {
+                self.set_snapshot_aside(&id, &dir_id);
+            } else if has_vmm {
+                // The guest may run on mem.bin (it was woken): only the state
+                // file goes.
+                remove_if_present(&id, &format!("{}/{}", dir, VMSTATE));
+            } else {
+                self.discard_snapshot_files_in(&id, &dir_id, &scan);
+            }
+        }
+    }
+
     /// SIGKILL an instance's Firecracker. Returns whether there is a dying
     /// process worth waiting for (`wait_fc_gone`).
     ///
@@ -1370,8 +2149,89 @@ impl Manager {
     /// A `--net off` node has no guest network at all, so there is nothing to
     /// isolate and nothing to report as broken — the underlying atomics only
     /// mean anything once host networking has been set up.
+    ///
+    /// FLU-8 N9': once the isolation watch has completed a tick, its verdict
+    /// (`watch::Record::verdict`); before that, and with the watch off,
+    /// start-up's and the last rule change's (`net::netfilter_ready`).
     pub fn isolation_ok(&self) -> bool {
-        !self.net_on || net::netfilter_ready()
+        if !self.rules_on() { return true; }
+        let (withheld, verdict) = {
+            let w = lock_std(&self.watch);
+            (w.withheld, w.verdict(Instant::now()))
+        };
+        // Z2: a worker that hands out no guest address says so, in every
+        // watch mode — the control plane would otherwise keep placing every
+        // create on it (it has the fewest sandboxes, since it refuses them).
+        if withheld {
+            return false;
+        }
+        verdict.unwrap_or_else(|| self.rules.fences_ready())
+    }
+
+    /// Remove slot `s`'s tap (its anti-spoof chain first) under the rule lock,
+    /// so that a watch tick never pins a tap that is being taken away, nor
+    /// counts its vanishing as a failed repair.
+    async fn remove_tap_locked(&self, s: u32) {
+        let _rules = self.ruleset_lock.lock().await;
+        self.rules.remove_tap(&net::tap_name(s));
+    }
+
+    /// After a rule rebuild, under the rule lock: what the kernel now holds
+    /// may let guest addresses go again.
+    ///
+    /// A. Slots a delete held because a rebuild failed are freed by the first
+    ///    state in which the latest isolation AND the latest ingress rebuild
+    ///    both succeeded: both ran after those sandboxes left the membership,
+    ///    so no rule names their addresses any more.
+    /// B. A start-up whose ingress chain could be neither rebuilt nor flushed
+    ///    hands out no address until the chain has been rebuilt: the previous
+    ///    run's `dport -> address` rules would otherwise put each new sandbox
+    ///    behind somebody else's node ports.
+    fn settle_slots(&self, g: &mut Inner) {
+        let (pair_ok, ingress_ok) = {
+            let r = lock_std(&self.watch);
+            (r.applied(&net::Chain::Forward) && r.applied(&net::Chain::Ingress), r.applied(&net::Chain::Ingress))
+        };
+        if ingress_ok && g.slots_withheld {
+            g.slots_withheld = false;
+            lock_std(&self.watch).withheld = false;
+            info!("the ingress DNAT chain has been rebuilt: guest addresses are handed out again");
+        }
+        if pair_ok && !g.held_slots.is_empty() {
+            let held: Vec<u32> = std::mem::take(&mut g.held_slots).into_iter().collect();
+            for s in &held {
+                Self::free_slot(g, *s);
+            }
+            info!(slots = ?held, "both rule rebuilds succeeded: the slots held since a failed rebuild are free again");
+        }
+    }
+
+    /// Start-up's ingress rebuild (B). When it fails, a bare flush of the
+    /// chain is tried — one small transaction, the chain with no rule but its
+    /// marker — and when that fails as well, no guest address is handed out
+    /// until the chain has been rebuilt (the watch retries it every tick).
+    /// Returns whether the rebuild succeeded.
+    pub async fn start_ingress(&self) -> bool {
+        if self.refresh_ingress().await { return true; }
+        if !self.rules_on() { return true; }
+        let flushed = {
+            let _rules = self.ruleset_lock.lock().await;
+            let rules = Arc::clone(&self.rules);
+            tokio::task::spawn_blocking(move || rules.kernel().apply(&net::ingress_ruleset(&[])).ok())
+                .await
+                .unwrap_or(false)
+        };
+        if flushed {
+            warn!("the ingress DNAT chain could not be rebuilt at start-up and has been emptied instead: \
+                   exposed ports do not answer until a rebuild succeeds");
+        } else {
+            self.inner.lock().await.slots_withheld = true;
+            lock_std(&self.watch).withheld = true;
+            error!("the ingress DNAT chain could be neither rebuilt nor emptied at start-up: it may still hold \
+                    the previous run's node-port rules for addresses no sandbox holds now, so creates, forks \
+                    and pool refills are refused (no guest address is handed out) until it is rebuilt");
+        }
+        false
     }
 
     /// Rebuild the cross-tenant isolation ruleset from the current VM list
@@ -1385,46 +2245,109 @@ impl Manager {
     /// that triggered the rebuild must not leave a VM running on a node where
     /// every sandbox shares one flat network.
     pub async fn refresh_isolation(&self) -> bool {
-        if !self.net_on { return true; }
+        if !self.rules_on() { return true; }
         let _guard = self.ruleset_lock.lock().await;
-        let members: Vec<(String, String)> = {
-            let g = self.inner.lock().await;
-            g.vms.iter()
-                .filter_map(|v| {
-                    v.ip.clone().map(|ip| (v.tenant_id.clone().unwrap_or_default(), ip))
-                })
-                .collect()
-        };
-        net::rebuild_isolation(&members)
+        let members = Self::isolation_members(&*self.inner.lock().await);
+        let (outcome, ok) = self.rules.rebuild_isolation(&members);
+        // FLU-8: what the watch compares the kernel with, under this lock.
+        lock_std(&self.watch).built(net::Chain::Forward, outcome.ok().then(|| net::marker_of(&net::isolation_ruleset(&members))).flatten());
+        self.settle_slots(&mut *self.inner.lock().await);
+        ok
+    }
+
+    /// `(tenant, ip)` of every VM holding an IP: the isolation membership.
+    fn isolation_members(g: &Inner) -> Vec<(String, String)> {
+        g.vms.iter()
+            .filter_map(|v| {
+                v.ip.clone().map(|ip| (v.tenant_id.clone().unwrap_or_default(), ip))
+            })
+            .collect()
+    }
+
+    /// `(node_port, ip, guest_port)` of every expose of every VM holding an
+    /// IP: the ingress membership.
+    fn ingress_members(g: &Inner) -> Vec<(u16, String, u16)> {
+        let mut out = Vec::new();
+        for v in &g.vms {
+            if let Some(ip) = &v.ip {
+                for e in &v.exposes {
+                    out.push((e.node_port, ip.clone(), e.guest_port));
+                }
+            }
+        }
+        out
     }
 
     /// Rebuild the ingress DNAT ruleset from the current VM list (every expose
     /// of every VM holding an IP). Same discipline as `refresh_isolation`:
     /// snapshot membership under the state lock, release it, then shell out to
     /// nft under the ruleset lock so rebuilds never interleave.
-    pub async fn refresh_ingress(&self) {
-        if !self.net_on { return; }
+    ///
+    /// Returns false when the rules were not applied (the kernel keeps the
+    /// previous chain): an expose must not answer success for a rule that is
+    /// not there.
+    pub async fn refresh_ingress(&self) -> bool {
+        if !self.rules_on() { return true; }
         let _guard = self.ruleset_lock.lock().await;
-        let members: Vec<(u16, String, u16)> = {
-            let g = self.inner.lock().await;
-            let mut out = Vec::new();
-            for v in &g.vms {
-                if let Some(ip) = &v.ip {
-                    for e in &v.exposes {
-                        out.push((e.node_port, ip.clone(), e.guest_port));
-                    }
-                }
-            }
-            out
-        };
-        net::rebuild_ingress(&members);
+        self.rebuild_ingress_locked().await
+    }
+
+    /// `refresh_ingress` for a caller that holds the rule lock already.
+    async fn rebuild_ingress_locked(&self) -> bool {
+        // As `refresh_ingress`: nothing to touch on a node without rules. The
+        // expose path called this unguarded from r6 on, and a `--net off`
+        // manager in a unit test applied a real DNAT rule to the host.
+        if !self.rules_on() { return true; }
+        let members = Self::ingress_members(&*self.inner.lock().await);
+        let ok = self.rules.rebuild_ingress(&members).ok();
+        lock_std(&self.watch).built(net::Chain::Ingress, ok.then(|| net::marker_of(&net::ingress_ruleset(&members))).flatten());
+        self.settle_slots(&mut *self.inner.lock().await);
+        ok
+    }
+
+    /// Whether the rule rebuilds and the tap removal touch anything.
+    fn rules_on(&self) -> bool {
+        self.rules.active(self.net_on)
     }
 
     // ---- ingress expose (v4 P3) ----
 
     /// Map a host node port to `id`'s ip:guest_port (TCP DNAT). Idempotent per
-    /// (vm, guest_port): an existing entry returns its node_port unchanged.
-    pub async fn expose(&self, id: &str, guest_port: u16) -> Result<u16, ExposeError> {
+    /// (vm, guest_port): an existing entry returns its node_port unchanged,
+    /// whatever `avoid` says (the control plane never lists that port in it).
+    ///
+    /// A new mapping gets `prefer` when no sandbox here holds it, and
+    /// otherwise the next port round-robin that is neither in use nor in
+    /// `avoid` (`pick_node_port`). The answer is success only once the DNAT
+    /// rule is in the kernel: a rebuild that fails takes the mapping back out
+    /// of the record and answers `RuleFailed`.
+    ///
+    /// The whole of it — the mapping into the record, the rebuild, and on a
+    /// failure the mapping out again and a second rebuild — runs under the
+    /// rule lock, and `meta.json` is written only once the rule is in. The
+    /// mapping used to be written first: a roll-back write that did not land
+    /// before a restart brought it back, possibly beside the sandbox that had
+    /// got the port since; and a rebuild for another sandbox, run between the
+    /// push and the failure, installed the doomed rule for good.
+    pub async fn expose(
+        &self,
+        id: &str,
+        guest_port: u16,
+        avoid: &std::collections::HashSet<u16>,
+        prefer: Option<u16>,
+    ) -> Result<u16, ExposeError> {
+        // The answers that need no rule change, without waiting for the rule
+        // lock (a delete in progress holds it while the record has no ip).
+        {
+            let g = self.inner.lock().await;
+            let v = g.vms.iter().find(|v| v.id == id).ok_or(ExposeError::NotFound)?;
+            if v.ip.is_none() { return Err(ExposeError::NoIp); }
+            if let Some(e) = v.exposes.iter().find(|e| e.guest_port == guest_port) {
+                return Ok(e.node_port);
+            }
+        }
+        let rules = self.ruleset_lock.lock().await;
+        // Looked at again below: anything may have changed while waiting.
         let node_port = {
             let mut g = self.inner.lock().await;
             // node ports are unique across ALL VMs — collect before the
@@ -1432,28 +2355,70 @@ impl Manager {
             let used: std::collections::HashSet<u16> = g.vms.iter()
                 .flat_map(|v| v.exposes.iter().map(|e| e.node_port))
                 .collect();
+            let cursor = g.node_port_cursor;
             let v = g.vms.iter_mut().find(|v| v.id == id).ok_or(ExposeError::NotFound)?;
             if v.ip.is_none() { return Err(ExposeError::NoIp); }
             if let Some(e) = v.exposes.iter().find(|e| e.guest_port == guest_port) {
                 // Idempotent: mapping already live, nothing to persist or rebuild.
                 return Ok(e.node_port);
             }
-            let np = lowest_free_node_port(&used).ok_or(ExposeError::Exhausted)?;
+            let (np, next) = pick_node_port(&used, avoid, prefer, cursor, NODE_PORT_MIN..=NODE_PORT_MAX)
+                .ok_or(ExposeError::Exhausted)?;
             v.exposes.push(ExposeEntry { guest_port, node_port: np });
+            g.node_port_cursor = next;
             np
         };
-        // Persist + rebuild outside the state lock (write_meta re-locks).
-        // Persist is best-effort like other meta writes off the happy path:
-        // the in-memory entry and the nft rule are already authoritative.
-        if let Err(e) = self.write_meta(id).await {
-            warn!(vm = %id, err = %e, "expose persist failed");
+        if self.rebuild_ingress_locked().await {
+            drop(rules);
+            // Persisted only now that the rule is in. Best-effort like other
+            // meta writes off the happy path: the in-memory entry is
+            // authoritative and a failed write is owed (`meta_owed`).
+            if let Err(e) = self.write_meta(id).await {
+                warn!(vm = %id, err = %e, "expose persist failed");
+            }
+            return Ok(node_port);
         }
-        self.refresh_ingress().await;
-        Ok(node_port)
+        // The rule is not there. Answering with the port would send the
+        // gateways to a node port nothing forwards — or, once the next
+        // rebuild succeeds, it would appear without anyone having been told
+        // it failed. Take this mapping back out, and say so. (A concurrent
+        // expose of the same guest port that arrived between the push above
+        // and this point was answered idempotently from this mapping; that
+        // caller has been told success for a rule that is not there.)
+        {
+            let mut g = self.inner.lock().await;
+            if let Some(v) = g.vms.iter_mut().find(|v| v.id == id) {
+                v.exposes.retain(|e| !(e.guest_port == guest_port && e.node_port == node_port));
+            }
+        }
+        // Again without it: a rebuild that "failed" by outrunning its time
+        // limit may have committed all the same, and no rule for a mapping
+        // nobody was told about may stay. Nothing was written to meta.json.
+        if !self.rebuild_ingress_locked().await {
+            error!(vm = %id, node_port, "expose: the rebuild without the failed mapping failed as well; \
+                   the watch retries the ingress chain");
+        }
+        drop(rules);
+        // X9: another write of this record (a sleep, a stop) may have landed
+        // between the push and the roll-back, with the doomed mapping in it;
+        // the record on disk is the one without it again (best effort).
+        if let Err(e) = self.write_meta(id).await {
+            warn!(vm = %id, err = %e, "expose roll-back persist failed");
+        }
+        error!(vm = %id, guest_port, node_port, "expose: the ingress rule could not be installed; mapping removed");
+        Err(ExposeError::RuleFailed)
     }
 
     /// Remove the (vm, guest_port) mapping. A missing entry is OK (idempotent);
     /// NotFound only when the VM itself is unknown.
+    ///
+    /// A rebuild that fails after the mapping left the record still answers
+    /// success: the mapping is gone, and a retry would find nothing to remove
+    /// and answer success anyway, so an error here could not be acted on. The
+    /// stale rule still forwards to this same guest, and the next successful
+    /// rebuild (any expose, unexpose or delete on this worker) removes it; the
+    /// port is not handed out again meanwhile unless the control plane, which
+    /// quarantines it, lets it.
     pub async fn unexpose(&self, id: &str, guest_port: u16) -> Result<(), ExposeError> {
         let changed = {
             let mut g = self.inner.lock().await;
@@ -1466,7 +2431,9 @@ impl Manager {
             if let Err(e) = self.write_meta(id).await {
                 warn!(vm = %id, err = %e, "unexpose persist failed");
             }
-            self.refresh_ingress().await;
+            if !self.refresh_ingress().await {
+                error!(vm = %id, guest_port, "unexpose: the ingress rules could not be rebuilt; the old rule stays until the next rebuild that succeeds");
+            }
         }
         Ok(())
     }
@@ -1588,8 +2555,48 @@ impl Manager {
 
     // ---- slot allocation ----
 
-    fn claim_slot(inner: &mut Inner) -> Option<u32> {
-        inner.allocator.as_mut()?.claim()
+    /// Whether a new guest may be put on (or a guest brought back onto) this
+    /// node now. "IsolationFailed":
+    /// * W3: while a fence this agent owns (input, forward or L2 chain, a
+    ///   switch, a dormant table, the bridge gone) is POSITIVELY unrepaired —
+    ///   the condition that takes the bridge down in `enforce` — in
+    ///   `enforce` and in `report` alike (`watch::Record::refusal`). Not for
+    ///   the host fence, a stale verdict, NAT or ingress, or "unknown".
+    /// * W11: while start-up could not settle the ingress chain
+    ///   (`start_ingress`); checked before any work, not only at the slot.
+    async fn refuse_new_guest(&self, op: &str, id: &str) -> Result<(), String> {
+        match self.new_guest_refusal().await {
+            Some(why) => {
+                warn!(vm = %id, op = %op, reason = %why, "refused: no new guest on this node now");
+                Err("IsolationFailed".into())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Why no new guest may be put on this node now (`refuse_new_guest`),
+    /// without logging it.
+    async fn new_guest_refusal(&self) -> Option<&'static str> {
+        let why = lock_std(&self.watch).refusal();
+        if why.is_some() {
+            return why;
+        }
+        if self.inner.lock().await.slots_withheld {
+            return Some("the ingress DNAT chain has not been rebuilt since start-up");
+        }
+        None
+    }
+
+    /// A free guest slot, or why there is none: "IsolationFailed" while
+    /// start-up could not settle the ingress chain (`start_ingress`), the
+    /// answer a create already gets when isolation is not in force.
+    fn claim_slot(inner: &mut Inner) -> Result<u32, &'static str> {
+        if inner.slots_withheld {
+            warn!("no guest address is handed out: the ingress DNAT chain has not been rebuilt since start-up \
+                   and may still name addresses of the previous run");
+            return Err("IsolationFailed");
+        }
+        inner.allocator.as_mut().and_then(|a| a.claim()).ok_or("IpPoolExhausted")
     }
 
     fn free_slot(inner: &mut Inner, idx: u32) {
@@ -1604,6 +2611,22 @@ impl Manager {
         Some(inner.allocator.as_ref()?.ip_for(idx))
     }
 
+    /// What slot `slot`'s tap is pinned to: the tap's name, the address and
+    /// the MAC. ONE derivation for create, fork, wake, start and the
+    /// isolation watch (FLU-8 N4'): the address of the record that holds the
+    /// slot when there is one (None when that record has none: nothing to
+    /// pin to), and the slot's own address when no record holds it — a VMM
+    /// whose record did not load keeps running by design, and its tap still
+    /// needs its pin. The MAC is always the slot's (`tap_pin_for_slot`).
+    fn tap_pin(&self, inner: &Inner, slot: u32) -> (String, Option<String>, net::GuestMac) {
+        let (tap, mac) = tap_pin_for_slot(slot);
+        let ip = match inner.vms.iter().find(|v| v.slot == Some(slot)) {
+            Some(v) => v.ip.clone(),
+            None => Some(crate::ipalloc::fmt_ip(self.cidr.host_at(slot))),
+        };
+        (tap, ip, mac)
+    }
+
     // ---- create ----
 
     pub async fn create(self: &Arc<Self>, spec: &CreateSpec) -> Result<(), String> {
@@ -1612,6 +2635,17 @@ impl Manager {
         if !valid_vm_id(&spec.id) {
             return Err("InvalidId".into());
         }
+        let r = self.create_checked(spec).await;
+        // W18: the worker's journal says why, not only the caller.
+        if let Err(e) = &r {
+            error!(vm = %spec.id, err = %e, "create failed");
+        }
+        r
+    }
+
+    async fn create_checked(self: &Arc<Self>, spec: &CreateSpec) -> Result<(), String> {
+        // Before any work: a refused create used to copy the image first.
+        self.refuse_new_guest("create", &spec.id).await?;
         // Try to claim a warm-pool VM of the exact requested shape
         // (image + vcpus + mem + disk); else cold boot.
         if self.claim_from_pool(spec).await? {
@@ -1628,7 +2662,9 @@ impl Manager {
     /// on either tenant's side would show it. Refusing the create is the only
     /// answer that fails closed; feluccad retries elsewhere.
     async fn commit_or_isolate(self: &Arc<Self>, id: &str) -> Result<(), String> {
-        if self.refresh_isolation().await {
+        // W3: checked again here, where the new VM is committed — a fence may
+        // have gone while it booted.
+        if self.refresh_isolation().await && self.refuse_new_guest("create", id).await.is_ok() {
             return Ok(());
         }
         warn!(vm = %id, "cross-tenant isolation is not in force; removing the new vm");
@@ -1667,6 +2703,7 @@ impl Manager {
                 image: spec.image.clone(),
                 image_sha256: spec.image_sha256.clone(),
                 disk_gb: spec.disk_gb,
+                snapshot_valid: false,
             });
         }
 
@@ -1705,29 +2742,33 @@ impl Manager {
         let mut ip_str: Option<String> = None;
         let mut slot: Option<u32> = None;
 
-        if self.net_on {
+        // `rules_on`, the same as `net_on` outside unit tests, which put the
+        // rule fake here and so run the slot claim and the pin.
+        if self.rules_on() {
             let s = {
                 let mut g = self.inner.lock().await;
                 if let Some(fs) = force_slot {
                     Self::reserve_slot(&mut g, fs);
                     fs
                 } else {
-                    Self::claim_slot(&mut g).ok_or("IpPoolExhausted")?
+                    Self::claim_slot(&mut g)?
                 }
             };
             slot = Some(s);
-            ip_str = {
-                let g = self.inner.lock().await;
-                Self::ip_for_slot(&g, s)
-            };
             // Cold boot sets the NIC's MAC itself (configure_guest), so the
             // L2 half of the pin applies from the first frame.
-            let (tap, mac) = tap_pin_for_slot(s);
-            if !ensure_pinned_tap(&tap, ip_str.as_deref(), &mac, Unpinned::Remove) {
+            let (tap, ip, mac) = {
+                let g = self.inner.lock().await;
+                self.tap_pin(&g, s)
+            };
+            ip_str = ip;
+            if !self.rules.pin_tap(&tap, ip_str.as_deref(), &mac) {
                 let mut g = self.inner.lock().await;
                 Self::free_slot(&mut g, s);
                 return Err("TapSetupFailed".into());
             }
+            // X4: pinned and up — not the watch's to hold down any more.
+            lock_std(&self.watch).release_tap(&tap);
         }
 
         let (pid, vsock_on) = self.spawn_and_configure(id, &dir_path, &rootfs_dst, vcpus, mem_mib, slot, ip_str.as_deref()).await?;
@@ -1951,15 +2992,9 @@ impl Manager {
 
         let pid = self.spawn_firecracker(id, &sock, dir_path)?;
 
-        // Poll the API socket up to 3000ms in 50ms steps.
-        let deadline = Instant::now() + Duration::from_millis(3000);
-        loop {
-            if Path::new(&sock).exists() { break; }
-            if Instant::now() >= deadline {
-                kill_and_reap(pid); // don't leak the half-spawned FC
-                return Err("SocketNeverAppeared".into());
-            }
-            sleep(Duration::from_millis(50)).await;
+        if let Err(e) = wait_api_socket(&sock, API_SOCKET_WAIT).await {
+            kill_and_reap(pid); // don't leak the half-spawned FC
+            return Err(e);
         }
 
         // Cold boot only attaches a vsock device when the guest-agent marker is
@@ -1992,7 +3027,7 @@ impl Manager {
             .map_err(|e| format!("dup serial.log: {}", e))?;
 
         // stdin null, stdout/stderr → serial.log.
-        let child = tokio::process::Command::new("firecracker")
+        let child = tokio::process::Command::new(&self.fc_bin)
             .arg("--api-sock").arg(sock)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(log_out))
@@ -2081,103 +3116,372 @@ impl Manager {
 
     // ---- pause / resume ----
 
-    pub async fn pause(&self, id: &str) -> Result<(), String> {
+    pub async fn pause(&self, id: &str) -> Result<(), OpError> {
+        let _op = self.begin_op(id, OpKind::Pause).await?;
         // A VM whose Firecracker never answered at start-up may be running
         // under a record that says paused. Then "already paused" is not an
         // answer: the request has to reach the VMM.
         let unsettled = self.claim_unsettled(id).await;
-        {
+        let pid = {
             let g = self.inner.lock().await;
             let v = g.vms.iter().find(|v| v.id == id).ok_or("NotFound")?;
             match v.state {
                 VmState::Paused if !unsettled => return Ok(()), // idempotent
                 VmState::Paused | VmState::Running => {}
-                _ => return Err(format!("InvalidState: {}", v.state.as_str())),
+                _ => return Err(OpError::invalid(&v.state, format!("InvalidState: {}", v.state.as_str()))),
             }
-        }
+            v.pid
+        };
         let sock = self.sock_path(id).await.ok_or("InvalidId")?;
         fc::patch_vm_state(&sock, "Paused").await.map_err(|e| e.to_string())?;
-        self.set_state(id, VmState::Paused).await;
-        self.write_meta(id).await
+        self.commit_run_state(id, pid, VmState::Paused).await?;
+        Ok(self.write_meta(id).await?)
     }
 
-    pub async fn resume(&self, id: &str) -> Result<(), String> {
+    pub async fn resume(&self, id: &str) -> Result<(), OpError> {
+        let _op = self.begin_op(id, OpKind::Resume).await?;
         // As in `pause`. The usual case: a guest left paused by a sleep or a
         // fork the previous agent did not finish, under a record that still
         // says running — where answering "already running" would leave it
         // frozen.
         let unsettled = self.claim_unsettled(id).await;
-        {
+        let pid = {
             let g = self.inner.lock().await;
             let v = g.vms.iter().find(|v| v.id == id).ok_or("NotFound")?;
             match v.state {
                 VmState::Running if !unsettled => return Ok(()), // idempotent
                 VmState::Running | VmState::Paused => {}
-                _ => return Err(format!("InvalidState: {}", v.state.as_str())),
+                _ => return Err(OpError::invalid(&v.state, format!("InvalidState: {}", v.state.as_str()))),
             }
-        }
+            v.pid
+        };
         let sock = self.sock_path(id).await.ok_or("InvalidId")?;
         fc::patch_vm_state(&sock, "Resumed").await.map_err(|e| e.to_string())?;
-        self.set_state(id, VmState::Running).await;
-        self.write_meta(id).await
+        self.commit_run_state(id, pid, VmState::Running).await?;
+        Ok(self.write_meta(id).await?)
+    }
+
+    /// The commit point of pause and resume: the record takes the new run
+    /// state, unless a stop or delete came in, or the VMM the operation
+    /// talked to is no longer the record's (`may_commit`).
+    async fn commit_run_state(&self, id: &str, pid: Option<i32>, state: VmState) -> Result<(), OpError> {
+        let mut g = self.inner.lock().await;
+        let v = g.vms.iter_mut().find(|v| v.id == id).ok_or("NotFound")?;
+        if !self.may_commit(v, pid) {
+            return Err(aborted(id));
+        }
+        v.state = state;
+        Ok(())
     }
 
     // ---- sleep / wake ----
 
-    pub async fn sleep_vm(&self, id: &str) -> Result<(), String> {
+    /// Put a running or paused VM to sleep: its state and memory go to
+    /// `vmstate.bin` and `mem.bin`, and its Firecracker goes away.
+    ///
+    /// The order is what makes a `sleeping` record on disk mean "the snapshot
+    /// beside me is complete and durable" (FLU-4, FLU-70): pause; snapshot,
+    /// the state file under its temporary name; fsync the disk image; rename
+    /// the state file; fsync the directory; record `sleeping` with the
+    /// snapshot marker, written; only THEN the VMM is killed. Killed first, an
+    /// agent that stopped before the write left a `running` record with a
+    /// dead VMM — which start-up now turns into `stopped`, throwing a complete
+    /// snapshot away.
+    ///
+    /// Every failure before the kill is undone with the guest still alive
+    /// (`undo_snapshot`): a failed `snapshot/create` leaves a complete-looking
+    /// state file and a full-size, partly written memory file (lab), and the
+    /// guest paused under a record that says `running`.
+    pub async fn sleep_vm(&self, id: &str) -> Result<(), OpError> {
+        let _op = self.begin_op(id, OpKind::Sleep).await?;
         self.claim_unsettled(id).await;
-        {
+        let (was, pid, dir_id) = {
             let g = self.inner.lock().await;
             let v = g.vms.iter().find(|v| v.id == id).ok_or("NotFound")?;
-            if v.state == VmState::Sleeping { return Ok(()); }
-        }
+            match v.state {
+                VmState::Sleeping => return Ok(()), // idempotent
+                VmState::Running | VmState::Paused => {}
+                _ => {
+                    return Err(OpError::invalid(
+                        &v.state,
+                        format!("InvalidState: {} (only a running or paused VM can sleep)", v.state.as_str()),
+                    ))
+                }
+            }
+            (v.state.clone(), v.pid, v.dir_id.clone())
+        };
 
         let sock = self.sock_path(id).await.ok_or("InvalidId")?;
         let dir_path = self.instance_dir(id).await.ok_or("InvalidId")?;
+        // A new snapshot is on its way: one set aside as stale is of no use
+        // any more (S3'), and its memory file takes the space this one needs.
+        self.remove_outrun(id, &dir_id);
+        // The image the snapshot goes with is the one Firecracker has open as
+        // the root drive (K7): for every sandbox created or forked by this
+        // release that is its own `rootfs.ext4`; one forked before runs on its
+        // parent's, and that is the one whose writes must be on disk.
+        let own_rootfs = format!("{}/rootfs.ext4", dir_path);
+        let rootfs = fc::get_root_drive_path(&sock).await.map_err(|e| e.to_string())?;
+        if rootfs != own_rootfs {
+            warn!(vm = %id, image = %rootfs, "sleep: this sandbox runs on another image than its own rootfs.ext4 (it was forked before this release); that image is synced");
+        }
 
         fc::patch_vm_state(&sock, "Paused").await.map_err(|e| e.to_string())?;
+        // Only a guest this sleep paused is resumed when it fails: a sandbox
+        // that was `paused` before stays paused, as its record says.
+        let paused_here = was == VmState::Running;
 
-        let vmstate = format!("{}/vmstate.bin", dir_path);
-        let mem = format!("{}/mem.bin", dir_path);
-        fc::put_snapshot_create(&sock, &vmstate, &mem).await
-            .map_err(|e| e.to_string())?;
+        // The state file is written under a name nothing takes for a
+        // snapshot, and gets its real name only once Firecracker said the
+        // whole snapshot was written. (`mem.bin` is written in place: a woken
+        // guest runs on a private mapping of it, which Firecracker supports
+        // writing over.)
+        let vmstate_tmp = format!("{}/{}", dir_path, VMSTATE_TMP);
+        let vmstate = format!("{}/{}", dir_path, VMSTATE);
+        let mem = format!("{}/{}", dir_path, MEM);
+        if let Err(e) = fc::put_snapshot_create(&sock, &vmstate_tmp, &mem).await {
+            return Err(self.undo_snapshot(id, &dir_id, &sock, paused_here, pid, e.to_string()).await);
+        }
 
-        // The guest's state is on disk: from here the VM is asleep. The record
-        // says so, loses its pid and the VMM is told to go in ONE step with no
-        // await in it, so nothing can be left half-way by a caller that hangs
-        // up — a record that still said `running` with no pid was a dead VM
-        // listed as running, which no later request could move. Clearing the
-        // pid before the kill also makes the exit reaper see a pid mismatch
-        // and treat this as a deliberate kill (no error transition).
-        let (pid, dir_id) = {
+        // Durable before it is acknowledged. Firecracker fsyncs both snapshot
+        // files itself; what it does not sync is the disk image the snapshot
+        // goes with, and the directory entry the rename makes. Without these,
+        // a power cut after the answer can bring back a `sleeping` record
+        // whose state file is missing, or whose disk is older than its memory.
+        // On a blocking thread: an fsync of a multi-GiB image takes seconds.
+        let durable = {
+            let (dir, tmp, dst) = (dir_path.clone(), vmstate_tmp.clone(), vmstate.clone());
+            tokio::task::spawn_blocking(move || -> Result<(), String> {
+                std::fs::File::open(&rootfs)
+                    .and_then(|f| f.sync_all())
+                    .map_err(|e| format!("fsync {}: {}", rootfs, e))?;
+                std::fs::rename(&tmp, &dst).map_err(|e| format!("rename {} -> {}: {}", tmp, dst, e))?;
+                std::fs::File::open(&dir)
+                    .and_then(|f| f.sync_all())
+                    .map_err(|e| format!("fsync {}: {}", dir, e))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("sleep: fsync task: {}", e)))
+        };
+        if let Err(e) = durable {
+            return Err(self.undo_snapshot(id, &dir_id, &sock, paused_here, pid, e).await);
+        }
+
+        // The commit point. The pid stays in the record for the moment: the
+        // VMM is still there, and is not killed before the record is on disk.
+        {
             let mut g = self.inner.lock().await;
             let v = g.vms.iter_mut().find(|v| v.id == id).ok_or("NotFound")?;
+            if !self.may_commit(v, pid) {
+                drop(g);
+                // Whoever took the VMM (a stop, the exit reaper) does not
+                // want this snapshot either.
+                self.discard_snapshot_files(id, &dir_id);
+                return Err(aborted(id));
+            }
             v.state = VmState::Sleeping;
-            (v.pid.take(), v.dir_id.clone())
-        };
-        let dying = pid.filter(|p| self.kill_fc(*p, &dir_id));
+            v.snapshot_valid = true;
+        }
+        if let Err(e) = self.write_meta(id).await {
+            // Not on disk, so not asleep: the record goes back to what it
+            // was (the meta.json write owed from here then writes that), and
+            // the snapshot is undone with the guest still alive — the state
+            // file first, so that nothing, not even a `sleeping` file that
+            // did land before a failed directory fsync, can be woken from it.
+            {
+                let mut g = self.inner.lock().await;
+                if let Some(v) = g.vms.iter_mut().find(|v| v.id == id) {
+                    if v.pid == pid && v.state == VmState::Sleeping {
+                        v.state = was;
+                        v.snapshot_valid = false;
+                        // Owed from this same section: the failed write's own
+                        // claim on the list can have been settled meanwhile
+                        // by another writer (the liveness flush, an expose)
+                        // that wrote `sleeping` — leaving it on disk under a
+                        // record that no longer says so.
+                        lock_std(&self.meta_owed).insert(id.to_string());
+                    }
+                }
+            }
+            return Err(self.undo_snapshot(id, &dir_id, &sock, paused_here, pid, e).await);
+        }
 
-        let persisted = self.write_meta(id).await;
+        // The record is on disk: from here the VM is asleep. The record loses
+        // its pid and the VMM is told to go in ONE step with no await in it.
+        // Clearing the pid before the kill makes the exit reaper see a pid
+        // mismatch and treat this as a deliberate kill (no error transition).
+        // The pid-less record is owed to meta.json from this same step, so a
+        // caller that goes away before the write below cannot leave the
+        // file naming a dead VMM.
+        let (dying, dir_id) = {
+            let mut g = self.inner.lock().await;
+            let v = g.vms.iter_mut().find(|v| v.id == id).ok_or("NotFound")?;
+            // A stop that came in since the commit has taken the pid,
+            // signalled the VMM and recorded `stopped`: this sleep did not
+            // happen, and answering 200 would report a sandbox asleep that is
+            // not. (Its snapshot is the stop's to remove, once this lets go.)
+            if v.state != VmState::Sleeping || v.pid != pid {
+                return Err(aborted(id));
+            }
+            let p = v.pid.take();
+            lock_std(&self.meta_owed).insert(id.to_string());
+            (p, v.dir_id.clone())
+        };
+        let dying = dying.filter(|p| self.kill_fc(*p, &dir_id));
+
+        if let Err(e) = self.write_meta(id).await {
+            // The file already says `sleeping`; only the pid in it is stale,
+            // and start-up ignores the pid of a sleeping record.
+            warn!(vm = %id, err = %e, "sleep: could not write the record without its pid yet");
+        }
         if let Some(p) = dying {
             // Waits for the process to be gone even when it is not this
             // agent's child (a VMM adopted at start-up): the wake that follows
             // needs the tap and the sockets it holds.
             self.wait_fc_gone(p, &dir_id).await;
         }
-        persisted
+        Ok(())
     }
 
-    /// Spawn firecracker → snapshot/load. Returns wake latency in ms.
-    pub async fn wake_vm(self: &Arc<Self>, id: &str) -> Result<u64, String> {
-        let (slot, ip) = {
+    /// Undo a sleep's snapshot that failed before its VMM was killed (F2):
+    /// the snapshot files go — `mem.bin` only when no live VMM of the
+    /// instance maps it (a woken guest runs on it) — and the guest is
+    /// resumed if this operation paused it. The record is not changed, except
+    /// to `paused` when that resume fails too. Returns `err` as the answer.
+    ///
+    /// Resumed, the guest works at once (lab: exec 30 of 30 after a failed
+    /// create and a resume); left paused under a record that says `running`,
+    /// nothing would ever resume it.
+    async fn undo_snapshot(
+        &self,
+        id: &str,
+        dir_id: &str,
+        sock: &str,
+        paused_here: bool,
+        pid: Option<i32>,
+        err: String,
+    ) -> OpError {
+        warn!(vm = %id, err = %err, "the snapshot failed; its files are removed and the guest is left as it was");
+        // The state files first: they are small, and they are what makes a
+        // snapshot look valid. Then the guest is given back, and only then
+        // `mem.bin` is dealt with — the `/proc` scan and the unlink of a
+        // multi-GiB file used to keep the guest paused for their length.
+        if let Some(dir) = instance_path(&self.data_dir, dir_id) {
+            remove_if_present(id, &format!("{}/{}", dir, VMSTATE_TMP));
+            remove_if_present(id, &format!("{}/{}", dir, VMSTATE));
+        }
+        if paused_here {
+            self.resume_or_record_paused(id, sock, pid).await;
+        }
+        self.discard_snapshot_files(id, dir_id);
+        OpError::Other(err)
+    }
+
+    /// Resume a guest an operation paused and is now giving back. When the
+    /// resume fails the guest stays paused, and the record says so, on disk:
+    /// `running` would be a guest nobody can reach that nothing resumes. Not
+    /// when the record no longer holds the VMM `pid` or the sandbox is being
+    /// stopped or deleted (`may_commit`): the record is not this
+    /// operation's to write any more. Returns whether the guest was resumed.
+    async fn resume_or_record_paused(&self, id: &str, sock: &str, pid: Option<i32>) -> bool {
+        let Err(e) = fc::patch_vm_state(sock, "Resumed").await else {
+            return true;
+        };
+        let changed = {
+            let mut g = self.inner.lock().await;
+            match g.vms.iter_mut().find(|v| v.id == id) {
+                Some(v) if v.state == VmState::Running && self.may_commit(v, pid) => {
+                    v.state = VmState::Paused;
+                    true
+                }
+                _ => false,
+            }
+        };
+        warn!(vm = %id, err = %e, "could not resume the guest this operation paused; it stays paused");
+        if changed {
+            if let Err(we) = self.write_meta(id).await {
+                warn!(vm = %id, err = %we, "could not write the paused record yet");
+            }
+        }
+        false
+    }
+
+    /// Spawn firecracker → snapshot/load → record `running` → resume.
+    /// Returns wake latency in ms.
+    ///
+    /// The record says `running`, on disk, before the guest executes again
+    /// (FLU-4): a guest that runs writes to its disk, and a record that still
+    /// said `sleeping` after that would hand the next start-up a snapshot the
+    /// disk has outrun. Hence the load without resume, the record, and only
+    /// then the resume.
+    pub async fn wake_vm(self: &Arc<Self>, id: &str) -> Result<u64, OpError> {
+        let _op = self.begin_op(id, OpKind::Wake).await?;
+        let (slot, marker, pid0, dir_id) = {
             let g = self.inner.lock().await;
             let v = g.vms.iter().find(|v| v.id == id).ok_or("NotFound")?;
-            if v.state == VmState::Running { return Ok(0); }
-            (v.slot, v.ip.clone())
+            match v.state {
+                VmState::Running => return Ok(0), // idempotent
+                VmState::Sleeping => {}
+                _ => {
+                    return Err(OpError::invalid(
+                        &v.state,
+                        format!("InvalidState: {} (only a sleeping VM can be woken)", v.state.as_str()),
+                    ))
+                }
+            }
+            (v.slot, v.snapshot_valid, v.pid, v.dir_id.clone())
         };
+        // W3: no guest back onto a network whose fences are positively gone.
+        self.refuse_new_guest("wake", id).await.map_err(OpError::Other)?;
 
         let start = Instant::now();
-        let dir_path = self.instance_dir(id).await.ok_or("InvalidId")?;
+        let dir_path = instance_path(&self.data_dir, &dir_id).ok_or("InvalidId")?;
+        let vmstate = format!("{}/{}", dir_path, VMSTATE);
+        let mem = format!("{}/{}", dir_path, MEM);
+
+        // Both snapshot files, before anything is spawned. A file that cannot
+        // even be looked at changes nothing (a failed stat is not a missing
+        // snapshot); one that is missing or empty means there is nothing to
+        // wake.
+        let mut incomplete: Option<&str> = None;
+        for (name, path) in [(VMSTATE, &vmstate), (MEM, &mem)] {
+            match check_file(path) {
+                FileCheck::There(len) if len > 0 => {}
+                FileCheck::There(_) | FileCheck::Missing => {
+                    incomplete.get_or_insert(name);
+                }
+                FileCheck::Unknown(e) => {
+                    return Err(OpError::Other(format!("cannot examine {}: {}", path, e)));
+                }
+            }
+        }
+        if let Some(name) = incomplete {
+            return Err(self.discard_incomplete_snapshot(id, pid0, name).await);
+        }
+        // A record without the marker was written by an older agent: the
+        // judgement start-up makes of it (S3) is made again here. A record
+        // start-up could not judge ("cannot tell") stayed `sleeping`, and
+        // nothing else would ever look at its disk before waking it.
+        if !marker {
+            match reconcile::judge_sleeper(&dir_path, false) {
+                reconcile::Sleeper::Keep => {}
+                reconcile::Sleeper::Incomplete(name) => {
+                    return Err(self.discard_incomplete_snapshot(id, pid0, name).await);
+                }
+                reconcile::Sleeper::Outrun { disk, snapshot } => {
+                    let reason = format!(
+                        "InvalidState: the disk was written after the snapshot (rootfs.ext4 {}, vmstate.bin {}): \
+                         the guest ran since; the VM is stopped (use start)",
+                        reconcile::epoch(disk),
+                        reconcile::epoch(snapshot)
+                    );
+                    return Err(self.stop_stale_wake(id, pid0, None, reason).await);
+                }
+                reconcile::Sleeper::CannotTell(e) => {
+                    return Err(OpError::Other(format!("cannot examine the snapshot of {}: {}", id, e)));
+                }
+            }
+        }
 
         // Re-assert tap exists (idempotent) and re-pin it, MAC included: the
         // nft chains do not survive a host reboot.
@@ -2194,16 +3498,22 @@ impl Manager {
         // A snapshot taken by a pre-pin agent carries a Firecracker-chosen MAC
         // instead and goes dark on wake until a stop/start cold-boots it onto
         // the derived one. Dark is the correct direction for that trade.
-        if self.net_on {
+        // Through the rule seam (`pin_tap`), so that unit tests run the pin.
+        if self.rules_on() {
             if let Some(s) = slot {
-                let (tap, mac) = tap_pin_for_slot(s);
-                if !ensure_pinned_tap(&tap, ip.as_deref(), &mac, Unpinned::Remove) {
+                let (tap, pin_ip, mac) = {
+                    let g = self.inner.lock().await;
+                    self.tap_pin(&g, s)
+                };
+                if !self.rules.pin_tap(&tap, pin_ip.as_deref(), &mac) {
                     return Err("TapSetupFailed".into());
                 }
+                // X4: pinned and up — not the watch's to hold down any more.
+                lock_std(&self.watch).release_tap(&tap);
             }
         }
 
-        let sock = self.sock_path(id).await.ok_or("InvalidId")?;
+        let sock = format!("{}/{}", dir_path, procscan::SOCK_NAME);
         let _ = std::fs::remove_file(&sock);
         // A SIGKILLed FC (sleep) leaves the vsock host UDS behind; the restore
         // re-binds the snapshot-baked path and fails with EADDRINUSE if the
@@ -2212,135 +3522,474 @@ impl Manager {
 
         let pid = self.spawn_firecracker(id, &sock, &dir_path)?;
 
-        // Poll socket.
-        let deadline = Instant::now() + Duration::from_millis(3000);
-        loop {
-            if Path::new(&sock).exists() { break; }
-            if Instant::now() >= deadline {
-                kill_and_reap(pid); // don't leak the half-spawned FC
-                return Err("SocketNeverAppeared".into());
-            }
-            sleep(Duration::from_millis(50)).await;
+        if let Err(e) = wait_api_socket(&sock, API_SOCKET_WAIT).await {
+            kill_and_reap(pid); // don't leak the half-spawned FC
+            return Err(e.into());
         }
 
-        let vmstate = format!("{}/vmstate.bin", dir_path);
-        let mem = format!("{}/mem.bin", dir_path);
         // Wake restores into the VM's OWN dir, so the baked vsock uds_path is
-        // already correct — no override needed (None re-binds the original path).
-        if let Err(e) = fc::put_snapshot_load(&sock, &vmstate, &mem, self.net_on, slot, None).await {
+        // already correct — no override needed (None re-binds the original
+        // path). Loaded paused: the guest does not run until the record says so.
+        if let Err(e) = fc::put_snapshot_load(&sock, &vmstate, &mem, self.net_on, slot, None, false).await {
             kill_and_reap(pid); // don't leak the FC that failed to restore
-            return Err(e.to_string());
+            return Err(e.to_string().into());
         }
 
+        // Which image the loaded guest's disk is (K6). A sandbox forked
+        // before this release runs on its PARENT's image (the snapshot names
+        // it, and nothing re-pointed it). That image may have been written
+        // since this snapshot by the parent; waking would then pair this
+        // memory with a disk that moved on without it.
+        let own_rootfs = format!("{}/rootfs.ext4", dir_path);
+        let drive = match fc::get_root_drive_path(&sock).await {
+            Ok(p) => p,
+            Err(e) => {
+                kill_and_reap(pid); // never ran
+                return Err(e.to_string().into());
+            }
+        };
+        if drive != own_rootfs {
+            match modified_after(&drive, &vmstate) {
+                Ok(false) => warn!(
+                    vm = %id,
+                    image = %drive,
+                    "wake: this sandbox runs on another image than its own rootfs.ext4 (it was forked before this \
+                     release); that image has not been written since the snapshot, so it is woken on it"
+                ),
+                Ok(true) => {
+                    // The path goes to the log only: the control plane
+                    // relays the answer to the tenant word for word.
+                    warn!(vm = %id, image = %drive,
+                        "wake refused: this sandbox runs on another image than its own rootfs.ext4 (it was forked \
+                         before this release), and that image was written after the snapshot; it is stopped");
+                    return Err(self.stop_stale_wake(id, pid0, Some(pid), WAKE_REFUSED_FORKED_BEFORE.into()).await);
+                }
+                Err(e) => {
+                    kill_and_reap(pid); // never ran
+                    return Err(OpError::Other(format!("cannot examine {}: {}", drive, e)));
+                }
+            }
+        }
+
+        // The commit point: the record takes the new VMM and says `running`.
+        {
+            let mut g = self.inner.lock().await;
+            let committed = match g.vms.iter_mut().find(|v| v.id == id) {
+                Some(v) if v.state == VmState::Sleeping && self.may_commit(v, pid0) => {
+                    v.pid = Some(pid);
+                    v.state = VmState::Running;
+                    v.snapshot_valid = false;
+                    true
+                }
+                _ => false,
+            };
+            if !committed {
+                drop(g);
+                kill_and_reap(pid); // never ran: nothing of the guest is lost
+                return Err(aborted(id));
+            }
+        }
+        if let Err(e) = self.write_meta(id).await {
+            // The file still says `sleeping`, which is true: the guest has not
+            // run. Memory goes back to that, without the VMM.
+            self.unwind_wake(id, pid, marker).await;
+            return Err(e.into());
+        }
+
+        match fc::patch_vm_state_answer(&sock, "Resumed").await {
+            Ok((status, _)) if status < 300 => {}
+            answer => {
+                let (answered, err) = match answer {
+                    Ok((status, body)) => (true, format!("FcError: PATCH /vm -> {}: {}", status, body)),
+                    Err(e) => (false, e.to_string()),
+                };
+                // Back to `sleeping` only on proof that the guest did not
+                // run (S7'): Firecracker refused the resume, and says the VM
+                // is still paused. Without an answer the request may well
+                // have reached it and the vCPUs run before the VMM died or
+                // the reply was lost — and waking that snapshot again would
+                // restore old memory over a disk the guest has written.
+                if answered && probe_vmm(&sock).await.as_deref() == Some("Paused") {
+                    if self.unwind_wake(id, pid, marker).await {
+                        if let Err(we) = self.write_meta(id).await {
+                            warn!(vm = %id, err = %we, "wake: could not write the record back to sleeping yet");
+                        }
+                    }
+                    return Err(err.into());
+                }
+                let reason = format!(
+                    "InvalidState: the resume failed ({}) and the guest may have run; the VM is stopped (use start)",
+                    err
+                );
+                return Err(self.stop_stale_wake(id, Some(pid), Some(pid), reason).await);
+            }
+        }
         let elapsed = start.elapsed().as_millis() as u64;
 
-        self.set_pid(id, Some(pid)).await;
-        self.set_state(id, VmState::Running).await;
-        self.write_meta(id).await?;
+        // The guest runs: its state file describes a past it has left. mem.bin
+        // stays — the guest runs on a private mapping of it.
+        remove_if_present(id, &vmstate);
         Ok(elapsed)
+    }
+
+    /// Undo a wake whose record named the new VMM `pid`: the record goes back
+    /// to `sleeping` with the snapshot marker it had, without a VMM, and the
+    /// VMM is killed — pid first, then the signal, with no await between, so
+    /// the exit reaper takes it for a deliberate kill. Returns false, and
+    /// does nothing, when the record no longer names `pid` (a stop took it
+    /// and ended the VMM itself).
+    async fn unwind_wake(&self, id: &str, pid: i32, marker: bool) -> bool {
+        {
+            let mut g = self.inner.lock().await;
+            match g.vms.iter_mut().find(|v| v.id == id) {
+                Some(v) if v.pid == Some(pid) => {
+                    v.pid = None;
+                    v.state = VmState::Sleeping;
+                    v.snapshot_valid = marker;
+                    // Owed from this same section, as in sleep's revert: a
+                    // writer that settled the failed write's claim meanwhile
+                    // wrote `running` with this pid.
+                    lock_std(&self.meta_owed).insert(id.to_string());
+                }
+                _ => return false,
+            }
+        }
+        kill_and_reap(pid);
+        true
+    }
+
+    /// A wake found its snapshot stale, or possibly so (S3', S7', K6): the
+    /// guest ran after it was taken, or may have. The record becomes
+    /// `stopped`, on disk too; the VMM this wake spawned (`vmm`) is killed —
+    /// the record lets go of it first, so the exit reaper takes it for a
+    /// deliberate kill; the snapshot files are set aside, not removed
+    /// (`set_snapshot_aside`). The answer is the 409 that says `stopped`
+    /// (`reason`). Not when the record no longer holds `expect` or the
+    /// sandbox is being stopped or deleted (`may_commit`): the record is not
+    /// this wake's to write any more, and only the VMM goes.
+    async fn stop_stale_wake(&self, id: &str, expect: Option<i32>, vmm: Option<i32>, reason: String) -> OpError {
+        let dir_id = {
+            let mut g = self.inner.lock().await;
+            match g.vms.iter_mut().find(|v| v.id == id) {
+                Some(v) if self.may_commit(v, expect) => {
+                    v.state = VmState::Stopped;
+                    v.pid = None;
+                    v.snapshot_valid = false;
+                    lock_std(&self.meta_owed).insert(id.to_string());
+                    Some(v.dir_id.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(p) = vmm {
+            kill_and_reap(p);
+        }
+        let Some(dir_id) = dir_id else {
+            return aborted(id);
+        };
+        warn!(vm = %id, reason = %reason, "wake: the snapshot is stale or may be; the VM is stopped and its snapshot set aside");
+        self.set_snapshot_aside(id, &dir_id);
+        if let Err(e) = self.write_meta(id).await {
+            warn!(vm = %id, err = %e, "wake: could not write the stopped record yet");
+        }
+        OpError::invalid(&VmState::Stopped, reason)
+    }
+
+    /// A wake found a snapshot file missing or empty (`missing` names it):
+    /// there is nothing to wake. The record becomes `stopped` on disk, the
+    /// rest of the snapshot goes, and the answer is the 409 that says so.
+    async fn discard_incomplete_snapshot(&self, id: &str, pid: Option<i32>, missing: &str) -> OpError {
+        let dir_id = {
+            let mut g = self.inner.lock().await;
+            let Some(v) = g.vms.iter_mut().find(|v| v.id == id) else {
+                return OpError::Other("NotFound".into());
+            };
+            if v.state != VmState::Sleeping || !self.may_commit(v, pid) {
+                return aborted(id);
+            }
+            v.state = VmState::Stopped;
+            v.snapshot_valid = false;
+            v.dir_id.clone()
+        };
+        warn!(vm = %id, file = %missing, "wake: the snapshot is incomplete; the sandbox is stopped and what is left of the snapshot is removed");
+        if let Err(e) = self.write_meta(id).await {
+            warn!(vm = %id, err = %e, "wake: could not write the stopped record yet");
+        }
+        self.discard_snapshot_files(id, &dir_id);
+        OpError::invalid(
+            &VmState::Stopped,
+            format!("InvalidState: snapshot incomplete ({} missing or empty); the VM is stopped (use start)", missing),
+        )
     }
 
     // ---- fork ----
 
-    /// Fork the parent: ensure snapshot exists, reflink rootfs + copy mem.bin,
-    /// spawn child FC and restore. Child inherits parent's guest-internal IP
-    /// (v2 documented caveat; fixed in v3).
+    /// Fork the parent: reserve the child, write (running or paused parent)
+    /// or copy (sleeping parent) a snapshot into the child's own directory,
+    /// reflink the rootfs, spawn the child's FC and restore. Child inherits
+    /// parent's guest-internal IP (v2 documented caveat; fixed in v3).
+    /// `Err("AlreadyExists")` (→ 409) when the child id or its directory is
+    /// taken, before anything is written.
+    ///
+    /// The plain-text form the unit tests use; the handler takes
+    /// `fork_answer`. (Not `cfg(test)`: the structural tests read this
+    /// file's production half up to its first test-only attribute.)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn fork(self: &Arc<Self>, parent_id: &str, child_id: &str, child_name: &str) -> Result<Option<String>, String> {
+        self.fork_inner(parent_id, child_id, child_name, &mut None).await
+    }
+
+    /// `fork`, answered the way sleep, wake, stop and start answer: `Busy`;
+    /// a refusal for the parent's state as `InvalidState` carrying the state
+    /// the agent holds for the parent when the refusal is built (the control
+    /// plane records it); everything else `Other`, verbatim.
+    pub async fn fork_answer(
+        self: &Arc<Self>,
+        parent_id: &str,
+        child_id: &str,
+        child_name: &str,
+    ) -> Result<Option<String>, OpError> {
+        let mut refused = None;
+        match self.fork_inner(parent_id, child_id, child_name, &mut refused).await {
+            Ok(ip) => Ok(ip),
+            Err(e) if e == BUSY => Err(OpError::Busy),
+            Err(e) => Err(match refused {
+                Some(state) => OpError::InvalidState { msg: e, state },
+                None => OpError::Other(e),
+            }),
+        }
+    }
+
+    /// The parent's state as the record says now, or `fallback`.
+    async fn state_now(&self, id: &str, fallback: &VmState) -> VmState {
+        let g = self.inner.lock().await;
+        g.vms.iter().find(|v| v.id == id).map(|v| v.state.clone()).unwrap_or_else(|| fallback.clone())
+    }
+
+    /// The body of `fork`. A refusal for the parent's state also sets
+    /// `refused` to that state.
+    async fn fork_inner(
+        self: &Arc<Self>,
+        parent_id: &str,
+        child_id: &str,
+        child_name: &str,
+        refused: &mut Option<VmState>,
+    ) -> Result<Option<String>, String> {
         if !valid_vm_id(child_id) {
             return Err("InvalidId".into());
         }
-        // Fork pauses, snapshots and resumes the parent itself.
-        self.claim_unsettled(parent_id).await;
-        let (parent_was_running, parent_vcpus, parent_mem_mib, parent_vsock, parent_tenant_id, parent_image, parent_image_sha256, parent_disk_gb) = {
-            let g = self.inner.lock().await;
-            let p = g.vms.iter().find(|v| v.id == parent_id).ok_or("NotFound")?;
-            (p.state == VmState::Running, p.vcpus, p.mem_mib, p.vsock, p.tenant_id.clone(), p.image.clone(), p.image_sha256.clone(), p.disk_gb)
-        };
-
-        let parent_dir = self.instance_dir(parent_id).await.ok_or("InvalidId")?;
-        let parent_sock = self.sock_path(parent_id).await.ok_or("InvalidId")?;
         // The child id comes from the request BODY, not a URL capture, so it
         // is validated here as well as at the handler.
         let child_dir = instance_path(&self.data_dir, child_id).ok_or("InvalidId")?;
+        // The parent is held until the child's files are complete: a sleep,
+        // wake, stop or delete of the parent in between would move or remove
+        // the parent's files under the copy, or kill the VMM being snapshot.
+        // A parent that is busy answers busy at once, and nothing is reserved.
+        // W3, W11: before anything is reserved, and long before the pause.
+        self.refuse_new_guest("fork", child_id).await?;
+        let mut parent_op = self.begin_fork(parent_id).map_err(|e| e.to_string())?;
+        // Fork pauses, snapshots and resumes the parent itself.
+        self.claim_unsettled(parent_id).await;
 
-        // 1) Ensure parent snapshot exists.
-        let parent_state = {
-            let g = self.inner.lock().await;
-            g.vms.iter().find(|v| v.id == parent_id).map(|v| v.state.clone()).ok_or("NotFound")?
-        };
-
-        if parent_state != VmState::Sleeping {
-            if parent_was_running {
-                fc::patch_vm_state(&parent_sock, "Paused").await.map_err(|e| e.to_string())?;
-            }
-            let vmstate = format!("{}/vmstate.bin", parent_dir);
-            let mem = format!("{}/mem.bin", parent_dir);
-            fc::put_snapshot_create(&parent_sock, &vmstate, &mem).await
-                .map_err(|e| e.to_string())?;
-            if parent_was_running {
-                fc::patch_vm_state(&parent_sock, "Resumed").await.map_err(|e| e.to_string())?;
-            }
-        }
-
-        // 2) Create child instance dir; reflink rootfs + copy mem.bin.
-        create_instance_dir(&child_dir).map_err(|e| e.to_string())?;
-
-        let parent_rootfs = format!("{}/rootfs.ext4", parent_dir);
-        let child_rootfs = format!("{}/rootfs.ext4", child_dir);
-        copy_rootfs(&parent_rootfs, &child_rootfs)?;
-
-        let parent_vmstate = format!("{}/vmstate.bin", parent_dir);
-        let child_vmstate = format!("{}/vmstate.bin", child_dir);
-        let parent_mem_file = format!("{}/mem.bin", parent_dir);
-        let child_mem_file = format!("{}/mem.bin", child_dir);
-        copy_rootfs(&parent_vmstate, &child_vmstate)?;
-        copy_rootfs(&parent_mem_file, &child_mem_file)?;
-
-        // 3) Register child record + claim slot.
-        {
+        // The child id is reserved before anything is written (F4), in the
+        // same critical section that reads the parent. It used to be checked
+        // only after the files were written — and a fork onto an existing id
+        // had by then copied the parent's disk and snapshot over that
+        // sandbox's own. A pool VM that was claimed lives in a directory
+        // named after its pool id, so a directory id counts as taken too.
+        let (parent, _child_op) = {
             let mut g = self.inner.lock().await;
-            if g.vms.iter().any(|v| v.id == child_id) {
-                return Err("AlreadyExists".into());
+            let p = g.vms.iter().find(|v| v.id == parent_id).ok_or("NotFound")?;
+            // Only a guest that exists can be forked: a `pooled` or
+            // `creating` parent whose VMM is alive used to be snapshotted
+            // too. Refused before anything is reserved.
+            if !matches!(p.state, VmState::Running | VmState::Paused | VmState::Sleeping) {
+                *refused = Some(p.state.clone());
+                return Err(format!(
+                    "InvalidState: {} (only a running, paused or sleeping VM can be forked)",
+                    p.state.as_str()
+                ));
             }
-            g.vms.push(Vm {
+            let child = Vm {
                 id: child_id.to_string(),
                 name: child_name.to_string(),
                 dir_id: child_id.to_string(),
-                vcpus: parent_vcpus,
-                mem_mib: parent_mem_mib,
+                vcpus: p.vcpus,
+                mem_mib: p.mem_mib,
                 state: VmState::Creating,
                 pid: None,
                 slot: None,
                 ip: None,
                 // The snapshot carries the parent's vsock device; the child
                 // inherits it (rebound to its own UDS via vsock_override below).
-                vsock: parent_vsock,
+                vsock: p.vsock,
                 // Child inherits parent's tenant_id.
-                tenant_id: parent_tenant_id.clone(),
+                tenant_id: p.tenant_id.clone(),
                 // Exposes are NOT inherited: the parent's node ports keep
                 // pointing at the parent; feluccad re-exposes the child.
                 exposes: Vec::new(),
                 // The child's rootfs is a reflink of the parent's — same
                 // image and disk size for accounting (no image interaction).
-                image: parent_image.clone(),
-                image_sha256: parent_image_sha256.clone(),
-                disk_gb: parent_disk_gb,
-            });
+                image: p.image.clone(),
+                image_sha256: p.image_sha256.clone(),
+                disk_gb: p.disk_gb,
+                snapshot_valid: false,
+            };
+            let parent = (
+                p.state.clone(),
+                p.pid,
+                Self::instance_dir_sync(&g.vms, &self.data_dir, parent_id).ok_or("InvalidId")?,
+                Self::sock_path_sync(&g.vms, &self.data_dir, parent_id).ok_or("InvalidId")?,
+                p.vsock,
+            );
+            if g.vms.iter().any(|v| v.id == child_id || v.dir_id == child_id) {
+                return Err("AlreadyExists".into());
+            }
+            // A parent that is asleep is only read from: other forks of it
+            // may run alongside this one (S4'). A stop or delete of it that
+            // came in since this fork joined them has the last word.
+            if parent.0 == VmState::Sleeping {
+                parent_op.share();
+            }
+            if self.closing(parent_id) {
+                return Err(BUSY.into());
+            }
+            // The child is this fork's from its reservation to the end
+            // (S4'): a stop or delete of it meanwhile pre-empts the fork (it
+            // kills the child's VMM, and the fork aborts at its next check)
+            // instead of racing it.
+            let child_op = self.begin_fork(child_id).map_err(|e| e.to_string())?;
+            g.vms.push(child);
+            (parent, child_op)
+        };
+        let (parent_state, parent_pid, parent_dir, parent_sock, parent_vsock) = parent;
+
+        // The child's directory is its own from the start: created
+        // exclusively. One that exists although no record owns it can be a
+        // VM whose meta.json did not load at start-up, still running out of
+        // it — it is never written into.
+        if let Err(e) = create_new_instance_dir(&child_dir) {
+            self.drop_unborn_child(child_id, None, None).await;
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                warn!(vm = %child_id, "fork: the child's directory exists although no record owns it; left alone");
+                return Err("AlreadyExists".into());
+            }
+            return Err(format!("create {}: {}", child_dir, e));
         }
 
-        let mut child_ip: Option<String> = None;
-        let mut child_slot: Option<u32> = None;
+        // The child's network slot, before the parent is touched: a node out
+        // of addresses used to pause the parent and write the whole snapshot
+        // first, for nothing. From here every failure gives it back. And the
+        // reservation is looked at once more: a stop or delete of the child
+        // that came in meanwhile ends the fork here.
+        let (child_slot, child_ip) = {
+            let mut g = self.inner.lock().await;
+            if !self.child_reserved(&g, child_id) {
+                drop(g);
+                self.drop_unborn_child(child_id, Some(&child_dir), None).await;
+                return Err(aborted(child_id).to_string());
+            }
+            if self.rules_on() {
+                let s = match Self::claim_slot(&mut g) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        drop(g);
+                        self.drop_unborn_child(child_id, Some(&child_dir), None).await;
+                        return Err(e.into());
+                    }
+                };
+                (Some(s), Self::ip_for_slot(&g, s))
+            } else {
+                (None, None)
+            }
+        };
 
-        if self.net_on {
-            let s = {
-                let mut g = self.inner.lock().await;
-                Self::claim_slot(&mut g).ok_or("IpPoolExhausted")?
+        let parent_rootfs = format!("{}/rootfs.ext4", parent_dir);
+        let child_rootfs = format!("{}/rootfs.ext4", child_dir);
+        let child_vmstate = format!("{}/{}", child_dir, VMSTATE);
+        let child_mem_file = format!("{}/{}", child_dir, MEM);
+
+        // 1) The child's snapshot. Written straight into the child's own
+        // directory: the parent's directory gets no snapshot files (a
+        // `vmstate.bin` there would say "asleep" to an older agent, S11), and
+        // two forks of one parent no longer write over one pair of files.
+        if parent_state == VmState::Sleeping {
+            // Its snapshot is complete (the record says so), and it cannot
+            // move while the parent is held.
+            let parent_vmstate = format!("{}/{}", parent_dir, VMSTATE);
+            let parent_mem_file = format!("{}/{}", parent_dir, MEM);
+            for (src, dst) in [(&parent_rootfs, &child_rootfs), (&parent_vmstate, &child_vmstate), (&parent_mem_file, &child_mem_file)] {
+                if let Err(e) = copy_rootfs(src, dst) {
+                    self.drop_unborn_child(child_id, Some(&child_dir), child_slot).await;
+                    return Err(e);
+                }
+            }
+        } else {
+            // Only a parent this fork paused is resumed by it: a `paused`
+            // parent stays paused.
+            let paused_here = parent_state == VmState::Running;
+            // A parent that does not run on its own disk is not forked (K5):
+            // a sandbox forked before this release runs on ITS parent's image,
+            // and its own `rootfs.ext4` is the disk as it was at that fork —
+            // copying that beside this memory would pair it with a stale disk.
+            // Asked before the pause, so that such a fork costs nothing; the
+            // child's own check after its load is the one that decides.
+            match fc::get_root_drive_path(&parent_sock).await {
+                Ok(p) if same_file(&p, &parent_rootfs).unwrap_or(false) => {}
+                Ok(p) => {
+                    // The path and the ids go to the log only: the control
+                    // plane relays the answer to the tenant word for word.
+                    warn!(vm = %parent_id, child = %child_id, image = %p,
+                        "fork refused: the parent runs on another image than its own rootfs.ext4 (it was forked \
+                         before this release)");
+                    self.drop_unborn_child(child_id, Some(&child_dir), child_slot).await;
+                    *refused = Some(self.state_now(parent_id, &parent_state).await);
+                    return Err(FORK_REFUSED_FORKED_BEFORE.into());
+                }
+                Err(e) => {
+                    self.drop_unborn_child(child_id, Some(&child_dir), child_slot).await;
+                    return Err(e.to_string());
+                }
+            }
+            if paused_here {
+                if let Err(e) = fc::patch_vm_state(&parent_sock, "Paused").await {
+                    self.drop_unborn_child(child_id, Some(&child_dir), child_slot).await;
+                    return Err(e.to_string());
+                }
+            }
+            // The state file under its temporary name, renamed once
+            // Firecracker said the whole snapshot was written: a failed
+            // create leaves a complete-looking state file behind.
+            //
+            // The disk is copied while the parent is still paused (FLU-72),
+            // so that it is the disk of the same instant as the memory. Copied
+            // after the resume, as it used to be, it held writes the child's
+            // memory knows nothing of — a disk and a page cache that disagree.
+            let child_vmstate_tmp = format!("{}/{}", child_dir, VMSTATE_TMP);
+            let made = match fc::put_snapshot_create(&parent_sock, &child_vmstate_tmp, &child_mem_file).await {
+                Ok(()) => match std::fs::rename(&child_vmstate_tmp, &child_vmstate) {
+                    Ok(()) => self.copy_disk_in_pause(parent_id, &parent_rootfs, &child_rootfs).await,
+                    Err(e) => Err(format!("rename {} -> {}: {}", child_vmstate_tmp, child_vmstate, e)),
+                },
+                Err(e) => Err(e.to_string()),
             };
-            child_slot = Some(s);
-            child_ip = {
-                let g = self.inner.lock().await;
-                Self::ip_for_slot(&g, s)
-            };
+            // The parent is given back first, the child's files removed
+            // after: the parent need not stay paused for the unlink of a
+            // multi-GiB memory file. If it cannot be resumed, its record says
+            // `paused`.
+            let resumed = !paused_here || self.resume_or_record_paused(parent_id, &parent_sock, parent_pid).await;
+            if let Err(e) = made {
+                warn!(vm = %parent_id, child = %child_id, err = %e, "fork: the snapshot failed; the child is removed");
+                self.drop_unborn_child(child_id, Some(&child_dir), child_slot).await;
+                return Err(e);
+            }
+            if !resumed {
+                self.drop_unborn_child(child_id, Some(&child_dir), child_slot).await;
+                return Err(format!("fork: {} could not be resumed after its snapshot and stays paused", parent_id));
+            }
+        }
+
+        if let Some(s) = child_slot {
             // Pinned to the child's OWN MAC before its Firecracker is even
             // spawned, not after the in-guest re-MAC below: the clone restores
             // still carrying the parent's L2 identity, and a window in which it
@@ -2348,31 +3997,29 @@ impl Manager {
             // holds the clone's frames off the bridge until the guest takes the
             // MAC that matches it — and the re-MAC travels over vsock, not over
             // this tap, so it is unaffected.
-            let (tap, mac) = tap_pin_for_slot(s);
-            if !ensure_pinned_tap(&tap, child_ip.as_deref(), &mac, Unpinned::Remove) {
-                let mut g = self.inner.lock().await;
-                Self::free_slot(&mut g, s);
-                drop(g);
-                self.set_state(child_id, VmState::Error).await;
-                return Err("TapSetupFailed".into());
+            let (tap, pin_ip, mac) = {
+                let g = self.inner.lock().await;
+                self.tap_pin(&g, s)
+            };
+            if !self.rules.pin_tap(&tap, pin_ip.as_deref(), &mac) {
+                return Err(self.fail_child(child_id, &child_dir, None, child_slot, "TapSetupFailed".into()).await);
             }
+            // X4: pinned and up — not the watch's to hold down any more.
+            lock_std(&self.watch).release_tap(&tap);
         }
 
         // 4) Spawn child FC and restore.
         let child_sock = format!("{}/fc.sock", child_dir);
         let _ = std::fs::remove_file(&child_sock);
 
-        let child_pid = self.spawn_firecracker(child_id, &child_sock, &child_dir)?;
+        let child_pid = match self.spawn_firecracker(child_id, &child_sock, &child_dir) {
+            Ok(p) => p,
+            Err(e) => return Err(self.fail_child(child_id, &child_dir, None, child_slot, e).await),
+        };
 
-        let deadline = Instant::now() + Duration::from_millis(3000);
-        loop {
-            if Path::new(&child_sock).exists() { break; }
-            if Instant::now() >= deadline {
-                kill_and_reap(child_pid); // don't leak the half-spawned child FC
-                self.set_state(child_id, VmState::Error).await;
-                return Err("SocketNeverAppeared".into());
-            }
-            sleep(Duration::from_millis(50)).await;
+        if let Err(e) = wait_api_socket(&child_sock, API_SOCKET_WAIT).await {
+            // Don't leak the half-spawned child FC.
+            return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e).await);
         }
 
         // If the parent had a vsock device, the snapshot's baked uds_path points
@@ -2388,23 +4035,96 @@ impl Manager {
         } else {
             None
         };
-        if let Err(e) = fc::put_snapshot_load(&child_sock, &child_vmstate, &child_mem_file, self.net_on, child_slot, vsock_override).await {
-            kill_and_reap(child_pid); // don't leak the child FC that failed to restore
-            self.set_state(child_id, VmState::Error).await;
-            return Err(e.to_string());
+        // Loaded paused: the snapshot names the PARENT's disk image (it
+        // records the drive's absolute path, and the load has no override
+        // for it), so the child must not run before its drive is its own.
+        if let Err(e) = fc::put_snapshot_load(&child_sock, &child_vmstate, &child_mem_file, self.net_on, child_slot, vsock_override, false).await {
+            // Don't leak the child FC that failed to restore.
+            return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e.to_string()).await);
         }
+        // Loaded: its state file is used up and describes nothing the child
+        // will be (S11: `vmstate.bin` only beside a `sleeping` record).
+        // mem.bin stays — the child runs on a private mapping of it.
+        remove_if_present(child_id, &child_vmstate);
+
+        // The image the loaded state names is the one the parent really ran
+        // on when the snapshot was taken. It must be the parent's own
+        // `rootfs.ext4` (K5) — the same file, by device and inode, not by the
+        // spelling of its path. Otherwise the parent was forked before this
+        // release and runs on its own parent's image; the copy made above is
+        // the disk of an older instant than this memory.
+        match fc::get_root_drive_path(&child_sock).await {
+            Ok(p) if same_file(&p, &parent_rootfs).unwrap_or(false) => {}
+            Ok(p) => {
+                // A refusal like the running parent's (409, not 500: the
+                // request can never succeed); the path and the ids are logged.
+                warn!(vm = %parent_id, child = %child_id, image = %p,
+                    "fork refused: the parent ran on another image than its own rootfs.ext4 when it was \
+                     snapshotted (it was forked before this release); the child is not started");
+                // Z1: a refusal leaves nothing behind — the control plane
+                // takes a 409 InvalidState from fork as "nothing was
+                // created" and forgets the id, so an `error` record kept
+                // "for its owner to see" (`fail_child`) would never be
+                // deleted, and each retry left another full disk copy. The
+                // VMM goes, then the record, the directory, the tap and the
+                // slot, as for a fork refused before its pause.
+                kill_and_reap(child_pid);
+                self.drop_unborn_child(child_id, Some(&child_dir), child_slot).await;
+                *refused = Some(self.state_now(parent_id, &parent_state).await);
+                return Err(FORK_REFUSED_FORKED_BEFORE.into());
+            }
+            Err(e) => return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e.to_string()).await),
+        }
+
+        // Its own disk (FLU-72), and checked: a child resumed on its parent's
+        // image writes over the parent's filesystem from a second kernel.
+        if let Err(e) = fc::patch_drive_rootfs(&child_sock, &child_rootfs).await {
+            return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e.to_string()).await);
+        }
+        match fc::get_root_drive_path(&child_sock).await {
+            Ok(p) if p == child_rootfs => {}
+            Ok(p) => {
+                let e = format!("fork: the child's drive is {} after the PATCH, not {}", p, child_rootfs);
+                return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e).await);
+            }
+            Err(e) => return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e.to_string()).await),
+        }
+        // Everything from here is the child's. The parent was held until now
+        // (FK-7): the child's load reads the parent's image until its drive
+        // is re-pointed, and a delete of the parent that was waiting would
+        // otherwise remove that image under it.
+        drop(parent_op);
 
         {
             let mut g = self.inner.lock().await;
-            if let Some(v) = g.vms.iter_mut().find(|v| v.id == child_id) {
-                v.pid = Some(child_pid);
-                v.slot = child_slot;
-                v.state = VmState::Running;
-                v.ip = child_ip.clone();
-                v.vsock = parent_vsock;
+            let closing = self.closing(child_id);
+            match g.vms.iter_mut().find(|v| v.id == child_id) {
+                Some(v) if v.state == VmState::Creating && !closing => {
+                    v.pid = Some(child_pid);
+                    v.slot = child_slot;
+                    v.state = VmState::Running;
+                    v.ip = child_ip.clone();
+                    v.vsock = parent_vsock;
+                }
+                // Stopped or deleted while it was being made: its VMM is not
+                // wanted, nor anything else of it (E2).
+                _ => {
+                    drop(g);
+                    kill_and_reap(child_pid);
+                    self.drop_unborn_child(child_id, Some(&child_dir), child_slot).await;
+                    return Err(aborted(child_id).to_string());
+                }
             }
         }
-        self.write_meta(child_id).await?;
+        if let Err(e) = self.write_meta(child_id).await {
+            return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e).await);
+        }
+        // Only now does the child run: its record says `running` on disk, and
+        // a start-up that finds this VMM still paused resumes it — on its own
+        // drive by then.
+        if let Err(e) = fc::patch_vm_state(&child_sock, "Resumed").await {
+            return Err(self.fail_child(child_id, &child_dir, Some(child_pid), child_slot, e.to_string()).await);
+        }
 
         // Fork re-IP: the child restored with the parent's guest-internal IP.
         // If it has a working vsock, tell the guest to reconfigure eth0 to its
@@ -2474,6 +4194,138 @@ impl Manager {
         // pair set before the fork returns.
         self.commit_or_isolate(child_id).await?;
         Ok(child_ip)
+    }
+
+    /// Copy the parent's disk image while the parent is paused for a fork
+    /// (K1, K8): `cp --reflink=auto`, as a child process the fork awaits, so
+    /// that the runtime is not blocked for the length of a multi-GiB copy and
+    /// the copy can be ended. There is no fallback: after a `cp` that failed
+    /// (out of space, say) a second, hole-less copy from the start would only
+    /// keep the parent paused longer. A stop or delete of the parent ends the
+    /// copy and the fork.
+    async fn copy_disk_in_pause(&self, parent_id: &str, src: &str, dst: &str) -> Result<(), String> {
+        let mut cp = tokio::process::Command::new("cp")
+            .arg("--reflink=auto")
+            .arg(src)
+            .arg(dst)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("copy {} -> {}: {}", src, dst, e))?;
+        loop {
+            tokio::select! {
+                st = cp.wait() => {
+                    return match st {
+                        Ok(st) if st.success() => Ok(()),
+                        Ok(st) => Err(format!("copy {} -> {}: cp {}", src, dst, st)),
+                        Err(e) => Err(format!("copy {} -> {}: {}", src, dst, e)),
+                    };
+                }
+                _ = sleep(BUSY_POLL) => {
+                    if self.closing(parent_id) {
+                        let _ = cp.kill().await;
+                        return Err(format!("fork: {} is being stopped or deleted; the copy of its disk was ended", parent_id));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A fork that failed before its child had a VMM leaves nothing behind
+    /// (F4): the child's directory, when this fork created it (`child_dir`),
+    /// the record it reserved, and the network slot and tap it claimed
+    /// (`slot`).
+    async fn drop_unborn_child(&self, child_id: &str, child_dir: Option<&str>, slot: Option<u32>) {
+        if let Some(d) = child_dir {
+            if let Err(e) = std::fs::remove_dir_all(d) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(vm = %child_id, path = %d, err = %e, "fork: could not remove the child's directory");
+                }
+            }
+        }
+        {
+            let mut g = self.inner.lock().await;
+            // A stop of the child that came in meanwhile has made the
+            // reserved record `stopped`; it is still the reservation (the
+            // child id is this fork's, nothing else can have written it), and
+            // goes with the directory it would otherwise outlive.
+            if let Some(pos) = g.vms.iter().position(|v| {
+                v.id == child_id && v.pid.is_none() && matches!(v.state, VmState::Creating | VmState::Stopped)
+            }) {
+                g.vms.remove(pos);
+                lock_std(&self.meta_owed).remove(child_id);
+            }
+        }
+        self.release_child_slot(slot).await;
+    }
+
+    /// Give back the network slot a fork claimed for its child, and the tap
+    /// of that slot: the tap first, then the slot, so that the next sandbox
+    /// to take the slot never finds this one's device (FLU-6 R7's order).
+    async fn release_child_slot(&self, slot: Option<u32>) {
+        let Some(s) = slot else { return };
+        if self.rules_on() {
+            self.remove_tap_locked(s).await;
+        }
+        let mut g = self.inner.lock().await;
+        Self::free_slot(&mut g, s);
+    }
+
+    /// Is the child's reservation still this fork's: the record is there, in
+    /// `creating`, and no stop or delete of it has come in?
+    fn child_reserved(&self, g: &Inner, child_id: &str) -> bool {
+        g.vms.iter().any(|v| v.id == child_id && v.state == VmState::Creating) && !self.closing(child_id)
+    }
+
+    /// A fork that failed once its child had, or was about to get, a VMM
+    /// (F4): that VMM is killed — the record lets go of its pid first, so the
+    /// exit reaper takes it for a deliberate kill — the child's snapshot
+    /// files go, the slot and the tap this fork claimed (`slot`) are given
+    /// back, and the child stays as an `error` record for its owner to see
+    /// and delete. A record that was already written (`running`) is written
+    /// again. Returns `err` as the answer.
+    ///
+    /// A reservation that is no longer this fork's — the record gone, or a
+    /// stop or delete of the child pre-empted the fork (most likely why it
+    /// failed) — leaves nothing of the child behind (`drop_unborn_child`).
+    async fn fail_child(&self, child_id: &str, child_dir: &str, child_pid: Option<i32>, slot: Option<u32>, err: String) -> String {
+        let found = {
+            let mut g = self.inner.lock().await;
+            let closing = self.closing(child_id);
+            match g.vms.iter_mut().find(|v| v.id == child_id) {
+                Some(v) if !closing && matches!(v.state, VmState::Creating | VmState::Running) => {
+                    let written = v.state != VmState::Creating;
+                    v.state = VmState::Error;
+                    v.pid = None;
+                    v.snapshot_valid = false;
+                    // The slot goes back below: the record must not keep it.
+                    if v.slot == slot {
+                        v.slot = None;
+                        v.ip = None;
+                    }
+                    Some((v.dir_id.clone(), written))
+                }
+                _ => None,
+            }
+        };
+        if let Some(p) = child_pid {
+            kill_and_reap(p);
+        }
+        warn!(vm = %child_id, err = %err, "fork: the child failed; its VMM is gone and its snapshot files are removed");
+        let Some((dir_id, written)) = found else {
+            self.drop_unborn_child(child_id, Some(child_dir), slot).await;
+            return err;
+        };
+        self.discard_snapshot_files(child_id, &dir_id);
+        self.release_child_slot(slot).await;
+        if written {
+            if let Err(e) = self.write_meta(child_id).await {
+                warn!(vm = %child_id, err = %e, "fork: could not write the child's error record yet");
+            }
+        }
+        err
     }
 
     // ---- exec (v3 vsock guest agent) ----
@@ -2605,6 +4457,21 @@ impl Manager {
             }
         }
 
+        // W3, W11: no new guest while a fence is positively gone or start-up
+        // could not settle the ingress chain — before any work.
+        if !specs.is_empty() {
+            let why = self.new_guest_refusal().await;
+            // X11: logged when it starts and when it ends, not every 5 s.
+            if net::state_changed_to("pool-refill-refused", why.map(str::to_string)) {
+                match why {
+                    Some(why) => warn!(reason = %why, "pool refill refused: no new guest on this node now"),
+                    None => info!("pool refill: new guests are allowed again"),
+                }
+            }
+            if why.is_some() {
+                return;
+            }
+        }
         for spec in specs {
             // Skip specs in failure backoff.
             {
@@ -2717,20 +4584,26 @@ impl Manager {
 
     // ---- stop / start / delete ----
 
-    pub async fn stop(&self, id: &str) -> Result<(), String> {
+    pub async fn stop(&self, id: &str) -> Result<(), OpError> {
         use nix::sys::signal::{kill, Signal};
         use nix::unistd::Pid;
+        // From here no operation starts on this VM, and none in progress
+        // commits. Stop does not queue behind one: ending the VMM below is
+        // what makes a Firecracker call in progress fail.
+        let _closing = self.begin_close(id);
         self.claim_unsettled(id).await;
         // Read the pid and clear the record in ONE critical section: the exit
         // reaper then sees a pid mismatch and treats this as a deliberate kill
         // (no error transition), and nothing can change the record between
-        // the read and the write.
+        // the read and the write. Stopping a sleeping VM discards its
+        // snapshot (below), so the marker goes with the state.
         let (pid, dir_id) = {
             let mut g = self.inner.lock().await;
             let v = g.vms.iter_mut().find(|v| v.id == id).ok_or("NotFound")?;
             let out = (v.pid, v.dir_id.clone());
             v.state = VmState::Stopped;
             v.pid = None;
+            v.snapshot_valid = false;
             out
         };
         // The signal follows with no await in between: a stop is never left
@@ -2753,13 +4626,31 @@ impl Manager {
             // Otherwise it is gone long ago, or a stranger now has the number:
             // there is nothing of ours to wait for.
         }
+        // Pre-empting an operation in progress (S4'): every Firecracker of
+        // this unit in the instance directory is killed, not only the one the
+        // record names — a wake, a start or a fork child whose new VMM is not
+        // in the record yet holds its operation in a call to that VMM, and
+        // only its death ends the call. Killed outright, not asked: a stop
+        // that gives up below must not leave a signalled VMM alive.
+        if self.op_in_progress(id) {
+            self.kill_instance_vmms(id, &dir_id);
+        }
         // On disk straight away. A stop that was never written down reads as
-        // `running` with a dead pid at the next agent start — and from there
-        // as `sleeping` whenever an old snapshot is still lying in the
-        // directory, a state `start` refuses.
+        // `running` with a dead pid at the next agent start.
         let persisted = self.write_meta(id).await;
         if let Some(e) = signal_err {
-            return Err(e);
+            return Err(e.into());
+        }
+        // An operation in progress lets go once its Firecracker call fails or
+        // it reaches its commit point and finds the VM being stopped. Until it
+        // has, the files below may still be its to write or read.
+        if !self.wait_op_released(id).await {
+            // The record says `stopped`, on disk: that is the answer, so
+            // that the control plane records it (S10). A plain `busy` says
+            // "nothing was decided", and it would go on listing the sandbox
+            // as running or asleep.
+            warn!(vm = %id, "stop: an operation in progress did not let go of this VM in time");
+            return Err(OpError::invalid(&VmState::Stopped, STOP_GAVE_UP));
         }
         if let Some(p) = wait_for {
             // Wait for the FC process to actually exit: "stopped" gates the
@@ -2788,70 +4679,119 @@ impl Manager {
                 sleep(Duration::from_millis(100)).await;
             }
         }
-        persisted
+        // A stopped VM is never woken: whatever snapshot it had is of no use
+        // any more (and, left there, an older agent would read the VM as
+        // asleep). mem.bin is kept if a VMM that did not exit still maps it.
+        self.discard_snapshot_files(id, &dir_id);
+        self.remove_outrun(id, &dir_id);
+        Ok(persisted?)
     }
 
-    pub async fn start(self: &Arc<Self>, id: &str) -> Result<(), String> {
-        let (vcpus, mem_mib, slot, ip) = {
+    /// SIGKILL every Firecracker this unit started that serves the instance
+    /// directory `dir_id` (the scan delete makes, `in_my_cgroup`), whether or
+    /// not a record names it. Not without the data-dir lock, as there.
+    fn kill_instance_vmms(&self, id: &str, dir_id: &str) {
+        if !valid_vm_id(dir_id) || !self.hold_data_dir_lock() {
+            return;
+        }
+        let procs = self.procs();
+        for p in procs.scan().into_iter().filter(|p| p.dir_name == dir_id) {
+            if procs.in_my_cgroup(p.pid) {
+                warn!(vm = %id, pid = p.pid, "stop: killing a Firecracker of this VM an operation in progress is waiting on");
+                self.kill_fc(p.pid, dir_id);
+            }
+        }
+    }
+
+    pub async fn start(self: &Arc<Self>, id: &str) -> Result<(), OpError> {
+        let _op = self.begin_op(id, OpKind::Start).await?;
+        let (vcpus, mem_mib, slot, ip, pid0, dir_id) = {
             let g = self.inner.lock().await;
+            let v = g.vms.iter().find(|v| v.id == id).ok_or("NotFound")?;
             // A capture stream is reading this instance's rootfs: spawning
             // an FC over it would corrupt the published template bytes.
             if g.capturing.contains(id) {
-                return Err("InvalidState: capture in progress".into());
+                return Err(OpError::invalid(&v.state, "InvalidState: capture in progress"));
             }
-            let v = g.vms.iter().find(|v| v.id == id).ok_or("NotFound")?;
             // start is a cold boot: only valid when no FC owns the instance.
             // paused/sleeping VMs have live state to lose — spawning over them
             // would orphan the FC holding it (use resume/wake instead).
             match v.state {
                 VmState::Running => return Ok(()),
                 VmState::Stopped | VmState::Error => {}
-                VmState::Paused => return Err("InvalidState: paused (use resume)".into()),
-                VmState::Sleeping => return Err("InvalidState: sleeping (use wake)".into()),
+                VmState::Paused => return Err(OpError::invalid(&v.state, "InvalidState: paused (use resume)")),
+                VmState::Sleeping => return Err(OpError::invalid(&v.state, "InvalidState: sleeping (use wake)")),
                 VmState::Creating | VmState::Pooled => {
-                    return Err(format!("InvalidState: {}", v.state.as_str()));
+                    return Err(OpError::invalid(&v.state, format!("InvalidState: {}", v.state.as_str())));
                 }
             }
             if let Some(p) = v.pid {
                 use nix::sys::signal::kill;
                 use nix::unistd::Pid;
                 if kill(Pid::from_raw(p), None).is_ok() {
-                    return Err(format!("InvalidState: process {} still attached", p));
+                    return Err(OpError::invalid(&v.state, format!("InvalidState: process {} still attached", p)));
                 }
             }
-            (v.vcpus, v.mem_mib, v.slot, v.ip.clone())
+            (v.vcpus, v.mem_mib, v.slot, v.ip.clone(), v.pid, v.dir_id.clone())
         };
+        // W3: no guest back onto a network whose fences are positively gone.
+        self.refuse_new_guest("start", id).await.map_err(OpError::Other)?;
 
-        let dir_path = self.instance_dir(id).await.ok_or("InvalidId")?;
+        let dir_path = instance_path(&self.data_dir, &dir_id).ok_or("InvalidId")?;
         let rootfs_dst = format!("{}/rootfs.ext4", dir_path);
+
+        // A cold boot starts from the disk alone; a snapshot from before it
+        // would describe a guest that never was (S8), and one set aside as
+        // stale is of no use from here either (S3').
+        self.discard_snapshot_files(id, &dir_id);
+        self.remove_outrun(id, &dir_id);
 
         // Cold boot: configure_guest sets the NIC's MAC, so the full pin
         // (address, ARP and L2) applies from the first frame.
-        if self.net_on {
+        // Through the rule seam (`pin_tap`), so that unit tests run the pin.
+        if self.rules_on() {
             if let Some(s) = slot {
-                let (tap, mac) = tap_pin_for_slot(s);
-                if !ensure_pinned_tap(&tap, ip.as_deref(), &mac, Unpinned::Remove) {
+                let (tap, pin_ip, mac) = {
+                    let g = self.inner.lock().await;
+                    self.tap_pin(&g, s)
+                };
+                if !self.rules.pin_tap(&tap, pin_ip.as_deref(), &mac) {
                     return Err("TapSetupFailed".into());
                 }
+                // X4: pinned and up — not the watch's to hold down any more.
+                lock_std(&self.watch).release_tap(&tap);
             }
         }
 
         let (pid, vsock_on) = self.spawn_and_configure(id, &dir_path, &rootfs_dst, vcpus, mem_mib, slot, ip.as_deref()).await?;
-        self.set_pid(id, Some(pid)).await;
+        // The commit point.
         {
             let mut g = self.inner.lock().await;
-            if let Some(v) = g.vms.iter_mut().find(|v| v.id == id) {
-                v.vsock = vsock_on;
+            let committed = match g.vms.iter_mut().find(|v| v.id == id) {
+                Some(v) if self.may_commit(v, pid0) => {
+                    v.pid = Some(pid);
+                    v.vsock = vsock_on;
+                    v.state = VmState::Running;
+                    v.snapshot_valid = false;
+                    true
+                }
+                _ => false,
+            };
+            if !committed {
+                drop(g);
+                kill_and_reap(pid);
+                return Err(aborted(id));
             }
         }
-        self.set_state(id, VmState::Running).await;
-        self.write_meta(id).await
+        Ok(self.write_meta(id).await?)
     }
 
     pub async fn delete(&self, id: &str) -> Result<(), String> {
+        // As in `stop`: no operation starts or commits from here on.
+        let _closing = self.begin_close(id);
         self.claim_unsettled(id).await;
         // One critical section decides what this delete is about.
-        let (slot, dir_id, lives_there) = {
+        let (dir_id, lives_there) = {
             let mut g = self.inner.lock().await;
             match g.vms.iter_mut().find(|v| v.id == id) {
                 Some(v) => {
@@ -2865,13 +4805,12 @@ impl Manager {
                     if v.state == VmState::Pooled {
                         v.state = VmState::Stopped;
                     }
-                    (v.slot, v.dir_id.clone(), None)
+                    (v.dir_id.clone(), None)
                 }
                 // No record has this id, yet a VM may live in the directory
                 // of that name: a pool VM that was claimed keeps its pool
                 // directory under its new id.
                 None => (
-                    None,
                     id.to_string(),
                     g.vms.iter().find(|v| v.dir_id == id).map(|v| v.id.clone()),
                 ),
@@ -2887,8 +4826,15 @@ impl Manager {
             return Ok(());
         }
 
-        // stop is best-effort (idempotent delete).
-        let _ = self.stop(id).await;
+        // stop is best-effort (idempotent delete) — except when an operation
+        // in progress did not let go of the VM: the directory removed below
+        // may still hold the files it is writing or reading. The caller
+        // retries; the VM is `stopped` by then, and the answer says so.
+        if let Err(OpError::InvalidState { msg, .. }) = self.stop(id).await {
+            if msg == STOP_GAVE_UP {
+                return Err(STOP_GAVE_UP.into());
+            }
+        }
 
         // Nothing may be left running out of the directory this is about to
         // remove. stop() dealt with the VMM the record holds; what can remain
@@ -2924,15 +4870,71 @@ impl Manager {
             }
         }
 
-        if self.net_on {
+        // FLU-6 R7: the guest IP goes back to the pool only once no rule
+        // names it any more. It used to be freed first and the rules rebuilt
+        // last, so for that moment the next sandbox to take the address sat
+        // behind the previous owner's node ports and tenant pairs.
+        //
+        // (1) The sandbox leaves the membership, in one critical section.
+        // From here the record is on its way out: still in the list (its id
+        // and its directory stay taken until the directory is gone, and its
+        // slot stays reserved), marked closing (`begin_close`, so no
+        // operation commits to it), with no address and no exposes — it no
+        // longer counts for either rebuild, and an expose of it answers "no
+        // ip". Address and exposes go in the same section, so nothing reads
+        // the one without the other. (A listing taken meanwhile shows the
+        // record with `ip` null.)
+        //
+        // The slot is taken OFF the record here, in the same section, and
+        // only this value is used below: of two overlapping deletes of one
+        // sandbox exactly one gets it, and the other frees, holds and
+        // un-taps nothing. Both used to read it at entry, so the second freed
+        // it again after a create had claimed it — removing the NEW
+        // sandbox's tap and pin, and handing its address to the next one.
+        let slot = {
+            let mut g = self.inner.lock().await;
+            match g.vms.iter_mut().find(|v| v.id == id) {
+                Some(v) => {
+                    v.ip = None;
+                    v.exposes.clear();
+                    v.slot.take()
+                }
+                None => None,
+            }
+        };
+        // (2) Both rebuilds, each reporting whether it was applied.
+        let isolation_ok = self.refresh_isolation().await;
+        if !isolation_ok {
+            // Teardown goes on regardless: the VM is already gone, and
+            // returning an error here would only make delete non-idempotent.
+            warn!(vm = %id, "cross-tenant isolation not in force after delete");
+        }
+        let ingress_ok = self.refresh_ingress().await;
+        // (3) The tap, and only after rules that no longer name its address,
+        // the slot.
+        if self.rules_on() {
             if let Some(s) = slot {
-                let tap = net::tap_name(s);
-                // Before the tap goes: the pin is keyed on the device name,
-                // which the next VM to claim this slot will reuse.
-                net::clear_tap_antispoof(&tap);
-                net::delete_tap(&tap);
+                // The guest is gone: its tap goes either way.
+                self.remove_tap_locked(s).await;
                 let mut g = self.inner.lock().await;
-                Self::free_slot(&mut g, s);
+                if isolation_ok && ingress_ok {
+                    Self::free_slot(&mut g, s);
+                } else {
+                    // Held, not leaked (A): the first later pair of rebuilds
+                    // that both succeed lets it go (`settle_slots`). A create
+                    // rolled back by `commit_or_isolate` comes through here
+                    // too, so while a rebuild keeps failing each attempt
+                    // used to cost one address until a restart.
+                    g.held_slots.insert(s);
+                    error!(
+                        vm = %id,
+                        slot = s,
+                        isolation_rebuilt = isolation_ok,
+                        ingress_rebuilt = ingress_ok,
+                        "delete: a rule rebuild failed, so the old rules may still name this sandbox's address; \
+                         its IP slot is held until both rebuilds succeed again rather than go to the next sandbox"
+                    );
+                }
             }
         }
 
@@ -2958,13 +4960,6 @@ impl Manager {
         }
         // The record is gone, and with it anything still owed to its file.
         lock_std(&self.meta_owed).remove(id);
-        // Teardown does not fail on a broken ruleset: the VM is already gone,
-        // and returning an error here would only make delete non-idempotent.
-        if !self.refresh_isolation().await {
-            warn!(vm = %id, "cross-tenant isolation not in force after delete");
-        }
-        // The VM's exposes die with it: rebuild from the remaining members.
-        self.refresh_ingress().await;
         // Idempotent: unknown id is fine (no error).
         Ok(())
     }
@@ -2975,13 +4970,6 @@ impl Manager {
         let mut g = self.inner.lock().await;
         if let Some(v) = g.vms.iter_mut().find(|v| v.id == id) {
             v.state = state;
-        }
-    }
-
-    async fn set_pid(&self, id: &str, pid: Option<i32>) {
-        let mut g = self.inner.lock().await;
-        if let Some(v) = g.vms.iter_mut().find(|v| v.id == id) {
-            v.pid = pid;
         }
     }
 
@@ -2996,24 +4984,38 @@ impl Manager {
     /// nothing ever deletes — neither the drain (it looks at `pooled` VMs) nor
     /// a tenant (there is none).
     async fn on_fc_exit(&self, id: &str, pid: i32) {
-        let (transitioned, dead_pool) = {
+        let (transitioned, dead_pool, dir_id) = {
             let mut g = self.inner.lock().await;
             // A dead pool VM leaves the claimable set by this very transition:
             // claims match on state == Pooled, and Error is not claimable.
+            // While an operation holds the VM, its record is that operation's
+            // to settle (S7'): a wake whose new VMM died before the resume
+            // answered must decide what that means, and an `error` written
+            // here first would leave its intact snapshot under `error`.
+            // Whatever the operation leaves, `sweep_dead` settles within 5 s.
             match g.vms.iter_mut().find(|v| v.id == id) {
                 Some(v) if v.pid == Some(pid)
-                    && matches!(v.state, VmState::Creating | VmState::Running | VmState::Paused | VmState::Pooled) =>
+                    && matches!(v.state, VmState::Creating | VmState::Running | VmState::Paused | VmState::Pooled)
+                    && !self.op_in_progress(id) =>
                 {
                     let dead_pool = (v.state == VmState::Pooled).then(|| pool_spec_key_of(v));
                     v.state = VmState::Error;
                     v.pid = None;
-                    (true, dead_pool)
+                    v.snapshot_valid = false;
+                    (true, dead_pool, v.dir_id.clone())
                 }
-                _ => (false, None),
+                _ => (false, None, String::new()),
             }
         };
         if !transitioned {
             return;
+        }
+        // A guest that died took its memory with it: no snapshot beside it
+        // can be woken into what it was. Unless an operation holds the VM —
+        // then the files are that operation's to clean up on its own error
+        // path, and may be in the middle of being written.
+        if dead_pool.is_none() && !self.op_in_progress(id) {
+            self.discard_snapshot_files(id, &dir_id);
         }
         match dead_pool {
             Some(key) => {
@@ -3118,6 +5120,7 @@ impl Manager {
                 image: if v.image == DEFAULT_IMAGE { None } else { Some(v.image.clone()) },
                 disk_gb: if v.disk_gb == 0 { None } else { Some(v.disk_gb) },
                 image_sha256: v.image_sha256.clone(),
+                snapshot_valid: v.snapshot_valid,
             }
         };
 
@@ -3208,9 +5211,9 @@ fn ensure_pinned_tap(
     ip: Option<&str>,
     guest_mac: &net::GuestMac,
     unpinned: Unpinned,
-) -> bool {
+) -> Result<(), PinFailure> {
     if !net::ensure_tap(tap) {
-        return false;
+        return Err(PinFailure::NotSetUp);
     }
     // No allocated address means nothing to pin the port to, so the guest
     // behind it could claim any.
@@ -3220,7 +5223,7 @@ fn ensure_pinned_tap(
             Unpinned::Remove => net::delete_tap(tap),
             Unpinned::TakeDown => net::set_link_down(tap),
         }
-        return false;
+        return Err(PinFailure::Unpinned);
     };
     if !net::ensure_tap_antispoof(tap, ip, guest_mac) {
         match unpinned {
@@ -3231,9 +5234,33 @@ fn ensure_pinned_tap(
             // Whatever chain is already on the device stays; the link is down.
             Unpinned::TakeDown => net::set_link_down(tap),
         }
-        return false;
+        return Err(PinFailure::Unpinned);
     }
-    true
+    // Pinned first, raised after (W8): an adopted guest's tap found down
+    // used to come up before its pin was back.
+    if !net::raise_tap(tap) {
+        match unpinned {
+            Unpinned::Remove => {
+                net::clear_tap_antispoof(tap);
+                net::delete_tap(tap);
+            }
+            Unpinned::TakeDown => net::set_link_down(tap),
+        }
+        return Err(PinFailure::NotRaised);
+    }
+    Ok(())
+}
+
+/// Why `ensure_pinned_tap` did not pin a tap (X12: start-up says which).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinFailure {
+    /// The tap could not be created, put on the bridge or have IPv6 turned
+    /// off: nothing was taken down, there may be nothing on the bridge.
+    NotSetUp,
+    /// No address, or the pin was refused: the port is down (or removed).
+    Unpinned,
+    /// Pinned, but it could not be brought up.
+    NotRaised,
 }
 
 /// What `ensure_pinned_tap` does with a port it could not pin.
@@ -3273,6 +5300,17 @@ fn create_instance_dir(path: &str) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
+/// Create an instance directory that must not exist yet, 0700. Unlike
+/// `create_instance_dir`, an existing directory is an error
+/// (`AlreadyExists`): a fork child's directory is new or it is someone
+/// else's.
+fn create_new_instance_dir(path: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new().mode(0o700).create(path)?;
+    // The mode above is subject to the umask; as in `create_instance_dir`.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
 /// Open (and truncate) an instance's serial.log 0600. The guest writes its
 /// console here, which routinely carries boot secrets and application logs.
 fn open_serial_log(path: &str) -> std::io::Result<std::fs::File> {
@@ -3302,6 +5340,36 @@ fn copy_rootfs(src: &str, dst: &str) -> Result<(), String> {
     std::fs::copy(src, dst)
         .map(|_| ())
         .map_err(|e| format!("copy {} → {}: {}", src, dst, e))
+}
+
+/// How long a freshly spawned Firecracker has to accept on its API socket.
+const API_SOCKET_WAIT: Duration = Duration::from_millis(3000);
+
+/// Wait until a freshly spawned Firecracker's API socket ACCEPTS a
+/// connection, every 50 ms, for at most `limit` (V1). The socket file exists
+/// as soon as Firecracker has bound it; under load the first request used to
+/// arrive before it listened, and the refused connection failed the whole
+/// create (`FcError: send request: client error (Connect)`). A missing file
+/// or a refused connection is "not yet"; a connection that succeeds is
+/// closed at once (Firecracker ignores it). The error names no path: it can
+/// reach a tenant.
+async fn wait_api_socket(sock: &str, limit: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + limit;
+    loop {
+        // Bounded too: a full accept queue can hold a connect.
+        if let Ok(Ok(_conn)) = tokio::time::timeout(Duration::from_millis(250), tokio::net::UnixStream::connect(sock)).await {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let file = if Path::new(sock).exists() { "existed" } else { "did not exist" };
+            return Err(format!(
+                "SocketNeverAppeared: the Firecracker API socket did not accept a connection within {} ms (its file {})",
+                limit.as_millis(),
+                file
+            ));
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
 }
 
 fn kill_and_reap(pid: i32) {
@@ -3505,7 +5573,8 @@ mod tests {
             .map(|l| l.split("//").next().unwrap_or(""))
             .collect::<Vec<_>>()
             .join("\n");
-        let needle = ["Command::new(", "\"firecracker\")"].concat();
+        // The binary is `self.fc_bin` ("firecracker" outside unit tests).
+        let needle = ["Command::new(", "&self.fc_bin)"].concat();
         assert_eq!(
             code.matches(needle.as_str()).count(),
             1,
@@ -3741,36 +5810,137 @@ mod tests {
         assert_eq!(mode, 0o600, "got {:o}", mode);
     }
 
+    // ---- FLU-6: node ports round-robin, avoid and prefer ----
+    //
+    // These replace four tests that pinned lowest-free on purpose: lowest-free
+    // handed the port a sandbox had just released to the very next expose,
+    // another tenant's, while the gateways still sent the old hostname there.
+
+    fn ports(p: &[u16]) -> HashSet<u16> {
+        p.iter().copied().collect()
+    }
+
+    const RANGE: std::ops::RangeInclusive<u16> = NODE_PORT_MIN..=NODE_PORT_MAX;
+
     #[test]
-    fn test_node_port_alloc_lowest_free() {
-        let used = HashSet::new();
-        assert_eq!(lowest_free_node_port(&used), Some(20000));
+    fn test_node_ports_go_round_robin_from_the_cursor() {
+        let none = HashSet::new();
+        let mut used = HashSet::new();
+        let mut cursor = 24000;
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            let (p, next) = pick_node_port(&used, &none, None, cursor, RANGE).unwrap();
+            got.push(p);
+            used.insert(p);
+            cursor = next;
+        }
+        assert_eq!(got, [24000, 24001, 24002, 24003]);
+        // The cursor is the port after the last one handed out.
+        assert_eq!(cursor, 24004);
+        // A port released behind the cursor is not the next one handed out.
+        used.remove(&24001);
+        assert_eq!(pick_node_port(&used, &none, None, cursor, RANGE), Some((24004, 24005)));
     }
 
     #[test]
-    fn test_node_port_alloc_skips_taken_across_vms() {
-        // `used` spans every expose of every VM — holes are filled lowest-first.
-        let used: HashSet<u16> = [20000, 20001, 20003].into_iter().collect();
-        assert_eq!(lowest_free_node_port(&used), Some(20002));
-        let used: HashSet<u16> = (20000..=20999).collect();
-        assert_eq!(lowest_free_node_port(&used), Some(21000));
+    fn test_node_ports_wrap_around_once() {
+        let none = HashSet::new();
+        // At the top of the range: the cursor wraps to the bottom.
+        assert_eq!(pick_node_port(&none, &none, None, NODE_PORT_MAX, RANGE), Some((NODE_PORT_MAX, NODE_PORT_MIN)));
+        // Everything from the cursor up is taken: the search wraps.
+        let used: HashSet<u16> = (29990..=NODE_PORT_MAX).collect();
+        assert_eq!(pick_node_port(&used, &none, None, 29990, RANGE), Some((NODE_PORT_MIN, NODE_PORT_MIN + 1)));
+        // Only a port below the cursor is free: found after the wrap.
+        let used: HashSet<u16> = RANGE.filter(|p| *p != 21000).collect();
+        assert_eq!(pick_node_port(&used, &none, None, 25000, RANGE), Some((21000, 21001)));
+        // A cursor outside the range starts at the bottom.
+        assert_eq!(pick_node_port(&none, &none, None, 80, RANGE), Some((NODE_PORT_MIN, NODE_PORT_MIN + 1)));
     }
 
     #[test]
-    fn test_node_port_alloc_exhaustion() {
-        let mut used: HashSet<u16> = (NODE_PORT_MIN..=NODE_PORT_MAX).collect();
-        assert_eq!(lowest_free_node_port(&used), None);
-        // Freeing any one port makes exactly that port allocatable again.
-        used.remove(&25555);
-        assert_eq!(lowest_free_node_port(&used), Some(25555));
+    fn test_node_ports_skip_ports_in_use_and_avoided() {
+        let used = ports(&[20000, 20002]);
+        let avoid = ports(&[20001, 20003]);
+        assert_eq!(pick_node_port(&used, &avoid, None, 20000, RANGE), Some((20004, 20005)));
+        // Exhaustively over a small range: never a port in use or avoided,
+        // always the first one after the cursor that is neither.
+        let small = 100..=109u16;
+        for mask in 0u32..(1 << 10) {
+            let used: HashSet<u16> = (0..10).filter(|i| mask & (1 << i) != 0).map(|i| 100 + i as u16).collect();
+            for avoid_mask in [0u32, 0b1010101010, 0b0000011111] {
+                let avoid: HashSet<u16> = (0..10).filter(|i| avoid_mask & (1 << i) != 0).map(|i| 100 + i as u16).collect();
+                for cursor in small.clone() {
+                    let want = (0..10u16)
+                        .map(|i| 100 + (cursor - 100 + i) % 10)
+                        .find(|p| !used.contains(p) && !avoid.contains(p));
+                    let got = pick_node_port(&used, &avoid, None, cursor, small.clone());
+                    assert_eq!(got.map(|g| g.0), want, "used {used:?} avoid {avoid:?} cursor {cursor}");
+                    if let Some((p, next)) = got {
+                        assert_eq!(next, if p == 109 { 100 } else { p + 1 });
+                    }
+                }
+            }
+        }
     }
 
     #[test]
-    fn test_node_port_alloc_ignores_out_of_range_used() {
-        // Ports outside the range never block allocation (can't occur from our
-        // allocator, but the set is just u16s).
-        let used: HashSet<u16> = [80, 8069, 30000].into_iter().collect();
-        assert_eq!(lowest_free_node_port(&used), Some(20000));
+    fn test_node_ports_prefer_is_honoured_only_when_free_and_in_range() {
+        let none = HashSet::new();
+        // Free: returned, even though it is in avoid (it is in avoid because
+        // it is quarantined for this very mapping), and the cursor stays.
+        assert_eq!(pick_node_port(&none, &ports(&[21000]), Some(21000), 24000, RANGE), Some((21000, 24000)));
+        // In use by a sandbox here: ignored, round-robin instead.
+        assert_eq!(pick_node_port(&ports(&[21000]), &none, Some(21000), 24000, RANGE), Some((24000, 24001)));
+        // Outside the node-port range: ignored.
+        assert_eq!(pick_node_port(&none, &none, Some(8080), 24000, RANGE), Some((24000, 24001)));
+        assert_eq!(pick_node_port(&none, &none, Some(30000), 24000, RANGE), Some((24000, 24001)));
+        // Nothing else left: prefer still wins when it is free.
+        let avoid: HashSet<u16> = RANGE.collect();
+        assert_eq!(pick_node_port(&none, &avoid, Some(29999), 20000, RANGE), Some((29999, 20000)));
+    }
+
+    #[test]
+    fn test_node_ports_exhausted_when_in_use_and_avoid_cover_the_range() {
+        let used: HashSet<u16> = (NODE_PORT_MIN..25000).collect();
+        let mut avoid: HashSet<u16> = (25000..=NODE_PORT_MAX).collect();
+        for cursor in [NODE_PORT_MIN, 24999, 25000, NODE_PORT_MAX] {
+            assert_eq!(pick_node_port(&used, &avoid, None, cursor, RANGE), None);
+            // A prefer that is in use does not help.
+            assert_eq!(pick_node_port(&used, &avoid, Some(20000), cursor, RANGE), None);
+        }
+        // Lifting any one port makes exactly that port allocatable again.
+        avoid.remove(&25555);
+        assert_eq!(pick_node_port(&used, &avoid, None, 20000, RANGE), Some((25555, 25556)));
+    }
+
+    #[test]
+    fn test_node_ports_avoid_entries_outside_the_range_are_harmless() {
+        let none = HashSet::new();
+        let avoid = ports(&[0, 80, 8069, 19999, 30000, 65535]);
+        assert_eq!(pick_node_port(&none, &avoid, None, 20000, RANGE), Some((20000, 20001)));
+        assert_eq!(pick_node_port(&none, &avoid, None, NODE_PORT_MAX, RANGE), Some((NODE_PORT_MAX, NODE_PORT_MIN)));
+        // Ports in use outside the range do not block either.
+        assert_eq!(pick_node_port(&ports(&[80, 30000]), &none, None, 20000, RANGE), Some((20000, 20001)));
+    }
+
+    #[test]
+    fn test_the_node_port_cursor_starts_at_a_random_port_of_the_range() {
+        for _ in 0..1000 {
+            assert!(RANGE.contains(&random_port_in(RANGE)));
+        }
+        // Not one fixed place (1000 draws from 10 000 ports, all equal: no).
+        let draws: HashSet<u16> = (0..1000).map(|_| random_port_in(RANGE)).collect();
+        assert!(draws.len() > 1);
+        // The fallback seed's mapping stays in the range at both ends.
+        for seed in [0u64, 1, 9_999, 10_000, u64::MAX, u64::MAX - 1] {
+            assert!(RANGE.contains(&port_from_seed(seed, RANGE)), "{seed}");
+        }
+        assert_eq!(port_from_seed(0, RANGE), NODE_PORT_MIN);
+        assert_eq!(port_from_seed(9_999, RANGE), NODE_PORT_MAX);
+        // A manager starts its cursor inside the range.
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = mgr_for(dir.path().to_str().unwrap().to_string());
+        assert!(RANGE.contains(&mgr.inner.try_lock().unwrap().node_port_cursor));
     }
 
     // ---- v4 P4: pool specs + matching ----
@@ -3982,6 +6152,7 @@ mod tests {
             image: image.into(),
             image_sha256: None,
             disk_gb,
+            snapshot_valid: false,
         }
     }
 
@@ -4399,6 +6570,23 @@ mod tests {
         )
     }
 
+    /// The record a finished sleep writes: `sleeping` with the snapshot marker.
+    fn sleeper_line(id: &str) -> String {
+        let m = meta_line(id, None, "sleeping");
+        format!("{},\"snapshot_valid\":true}}", &m[..m.len() - 1])
+    }
+
+    /// The disk image of an instance directory.
+    fn disk_image(dir: &str) {
+        std::fs::write(format!("{}/rootfs.ext4", dir), b"parent disk").unwrap();
+    }
+
+    /// Both snapshot files, non-empty, in an instance directory.
+    fn snapshot_files(dir: &str) {
+        std::fs::write(format!("{}/vmstate.bin", dir), b"device state").unwrap();
+        std::fs::write(format!("{}/mem.bin", dir), b"guest memory").unwrap();
+    }
+
     #[tokio::test]
     async fn test_reconcile_takes_over_live_vmms_and_sweeps_what_never_became_a_vm() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4419,7 +6607,8 @@ mod tests {
         std::fs::write(format!("{}/pool-dead/rootfs.ext4", inst), "x").unwrap();
         std::fs::write(format!("{}/vm-run/meta.json", inst), meta_line("vm-run", Some(run.pid()), "running")).unwrap();
         std::fs::write(format!("{}/pool-1/meta.json", inst), meta_line("pool-1", Some(pool.pid()), "pooled")).unwrap();
-        std::fs::write(format!("{}/vm-sleep/meta.json", inst), meta_line("vm-sleep", None, "sleeping")).unwrap();
+        std::fs::write(format!("{}/vm-sleep/meta.json", inst), sleeper_line("vm-sleep")).unwrap();
+        snapshot_files(&format!("{}/vm-sleep", inst));
         std::fs::write(format!("{}/vm-damaged/meta.json", inst), "").unwrap();
         std::fs::write(format!("{}/vm-half/rootfs.ext4", inst), "x").unwrap();
         // vm-gone: an empty directory, nothing running in it.
@@ -4608,22 +6797,84 @@ mod tests {
     /// Stands in for a Firecracker's API socket. Every request is answered 200
     /// with an `InstanceInfo` carrying the current state; `PATCH /vm` changes
     /// that state the way a VMM would. The request lines are kept.
+    ///
+    /// `Behavior` makes it refuse, hold or act on chosen requests (FLU-4).
     struct FakeApi {
         state: Arc<std::sync::Mutex<String>>,
         seen: Arc<std::sync::Mutex<Vec<String>>>,
+        bodies: Arc<std::sync::Mutex<Vec<String>>>,
+        meta_seen: Arc<std::sync::Mutex<Vec<(String, String)>>>,
         task: tokio::task::JoinHandle<()>,
+    }
+
+    /// What a `FakeApi` does besides answering 200.
+    #[derive(Clone, Default)]
+    struct Behavior {
+        /// Requests whose line starts with one of these are answered 400.
+        fail: Vec<&'static str>,
+        /// Requests whose body contains one of these are answered 400 (a
+        /// resume, but not the pause before it: `"Resumed"`).
+        fail_body: Vec<&'static str>,
+        /// A request whose line starts with this is never answered while the
+        /// process `pid` lives (None: never) — a Firecracker busy with it;
+        /// its API goes away with it.
+        hang: Option<(&'static str, Option<i32>)>,
+        /// Answered only after this long.
+        delay: Option<(&'static str, Duration)>,
+        /// `snapshot/create` writes both files it names, as Firecracker does.
+        write_snapshot: bool,
+        /// Read this meta.json at every request and keep (request line, contents).
+        watch_meta: Option<String>,
+        /// The root drive's `path_on_host` that `GET /vm/config` answers
+        /// (what a loaded snapshot names). `PATCH /drives/rootfs` changes it,
+        /// as Firecracker does, unless `keep_drive`.
+        drive: Option<String>,
+        keep_drive: bool,
+        /// Requests whose line starts with one of these are read and then
+        /// left without an answer: the connection is closed, as when the
+        /// reply is lost or the VMM dies before it answers.
+        drop: Vec<&'static str>,
+        /// A request whose line starts with this is held until the process
+        /// whose pid is in this file (once it exists) is gone, and then left
+        /// unanswered: a call to a VMM a wake or a start has just spawned.
+        hang_pidfile: Option<(&'static str, String)>,
+        /// `forking`: the parent's `snapshot/create` answers success and
+        /// writes nothing.
+        writes_nothing: bool,
+        /// The state a refused `PATCH /vm` leaves (the request was refused,
+        /// but the VM did change: no proof of anything).
+        refused_sets: Option<&'static str>,
+    }
+
+    /// Has `pid` exited (gone, or a zombie nobody has reaped yet)?
+    fn proc_gone(pid: i32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{}/stat", pid)) {
+            Ok(stat) => stat.rfind(')').is_some_and(|i| stat[i + 1..].trim_start().starts_with('Z')),
+            Err(_) => true,
+        }
     }
 
     impl FakeApi {
         fn serve(sock: &str, state: &str) -> Self {
+            Self::serve_with(sock, state, Behavior::default())
+        }
+
+        fn serve_with(sock: &str, state: &str, behavior: Behavior) -> Self {
             let listener = tokio::net::UnixListener::bind(sock).expect("bind the fake api socket");
             let state = Arc::new(std::sync::Mutex::new(state.to_string()));
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let (st, sn) = (Arc::clone(&state), Arc::clone(&seen));
+            let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let meta_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            // Unless told otherwise, the root drive is the image beside the
+            // socket: the instance's own `rootfs.ext4`.
+            let own = Path::new(sock).parent().map(|d| d.join("rootfs.ext4").to_string_lossy().into_owned()).unwrap_or_default();
+            let drive = Arc::new(std::sync::Mutex::new(behavior.drive.clone().unwrap_or(own)));
+            let (st, sn, bd, ms) = (Arc::clone(&state), Arc::clone(&seen), Arc::clone(&bodies), Arc::clone(&meta_seen));
             let task = tokio::spawn(async move {
                 loop {
                     let Ok((mut conn, _)) = listener.accept().await else { return };
-                    let (st, sn) = (Arc::clone(&st), Arc::clone(&sn));
+                    let (st, sn, bd, ms, behavior, dr) =
+                        (Arc::clone(&st), Arc::clone(&sn), Arc::clone(&bd), Arc::clone(&ms), behavior.clone(), Arc::clone(&drive));
                     tokio::spawn(async move {
                         use tokio::io::{AsyncReadExt, AsyncWriteExt};
                         // Headers, then as many body bytes as they announce.
@@ -4646,20 +6897,99 @@ mod tests {
                             }
                         };
                         let line = request.lines().next().unwrap_or("").to_string();
-                        if line.starts_with("PATCH /vm") {
-                            if request.contains("Resumed") {
-                                *st.lock().unwrap() = "Running".into();
-                            } else if request.contains("Paused") {
-                                *st.lock().unwrap() = "Paused".into();
+                        // A connection that sends nothing is the agent's
+                        // readiness probe (`wait_api_socket`): not a request.
+                        if line.is_empty() {
+                            return;
+                        }
+                        let body = request.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+                        if let Some(path) = &behavior.watch_meta {
+                            let now = std::fs::read_to_string(path).unwrap_or_default();
+                            ms.lock().unwrap().push((line.clone(), now));
+                        }
+                        sn.lock().unwrap().push(line.clone());
+                        bd.lock().unwrap().push(body.clone());
+                        if let Some((prefix, pid)) = behavior.hang {
+                            if line.starts_with(prefix) {
+                                // Held until the VMM dies; then the connection
+                                // goes away unanswered, as it does when a
+                                // Firecracker is killed in the middle of a call.
+                                loop {
+                                    if pid.is_some_and(proc_gone) {
+                                        return;
+                                    }
+                                    sleep(Duration::from_millis(10)).await;
+                                }
                             }
                         }
-                        sn.lock().unwrap().push(line);
-                        let body = format!(
-                            "{{\"id\":\"t\",\"state\":\"{}\",\"vmm_version\":\"1.16.0\",\"app_name\":\"Firecracker\"}}",
-                            st.lock().unwrap()
-                        );
+                        if behavior.drop.iter().any(|p| line.starts_with(p)) {
+                            return;
+                        }
+                        if let Some((prefix, pidfile)) = &behavior.hang_pidfile {
+                            if line.starts_with(prefix) {
+                                loop {
+                                    let pid = std::fs::read_to_string(pidfile).ok().and_then(|s| s.trim().parse::<i32>().ok());
+                                    if pid.is_some_and(proc_gone) {
+                                        return;
+                                    }
+                                    sleep(Duration::from_millis(10)).await;
+                                }
+                            }
+                        }
+                        if let Some((prefix, d)) = behavior.delay {
+                            if line.starts_with(prefix) {
+                                sleep(d).await;
+                            }
+                        }
+                        let failed = behavior.fail.iter().any(|p| line.starts_with(p))
+                            || behavior.fail_body.iter().any(|b| body.contains(b));
+                        if failed && line.starts_with("PATCH /vm") {
+                            if let Some(to) = behavior.refused_sets {
+                                *st.lock().unwrap() = to.into();
+                            }
+                        }
+                        if !failed {
+                            // A snapshot is loaded paused unless told to resume.
+                            if line.starts_with("PUT /snapshot/load") {
+                                *st.lock().unwrap() = if body.contains("\"resume_vm\":true") { "Running" } else { "Paused" }.into();
+                            }
+                            if line.starts_with("PATCH /vm") {
+                                if request.contains("Resumed") {
+                                    *st.lock().unwrap() = "Running".into();
+                                } else if request.contains("Paused") {
+                                    *st.lock().unwrap() = "Paused".into();
+                                }
+                            }
+                            if behavior.write_snapshot && line.starts_with("PUT /snapshot/create") {
+                                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                                std::fs::write(v["snapshot_path"].as_str().unwrap(), b"device state").unwrap();
+                                std::fs::write(v["mem_file_path"].as_str().unwrap(), b"guest memory").unwrap();
+                            }
+                            if line.starts_with("PATCH /drives/rootfs") && !behavior.keep_drive {
+                                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                                *dr.lock().unwrap() = v["path_on_host"].as_str().unwrap().to_string();
+                            }
+                        }
+                        let (status, body) = if failed {
+                            ("400 Bad Request", "{\"fault_message\":\"refused by the test\"}".to_string())
+                        } else if line.starts_with("GET /vm/config") {
+                            let drive = dr.lock().unwrap().clone();
+                            let drives = serde_json::json!([
+                                { "drive_id": "rootfs", "path_on_host": drive, "is_root_device": true, "is_read_only": false }
+                            ]);
+                            ("200 OK", serde_json::json!({ "drives": drives }).to_string())
+                        } else {
+                            (
+                                "200 OK",
+                                format!(
+                                    "{{\"id\":\"t\",\"state\":\"{}\",\"vmm_version\":\"1.16.0\",\"app_name\":\"Firecracker\"}}",
+                                    st.lock().unwrap()
+                                ),
+                            )
+                        };
                         let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            status,
                             body.len(),
                             body
                         );
@@ -4668,11 +6998,20 @@ mod tests {
                     });
                 }
             });
-            FakeApi { state, seen, task }
+            FakeApi { state, seen, bodies, meta_seen, task }
         }
 
         fn requests(&self) -> Vec<String> {
             self.seen.lock().unwrap().clone()
+        }
+
+        fn bodies(&self) -> Vec<String> {
+            self.bodies.lock().unwrap().clone()
+        }
+
+        /// (request line, meta.json at that moment), for `Behavior::watch_meta`.
+        fn meta_seen(&self) -> Vec<(String, String)> {
+            self.meta_seen.lock().unwrap().clone()
         }
 
         fn state(&self) -> String {
@@ -4710,8 +7049,11 @@ mod tests {
         let mut woke = FakeVmm::spawn(&data_dir, "vm-woke");
         let mut loading = FakeVmm::spawn(&data_dir, "vm-loading");
         let mut started = FakeVmm::spawn(&data_dir, "vm-started");
-        std::fs::write(format!("{}/vm-woke/meta.json", inst), meta_line("vm-woke", None, "sleeping")).unwrap();
-        std::fs::write(format!("{}/vm-loading/meta.json", inst), meta_line("vm-loading", None, "sleeping")).unwrap();
+        std::fs::write(format!("{}/vm-woke/meta.json", inst), sleeper_line("vm-woke")).unwrap();
+        std::fs::write(format!("{}/vm-loading/meta.json", inst), sleeper_line("vm-loading")).unwrap();
+        // FLU-4: a sleeping record keeps its state only with its snapshot.
+        snapshot_files(&format!("{}/vm-woke", inst));
+        snapshot_files(&format!("{}/vm-loading", inst));
         std::fs::write(format!("{}/vm-started/meta.json", inst), meta_line("vm-started", None, "stopped")).unwrap();
         let _woke_api = FakeApi::serve(&format!("{}/vm-woke/fc.sock", inst), "Running");
         let _loading_api = FakeApi::serve(&format!("{}/vm-loading/fc.sock", inst), "Paused");
@@ -4728,10 +7070,18 @@ mod tests {
         assert!(started.alive());
         let on_disk = meta_on_disk(&data_dir, "vm-woke");
         assert_eq!((on_disk.state, on_disk.pid), (VmState::Running, Some(woke.pid())));
+        // FLU-4: the snapshot the guest has run past is no longer valid, and
+        // its state file goes; the memory file stays (the guest runs on it).
+        assert!(!on_disk.snapshot_valid);
+        assert!(!Path::new(&format!("{}/vm-woke/vmstate.bin", inst)).exists());
+        assert!(Path::new(&format!("{}/vm-woke/mem.bin", inst)).exists());
         // Loaded but never resumed: nothing has run since the snapshot, so
         // the state on disk is still current and the VMM is simply removed.
         assert_eq!(record_of(&mgr, "vm-loading").await, Some((VmState::Sleeping, None)));
         assert!(!loading.alive(), "a VMM whose guest never ran must be killed");
+        assert!(meta_on_disk(&data_dir, "vm-loading").snapshot_valid);
+        assert!(Path::new(&format!("{}/vm-loading/vmstate.bin", inst)).exists());
+        assert!(Path::new(&format!("{}/vm-loading/mem.bin", inst)).exists());
     }
 
     #[tokio::test]
@@ -4813,7 +7163,10 @@ mod tests {
         let dir = format!("{}/instances/vm-1", data_dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut vmm = FakeVmm::spawn(&data_dir, "vm-1");
-        let _api = FakeApi::serve(&format!("{}/fc.sock", dir), "Running");
+        // FLU-70: a sleep succeeds only once the snapshot is there and the
+        // disk image could be synced, so both have to exist here.
+        disk_image(&dir);
+        let _api = FakeApi::serve_with(&format!("{}/fc.sock", dir), "Running", Behavior { write_snapshot: true, ..Default::default() });
         let mgr = mgr_for(data_dir.clone());
         mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
 
@@ -4822,6 +7175,24 @@ mod tests {
         // still saying `running`, which nothing could move afterwards.
         // `biased`, watcher first: it looks at the record every time the
         // sleep yields, so it cannot miss that moment.
+        //
+        // FLU-4 changed the order on purpose, and this test with it: the
+        // record goes to disk as `sleeping` with the snapshot marker BEFORE
+        // the VMM is killed. It used to be kill first, write afterwards — and
+        // an agent stopped in between left a complete snapshot under a
+        // `running` record with a dead VMM, which start-up now turns into
+        // `stopped`. A thread watches the VMM and reads meta.json the moment
+        // it sees it die.
+        mgr.write_meta("vm-1").await.unwrap(); // `running`, as before the sleep
+        let (meta_path, vpid) = (format!("{}/meta.json", dir), vmm.pid());
+        let at_death = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !proc_gone(vpid) {
+                assert!(std::time::Instant::now() < deadline, "the VMM was never killed");
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+            std::fs::read_to_string(&meta_path).unwrap()
+        });
         let watcher = Arc::clone(&mgr);
         tokio::select! {
             biased;
@@ -4835,6 +7206,12 @@ mod tests {
             } => {}
             r = mgr.sleep_vm("vm-1") => r.unwrap(),
         }
+        let at_death: Meta = serde_json::from_str(&at_death.join().unwrap()).expect("meta.json when the VMM died");
+        assert_eq!(
+            (at_death.state, at_death.snapshot_valid),
+            (VmState::Sleeping, true),
+            "the record must be on disk, asleep and marked, before the VMM is killed"
+        );
         assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Sleeping, None)));
         // The VMM was told to go in that same step.
         for _ in 0..300 {
@@ -4957,5 +7334,3420 @@ mod tests {
         mgr.flush_unwritten_meta().await;
         assert!(lock_std(&mgr.meta_owed).is_empty());
         assert_eq!(meta_on_disk(&data_dir, "vm-1").state, VmState::Running);
+    }
+
+    // ---- FLU-4: a sandbox is asleep only when its record says so ----
+
+    /// A stand-in `firecracker` for the paths that spawn one (wake, start):
+    /// it links the API socket the test serves at `<sock>.fake` to the path it
+    /// was given, writes its pid to `<sock>.pid`, and lives until it is killed
+    /// — under a command line procscan reads as that instance's Firecracker.
+    /// Written once per test process and left to settle, so that no exec of
+    /// it can meet a descriptor another test thread's fork still holds open
+    /// for writing (ETXTBSY).
+    ///
+    /// It lives beside the test binary — a directory that can certainly
+    /// execute, where the temp dir may be mounted noexec — and is removed when
+    /// the test process exits.
+    fn fake_fc_bin() -> String {
+        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        static BIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        extern "C" fn remove_fake_fc_dir() {
+            if let Some(dir) = DIR.get() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+        BIN.get_or_init(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let exe = std::env::current_exe().expect("the test binary's path");
+            let dir = DIR.get_or_init(|| exe.parent().unwrap().join(format!("felucca-fake-fc-{}", std::process::id())));
+            std::fs::create_dir_all(dir).unwrap();
+            // SAFETY: registers a plain function; it only reads a OnceLock.
+            unsafe {
+                libc::atexit(remove_fake_fc_dir);
+            }
+            let path = dir.join("firecracker");
+            // The socket is linked to `<sock>.fake`, or, when there is none,
+            // to `<instance dir>.fake.sock` beside the instance directory: a
+            // fork creates its child's directory itself, so the child's fake
+            // API has to be bound outside it, before the fork starts. The pid
+            // is written first: a caller that sees the socket may kill the
+            // stand-in at once, and `spawned_pid` must still find it.
+            std::fs::write(
+                &path,
+                "#!/bin/bash\nt=\"$2.fake\"; [ -e \"$t\" ] || t=\"$(dirname \"$2\").fake.sock\"\n\
+                 echo $$ > \"$2.pid\"\nln -sf \"$t\" \"$2\"\n\
+                 exec -a firecracker bash -c 'while :; do sleep 1; done' firecracker --api-sock \"$2\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            path.to_str().unwrap().to_string()
+        })
+        .clone()
+    }
+
+    fn mgr_with_fc(data_dir: String, fc_bin: &str) -> Arc<Manager> {
+        let mut mgr = mgr_for(data_dir);
+        Arc::get_mut(&mut mgr).expect("a fresh manager").fc_bin = fc_bin.to_string();
+        mgr
+    }
+
+    /// The pid the stand-in Firecracker of `dir` wrote, once it has.
+    async fn spawned_pid(dir: &str) -> i32 {
+        for _ in 0..200 {
+            if let Ok(s) = std::fs::read_to_string(format!("{}/fc.sock.pid", dir)) {
+                if let Ok(p) = s.trim().parse() {
+                    return p;
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the stand-in firecracker in {dir} never wrote its pid");
+    }
+
+    async fn gone_soon(pid: i32) -> bool {
+        for _ in 0..200 {
+            if proc_gone(pid) {
+                return true;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    fn sleeping_vm(id: &str) -> Vm {
+        let mut v = running_vm(id, 0);
+        v.state = VmState::Sleeping;
+        v.pid = None;
+        v.snapshot_valid = true;
+        v
+    }
+
+    async fn marker_of(mgr: &Manager, id: &str) -> bool {
+        mgr.inner.lock().await.vms.iter().find(|v| v.id == id).map(|v| v.snapshot_valid).unwrap()
+    }
+
+    fn exists(path: &str) -> bool {
+        std::fs::symlink_metadata(path).is_ok()
+    }
+
+    /// A meta.json that cannot be written: its temp file's name is taken by a
+    /// directory.
+    fn break_meta_writes(dir: &str) {
+        std::fs::create_dir_all(format!("{}/meta.json.tmp", dir)).unwrap();
+    }
+
+    // -- start-up --
+
+    #[tokio::test]
+    async fn test_start_up_writes_what_it_decided_and_removes_snapshots_nothing_can_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let inst = format!("{}/instances", data_dir);
+        for d in ["vm-dead", "vm-asleep", "vm-half", "vm-damaged", "vm-alive"] {
+            std::fs::create_dir_all(format!("{}/{}", inst, d)).unwrap();
+            std::fs::write(format!("{}/{}/rootfs.ext4", inst, d), b"disk").unwrap();
+            snapshot_files(&format!("{}/{}", inst, d));
+            std::fs::write(format!("{}/{}/vmstate.bin.tmp", inst, d), b"half a state").unwrap();
+        }
+        // Rebooted under a running guest that had slept and woken before.
+        std::fs::write(format!("{}/vm-dead/meta.json", inst), meta_line("vm-dead", Some(999_999), "running")).unwrap();
+        // Asleep, properly.
+        std::fs::write(format!("{}/vm-asleep/meta.json", inst), sleeper_line("vm-asleep")).unwrap();
+        // Asleep, but its state file is gone.
+        std::fs::write(format!("{}/vm-half/meta.json", inst), sleeper_line("vm-half")).unwrap();
+        std::fs::remove_file(format!("{}/vm-half/vmstate.bin", inst)).unwrap();
+        // A record that does not load: nothing in its directory is touched.
+        std::fs::write(format!("{}/vm-damaged/meta.json", inst), "{\"id\":\"vm-da").unwrap();
+        // Running, with its VMM, after a wake: the state file goes, the memory
+        // the guest runs on stays.
+        let vmm = FakeVmm::spawn(&data_dir, "vm-alive");
+        let _api = FakeApi::serve(&format!("{}/vm-alive/fc.sock", inst), "Running");
+        std::fs::write(format!("{}/vm-alive/meta.json", inst), meta_line("vm-alive", Some(vmm.pid()), "running")).unwrap();
+
+        let mgr = mgr_for(data_dir.clone());
+        mgr.reconcile().await;
+
+        let on_disk = meta_on_disk(&data_dir, "vm-dead");
+        assert_eq!((on_disk.state, on_disk.pid), (VmState::Stopped, None), "the corrected state is written");
+        for f in ["vmstate.bin", "mem.bin", "vmstate.bin.tmp"] {
+            assert!(!exists(&format!("{}/vm-dead/{}", inst, f)), "vm-dead/{f}");
+        }
+        assert_eq!(record_of(&mgr, "vm-asleep").await, Some((VmState::Sleeping, None)));
+        assert!(meta_on_disk(&data_dir, "vm-asleep").snapshot_valid);
+        assert!(exists(&format!("{}/vm-asleep/vmstate.bin", inst)) && exists(&format!("{}/vm-asleep/mem.bin", inst)));
+        assert!(!exists(&format!("{}/vm-asleep/vmstate.bin.tmp", inst)), "a temp state file is never part of a snapshot");
+        let half = meta_on_disk(&data_dir, "vm-half");
+        assert_eq!((half.state, half.snapshot_valid), (VmState::Stopped, false));
+        assert!(!exists(&format!("{}/vm-half/mem.bin", inst)), "what is left of an incomplete snapshot goes");
+        for f in ["vmstate.bin", "mem.bin", "vmstate.bin.tmp", "meta.json"] {
+            assert!(exists(&format!("{}/vm-damaged/{}", inst, f)), "vm-damaged/{f} must be left alone");
+        }
+        assert_eq!(record_of(&mgr, "vm-alive").await, Some((VmState::Running, Some(vmm.pid()))));
+        assert!(!exists(&format!("{}/vm-alive/vmstate.bin", inst)));
+        assert!(exists(&format!("{}/vm-alive/mem.bin", inst)), "a live guest's memory file must stay");
+    }
+
+    #[tokio::test]
+    async fn test_start_up_changes_no_file_without_the_data_dir_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-dead", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        snapshot_files(&dir);
+        std::fs::write(format!("{}/meta.json", dir), meta_line("vm-dead", Some(999_999), "running")).unwrap();
+
+        let first = mgr_for(data_dir.clone());
+        assert!(first.hold_data_dir_lock());
+        let second = mgr_for(data_dir.clone());
+        second.reconcile().await;
+        assert_eq!(meta_on_disk(&data_dir, "vm-dead").state, VmState::Running, "no record is written");
+        assert!(exists(&format!("{}/vmstate.bin", dir)) && exists(&format!("{}/mem.bin", dir)), "no file is removed");
+        drop(second);
+        drop(first);
+
+        let third = mgr_for(data_dir.clone());
+        third.reconcile().await;
+        assert_eq!(meta_on_disk(&data_dir, "vm-dead").state, VmState::Stopped);
+        assert!(!exists(&format!("{}/vmstate.bin", dir)) && !exists(&format!("{}/mem.bin", dir)));
+    }
+
+    // -- the busy mark --
+
+    #[tokio::test]
+    async fn test_a_second_sleep_waits_for_the_first_and_other_operations_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir); // FLU-70: synced before the sleep is recorded
+        let vmm = FakeVmm::spawn(&data_dir, "vm-1");
+        let api = FakeApi::serve_with(
+            &format!("{}/fc.sock", dir),
+            "Running",
+            Behavior { write_snapshot: true, delay: Some(("PUT /snapshot/create", Duration::from_millis(1500))), ..Default::default() },
+        );
+        let mgr = mgr_for(data_dir.clone());
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
+
+        let first = {
+            let m = Arc::clone(&mgr);
+            tokio::spawn(async move { m.sleep_vm("vm-1").await })
+        };
+        while !mgr.op_in_progress("vm-1") {
+            sleep(Duration::from_millis(5)).await;
+        }
+        // Another kind: refused at once.
+        let t = Instant::now();
+        assert_eq!(mgr.wake_vm("vm-1").await, Err(OpError::Busy));
+        assert_eq!(mgr.pause("vm-1").await, Err(OpError::Busy));
+        assert_eq!(mgr.resume("vm-1").await, Err(OpError::Busy));
+        assert_eq!(mgr.start("vm-1").await, Err(OpError::Busy));
+        assert_eq!(mgr.fork("vm-1", "vm-2", "c").await, Err(BUSY.to_string()));
+        // Well below the 1.5 s the first one takes: a refusal must not wait
+        // (a tighter bound flaked under load).
+        assert!(t.elapsed() < Duration::from_millis(1000), "a refusal must not wait");
+        // The same kind: waits, then answers from what the first one left.
+        assert_eq!(mgr.sleep_vm("vm-1").await, Ok(()));
+        assert_eq!(first.await.unwrap(), Ok(()));
+        assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Sleeping, None)));
+        let creates = api.requests().iter().filter(|l| l.starts_with("PUT /snapshot/create")).count();
+        assert_eq!(creates, 1, "the second sleep must not snapshot again: {:?}", api.requests());
+        assert!(lock_std(&mgr.busy).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_nothing_starts_while_a_vm_is_being_stopped_and_marks_go_with_their_guards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = mgr_for(tmp.path().to_str().unwrap().to_string());
+        let closing = mgr.begin_close("vm-1");
+        assert!(matches!(mgr.begin_op("vm-1", OpKind::Sleep).await, Err(OpError::Busy)));
+        drop(closing);
+        let op = mgr.begin_op("vm-1", OpKind::Sleep).await.expect("free again");
+        assert!(matches!(mgr.begin_op("vm-1", OpKind::Wake).await, Err(OpError::Busy)));
+        // Another sandbox is not affected.
+        drop(mgr.begin_op("vm-2", OpKind::Wake).await.expect("vm-2 is free"));
+        drop(op);
+        assert!(lock_std(&mgr.busy).is_empty(), "no entry outlives its guards");
+    }
+
+    #[tokio::test]
+    async fn test_every_error_path_of_sleep_lets_go_of_the_vm() {
+        for case in ["PATCH /vm", "PUT /snapshot/create", "meta.json", "unknown", "stopped"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().to_str().unwrap().to_string();
+            let dir = format!("{}/instances/vm-1", data_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut vmm = FakeVmm::spawn(&data_dir, "vm-1");
+            let fail = if case.starts_with("P") { vec![case] } else { vec![] };
+            // FLU-70: for the meta.json case to reach the record write, the
+            // snapshot and the disk image must be there.
+            disk_image(&dir);
+            let api = FakeApi::serve_with(&format!("{}/fc.sock", dir), "Running", Behavior { fail, write_snapshot: true, ..Default::default() });
+            let mgr = mgr_for(data_dir.clone());
+            let mut v = running_vm("vm-1", vmm.pid());
+            if case == "stopped" {
+                v.state = VmState::Stopped;
+            }
+            mgr.inner.lock().await.vms.push(v);
+            if case == "meta.json" {
+                break_meta_writes(&dir);
+            }
+            let id = if case == "unknown" { "vm-nope" } else { "vm-1" };
+
+            let r = mgr.sleep_vm(id).await;
+            assert!(r.is_err(), "{case}: {r:?}");
+            assert!(lock_std(&mgr.busy).is_empty(), "{case}: the mark must be released");
+            drop(mgr.begin_op(id, OpKind::Wake).await.unwrap_or_else(|e| panic!("{case}: {e}")));
+            match case {
+                "stopped" => assert!(matches!(r, Err(OpError::InvalidState { state: VmState::Stopped, .. }))),
+                "unknown" => assert_eq!(r, Err(OpError::Other("NotFound".into()))),
+                _ => {
+                    // Nothing committed: the VM runs on, with its VMM.
+                    assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Running, Some(vmm.pid()))), "{case}");
+                    assert!(!marker_of(&mgr, "vm-1").await, "{case}");
+                    assert!(vmm.alive(), "{case}: the VMM must be left alive");
+                    // FLU-70: and the guest is running again. A failed sleep
+                    // used to leave it paused under a `running` record.
+                    assert_eq!(api.state(), "Running", "{case}: {:?}", api.requests());
+                    for f in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
+                        assert!(!exists(&format!("{}/{}", dir, f)), "{case}: {f}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_every_error_path_of_wake_lets_go_of_the_vm_and_leaves_no_vmm() {
+        for case in ["load", "resume", "meta.json", "spawn", "missing", "running"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().to_str().unwrap().to_string();
+            let dir = format!("{}/instances/vm-1", data_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            snapshot_files(&dir);
+            std::fs::write(format!("{}/meta.json", dir), sleeper_line("vm-1")).unwrap();
+            let fail = match case {
+                "load" => vec!["PUT /snapshot/load"],
+                "resume" => vec!["PATCH /vm"],
+                _ => vec![],
+            };
+            let _api = FakeApi::serve_with(&format!("{}/fc.sock.fake", dir), "Not started", Behavior { fail, ..Default::default() });
+            let bin = if case == "spawn" { "/nonexistent/firecracker".to_string() } else { fake_fc_bin() };
+            let mgr = mgr_with_fc(data_dir.clone(), &bin);
+            let mut v = sleeping_vm("vm-1");
+            if case == "running" {
+                v.state = VmState::Running;
+            }
+            mgr.inner.lock().await.vms.push(v);
+            if case == "meta.json" {
+                break_meta_writes(&dir);
+            }
+            if case == "missing" {
+                std::fs::remove_file(format!("{}/mem.bin", dir)).unwrap();
+            }
+
+            let r = mgr.wake_vm("vm-1").await;
+            assert!(lock_std(&mgr.busy).is_empty(), "{case}: the mark must be released");
+            drop(mgr.begin_op("vm-1", OpKind::Sleep).await.unwrap_or_else(|e| panic!("{case}: {e}")));
+            match case {
+                // Idempotent: nothing is spawned.
+                "running" => {
+                    assert_eq!(r, Ok(0));
+                    assert!(!exists(&format!("{}/fc.sock.pid", dir)));
+                }
+                "missing" => {
+                    assert!(matches!(r, Err(OpError::InvalidState { state: VmState::Stopped, .. })), "{r:?}");
+                    assert!(!exists(&format!("{}/fc.sock.pid", dir)), "nothing may be spawned for an incomplete snapshot");
+                }
+                _ => {
+                    assert!(matches!(r, Err(OpError::Other(_))), "{case}: {r:?}");
+                    // Back where it was: asleep, marker as it was, no VMM.
+                    assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Sleeping, None)), "{case}");
+                    assert!(marker_of(&mgr, "vm-1").await, "{case}");
+                    assert!(exists(&format!("{}/vmstate.bin", dir)) && exists(&format!("{}/mem.bin", dir)), "{case}");
+                    let disk = meta_on_disk(&data_dir, "vm-1");
+                    assert_eq!((disk.state, disk.pid, disk.snapshot_valid), (VmState::Sleeping, None, true), "{case}");
+                    if case != "spawn" {
+                        let pid = spawned_pid(&dir).await;
+                        assert!(gone_soon(pid).await, "{case}: the VMM the wake spawned must be gone");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stop_and_delete_end_a_sleep_stuck_in_a_firecracker_call() {
+        for delete in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().to_str().unwrap().to_string();
+            let dir = format!("{}/instances/vm-1", data_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let vmm = FakeVmm::spawn(&data_dir, "vm-1");
+            // snapshot/create is not answered while the VMM lives.
+            let api = FakeApi::serve_with(
+                &format!("{}/fc.sock", dir),
+                "Running",
+                Behavior { hang: Some(("PUT /snapshot/create", Some(vmm.pid()))), ..Default::default() },
+            );
+            // What a snapshot in progress has written so far.
+            snapshot_files(&dir);
+            let mgr = mgr_for(data_dir.clone());
+            mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
+
+            let sleeping = {
+                let m = Arc::clone(&mgr);
+                tokio::spawn(async move { m.sleep_vm("vm-1").await })
+            };
+            while !api.requests().iter().any(|l| l.starts_with("PUT /snapshot/create")) {
+                sleep(Duration::from_millis(5)).await;
+            }
+            let t = Instant::now();
+            if delete {
+                mgr.delete("vm-1").await.unwrap();
+            } else {
+                mgr.stop("vm-1").await.unwrap();
+            }
+            assert!(t.elapsed() < CLOSE_WAIT, "took {:?}", t.elapsed());
+            let r = sleeping.await.unwrap();
+            assert!(matches!(r, Err(OpError::Other(_))), "the sleep must fail, not commit: {r:?}");
+            if delete {
+                assert!(record_of(&mgr, "vm-1").await.is_none());
+                assert!(!Path::new(&dir).exists());
+            } else {
+                assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Stopped, None)));
+                assert!(!marker_of(&mgr, "vm-1").await);
+                let disk = meta_on_disk(&data_dir, "vm-1");
+                assert_eq!((disk.state, disk.snapshot_valid), (VmState::Stopped, false));
+                assert!(!exists(&format!("{}/vmstate.bin", dir)) && !exists(&format!("{}/mem.bin", dir)));
+            }
+            assert!(lock_std(&mgr.busy).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stop_answers_busy_when_the_operation_does_not_let_go() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let vmm = FakeVmm::spawn(&data_dir, "vm-1");
+        // A Firecracker call that never returns, VMM or not.
+        let api = FakeApi::serve_with(
+            &format!("{}/fc.sock", dir),
+            "Running",
+            Behavior { hang: Some(("PUT /snapshot/create", None)), ..Default::default() },
+        );
+        let mgr = mgr_for(data_dir.clone());
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
+        let sleeping = {
+            let m = Arc::clone(&mgr);
+            tokio::spawn(async move { m.sleep_vm("vm-1").await })
+        };
+        while !api.requests().iter().any(|l| l.starts_with("PUT /snapshot/create")) {
+            sleep(Duration::from_millis(5)).await;
+        }
+
+        let t = Instant::now();
+        // FLU-4 S4' changed the answer on purpose: stop has written
+        // `stopped`, so it says so (it used to answer a plain `busy`).
+        assert_eq!(mgr.stop("vm-1").await, Err(OpError::invalid(&VmState::Stopped, STOP_GAVE_UP)));
+        assert!(t.elapsed() >= CLOSE_WAIT && t.elapsed() < CLOSE_WAIT + Duration::from_secs(8), "{:?}", t.elapsed());
+        // The VMM was ended and the record says so, on disk too: a retry finds
+        // a stopped VM.
+        assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Stopped, None)));
+        assert_eq!(meta_on_disk(&data_dir, "vm-1").state, VmState::Stopped);
+        assert_eq!(mgr.delete("vm-1").await, Err(STOP_GAVE_UP.to_string()));
+        assert!(Path::new(&dir).exists(), "nothing may be removed under an operation that holds the VM");
+
+        // The stuck operation goes away (its caller was dropped): the mark
+        // goes with it, and the retry gets through.
+        sleeping.abort();
+        let _ = sleeping.await;
+        assert!(!mgr.op_in_progress("vm-1"));
+        mgr.delete("vm-1").await.unwrap();
+        assert!(!Path::new(&dir).exists());
+        drop(vmm);
+    }
+
+    // -- sleep --
+
+    #[tokio::test]
+    async fn test_a_sleep_whose_record_cannot_be_written_leaves_the_vm_as_it_was() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut vmm = FakeVmm::spawn(&data_dir, "vm-1");
+        disk_image(&dir); // FLU-70: so that the sleep gets as far as the record
+        let api = FakeApi::serve_with(&format!("{}/fc.sock", dir), "Paused", Behavior { write_snapshot: true, ..Default::default() });
+        let mgr = mgr_for(data_dir.clone());
+        let mut v = running_vm("vm-1", vmm.pid());
+        v.state = VmState::Paused;
+        mgr.inner.lock().await.vms.push(v);
+        break_meta_writes(&dir);
+
+        assert!(mgr.sleep_vm("vm-1").await.is_err());
+        assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Paused, Some(vmm.pid()))), "the state it had");
+        assert!(!marker_of(&mgr, "vm-1").await);
+        assert!(vmm.alive(), "a VMM whose sleep was not recorded must not be killed");
+        // FLU-70: the snapshot is undone; a guest that was paused before the
+        // sleep is not resumed by its failure.
+        for f in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
+            assert!(!exists(&format!("{}/{}", dir, f)), "{f}");
+        }
+        assert!(!api.bodies().iter().any(|b| b.contains("Resumed")), "{:?}", api.requests());
+        assert_eq!(api.state(), "Paused");
+    }
+
+    /// A manager whose `/proc` is the directory `proc_root`, in which pid
+    /// 4000 is the Firecracker of `<data_dir>/instances/vm-1` and maps that
+    /// instance's `mem.bin` (a guest that was woken runs on it).
+    fn mgr_with_mapped_mem(data_dir: &str, proc_root: &Path) -> Arc<Manager> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = format!("{}/instances/vm-1", data_dir);
+        let p = proc_root.join("4000");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("cmdline"), format!("firecracker\0--api-sock\0{}/fc.sock\0", dir)).unwrap();
+        let mem = format!("{}/mem.bin", dir);
+        let st = std::fs::metadata(&mem).unwrap();
+        let (ma, mi) = dev_major_minor(st.dev());
+        std::fs::write(
+            p.join("maps"),
+            format!("7f0000000000-7f0010000000 rw-p 00000000 {:02x}:{:02x} {} {}\n", ma, mi, st.ino(), mem),
+        )
+        .unwrap();
+        Manager::with_proc_root(
+            data_dir.to_string(),
+            false,
+            Cidr { base: 0x0AE7_0000, prefix: 24 },
+            0,
+            "http://cp".into(),
+            "tok".into(),
+            proc_root.to_path_buf(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_a_refused_snapshot_create_is_undone_and_the_guest_given_back() {
+        // (record state, a live VMM maps mem.bin)
+        for (was, mapped) in [(VmState::Running, false), (VmState::Paused, false), (VmState::Running, true)] {
+            let what = format!("{was} mapped={mapped}");
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let data_dir = base.join("data").to_str().unwrap().to_string();
+            let dir = format!("{}/instances/vm-1", data_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            disk_image(&dir);
+            // What a create that failed part-way leaves (lab, round 3 E): a
+            // complete-looking state file and a partly written memory file.
+            std::fs::write(format!("{}/vmstate.bin.tmp", dir), b"device state").unwrap();
+            std::fs::write(format!("{}/mem.bin", dir), b"half the memory").unwrap();
+            let api = FakeApi::serve_with(
+                &format!("{}/fc.sock", dir),
+                if was == VmState::Paused { "Paused" } else { "Running" },
+                Behavior { fail: vec!["PUT /snapshot/create"], ..Default::default() },
+            );
+            let mgr = if mapped { mgr_with_mapped_mem(&data_dir, &base.join("proc")) } else { mgr_for(data_dir.clone()) };
+            let mut v = running_vm("vm-1", 4000);
+            v.state = was.clone();
+            mgr.inner.lock().await.vms.push(v);
+
+            let r = mgr.sleep_vm("vm-1").await;
+            assert!(matches!(&r, Err(OpError::Other(m)) if m.contains("snapshot/create")), "{what}: {r:?}");
+            assert!(!exists(&format!("{}/vmstate.bin", dir)), "{what}");
+            assert!(!exists(&format!("{}/vmstate.bin.tmp", dir)), "{what}");
+            // Removed, unless the guest runs on it.
+            assert_eq!(exists(&format!("{}/mem.bin", dir)), mapped, "{what}");
+            // Resumed when this sleep paused it; a paused sandbox stays paused.
+            let resumes = api.bodies().iter().filter(|b| b.contains("Resumed")).count();
+            assert_eq!(resumes, usize::from(was == VmState::Running), "{what}: {:?}", api.requests());
+            assert_eq!(api.state(), if was == VmState::Paused { "Paused" } else { "Running" }, "{what}");
+            // The record does not change, and nothing is written.
+            assert_eq!(record_of(&mgr, "vm-1").await, Some((was.clone(), Some(4000))), "{what}");
+            assert!(!marker_of(&mgr, "vm-1").await, "{what}");
+            assert!(!exists(&format!("{}/meta.json", dir)), "{what}");
+            assert!(lock_std(&mgr.busy).is_empty(), "{what}: the mark must be released");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_sleep_whose_create_and_resume_both_fail_records_paused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        let vmm = FakeVmm::spawn(&data_dir, "vm-1");
+        let _api = FakeApi::serve_with(
+            &format!("{}/fc.sock", dir),
+            "Running",
+            Behavior { fail: vec!["PUT /snapshot/create"], fail_body: vec!["Resumed"], ..Default::default() },
+        );
+        let mgr = mgr_for(data_dir.clone());
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
+
+        assert!(mgr.sleep_vm("vm-1").await.is_err());
+        // The guest is paused and nothing will resume it: the record says so.
+        assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Paused, Some(vmm.pid()))));
+        let disk = meta_on_disk(&data_dir, "vm-1");
+        assert_eq!((disk.state, disk.pid, disk.snapshot_valid), (VmState::Paused, Some(vmm.pid()), false));
+        assert!(lock_std(&mgr.busy).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_sleep_that_fails_after_the_create_is_undone_like_a_failed_create() {
+        for case in ["fsync", "rename", "meta.json"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().to_str().unwrap().to_string();
+            let dir = format!("{}/instances/vm-1", data_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            match case {
+                // No disk image to sync.
+                "fsync" => {}
+                // A non-empty directory is in the way of the state file's name.
+                "rename" => {
+                    disk_image(&dir);
+                    std::fs::create_dir_all(format!("{}/vmstate.bin/x", dir)).unwrap();
+                }
+                _ => {
+                    disk_image(&dir);
+                    break_meta_writes(&dir);
+                }
+            }
+            let mut vmm = FakeVmm::spawn(&data_dir, "vm-1");
+            let api = FakeApi::serve_with(&format!("{}/fc.sock", dir), "Running", Behavior { write_snapshot: true, ..Default::default() });
+            let mgr = mgr_for(data_dir.clone());
+            mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
+
+            let r = mgr.sleep_vm("vm-1").await;
+            assert!(matches!(r, Err(OpError::Other(_))), "{case}: {r:?}");
+            assert!(std::fs::metadata(format!("{}/vmstate.bin", dir)).map(|m| !m.is_file()).unwrap_or(true), "{case}: no state file");
+            assert!(!exists(&format!("{}/vmstate.bin.tmp", dir)), "{case}");
+            assert!(!exists(&format!("{}/mem.bin", dir)), "{case}");
+            assert_eq!(api.state(), "Running", "{case}: the guest must be resumed: {:?}", api.requests());
+            assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Running, Some(vmm.pid()))), "{case}");
+            assert!(!marker_of(&mgr, "vm-1").await, "{case}");
+            assert!(vmm.alive(), "{case}: the VMM must be left alive");
+            assert!(lock_std(&mgr.busy).is_empty(), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_sleep_is_complete_renamed_and_recorded_before_its_vmm_is_killed() {
+        // Observable here: the files and the record at the moment the VMM
+        // dies. Whether the fsyncs happened is not (nothing in a unit test
+        // can tell a synced file from an unsynced one).
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        let vmm = FakeVmm::spawn(&data_dir, "vm-1");
+        let api = FakeApi::serve_with(&format!("{}/fc.sock", dir), "Running", Behavior { write_snapshot: true, ..Default::default() });
+        let mgr = mgr_for(data_dir.clone());
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
+
+        let (d, vpid) = (dir.clone(), vmm.pid());
+        let at_death = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !proc_gone(vpid) {
+                assert!(std::time::Instant::now() < deadline, "the VMM was never killed");
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+            (
+                exists(&format!("{}/vmstate.bin", d)),
+                exists(&format!("{}/vmstate.bin.tmp", d)),
+                std::fs::read_to_string(format!("{}/meta.json", d)).unwrap(),
+            )
+        });
+        mgr.sleep_vm("vm-1").await.unwrap();
+        let (state_file, tmp_file, meta) = at_death.join().unwrap();
+        assert!(state_file && !tmp_file, "renamed before the kill: vmstate.bin {state_file}, .tmp {tmp_file}");
+        let meta: Meta = serde_json::from_str(&meta).unwrap();
+        assert_eq!((meta.state, meta.snapshot_valid), (VmState::Sleeping, true));
+        // Firecracker was told to write the state file under the temp name.
+        let create = api.bodies().into_iter().find(|b| b.contains("snapshot_path")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&create).unwrap();
+        assert_eq!(v["snapshot_path"], serde_json::json!(format!("{}/vmstate.bin.tmp", dir)));
+        assert_eq!(v["mem_file_path"], serde_json::json!(format!("{}/mem.bin", dir)));
+        assert!(exists(&format!("{}/mem.bin", dir)));
+        drop(vmm);
+    }
+
+    // -- wake --
+
+    #[tokio::test]
+    async fn test_wake_is_refused_from_every_state_but_sleeping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = mgr_with_fc(tmp.path().to_str().unwrap().to_string(), "/nonexistent/firecracker");
+        for state in [VmState::Stopped, VmState::Error, VmState::Paused, VmState::Creating, VmState::Pooled] {
+            let mut v = running_vm("vm-1", 4242);
+            v.state = state.clone();
+            mgr.inner.lock().await.vms = vec![v];
+            match mgr.wake_vm("vm-1").await {
+                Err(OpError::InvalidState { state: s, msg }) => {
+                    assert_eq!(s, state);
+                    assert!(msg.starts_with("InvalidState"), "{msg}");
+                }
+                other => panic!("{state}: {other:?}"),
+            }
+            assert_eq!(record_of(&mgr, "vm-1").await.unwrap().0, state, "a refusal changes nothing");
+        }
+        // Already running: success, nothing done.
+        mgr.inner.lock().await.vms = vec![running_vm("vm-1", 4242)];
+        assert_eq!(mgr.wake_vm("vm-1").await, Ok(0));
+        // And sleep's own table.
+        for state in [VmState::Stopped, VmState::Error, VmState::Creating, VmState::Pooled] {
+            let mut v = running_vm("vm-1", 4242);
+            v.state = state.clone();
+            mgr.inner.lock().await.vms = vec![v];
+            assert!(matches!(mgr.sleep_vm("vm-1").await, Err(OpError::InvalidState { state: ref s, .. }) if *s == state));
+        }
+        mgr.inner.lock().await.vms = vec![sleeping_vm("vm-1")];
+        assert_eq!(mgr.sleep_vm("vm-1").await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn test_wake_checks_both_snapshot_files_before_it_spawns_anything() {
+        for case in ["no vmstate", "no mem", "empty vmstate", "empty mem", "unreadable vmstate"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().to_str().unwrap().to_string();
+            let dir = format!("{}/instances/vm-1", data_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            snapshot_files(&dir);
+            std::fs::write(format!("{}/meta.json", dir), sleeper_line("vm-1")).unwrap();
+            let (vmstate, mem) = (format!("{}/vmstate.bin", dir), format!("{}/mem.bin", dir));
+            match case {
+                "no vmstate" => std::fs::remove_file(&vmstate).unwrap(),
+                "no mem" => std::fs::remove_file(&mem).unwrap(),
+                "empty vmstate" => std::fs::write(&vmstate, b"").unwrap(),
+                "empty mem" => std::fs::write(&mem, b"").unwrap(),
+                _ => {
+                    std::fs::remove_file(&vmstate).unwrap();
+                    std::os::unix::fs::symlink("vmstate.bin", &vmstate).unwrap(); // ELOOP
+                }
+            }
+            // A spawn would fail loudly with this binary.
+            let mgr = mgr_with_fc(data_dir.clone(), "/nonexistent/firecracker");
+            mgr.inner.lock().await.vms.push(sleeping_vm("vm-1"));
+
+            let r = mgr.wake_vm("vm-1").await;
+            if case == "unreadable vmstate" {
+                // Could not look: 500, and nothing changes.
+                assert!(matches!(&r, Err(OpError::Other(m)) if m.starts_with("cannot examine")), "{r:?}");
+                assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Sleeping, None)));
+                assert!(marker_of(&mgr, "vm-1").await);
+                assert!(exists(&vmstate) && exists(&mem));
+                assert!(meta_on_disk(&data_dir, "vm-1").snapshot_valid);
+            } else {
+                assert!(matches!(r, Err(OpError::InvalidState { state: VmState::Stopped, .. })), "{case}: {r:?}");
+                assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Stopped, None)), "{case}");
+                let disk = meta_on_disk(&data_dir, "vm-1");
+                assert_eq!((disk.state, disk.snapshot_valid), (VmState::Stopped, false), "{case}");
+                assert!(!exists(&vmstate) && !exists(&mem), "{case}: the rest of the snapshot goes");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_wake_writes_running_before_the_guest_resumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        snapshot_files(&dir);
+        std::fs::write(format!("{}/meta.json", dir), sleeper_line("vm-1")).unwrap();
+        let api = FakeApi::serve_with(
+            &format!("{}/fc.sock.fake", dir),
+            "Not started",
+            Behavior { watch_meta: Some(format!("{}/meta.json", dir)), ..Default::default() },
+        );
+        let mgr = mgr_with_fc(data_dir.clone(), &fake_fc_bin());
+        mgr.inner.lock().await.vms.push(sleeping_vm("vm-1"));
+
+        mgr.wake_vm("vm-1").await.unwrap();
+        let pid = spawned_pid(&dir).await;
+
+        let lines = api.requests();
+        let load = lines.iter().position(|l| l.starts_with("PUT /snapshot/load")).expect("a load");
+        let resume = lines.iter().position(|l| l.starts_with("PATCH /vm")).expect("a resume");
+        assert!(load < resume, "{lines:?}");
+        assert!(api.bodies()[load].contains("\"resume_vm\":false"), "loaded paused: {}", api.bodies()[load]);
+        assert!(api.bodies()[resume].contains("Resumed"));
+        // What meta.json said when the resume reached the VMM.
+        let (_, at_resume) = api.meta_seen().into_iter().find(|(l, _)| l.starts_with("PATCH /vm")).unwrap();
+        let at_resume: Meta = serde_json::from_str(&at_resume).expect("meta.json at the resume");
+        assert_eq!((at_resume.state, at_resume.pid, at_resume.snapshot_valid), (VmState::Running, Some(pid), false));
+        // Afterwards: running on the new VMM, the state file gone, the memory kept.
+        assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Running, Some(pid))));
+        assert!(!marker_of(&mgr, "vm-1").await);
+        assert!(!exists(&format!("{}/vmstate.bin", dir)));
+        assert!(exists(&format!("{}/mem.bin", dir)), "the guest runs on mem.bin");
+
+        // And a stop ends that VMM.
+        mgr.stop("vm-1").await.unwrap();
+        assert!(gone_soon(pid).await);
+    }
+
+    // -- review fixes (FLU-4) --
+
+    /// A sleeping `vm-1` with its snapshot, its disk image and its record on
+    /// disk, under a manager whose Firecracker is `fc_bin`; the API of the
+    /// VMM a wake or start spawns is served with `behavior`.
+    async fn asleep(marker: bool, behavior: Behavior, fc_bin: &str) -> (tempfile::TempDir, String, String, Arc<Manager>, FakeApi) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        snapshot_files(&dir);
+        let line = if marker { sleeper_line("vm-1") } else { meta_line("vm-1", None, "sleeping") };
+        std::fs::write(format!("{}/meta.json", dir), line).unwrap();
+        let api = FakeApi::serve_with(&format!("{}/fc.sock.fake", dir), "Not started", behavior);
+        let mgr = mgr_with_fc(data_dir.clone(), fc_bin);
+        let mut v = sleeping_vm("vm-1");
+        v.snapshot_valid = marker;
+        mgr.inner.lock().await.vms.push(v);
+        (tmp, data_dir, dir, mgr, api)
+    }
+
+    fn set_mtime(path: &str, t: std::time::SystemTime) {
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(t).unwrap();
+    }
+
+    /// The disk image of `dir` made newer (`later`) or older than its state file.
+    fn disk_vs_snapshot(dir: &str, image: &str, later: bool) {
+        let t0 = std::fs::metadata(format!("{}/vmstate.bin", dir)).unwrap().modified().unwrap();
+        let t = if later { t0 + Duration::from_secs(5) } else { t0 - Duration::from_secs(5) };
+        set_mtime(image, t);
+    }
+
+    fn set_aside(dir: &str) -> bool {
+        !exists(&format!("{}/vmstate.bin", dir))
+            && !exists(&format!("{}/mem.bin", dir))
+            && read(&format!("{}/vmstate.bin.outrun", dir)) == "device state"
+            && read(&format!("{}/mem.bin.outrun", dir)) == "guest memory"
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_resume_goes_back_to_sleep_only_on_proof_that_the_guest_did_not_run() {
+        for case in ["refused, still paused", "refused, but running", "no answer"] {
+            let behavior = match case {
+                "refused, still paused" => Behavior { fail: vec!["PATCH /vm"], ..Default::default() },
+                "refused, but running" => Behavior { fail: vec!["PATCH /vm"], refused_sets: Some("Running"), ..Default::default() },
+                _ => Behavior { drop: vec!["PATCH /vm"], ..Default::default() },
+            };
+            let (_tmp, data_dir, dir, mgr, _api) = asleep(true, behavior, &fake_fc_bin()).await;
+
+            let r = mgr.wake_vm("vm-1").await;
+            let pid = spawned_pid(&dir).await;
+            assert!(gone_soon(pid).await, "{case}: the VMM the wake spawned must be gone");
+            assert!(lock_std(&mgr.busy).is_empty(), "{case}");
+            if case == "refused, still paused" {
+                // Firecracker answered, and the VM never left `Paused`.
+                assert!(matches!(r, Err(OpError::Other(_))), "{case}: {r:?}");
+                assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Sleeping, None)), "{case}");
+                assert!(marker_of(&mgr, "vm-1").await, "{case}");
+                let disk = meta_on_disk(&data_dir, "vm-1");
+                assert_eq!((disk.state, disk.snapshot_valid), (VmState::Sleeping, true), "{case}");
+                assert!(exists(&format!("{}/vmstate.bin", dir)) && exists(&format!("{}/mem.bin", dir)), "{case}");
+            } else {
+                // The guest may have run: never woken from this snapshot again.
+                assert!(matches!(r, Err(OpError::InvalidState { state: VmState::Stopped, .. })), "{case}: {r:?}");
+                assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Stopped, None)), "{case}");
+                let disk = meta_on_disk(&data_dir, "vm-1");
+                assert_eq!((disk.state, disk.pid, disk.snapshot_valid), (VmState::Stopped, None, false), "{case}");
+                assert!(set_aside(&dir), "{case}: the snapshot is set aside, not removed");
+                // start and stop clear what was set aside.
+                if case == "no answer" {
+                    mgr.start("vm-1").await.unwrap();
+                    let started = record_of(&mgr, "vm-1").await.unwrap().1.unwrap();
+                    assert!(!exists(&format!("{}/vmstate.bin.outrun", dir)) && !exists(&format!("{}/mem.bin.outrun", dir)));
+                    mgr.stop("vm-1").await.unwrap();
+                    assert!(gone_soon(started).await);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_vmm_that_dies_under_a_wake_leaves_the_record_to_the_wake() {
+        // The VMM dies after the commit and before the resume answers: the
+        // exit reaper used to record `error` first, and the wake answered 500
+        // with its snapshot under that `error`.
+        let (_tmp, data_dir, dir, mgr, _api) =
+            asleep(true, Behavior { delay: Some(("PATCH /vm", Duration::from_millis(400))), ..Default::default() }, &fake_fc_bin())
+                .await;
+        let waking = {
+            let m = Arc::clone(&mgr);
+            tokio::spawn(async move { m.wake_vm("vm-1").await })
+        };
+        let pid = spawned_pid(&dir).await;
+        while record_of(&mgr, "vm-1").await.map(|r| r.0) != Some(VmState::Running) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        kill_and_reap(pid);
+        // The reaper has run by now: it left the record alone.
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Running, Some(pid))));
+        // The resume is answered (the stand-in API outlives the VMM), and
+        // the wake goes on; the next sweep finds the VMM dead.
+        let _ = waking.await.unwrap();
+        mgr.sweep_dead().await;
+        assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Error, None)));
+        assert_eq!(meta_on_disk(&data_dir, "vm-1").state, VmState::Error);
+    }
+
+    #[tokio::test]
+    async fn test_wake_judges_a_record_without_the_marker_before_it_spawns_anything() {
+        for later in [true, false] {
+            let (_tmp, data_dir, dir, mgr, _api) = asleep(false, Behavior::default(), &fake_fc_bin()).await;
+            disk_vs_snapshot(&dir, &format!("{}/rootfs.ext4", dir), later);
+
+            let r = mgr.wake_vm("vm-1").await;
+            if later {
+                assert!(matches!(&r, Err(OpError::InvalidState { state: VmState::Stopped, msg }) if msg.contains("rootfs.ext4")), "{r:?}");
+                assert!(!exists(&format!("{}/fc.sock.pid", dir)), "nothing may be spawned for a stale snapshot");
+                assert_eq!(meta_on_disk(&data_dir, "vm-1").state, VmState::Stopped);
+                assert!(set_aside(&dir));
+            } else {
+                assert!(r.is_ok(), "{r:?}");
+                let pid = spawned_pid(&dir).await;
+                assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Running, Some(pid))));
+                mgr.stop("vm-1").await.unwrap();
+                assert!(gone_soon(pid).await);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_wake_on_another_image_goes_on_only_while_that_image_is_unchanged() {
+        for later in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let image = format!("{}/parents-rootfs.ext4", tmp.path().to_str().unwrap());
+            std::fs::write(&image, b"the parent's disk").unwrap();
+            let behavior = Behavior { drive: Some(image.clone()), ..Default::default() };
+            let (_tmp, data_dir, dir, mgr, api) = asleep(true, behavior, &fake_fc_bin()).await;
+            disk_vs_snapshot(&dir, &image, later);
+
+            let r = mgr.wake_vm("vm-1").await;
+            let pid = spawned_pid(&dir).await;
+            // Asked after the load, before anything was committed or resumed.
+            let lines = api.requests();
+            let (load, config) = (
+                lines.iter().position(|l| l.starts_with("PUT /snapshot/load")).unwrap(),
+                lines.iter().position(|l| l.starts_with("GET /vm/config")).expect("the drive is asked for"),
+            );
+            assert!(load < config, "{lines:?}");
+            if later {
+                // Changed on purpose (fix list item 6): no path in the
+                // answer; the image is in the log.
+                assert!(matches!(&r, Err(OpError::InvalidState { state: VmState::Stopped, msg }) if msg == WAKE_REFUSED_FORKED_BEFORE), "{r:?}");
+                assert!(gone_soon(pid).await);
+                assert!(!api.bodies().iter().any(|b| b.contains("Resumed")), "never resumed: {lines:?}");
+                assert_eq!(meta_on_disk(&data_dir, "vm-1").state, VmState::Stopped);
+                assert!(set_aside(&dir));
+            } else {
+                assert!(r.is_ok(), "{r:?}");
+                assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Running, Some(pid))));
+                mgr.stop("vm-1").await.unwrap();
+                assert!(gone_soon(pid).await);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_start_up_sets_an_outrun_snapshot_aside_and_keeps_it_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-old", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        snapshot_files(&dir);
+        // An older agent's sleeper whose guest ran after its snapshot.
+        std::fs::write(format!("{}/meta.json", dir), meta_line("vm-old", None, "sleeping")).unwrap();
+        disk_vs_snapshot(&dir, &format!("{}/rootfs.ext4", dir), true);
+
+        let mgr = mgr_for(data_dir.clone());
+        mgr.reconcile().await;
+        assert_eq!(meta_on_disk(&data_dir, "vm-old").state, VmState::Stopped);
+        assert!(set_aside(&dir), "set aside, not removed");
+        drop(mgr);
+        // The next start-up does not remove them either.
+        let again = mgr_for(data_dir.clone());
+        again.reconcile().await;
+        assert!(set_aside(&dir), "start-up leaves what was set aside");
+        // stop does.
+        again.stop("vm-old").await.unwrap();
+        assert!(!exists(&format!("{}/vmstate.bin.outrun", dir)) && !exists(&format!("{}/mem.bin.outrun", dir)));
+    }
+
+    #[tokio::test]
+    async fn test_start_up_leaves_a_sleeper_it_cannot_judge_but_removes_its_temp_state_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-q", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        std::fs::write(format!("{}/mem.bin", dir), b"guest memory").unwrap();
+        std::fs::write(format!("{}/vmstate.bin.tmp", dir), b"half a state").unwrap();
+        // stat fails with ELOOP: "cannot tell".
+        std::os::unix::fs::symlink("vmstate.bin", format!("{}/vmstate.bin", dir)).unwrap();
+        let line = meta_line("vm-q", None, "sleeping");
+        std::fs::write(format!("{}/meta.json", dir), &line).unwrap();
+
+        let mgr = mgr_for(data_dir.clone());
+        mgr.reconcile().await;
+        assert_eq!(record_of(&mgr, "vm-q").await, Some((VmState::Sleeping, None)));
+        assert_eq!(read(&format!("{}/meta.json", dir)), line, "nothing is written");
+        assert!(exists(&format!("{}/vmstate.bin", dir)) && exists(&format!("{}/mem.bin", dir)), "nothing is removed");
+        assert!(!exists(&format!("{}/vmstate.bin.tmp", dir)), "a temporary state file is never a snapshot (S9)");
+    }
+
+    #[tokio::test]
+    async fn test_stop_ends_a_vmm_no_record_names_yet() {
+        // A wake whose load never answers: the new VMM is not in the record,
+        // and only its death ends the call the wake waits in.
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = format!("{}/instances/vm-1/fc.sock.pid", tmp.path().to_str().unwrap());
+        let behavior = Behavior { hang_pidfile: Some(("PUT /snapshot/load", pidfile)), ..Default::default() };
+        let (_tmp, data_dir, dir, mgr, api) = {
+            // `asleep` makes its own temp dir: build the same in `tmp`.
+            let data_dir = tmp.path().to_str().unwrap().to_string();
+            let dir = format!("{}/instances/vm-1", data_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            disk_image(&dir);
+            snapshot_files(&dir);
+            std::fs::write(format!("{}/meta.json", dir), sleeper_line("vm-1")).unwrap();
+            let api = FakeApi::serve_with(&format!("{}/fc.sock.fake", dir), "Not started", behavior);
+            let mgr = mgr_with_fc(data_dir.clone(), &fake_fc_bin());
+            mgr.inner.lock().await.vms.push(sleeping_vm("vm-1"));
+            (tmp, data_dir, dir, mgr, api)
+        };
+        let waking = {
+            let m = Arc::clone(&mgr);
+            tokio::spawn(async move { m.wake_vm("vm-1").await })
+        };
+        while !api.requests().iter().any(|l| l.starts_with("PUT /snapshot/load")) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        let pid = spawned_pid(&dir).await;
+        let t = Instant::now();
+        mgr.stop("vm-1").await.unwrap();
+        assert!(t.elapsed() < CLOSE_WAIT, "took {:?}", t.elapsed());
+        assert!(gone_soon(pid).await, "the VMM the wake spawned must be killed");
+        assert!(waking.await.unwrap().is_err());
+        assert_eq!(meta_on_disk(&data_dir, "vm-1").state, VmState::Stopped);
+        mgr.delete("vm-1").await.unwrap();
+        assert!(!exists(&dir));
+    }
+
+    #[tokio::test]
+    async fn test_a_late_firecracker_answer_after_a_stop_commits_nothing() {
+        for op in ["sleep", "wake", "start"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().to_str().unwrap().to_string();
+            let dir = format!("{}/instances/vm-1", data_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            disk_image(&dir);
+            let late = |what| Some((what, Duration::from_millis(600)));
+            let mgr = mgr_with_fc(data_dir.clone(), &fake_fc_bin());
+            let mut vmm = None;
+            let api = match op {
+                "sleep" => {
+                    let fake = FakeVmm::spawn(&data_dir, "vm-1");
+                    mgr.inner.lock().await.vms.push(running_vm("vm-1", fake.pid()));
+                    vmm = Some(fake);
+                    let b = Behavior { write_snapshot: true, delay: late("PUT /snapshot/create"), ..Default::default() };
+                    FakeApi::serve_with(&format!("{}/fc.sock", dir), "Running", b)
+                }
+                "wake" => {
+                    snapshot_files(&dir);
+                    std::fs::write(format!("{}/meta.json", dir), sleeper_line("vm-1")).unwrap();
+                    mgr.inner.lock().await.vms.push(sleeping_vm("vm-1"));
+                    let b = Behavior { delay: late("PUT /snapshot/load"), ..Default::default() };
+                    FakeApi::serve_with(&format!("{}/fc.sock.fake", dir), "Not started", b)
+                }
+                _ => {
+                    let mut v = running_vm("vm-1", 0);
+                    v.state = VmState::Stopped;
+                    v.pid = None;
+                    mgr.inner.lock().await.vms.push(v);
+                    let b = Behavior { delay: late("PUT /actions"), ..Default::default() };
+                    FakeApi::serve_with(&format!("{}/fc.sock.fake", dir), "Not started", b)
+                }
+            };
+            let running = {
+                let m = Arc::clone(&mgr);
+                let op = op.to_string();
+                tokio::spawn(async move {
+                    match op.as_str() {
+                        "sleep" => m.sleep_vm("vm-1").await,
+                        "wake" => m.wake_vm("vm-1").await.map(|_| ()),
+                        _ => m.start("vm-1").await,
+                    }
+                })
+            };
+            let call = match op {
+                "sleep" => "PUT /snapshot/create",
+                "wake" => "PUT /snapshot/load",
+                _ => "PUT /actions",
+            };
+            while !api.requests().iter().any(|l| l.starts_with(call)) {
+                sleep(Duration::from_millis(5)).await;
+            }
+            mgr.stop("vm-1").await.unwrap();
+            let r = running.await.unwrap();
+            assert!(matches!(&r, Err(OpError::Other(m)) if m.starts_with("Aborted")), "{op}: {r:?}");
+            assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Stopped, None)), "{op}");
+            let disk = meta_on_disk(&data_dir, "vm-1");
+            assert_eq!((disk.state, disk.pid, disk.snapshot_valid), (VmState::Stopped, None, false), "{op}");
+            for f in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
+                assert!(!exists(&format!("{}/{}", dir, f)), "{op}: {f}");
+            }
+            if op == "sleep" {
+                assert!(!vmm.as_mut().unwrap().alive(), "{op}");
+            } else {
+                let pid = spawned_pid(&dir).await;
+                assert!(gone_soon(pid).await, "{op}: the VMM it spawned must be gone");
+            }
+            assert!(lock_std(&mgr.busy).is_empty(), "{op}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_sleep_overtaken_by_a_stop_before_its_kill_step_does_not_answer_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        let vmm = FakeVmm::spawn(&data_dir, "vm-1");
+        let _api = FakeApi::serve_with(&format!("{}/fc.sock", dir), "Running", Behavior { write_snapshot: true, ..Default::default() });
+        let mgr = mgr_for(data_dir.clone());
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
+
+        // The sleep commits `sleeping` and then waits for the meta.json lock.
+        let writing = mgr.meta_write_lock.lock().await;
+        let sleeping = {
+            let m = Arc::clone(&mgr);
+            tokio::spawn(async move { m.sleep_vm("vm-1").await })
+        };
+        while record_of(&mgr, "vm-1").await.map(|r| r.0) != Some(VmState::Sleeping) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        // A stop takes the record meanwhile.
+        let stopping = {
+            let m = Arc::clone(&mgr);
+            tokio::spawn(async move { m.stop("vm-1").await })
+        };
+        while record_of(&mgr, "vm-1").await.map(|r| r.0) != Some(VmState::Stopped) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        drop(writing);
+        let r = sleeping.await.unwrap();
+        assert!(matches!(&r, Err(OpError::Other(m)) if m.starts_with("Aborted")), "{r:?}");
+        stopping.await.unwrap().unwrap();
+        assert_eq!(meta_on_disk(&data_dir, "vm-1").state, VmState::Stopped);
+        for f in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
+            assert!(!exists(&format!("{}/{}", dir, f)), "{f}");
+        }
+        drop(vmm);
+    }
+
+    #[tokio::test]
+    async fn test_a_sleep_whose_record_write_failed_owes_the_reverted_record() {
+        // Another writer settles the failed write's claim on the owed list
+        // between the failure and the revert (here: the test, standing in for
+        // the liveness flush).
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        let vmm = FakeVmm::spawn(&data_dir, "vm-1");
+        let _api = FakeApi::serve_with(&format!("{}/fc.sock", dir), "Running", Behavior { write_snapshot: true, ..Default::default() });
+        let mgr = mgr_for(data_dir.clone());
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
+        break_meta_writes(&dir);
+
+        let writing = mgr.meta_write_lock.lock().await;
+        let sleeping = {
+            let m = Arc::clone(&mgr);
+            tokio::spawn(async move { m.sleep_vm("vm-1").await })
+        };
+        while record_of(&mgr, "vm-1").await.map(|r| r.0) != Some(VmState::Sleeping) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        // Single-threaded runtime: from here the order is fixed. The sleep
+        // gets the write lock and waits for `inner` (held here)...
+        let held = mgr.inner.lock().await;
+        drop(writing);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        // ...takes it for its snapshot of the record, fails to write, and
+        // waits for `inner` again to revert — behind this second hold.
+        drop(held);
+        let held = mgr.inner.lock().await;
+        assert!(lock_std(&mgr.meta_owed).contains("vm-1"), "the failed write is owed");
+        lock_std(&mgr.meta_owed).remove("vm-1");
+        drop(held);
+        assert!(sleeping.await.unwrap().is_err());
+        assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Running, Some(vmm.pid()))));
+        assert!(lock_std(&mgr.meta_owed).contains("vm-1"), "the reverted record must be owed to meta.json");
+    }
+
+    #[tokio::test]
+    async fn test_a_same_kind_wait_is_bounded_and_answers_from_what_the_first_left() {
+        // Below the control plane's 30 s call timeout (S4').
+        assert!(SAME_OP_LIMIT < Duration::from_secs(30));
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = mgr_with_fc(tmp.path().to_str().unwrap().to_string(), "/nonexistent/firecracker");
+        // Bounded: then busy.
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", 4242));
+        let held = mgr.begin_op("vm-1", OpKind::Sleep).await.unwrap();
+        let t = Instant::now();
+        assert_eq!(mgr.sleep_vm("vm-1").await, Err(OpError::Busy));
+        assert!(t.elapsed() >= SAME_OP_WAIT, "{:?}", t.elapsed());
+        drop(held);
+        // Wake and start wait for the first one, then answer from its result.
+        for kind in [OpKind::Wake, OpKind::Start] {
+            let mut v = sleeping_vm("vm-1");
+            if kind == OpKind::Start {
+                v.state = VmState::Stopped;
+            }
+            mgr.inner.lock().await.vms = vec![v];
+            let held = mgr.begin_op("vm-1", kind).await.unwrap();
+            let second = {
+                let m = Arc::clone(&mgr);
+                tokio::spawn(async move {
+                    if kind == OpKind::Wake { m.wake_vm("vm-1").await.map(|_| ()) } else { m.start("vm-1").await }
+                })
+            };
+            sleep(Duration::from_millis(200)).await;
+            assert!(!second.is_finished(), "{kind:?}: the second one waits");
+            mgr.inner.lock().await.vms[0].state = VmState::Running;
+            drop(held);
+            assert_eq!(second.await.unwrap(), Ok(()), "{kind:?}: already running");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_never_waits_for_its_parent() {
+        let f = forking(VmState::Running, Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+        let held = f.mgr.begin_fork("vm-1").unwrap();
+        let t = Instant::now();
+        assert_eq!(f.mgr.fork("vm-1", "vm-2", "c").await, Err(BUSY.to_string()));
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        assert!(record_of(&f.mgr, "vm-2").await.is_none(), "nothing reserved");
+        assert!(!exists(&f.child_dir));
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn test_forks_of_a_sleeping_parent_share_it_and_everything_else_waits_or_is_refused() {
+        let f = forking(VmState::Sleeping, Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+        // Another fork of the sleeping parent reads its files right now.
+        let mut other = f.mgr.begin_fork("vm-1").unwrap();
+        other.share();
+        // This one joins it.
+        f.mgr.fork("vm-1", "vm-2", "c").await.unwrap();
+        let child_pid = spawned_pid(&f.child_dir).await;
+        // To anything else the parent is busy.
+        assert_eq!(f.mgr.wake_vm("vm-1").await, Err(OpError::Busy));
+        assert_eq!(f.mgr.sleep_vm("vm-1").await, Err(OpError::Busy));
+        assert_eq!(f.mgr.start("vm-1").await, Err(OpError::Busy));
+        // A stop cannot pre-empt a file copy: it waits, and gives up saying
+        // what it did.
+        assert_eq!(f.mgr.stop("vm-1").await, Err(OpError::invalid(&VmState::Stopped, STOP_GAVE_UP)));
+        drop(other);
+        assert!(lock_std(&f.mgr.busy).is_empty());
+        f.mgr.stop("vm-2").await.unwrap();
+        assert!(gone_soon(child_pid).await);
+    }
+
+    #[tokio::test]
+    async fn test_a_stop_of_the_child_pre_empts_its_fork() {
+        let f = forking_with(
+            VmState::Running,
+            |_, child_dir| {
+                let pidfile = format!("{}/fc.sock.pid", child_dir);
+                (Behavior::default(), Behavior { hang_pidfile: Some(("PUT /snapshot/load", pidfile)), ..Default::default() })
+            },
+            &fake_fc_bin(),
+        )
+        .await;
+        let forked = {
+            let m = Arc::clone(&f.mgr);
+            tokio::spawn(async move { m.fork("vm-1", "vm-2", "c").await })
+        };
+        while !f.child_api.requests().iter().any(|l| l.starts_with("PUT /snapshot/load")) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        let child_pid = spawned_pid(&f.child_dir).await;
+        let t = Instant::now();
+        f.mgr.stop("vm-2").await.unwrap();
+        assert!(t.elapsed() < CLOSE_WAIT, "took {:?}", t.elapsed());
+        assert!(gone_soon(child_pid).await, "the child's VMM must be killed");
+        let r = tokio::time::timeout(Duration::from_secs(10), forked).await.expect("the fork must end").unwrap();
+        assert!(r.is_err(), "{r:?}");
+        // The reservation was the fork's: nothing of the child is left
+        // (FLU-70 E2; the record used to stay as the stop's `stopped`).
+        assert!(record_of(&f.mgr, "vm-2").await.is_none());
+        assert!(!exists(&f.child_dir));
+        assert!(lock_std(&f.mgr.busy).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_expose_of_a_sleeping_sandbox_keeps_its_marker_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        std::fs::create_dir_all(format!("{}/instances/vm-1", data_dir)).unwrap();
+        let mgr = mgr_for(data_dir.clone());
+        let mut v = sleeping_vm("vm-1");
+        v.ip = Some("10.231.0.2".into());
+        mgr.inner.lock().await.vms.push(v);
+        mgr.expose("vm-1", 8080, &HashSet::new(), None).await.unwrap();
+        let disk = meta_on_disk(&data_dir, "vm-1");
+        assert_eq!((disk.state, disk.snapshot_valid, disk.exposes.len()), (VmState::Sleeping, true, 1));
+        mgr.unexpose("vm-1", 8080).await.unwrap();
+        assert!(meta_on_disk(&data_dir, "vm-1").snapshot_valid);
+    }
+
+    // -- review fixes (FLU-70) --
+
+    /// Networking "on" for a fork: the rule stand-in, a slot allocator, and
+    /// the free slots before anything happened.
+    fn netted(f: &mut Forking) -> (Arc<super::rule_fake::FakeRules>, Vec<u32>) {
+        let rules = super::rule_fake::install(&mut f.mgr);
+        let free = rules.free_slots();
+        (rules, free)
+    }
+
+    /// The fork gave back what it claimed: every slot free that was, and the
+    /// tap of each slot it pinned removed again.
+    fn gave_back(rules: &super::rule_fake::FakeRules, free: &[u32], what: &str) {
+        use super::rule_fake::RuleCall;
+        assert_eq!(rules.free_slots(), free, "{what}: the child's slot must be free again");
+        let calls = rules.calls();
+        for c in &calls {
+            if let RuleCall::PinTap { tap } = c {
+                assert!(
+                    calls.iter().any(|r| matches!(r, RuleCall::RemoveTap { tap: t, .. } if t == tap)),
+                    "{what}: the tap {tap} must be removed: {calls:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_refuses_a_parent_that_is_not_a_guest_before_it_reserves_anything() {
+        for state in [VmState::Pooled, VmState::Creating, VmState::Stopped, VmState::Error] {
+            let f = forking(VmState::Running, Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+            f.mgr.inner.lock().await.vms[0].state = state.clone();
+            let r = f.mgr.fork("vm-1", "vm-2", "c").await;
+            assert!(matches!(&r, Err(e) if e.starts_with("InvalidState") && e.contains(state.as_str())), "{state}: {r:?}");
+            assert!(record_of(&f.mgr, "vm-2").await.is_none(), "{state}");
+            assert!(!exists(&f.child_dir), "{state}");
+            assert!(f.parent_api.as_ref().unwrap().requests().is_empty(), "{state}: {:?}", f.parent_api.as_ref().unwrap().requests());
+            assert!(lock_std(&f.mgr.busy).is_empty(), "{state}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_without_a_free_slot_never_pauses_its_parent() {
+        let mut f = forking(VmState::Running, Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+        let (_rules, _) = netted(&mut f);
+        {
+            let mut g = f.mgr.inner.lock().await;
+            let a = g.allocator.as_mut().unwrap();
+            while a.claim().is_some() {}
+        }
+        assert_eq!(f.mgr.fork("vm-1", "vm-2", "c").await, Err("IpPoolExhausted".to_string()));
+        assert!(f.parent_api.as_ref().unwrap().requests().is_empty(), "{:?}", f.parent_api.as_ref().unwrap().requests());
+        assert!(record_of(&f.mgr, "vm-2").await.is_none());
+        assert!(!exists(&f.child_dir));
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_is_refused_while_start_up_could_not_settle_the_ingress_chain() {
+        // FLU-8 B: the kernel may still hold the previous run's node-port
+        // rules for addresses no sandbox holds now; none is handed out.
+        let mut f = forking(VmState::Running, Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+        let (rules, free) = netted(&mut f);
+        f.mgr.inner.lock().await.slots_withheld = true;
+        assert_eq!(f.mgr.fork("vm-1", "vm-2", "c").await, Err("IsolationFailed".to_string()));
+        assert!(f.parent_api.as_ref().unwrap().requests().is_empty(), "{:?}", f.parent_api.as_ref().unwrap().requests());
+        assert!(record_of(&f.mgr, "vm-2").await.is_none());
+        assert_eq!(rules.free_slots(), free, "no slot was taken");
+        // A successful ingress rebuild ends it.
+        assert!(f.mgr.refresh_ingress().await);
+        assert!(!f.mgr.inner.lock().await.slots_withheld);
+    }
+
+    #[tokio::test]
+    async fn test_every_failure_of_a_fork_gives_back_the_slot_and_the_tap() {
+        for case in ["tap", "load", "socket", "rename", "child resume"] {
+            let parent = if case == "rename" { Behavior { writes_nothing: true, ..Default::default() } } else { Behavior::default() };
+            let child = match case {
+                "load" => Behavior { fail: vec!["PUT /snapshot/load"], ..Default::default() },
+                "child resume" => Behavior { fail_body: vec!["Resumed"], ..Default::default() },
+                _ => Behavior::default(),
+            };
+            // A Firecracker that never makes its socket.
+            let bin = if case == "socket" { "/bin/true".to_string() } else { fake_fc_bin() };
+            let mut f = forking(VmState::Running, parent, child, &bin).await;
+            let (rules, free) = netted(&mut f);
+            if case == "tap" {
+                rules.fail_pin.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let r = f.mgr.fork("vm-1", "vm-2", "c").await;
+            assert!(r.is_err(), "{case}: {r:?}");
+            gave_back(&rules, &free, case);
+            match case {
+                // Before the child had a VMM: nothing of it is left.
+                "rename" => {
+                    assert!(record_of(&f.mgr, "vm-2").await.is_none(), "{case}");
+                    assert!(!exists(&f.child_dir), "{case}");
+                }
+                _ => {
+                    assert_eq!(record_of(&f.mgr, "vm-2").await, Some((VmState::Error, None)), "{case}");
+                    let ip = f.mgr.inner.lock().await.vms.iter().find(|v| v.id == "vm-2").unwrap().ip.clone();
+                    assert_eq!(ip, None, "{case}: the error record holds no address");
+                    for name in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
+                        assert!(!exists(&format!("{}/{}", f.child_dir, name)), "{case}: {name}");
+                    }
+                }
+            }
+            // The parent runs on.
+            assert_eq!(f.parent_api.as_ref().unwrap().state(), "Running", "{case}");
+            assert!(lock_std(&f.mgr.busy).is_empty(), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_whose_child_record_cannot_be_written_leaves_an_error_record_and_no_vmm() {
+        let f = forking(
+            VmState::Running,
+            Behavior::default(),
+            Behavior { delay: Some(("PATCH /drives/rootfs", Duration::from_millis(300))), ..Default::default() },
+            &fake_fc_bin(),
+        )
+        .await;
+        let forked = {
+            let m = Arc::clone(&f.mgr);
+            tokio::spawn(async move { m.fork("vm-1", "vm-2", "c").await })
+        };
+        while !f.child_api.requests().iter().any(|l| l.starts_with("PATCH /drives/rootfs")) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        break_meta_writes(&f.child_dir);
+        assert!(forked.await.unwrap().is_err());
+        let pid = spawned_pid(&f.child_dir).await;
+        assert!(gone_soon(pid).await);
+        assert_eq!(record_of(&f.mgr, "vm-2").await, Some((VmState::Error, None)));
+        assert!(!f.child_api.bodies().iter().any(|b| b.contains("Resumed")), "never resumed");
+        assert!(!exists(&format!("{}/mem.bin", f.child_dir)));
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_whose_child_is_stopped_before_its_commit_leaves_nothing() {
+        let mut f = forking(
+            VmState::Running,
+            Behavior::default(),
+            Behavior { delay: Some(("GET /vm/config", Duration::from_millis(600))), ..Default::default() },
+            &fake_fc_bin(),
+        )
+        .await;
+        let (rules, free) = netted(&mut f);
+        let forked = {
+            let m = Arc::clone(&f.mgr);
+            tokio::spawn(async move { m.fork("vm-1", "vm-2", "c").await })
+        };
+        while !f.child_api.requests().iter().any(|l| l.starts_with("GET /vm/config")) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        let pid = spawned_pid(&f.child_dir).await;
+        f.mgr.stop("vm-2").await.unwrap();
+        let r = forked.await.unwrap();
+        assert!(matches!(&r, Err(e) if e.starts_with("Aborted")), "{r:?}");
+        assert!(gone_soon(pid).await);
+        assert!(record_of(&f.mgr, "vm-2").await.is_none(), "the reservation was the fork's: it goes");
+        assert!(!exists(&f.child_dir));
+        gave_back(&rules, &free, "stopped before the commit");
+        assert!(lock_std(&f.mgr.busy).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_sleep_gives_the_guest_back_before_it_deals_with_mem_bin() {
+        // What the snapshot left, at the moment the resume reaches the VMM.
+        for (watch, want) in [("vmstate.bin.tmp", ""), ("mem.bin", "half the memory")] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().to_str().unwrap().to_string();
+            let dir = format!("{}/instances/vm-1", data_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            disk_image(&dir);
+            std::fs::write(format!("{}/vmstate.bin.tmp", dir), b"device state").unwrap();
+            std::fs::write(format!("{}/mem.bin", dir), b"half the memory").unwrap();
+            let api = FakeApi::serve_with(
+                &format!("{}/fc.sock", dir),
+                "Running",
+                Behavior { fail: vec!["PUT /snapshot/create"], watch_meta: Some(format!("{}/{}", dir, watch)), ..Default::default() },
+            );
+            let mgr = mgr_for(data_dir.clone());
+            mgr.inner.lock().await.vms.push(running_vm("vm-1", 4000));
+            assert!(mgr.sleep_vm("vm-1").await.is_err());
+            let seen = api.meta_seen();
+            let resume = seen.iter().rposition(|(l, _)| l.starts_with("PATCH /vm")).unwrap();
+            assert_eq!(seen[resume].1, want, "{watch} at the resume");
+            assert!(!exists(&format!("{}/mem.bin", dir)), "and mem.bin goes after it");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_parent_whose_vmm_dies_during_a_fork_loses_its_snapshot_files_too() {
+        // Its VMM dies while it writes the child's snapshot. The fork fails;
+        // the record of the parent is settled by the next sweep, and with it
+        // a mem.bin from an earlier wake (S8).
+        let f = forking(VmState::Running, Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+        drop(f.parent_api);
+        let _ = std::fs::remove_file(format!("{}/fc.sock", f.parent_dir));
+        let vmm_pid = f.vmm.as_ref().unwrap().pid();
+        let api = FakeApi::serve_with(
+            &format!("{}/fc.sock", f.parent_dir),
+            "Running",
+            Behavior { hang: Some(("PUT /snapshot/create", Some(vmm_pid))), ..Default::default() },
+        );
+        std::fs::write(format!("{}/mem.bin", f.parent_dir), b"woken from").unwrap();
+        let forked = {
+            let m = Arc::clone(&f.mgr);
+            tokio::spawn(async move { m.fork("vm-1", "vm-2", "c").await })
+        };
+        while !api.requests().iter().any(|l| l.starts_with("PUT /snapshot/create")) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        drop(f.vmm);
+        assert!(forked.await.unwrap().is_err());
+        assert!(record_of(&f.mgr, "vm-2").await.is_none());
+        f.mgr.sweep_dead().await;
+        assert_eq!(record_of(&f.mgr, "vm-1").await, Some((VmState::Error, None)));
+        assert!(!exists(&format!("{}/mem.bin", f.parent_dir)));
+    }
+
+    #[tokio::test]
+    async fn test_a_sleep_that_outlives_a_stop_removes_its_own_snapshot() {
+        // The stop gives up (the create is answered only after its limit),
+        // so the files the late create wrote are the sleep's alone to remove.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        let vmm = FakeVmm::spawn(&data_dir, "vm-1");
+        let api = FakeApi::serve_with(
+            &format!("{}/fc.sock", dir),
+            "Running",
+            Behavior { write_snapshot: true, delay: Some(("PUT /snapshot/create", CLOSE_WAIT + Duration::from_millis(800))), ..Default::default() },
+        );
+        let mgr = mgr_for(data_dir.clone());
+        mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
+        let sleeping = {
+            let m = Arc::clone(&mgr);
+            tokio::spawn(async move { m.sleep_vm("vm-1").await })
+        };
+        while !api.requests().iter().any(|l| l.starts_with("PUT /snapshot/create")) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(mgr.stop("vm-1").await, Err(OpError::invalid(&VmState::Stopped, STOP_GAVE_UP)));
+        let r = sleeping.await.unwrap();
+        assert!(matches!(&r, Err(OpError::Other(m)) if m.starts_with("Aborted")), "{r:?}");
+        for f in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
+            assert!(!exists(&format!("{}/{}", dir, f)), "{f} beside a stopped record");
+        }
+        drop(vmm);
+    }
+
+    // -- review fixes (FLU-72) --
+
+    /// An image beside the test's instances, as a sandbox forked before this
+    /// release runs on (its own parent's).
+    fn foreign_image(f: &Forking) -> String {
+        let image = format!("{}/grandparent-rootfs.ext4", f.data_dir);
+        std::fs::write(&image, b"the grandparent's disk").unwrap();
+        image
+    }
+
+    #[tokio::test]
+    async fn test_a_parent_that_runs_on_another_image_is_refused_before_its_pause() {
+        let image = std::env::temp_dir().join(format!("felucca-r5-foreign-{}.ext4", std::process::id()));
+        std::fs::write(&image, b"x").unwrap();
+        let image = image.to_str().unwrap().to_string();
+        let f = forking(VmState::Running, Behavior { drive: Some(image.clone()), ..Default::default() }, Behavior::default(), &fake_fc_bin()).await;
+        let r = f.mgr.fork_answer("vm-1", "vm-2", "c").await;
+        let _ = std::fs::remove_file(&image);
+        // Changed on purpose (fix list item 6): the answer reaches the tenant
+        // word for word, so it names no path; the log has the image.
+        assert_eq!(
+            r,
+            Err(OpError::InvalidState { msg: FORK_REFUSED_FORKED_BEFORE.into(), state: VmState::Running })
+        );
+        let api = f.parent_api.as_ref().unwrap();
+        assert!(!api.requests().iter().any(|l| l.starts_with("PATCH /vm") || l.starts_with("PUT /snapshot")), "{:?}", api.requests());
+        assert!(record_of(&f.mgr, "vm-2").await.is_none());
+        assert!(!exists(&f.child_dir));
+        assert!(lock_std(&f.mgr.busy).is_empty());
+    }
+
+    /// No process whose command line names `dir` is alive (zombies aside).
+    fn no_process_in(dir: &str) -> bool {
+        for _ in 0..200 {
+            let mut found = false;
+            for e in std::fs::read_dir("/proc").unwrap().flatten() {
+                let p = e.path();
+                let cmd = std::fs::read(p.join("cmdline")).unwrap_or_default();
+                let stat = std::fs::read_to_string(p.join("stat")).unwrap_or_default();
+                if String::from_utf8_lossy(&cmd).contains(dir) && stat.split_whitespace().nth(2) != Some("Z") {
+                    found = true;
+                }
+            }
+            if !found {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn test_a_child_whose_snapshot_names_another_image_than_its_parents_is_never_started() {
+        for state in [VmState::Running, VmState::Paused, VmState::Sleeping] {
+            // The child's loaded state names an image that is not the
+            // parent's own rootfs.ext4.
+            let mut f = forking(state.clone(), Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+            let image = foreign_image(&f);
+            drop(std::mem::replace(
+                &mut f.child_api,
+                {
+                    let _ = std::fs::remove_file(format!("{}.fake.sock", f.child_dir));
+                    FakeApi::serve_with(&format!("{}.fake.sock", f.child_dir), "Not started", Behavior { drive: Some(image.clone()), ..Default::default() })
+                },
+            ));
+            let (rules, free) = netted(&mut f);
+            let r = f.mgr.fork_answer("vm-1", "vm-2", "c").await;
+            // Changed on purpose (items 6, 7): a 409 refusal with the
+            // parent's state for every parent state — the sleeping parent's
+            // used to be a 500 — and no path in it.
+            assert_eq!(
+                r,
+                Err(OpError::InvalidState { msg: FORK_REFUSED_FORKED_BEFORE.into(), state: state.clone() }),
+                "{state}"
+            );
+            let lines = f.child_api.requests();
+            assert!(!lines.iter().any(|l| l.starts_with("PATCH")), "{state}: neither re-pointed nor resumed: {lines:?}");
+            // Changed on purpose (Z1): a refused fork leaves NOTHING — the
+            // control plane forgets the id on a 409, so the `error` record
+            // and its directory (a full disk copy) were never deleted.
+            assert!(no_process_in(&f.child_dir), "{state}: the child's VMM is still running");
+            assert_eq!(record_of(&f.mgr, "vm-2").await, None, "{state}");
+            assert!(!exists(&f.child_dir), "{state}: the child's directory is left");
+            gave_back(&rules, &free, &format!("{state}"));
+            // The parent is as it was: asleep and valid, or running, or paused.
+            assert_eq!(record_of(&f.mgr, "vm-1").await.unwrap().0, state, "{state}");
+            if state == VmState::Sleeping {
+                assert!(marker_of(&f.mgr, "vm-1").await, "the parent's snapshot stays valid");
+            }
+        }
+        // The same file under another spelling of its path is the same file.
+        let mut f = forking(VmState::Running, Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+        let spelled = format!("{}/./rootfs.ext4", f.parent_dir);
+        drop(std::mem::replace(&mut f.child_api, {
+            let _ = std::fs::remove_file(format!("{}.fake.sock", f.child_dir));
+            FakeApi::serve_with(&format!("{}.fake.sock", f.child_dir), "Not started", Behavior { drive: Some(spelled), ..Default::default() })
+        }));
+        f.mgr.fork("vm-1", "vm-2", "c").await.unwrap();
+        let pid = spawned_pid(&f.child_dir).await;
+        f.mgr.stop("vm-2").await.unwrap();
+        assert!(gone_soon(pid).await);
+    }
+
+    #[tokio::test]
+    async fn test_a_sleep_syncs_the_image_its_firecracker_reports() {
+        for case in ["another image", "a missing image"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().to_str().unwrap().to_string();
+            let dir = format!("{}/instances/vm-1", data_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            // No rootfs.ext4 of its own: only the reported image can be synced.
+            let image = format!("{}/parents-rootfs.ext4", data_dir);
+            if case == "another image" {
+                std::fs::write(&image, b"the parent's disk").unwrap();
+            }
+            let vmm = FakeVmm::spawn(&data_dir, "vm-1");
+            let api = FakeApi::serve_with(
+                &format!("{}/fc.sock", dir),
+                "Running",
+                Behavior { write_snapshot: true, drive: Some(image.clone()), ..Default::default() },
+            );
+            let mgr = mgr_for(data_dir.clone());
+            mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
+            let r = mgr.sleep_vm("vm-1").await;
+            let first = api.requests().first().cloned().unwrap_or_default();
+            assert!(first.starts_with("GET /vm/config"), "{case}: asked before the pause: {:?}", api.requests());
+            if case == "another image" {
+                assert_eq!(r, Ok(()), "{case}");
+                assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Sleeping, None)));
+            } else {
+                assert!(matches!(&r, Err(OpError::Other(m)) if m.contains(&image)), "{case}: {r:?}");
+                assert_eq!(api.state(), "Running", "{case}: undone");
+            }
+            drop(vmm);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_stop_of_the_parent_ends_the_copy_of_its_disk() {
+        // A disk image that cannot be read to the end (a FIFO nobody
+        // writes): the copy inside the pause never finishes by itself.
+        let f = forking(VmState::Running, Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+        let rootfs = format!("{}/rootfs.ext4", f.parent_dir);
+        std::fs::remove_file(&rootfs).unwrap();
+        let c = std::ffi::CString::new(rootfs.clone()).unwrap();
+        // SAFETY: a plain mkfifo(3) on a path we own.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let forked = {
+            let m = Arc::clone(&f.mgr);
+            tokio::spawn(async move { m.fork("vm-1", "vm-2", "c").await })
+        };
+        let api = f.parent_api.as_ref().unwrap();
+        while !api.requests().iter().any(|l| l.starts_with("PUT /snapshot/create")) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        sleep(Duration::from_millis(100)).await;
+        f.mgr.stop("vm-1").await.unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(10), forked).await.expect("the copy must be ended").unwrap();
+        assert!(matches!(&r, Err(e) if e.contains("being stopped or deleted")), "{r:?}");
+        assert!(record_of(&f.mgr, "vm-2").await.is_none());
+        assert!(!exists(&f.child_dir));
+        assert!(lock_std(&f.mgr.busy).is_empty());
+    }
+
+    // -- fork (FLU-70) --
+
+    /// A parent `vm-1` in `state` with its disk image, under a manager whose
+    /// Firecracker is the stand-in. A running or paused parent has a VMM and
+    /// an API that writes the snapshot it is asked for (`parent` adds to
+    /// that); a sleeping one has its snapshot and its record on disk. The
+    /// child `vm-2`'s API is bound beside its (not yet existing) directory.
+    struct Forking {
+        _tmp: tempfile::TempDir,
+        data_dir: String,
+        parent_dir: String,
+        child_dir: String,
+        mgr: Arc<Manager>,
+        vmm: Option<FakeVmm>,
+        parent_api: Option<FakeApi>,
+        child_api: FakeApi,
+    }
+
+    async fn forking(state: VmState, parent: Behavior, child: Behavior, fc_bin: &str) -> Forking {
+        forking_with(state, |_, _| (parent, child), fc_bin).await
+    }
+
+    /// `forking`, with the parent's and the child's behaviours made from the
+    /// parent's and the child's directories.
+    async fn forking_with(
+        state: VmState,
+        behaviors: impl FnOnce(&str, &str) -> (Behavior, Behavior),
+        fc_bin: &str,
+    ) -> Forking {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let parent_dir = format!("{}/instances/vm-1", data_dir);
+        let child_dir = format!("{}/instances/vm-2", data_dir);
+        let (parent, child) = behaviors(&parent_dir, &child_dir);
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        disk_image(&parent_dir);
+        // A loaded snapshot names the parent's disk image (FLU-72).
+        let child = Behavior { drive: child.drive.clone().or_else(|| Some(format!("{}/rootfs.ext4", parent_dir))), ..child };
+        let child_api = FakeApi::serve_with(&format!("{}.fake.sock", child_dir), "Not started", child);
+        let mgr = mgr_with_fc(data_dir.clone(), fc_bin);
+        let (vmm, parent_api) = if state == VmState::Sleeping {
+            snapshot_files(&parent_dir);
+            std::fs::write(format!("{}/meta.json", parent_dir), sleeper_line("vm-1")).unwrap();
+            mgr.inner.lock().await.vms.push(sleeping_vm("vm-1"));
+            (None, None)
+        } else {
+            let vmm = FakeVmm::spawn(&data_dir, "vm-1");
+            let initial = if state == VmState::Paused { "Paused" } else { "Running" };
+            let api = FakeApi::serve_with(
+                &format!("{}/fc.sock", parent_dir),
+                initial,
+                Behavior { write_snapshot: !parent.writes_nothing, ..parent },
+            );
+            let mut v = running_vm("vm-1", vmm.pid());
+            v.state = state;
+            mgr.inner.lock().await.vms.push(v);
+            (Some(vmm), Some(api))
+        };
+        Forking { _tmp: tmp, data_dir, parent_dir, child_dir, mgr, vmm, parent_api, child_api }
+    }
+
+    fn read(path: &str) -> String {
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_onto_a_taken_id_writes_nothing() {
+        // vm-2 is a sandbox; or a claimed pool VM lives in a directory vm-2.
+        for owner in ["vm-2", "vm-claimed"] {
+            let f = forking(VmState::Running, Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+            std::fs::create_dir_all(&f.child_dir).unwrap();
+            std::fs::write(format!("{}/rootfs.ext4", f.child_dir), b"their disk").unwrap();
+            std::fs::write(format!("{}/mem.bin", f.child_dir), b"their memory").unwrap();
+            std::fs::write(format!("{}/meta.json", f.child_dir), meta_line(owner, None, "stopped")).unwrap();
+            let mut theirs = running_vm(owner, 0);
+            theirs.state = VmState::Stopped;
+            theirs.pid = None;
+            theirs.dir_id = "vm-2".into();
+            f.mgr.inner.lock().await.vms.push(theirs);
+
+            assert_eq!(f.mgr.fork("vm-1", "vm-2", "c").await, Err("AlreadyExists".to_string()), "{owner}");
+            assert_eq!(read(&format!("{}/rootfs.ext4", f.child_dir)), "their disk", "{owner}");
+            assert_eq!(read(&format!("{}/mem.bin", f.child_dir)), "their memory", "{owner}");
+            assert_eq!(read(&format!("{}/meta.json", f.child_dir)), meta_line(owner, None, "stopped"), "{owner}");
+            assert!(!exists(&format!("{}/vmstate.bin", f.child_dir)), "{owner}");
+            // Refused before the parent was even paused.
+            assert!(f.parent_api.as_ref().unwrap().requests().is_empty(), "{owner}");
+            assert_eq!(f.mgr.inner.lock().await.vms.len(), 2, "{owner}: no record was added");
+            assert!(lock_std(&f.mgr.busy).is_empty(), "{owner}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_into_a_directory_no_record_owns_leaves_it_alone() {
+        let f = forking(VmState::Running, Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+        // A VM whose meta.json did not load at start-up.
+        std::fs::create_dir_all(&f.child_dir).unwrap();
+        std::fs::write(format!("{}/meta.json", f.child_dir), "{\"id\":\"vm-2").unwrap();
+        std::fs::write(format!("{}/rootfs.ext4", f.child_dir), b"their disk").unwrap();
+
+        assert_eq!(f.mgr.fork("vm-1", "vm-2", "c").await, Err("AlreadyExists".to_string()));
+        assert_eq!(read(&format!("{}/meta.json", f.child_dir)), "{\"id\":\"vm-2");
+        assert_eq!(read(&format!("{}/rootfs.ext4", f.child_dir)), "their disk");
+        let names: Vec<_> = std::fs::read_dir(&f.child_dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names.len(), 2, "nothing added: {names:?}");
+        assert!(record_of(&f.mgr, "vm-2").await.is_none(), "the reserved record is gone again");
+        assert!(f.parent_api.as_ref().unwrap().requests().is_empty());
+        assert!(lock_std(&f.mgr.busy).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_writes_the_snapshot_into_the_childs_directory() {
+        for state in [VmState::Running, VmState::Paused] {
+            let f = forking(state.clone(), Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+            f.mgr.fork("vm-1", "vm-2", "c").await.unwrap_or_else(|e| panic!("{state}: {e}"));
+            let child_pid = spawned_pid(&f.child_dir).await;
+            let api = f.parent_api.as_ref().unwrap();
+
+            let create = api.bodies().into_iter().find(|b| b.contains("snapshot_path")).expect("a create");
+            let v: serde_json::Value = serde_json::from_str(&create).unwrap();
+            assert_eq!(v["snapshot_path"], serde_json::json!(format!("{}/vmstate.bin.tmp", f.child_dir)), "{state}");
+            assert_eq!(v["mem_file_path"], serde_json::json!(format!("{}/mem.bin", f.child_dir)), "{state}");
+            for name in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
+                assert!(!exists(&format!("{}/{}", f.parent_dir, name)), "{state}: the parent's directory gets no {name}");
+            }
+            // Paused and resumed only by the fork that paused it.
+            let pauses = api.bodies().iter().filter(|b| b.contains("\"Paused\"")).count();
+            let resumes = api.bodies().iter().filter(|b| b.contains("Resumed")).count();
+            let by_fork = usize::from(state == VmState::Running);
+            assert_eq!((pauses, resumes), (by_fork, by_fork), "{state}: {:?}", api.requests());
+            assert_eq!(record_of(&f.mgr, "vm-1").await.unwrap().0, state);
+
+            // The child loaded its own files; its state file is gone after.
+            let load = f.child_api.bodies().into_iter().find(|b| b.contains("mem_backend")).expect("a load");
+            let v: serde_json::Value = serde_json::from_str(&load).unwrap();
+            assert_eq!(v["snapshot_path"], serde_json::json!(format!("{}/vmstate.bin", f.child_dir)));
+            assert_eq!(v["mem_backend"]["backend_path"], serde_json::json!(format!("{}/mem.bin", f.child_dir)));
+            assert!(!exists(&format!("{}/vmstate.bin", f.child_dir)), "{state}");
+            assert!(!exists(&format!("{}/vmstate.bin.tmp", f.child_dir)), "{state}");
+            assert_eq!(read(&format!("{}/mem.bin", f.child_dir)), "guest memory");
+            assert_eq!(read(&format!("{}/rootfs.ext4", f.child_dir)), "parent disk");
+            assert_eq!(record_of(&f.mgr, "vm-2").await, Some((VmState::Running, Some(child_pid))), "{state}");
+            assert_eq!(meta_on_disk(&f.data_dir, "vm-2").state, VmState::Running);
+            assert!(lock_std(&f.mgr.busy).is_empty());
+            f.mgr.stop("vm-2").await.unwrap();
+            assert!(gone_soon(child_pid).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_of_a_sleeping_parent_copies_its_snapshot_and_leaves_it_asleep() {
+        let f = forking(VmState::Sleeping, Behavior::default(), Behavior::default(), &fake_fc_bin()).await;
+        f.mgr.fork("vm-1", "vm-2", "c").await.unwrap();
+        let child_pid = spawned_pid(&f.child_dir).await;
+
+        assert_eq!(read(&format!("{}/vmstate.bin", f.parent_dir)), "device state");
+        assert_eq!(read(&format!("{}/mem.bin", f.parent_dir)), "guest memory");
+        assert_eq!(read(&format!("{}/rootfs.ext4", f.parent_dir)), "parent disk");
+        assert_eq!(record_of(&f.mgr, "vm-1").await, Some((VmState::Sleeping, None)));
+        assert!(marker_of(&f.mgr, "vm-1").await);
+        let disk = meta_on_disk(&f.data_dir, "vm-1");
+        assert_eq!((disk.state, disk.snapshot_valid), (VmState::Sleeping, true));
+
+        assert!(!exists(&format!("{}/vmstate.bin", f.child_dir)), "the child's state file goes after its load");
+        assert_eq!(read(&format!("{}/mem.bin", f.child_dir)), "guest memory");
+        assert_eq!(read(&format!("{}/rootfs.ext4", f.child_dir)), "parent disk");
+        assert_eq!(record_of(&f.mgr, "vm-2").await, Some((VmState::Running, Some(child_pid))));
+        assert!(lock_std(&f.mgr.busy).is_empty());
+        f.mgr.stop("vm-2").await.unwrap();
+        assert!(gone_soon(child_pid).await);
+    }
+
+    #[tokio::test]
+    async fn test_every_failure_of_a_fork_ends_as_specified() {
+        let cases = [
+            "pause", "create", "create paused", "parent resume", "copy", "sleeping copy", "spawn", "load",
+        ];
+        for case in cases {
+            let state = match case {
+                "create paused" => VmState::Paused,
+                "sleeping copy" => VmState::Sleeping,
+                _ => VmState::Running,
+            };
+            let parent = match case {
+                "pause" => Behavior { fail: vec!["PATCH /vm"], ..Default::default() },
+                "create" | "create paused" => Behavior { fail: vec!["PUT /snapshot/create"], ..Default::default() },
+                "parent resume" => Behavior { fail_body: vec!["Resumed"], ..Default::default() },
+                _ => Behavior::default(),
+            };
+            let child = if case == "load" { Behavior { fail: vec!["PUT /snapshot/load"], ..Default::default() } } else { Behavior::default() };
+            let bin = if case == "spawn" { "/nonexistent/firecracker".to_string() } else { fake_fc_bin() };
+            let f = forking(state.clone(), parent, child, &bin).await;
+            match case {
+                "copy" => std::fs::remove_file(format!("{}/rootfs.ext4", f.parent_dir)).unwrap(),
+                "sleeping copy" => std::fs::remove_file(format!("{}/mem.bin", f.parent_dir)).unwrap(),
+                _ => {}
+            }
+
+            let r = f.mgr.fork("vm-1", "vm-2", "c").await;
+            assert!(r.is_err(), "{case}: {r:?}");
+            assert!(lock_std(&f.mgr.busy).is_empty(), "{case}: the mark must be released");
+            match case {
+                "spawn" | "load" => {
+                    // The child had (or was about to get) a VMM: it stays, as
+                    // `error`, without snapshot files and without a VMM.
+                    assert_eq!(record_of(&f.mgr, "vm-2").await, Some((VmState::Error, None)), "{case}");
+                    for name in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
+                        assert!(!exists(&format!("{}/{}", f.child_dir, name)), "{case}: {name}");
+                    }
+                    if case == "load" {
+                        let pid = spawned_pid(&f.child_dir).await;
+                        assert!(gone_soon(pid).await, "{case}: the child's VMM must be gone");
+                    }
+                }
+                _ => {
+                    // Before the child had a VMM: nothing of it is left.
+                    assert!(record_of(&f.mgr, "vm-2").await.is_none(), "{case}");
+                    assert!(!exists(&f.child_dir), "{case}: the child's directory must be gone");
+                }
+            }
+            // The parent: given back as it was, or `paused` when that failed.
+            match case {
+                "sleeping copy" => {
+                    assert_eq!(record_of(&f.mgr, "vm-1").await, Some((VmState::Sleeping, None)), "{case}");
+                    assert!(exists(&format!("{}/vmstate.bin", f.parent_dir)), "{case}");
+                }
+                "parent resume" => {
+                    let pid = f.vmm.as_ref().unwrap().pid();
+                    assert_eq!(record_of(&f.mgr, "vm-1").await, Some((VmState::Paused, Some(pid))), "{case}");
+                    assert_eq!(meta_on_disk(&f.data_dir, "vm-1").state, VmState::Paused, "{case}");
+                }
+                _ => {
+                    let api = f.parent_api.as_ref().unwrap();
+                    assert_eq!(record_of(&f.mgr, "vm-1").await.unwrap().0, state, "{case}");
+                    let want = if state == VmState::Paused { "Paused" } else { "Running" };
+                    assert_eq!(api.state(), want, "{case}: {:?}", api.requests());
+                    for name in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
+                        assert!(!exists(&format!("{}/{}", f.parent_dir, name)), "{case}: {name}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_holds_the_parent_until_the_childs_drive_is_its_own() {
+        let f = forking(
+            VmState::Running,
+            Behavior { delay: Some(("PUT /snapshot/create", Duration::from_millis(300))), ..Default::default() },
+            Behavior { delay: Some(("PUT /snapshot/load", Duration::from_millis(300))), ..Default::default() },
+            &fake_fc_bin(),
+        )
+        .await;
+        let forked = {
+            let m = Arc::clone(&f.mgr);
+            tokio::spawn(async move { m.fork("vm-1", "vm-2", "c").await })
+        };
+        let api = f.parent_api.as_ref().unwrap();
+        while !api.requests().iter().any(|l| l.starts_with("PUT /snapshot/create")) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(f.mgr.op_in_progress("vm-1"), "held while its snapshot is written");
+        assert_eq!(f.mgr.sleep_vm("vm-1").await, Err(OpError::Busy));
+        while !f.child_api.requests().iter().any(|l| l.starts_with("PUT /snapshot/load")) {
+            sleep(Duration::from_millis(5)).await;
+        }
+        // FLU-72 E4 changed this on purpose: the parent used to be let go
+        // once the child's files were complete, but the child's load still
+        // reads the parent's image until its drive is re-pointed.
+        assert!(f.mgr.op_in_progress("vm-1"), "held until the child's drive is its own");
+        forked.await.unwrap().unwrap();
+        assert!(!f.mgr.op_in_progress("vm-1"));
+        assert!(lock_std(&f.mgr.busy).is_empty());
+        let child_pid = spawned_pid(&f.child_dir).await;
+        f.mgr.stop("vm-2").await.unwrap();
+        assert!(gone_soon(child_pid).await);
+    }
+
+    // -- fork: the child's own disk (FLU-72) --
+
+    #[tokio::test]
+    async fn test_a_fork_copies_the_disk_while_the_parent_is_paused() {
+        // `watch_meta` reads any file: here the child's disk image, at every
+        // request the parent's API receives.
+        let f = forking_with(
+            VmState::Running,
+            |_, child_dir| {
+                let watch = Behavior { watch_meta: Some(format!("{}/rootfs.ext4", child_dir)), ..Default::default() };
+                (watch, Behavior::default())
+            },
+            &fake_fc_bin(),
+        )
+        .await;
+        f.mgr.fork("vm-1", "vm-2", "c").await.unwrap();
+        let api = f.parent_api.as_ref().unwrap();
+        let seen = api.meta_seen();
+        let at = |what: &str| {
+            seen.iter()
+                .position(|(l, _)| l.starts_with(what))
+                .unwrap_or_else(|| panic!("no {what}: {:?}", api.requests()))
+        };
+        let (pause, create) = (at("PATCH /vm"), at("PUT /snapshot/create"));
+        let resume = seen.iter().rposition(|(l, _)| l.starts_with("PATCH /vm")).unwrap();
+        assert!(pause < create && create < resume, "{:?}", api.requests());
+        assert!(api.bodies()[pause].contains("Paused") && api.bodies()[resume].contains("Resumed"));
+        assert_eq!(seen[create].1, "", "not copied before the snapshot");
+        assert_eq!(seen[resume].1, "parent disk", "the child's disk must be there when the parent's resume arrives");
+        let child_pid = spawned_pid(&f.child_dir).await;
+        f.mgr.stop("vm-2").await.unwrap();
+        assert!(gone_soon(child_pid).await);
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_child_gets_its_own_disk_before_it_runs() {
+        for state in [VmState::Running, VmState::Sleeping] {
+            let f = forking_with(
+                state.clone(),
+                |_, child_dir| {
+                    let watch = Behavior { watch_meta: Some(format!("{}/meta.json", child_dir)), ..Default::default() };
+                    (Behavior::default(), watch)
+                },
+                &fake_fc_bin(),
+            )
+            .await;
+            f.mgr.fork("vm-1", "vm-2", "c").await.unwrap_or_else(|e| panic!("{state}: {e}"));
+            let child_pid = spawned_pid(&f.child_dir).await;
+            let child_rootfs = format!("{}/rootfs.ext4", f.child_dir);
+
+            // Exactly this, in this order.
+            let lines = f.child_api.requests();
+            let kinds: Vec<&str> = lines.iter().map(|l| l.rsplit_once(' ').map(|(a, _)| a).unwrap_or(l)).collect();
+            assert_eq!(
+                kinds,
+                // FLU-72 E1 added the first GET on purpose: which image the
+                // loaded state names, before the drive is re-pointed.
+                ["PUT /snapshot/load", "GET /vm/config", "PATCH /drives/rootfs", "GET /vm/config", "PATCH /vm"],
+                "{state}: {lines:?}"
+            );
+            let bodies = f.child_api.bodies();
+            assert!(bodies[0].contains("\"resume_vm\":false"), "{state}: loaded paused: {}", bodies[0]);
+            assert_eq!(bodies[2], fc::build_drive_rootfs_patch(&child_rootfs), "{state}");
+            assert!(bodies[4].contains("Resumed"), "{state}");
+            // When the resume reached the child, its record said `running`
+            // with its VMM, on disk.
+            let (_, at_resume) = f.child_api.meta_seen().into_iter().find(|(l, _)| l.starts_with("PATCH /vm")).unwrap();
+            let at_resume: Meta = serde_json::from_str(&at_resume).expect("meta.json at the resume");
+            assert_eq!((at_resume.state, at_resume.pid), (VmState::Running, Some(child_pid)), "{state}");
+            assert_eq!(record_of(&f.mgr, "vm-2").await, Some((VmState::Running, Some(child_pid))), "{state}");
+            f.mgr.stop("vm-2").await.unwrap();
+            assert!(gone_soon(child_pid).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_fork_child_whose_start_fails_is_never_resumed_on_any_disk() {
+        for case in ["load", "drive patch", "drive check", "child resume"] {
+            let child = match case {
+                "load" => Behavior { fail: vec!["PUT /snapshot/load"], ..Default::default() },
+                "drive patch" => Behavior { fail: vec!["PATCH /drives/rootfs"], ..Default::default() },
+                // The PATCH is answered, but the drive still names the
+                // parent's image.
+                "drive check" => Behavior { keep_drive: true, ..Default::default() },
+                _ => Behavior { fail_body: vec!["Resumed"], ..Default::default() },
+            };
+            let f = forking(VmState::Running, Behavior::default(), child, &fake_fc_bin()).await;
+
+            let r = f.mgr.fork("vm-1", "vm-2", "c").await;
+            assert!(r.is_err(), "{case}: {r:?}");
+            if case == "drive check" {
+                let e = r.unwrap_err();
+                assert!(e.contains(&format!("{}/rootfs.ext4", f.parent_dir)), "{case}: names the foreign drive: {e}");
+            }
+            // Never resumed — refused, in the last case.
+            let resumes = f.child_api.bodies().iter().filter(|b| b.contains("Resumed")).count();
+            assert_eq!(resumes, usize::from(case == "child resume"), "{case}: {:?}", f.child_api.requests());
+            let pid = spawned_pid(&f.child_dir).await;
+            assert!(gone_soon(pid).await, "{case}: the child's VMM must be gone");
+            assert_eq!(record_of(&f.mgr, "vm-2").await, Some((VmState::Error, None)), "{case}");
+            for name in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
+                assert!(!exists(&format!("{}/{}", f.child_dir, name)), "{case}: {name}");
+            }
+            if case == "child resume" {
+                // Its record had been written as `running`: it is written again.
+                let disk = meta_on_disk(&f.data_dir, "vm-2");
+                assert_eq!((disk.state, disk.pid), (VmState::Error, None), "{case}");
+            }
+            // The parent is not affected.
+            assert_eq!(f.parent_api.as_ref().unwrap().state(), "Running", "{case}");
+            assert_eq!(record_of(&f.mgr, "vm-1").await.unwrap().0, VmState::Running, "{case}");
+            assert!(lock_std(&f.mgr.busy).is_empty(), "{case}");
+        }
+    }
+
+    // -- clean-up of snapshot files --
+
+    #[tokio::test]
+    async fn test_stop_discards_the_snapshot_from_running_and_from_sleeping() {
+        for from_sleep in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().to_str().unwrap().to_string();
+            let dir = format!("{}/instances/vm-1", data_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            snapshot_files(&dir);
+            std::fs::write(format!("{}/vmstate.bin.tmp", dir), b"x").unwrap();
+            let mut vmm = FakeVmm::spawn(&data_dir, "vm-1");
+            let mgr = mgr_for(data_dir.clone());
+            let v = if from_sleep { sleeping_vm("vm-1") } else { running_vm("vm-1", vmm.pid()) };
+            mgr.inner.lock().await.vms.push(v);
+
+            mgr.stop("vm-1").await.unwrap();
+            for f in ["vmstate.bin", "vmstate.bin.tmp", "mem.bin"] {
+                assert!(!exists(&format!("{}/{}", dir, f)), "from_sleep={from_sleep}: {f}");
+            }
+            let disk = meta_on_disk(&data_dir, "vm-1");
+            assert_eq!((disk.state, disk.snapshot_valid), (VmState::Stopped, false));
+            assert_eq!(!vmm.alive(), !from_sleep);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_start_discards_an_old_snapshot_before_the_cold_boot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        snapshot_files(&dir);
+        let _api = FakeApi::serve(&format!("{}/fc.sock.fake", dir), "Not started");
+        let mgr = mgr_with_fc(data_dir.clone(), &fake_fc_bin());
+        let mut v = running_vm("vm-1", 0);
+        v.state = VmState::Stopped;
+        v.pid = None;
+        mgr.inner.lock().await.vms.push(v);
+
+        mgr.start("vm-1").await.unwrap();
+        let pid = spawned_pid(&dir).await;
+        assert!(!exists(&format!("{}/vmstate.bin", dir)) && !exists(&format!("{}/mem.bin", dir)));
+        assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Running, Some(pid))));
+        mgr.stop("vm-1").await.unwrap();
+        assert!(gone_soon(pid).await);
+    }
+
+    // ---- V1: wait until the API socket accepts, not until its file exists ----
+
+    /// A unix socket bound at `path` and NOT listening (connects are
+    /// refused); `listen` on the returned fd makes it accept.
+    fn bound_not_listening(path: &str) -> i32 {
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0);
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (i, b) in path.bytes().enumerate() {
+            addr.sun_path[i] = b as libc::c_char;
+        }
+        let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        assert_eq!(unsafe { libc::bind(fd, &addr as *const _ as *const libc::sockaddr, len) }, 0, "bind {path}");
+        fd
+    }
+
+    #[tokio::test]
+    async fn test_v1_the_api_socket_is_ready_when_it_accepts_not_when_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("fc.sock").to_str().unwrap().to_string();
+        let fd = bound_not_listening(&sock);
+        assert!(Path::new(&sock).exists(), "the file is there from the bind on");
+        let listen_at = Instant::now() + Duration::from_millis(200);
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(unsafe { libc::listen(fd, 8) }, 0);
+        });
+        let started = Instant::now();
+        wait_api_socket(&sock, API_SOCKET_WAIT).await.expect("ready once it listens");
+        assert!(Instant::now() >= listen_at, "ready before the socket listened (after {:?})", started.elapsed());
+        assert!(started.elapsed() < Duration::from_millis(1200), "took {:?}", started.elapsed());
+        t.join().unwrap();
+        unsafe { libc::close(fd) };
+    }
+
+    #[tokio::test]
+    async fn test_v1_a_socket_that_never_appears_is_an_error_after_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("fc.sock").to_str().unwrap().to_string();
+        let started = Instant::now();
+        let e = wait_api_socket(&sock, Duration::from_millis(300)).await.unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert!(started.elapsed() < Duration::from_millis(1000), "took {:?}", started.elapsed());
+        assert!(e.starts_with("SocketNeverAppeared") && e.contains("did not accept") && e.contains("did not exist"), "{e}");
+        assert!(!e.contains('/'), "no path in an answer that can reach a tenant: {e}");
+        // Bound but never listening: the file existed.
+        let fd = bound_not_listening(&sock);
+        let e = wait_api_socket(&sock, Duration::from_millis(200)).await.unwrap_err();
+        assert!(e.contains("(its file existed)"), "{e}");
+        unsafe { libc::close(fd) };
+    }
+
+    #[tokio::test]
+    async fn test_v1_a_socket_that_accepts_at_once_adds_no_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("fc.sock").to_str().unwrap().to_string();
+        let _l = tokio::net::UnixListener::bind(&sock).unwrap();
+        let started = Instant::now();
+        wait_api_socket(&sock, API_SOCKET_WAIT).await.unwrap();
+        assert!(started.elapsed() < Duration::from_millis(40), "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn test_v1_every_spawn_site_waits_for_the_socket_to_accept() {
+        // create and start (`spawn_and_configure`), wake, the fork child.
+        let src = include_str!("mod.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(prod.matches("wait_api_socket(&").count(), 3, "one wait per spawn site");
+        assert_eq!(prod.matches("self.spawn_firecracker(").count(), 3, "a spawn site without the wait?");
+        assert!(!prod.contains("sock).exists() { break; }"), "a wait on the socket FILE is back");
+    }
+
+    // ---- FLU-8 r7 W19: the lifecycle with networking ON, through the rule fake ----
+
+    /// The pin of `slot` in the fake kernel: its chain's rules, and whether
+    /// the tap is up.
+    fn pin_in(rules: &super::rule_fake::FakeRules, slot: u32) -> (Vec<String>, Option<bool>) {
+        let tap = net::tap_name(slot);
+        let chain = format!("as_{}", tap.replace('-', "_"));
+        let r = rules.k().chain_mut("netdev", "felucca", &chain).map(|c| c.rules.clone()).unwrap_or_default();
+        (r, rules.link_up(&tap))
+    }
+
+    #[tokio::test]
+    async fn test_start_pins_the_tap_with_networking_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        let _api = FakeApi::serve(&format!("{}/fc.sock.fake", dir), "Not started");
+        let mut mgr = mgr_with_fc(data_dir.clone(), &fake_fc_bin());
+        let rules = super::rule_fake::install(&mut mgr);
+        let mut v = running_vm("vm-1", 0);
+        v.state = VmState::Stopped;
+        v.pid = None;
+        v.slot = Some(3);
+        v.ip = Some("10.231.0.5".into());
+        {
+            let mut g = mgr.inner.lock().await;
+            Manager::reserve_slot(&mut g, 3);
+            g.vms.push(v);
+        }
+        mgr.start("vm-1").await.unwrap();
+        let pid = spawned_pid(&dir).await;
+        assert!(rules.calls().iter().any(|c| matches!(c, super::rule_fake::RuleCall::PinTap { tap } if tap == "hth-3")));
+        let (chain, up) = pin_in(&rules, 3);
+        assert!(chain.contains(&"ip saddr 10.231.0.5 accept".to_string()), "{chain:?}");
+        assert!(chain.contains(&format!("ether saddr != {} drop", net::guest_mac_for_slot(3))), "{chain:?}");
+        assert_eq!(up, Some(true), "pinned, then raised");
+        mgr.stop("vm-1").await.unwrap();
+        assert!(gone_soon(pid).await);
+    }
+
+    #[tokio::test]
+    async fn test_wake_pins_the_tap_with_networking_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        disk_image(&dir);
+        snapshot_files(&dir);
+        std::fs::write(format!("{}/meta.json", dir), sleeper_line("vm-1")).unwrap();
+        let _api = FakeApi::serve(&format!("{}/fc.sock.fake", dir), "Not started");
+        let mut mgr = mgr_with_fc(data_dir.clone(), &fake_fc_bin());
+        let rules = super::rule_fake::install(&mut mgr);
+        let mut v = sleeping_vm("vm-1");
+        v.snapshot_valid = true;
+        v.slot = Some(4);
+        v.ip = Some("10.231.0.6".into());
+        {
+            let mut g = mgr.inner.lock().await;
+            Manager::reserve_slot(&mut g, 4);
+            g.vms.push(v);
+        }
+        mgr.wake_vm("vm-1").await.unwrap();
+        let pid = spawned_pid(&dir).await;
+        let (chain, up) = pin_in(&rules, 4);
+        assert!(chain.contains(&"ip saddr 10.231.0.6 accept".to_string()), "{chain:?}");
+        assert_eq!(up, Some(true));
+        mgr.stop("vm-1").await.unwrap();
+        assert!(gone_soon(pid).await);
+    }
+
+    #[tokio::test]
+    async fn test_a_create_on_a_slot_a_delete_just_freed_gets_its_own_tap_and_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        std::fs::create_dir_all(format!("{}/images", data_dir)).unwrap();
+        std::fs::write(format!("{}/images/{}.ext4", data_dir, DEFAULT_IMAGE), b"image").unwrap();
+        let mut mgr = mgr_with_fc(data_dir.clone(), &fake_fc_bin());
+        let rules = super::rule_fake::install(&mut mgr);
+        // The sandbox that held slot 0, with its tap and pin, deleted.
+        let old_ip = super::rule_fake::add_vm(&mgr, "vm-old", 0, "t1").await;
+        assert!(rules.pin_tap("hth-0", Some(&old_ip), &net::guest_mac_for_slot(0)));
+        mgr.delete("vm-old").await.unwrap();
+        assert!(!rules.k().links.contains_key("hth-0"));
+        assert!(rules.free_slots().contains(&0));
+        // A create right after claims it, and pins its own tap.
+        let _api = FakeApi::serve(&format!("{}/instances/vm-new.fake.sock", data_dir), "Not started");
+        let spec = CreateSpec {
+            id: "vm-new".into(),
+            name: "vm-new".into(),
+            vcpus: 1,
+            mem_mib: 256,
+            tenant_id: Some("t2".into()),
+            image: DEFAULT_IMAGE.into(),
+            image_sha256: None,
+            disk_gb: 0,
+        };
+        mgr.create(&spec).await.unwrap();
+        let pid = spawned_pid(&format!("{}/instances/vm-new", data_dir)).await;
+        assert_eq!(mgr.inner.lock().await.vms.iter().find(|v| v.id == "vm-new").unwrap().slot, Some(0));
+        let (chain, up) = pin_in(&rules, 0);
+        assert!(chain.contains(&format!("ip saddr {} accept", old_ip)), "{chain:?}");
+        assert_eq!(up, Some(true));
+        assert!(!rules.free_slots().contains(&0));
+        mgr.delete("vm-new").await.unwrap();
+        assert!(gone_soon(pid).await);
+    }
+
+    #[test]
+    fn test_an_adopted_tap_is_pinned_before_it_is_raised() {
+        // W8: `ensure_pinned_tap` brought the tap up first and pinned it
+        // after; a guest's port found down came up before its pin was back.
+        let src = include_str!("mod.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let start = prod.find("fn ensure_pinned_tap(").unwrap();
+        let end = start + prod[start..].find("\n}\n").unwrap();
+        let body = &prod[start..end];
+        let pin = body.find("net::ensure_tap_antispoof(").expect("the pin");
+        let raise = body.find("net::raise_tap(").expect("the raise");
+        assert!(pin < raise, "raised before pinned");
+        let net_src = include_str!("../net.rs");
+        let et = net_src.find("pub fn ensure_tap(").unwrap();
+        let et_end = et + net_src[et..].find("\n}\n").unwrap();
+        assert!(!net_src[et..et_end].contains("\"up\""), "ensure_tap must not bring the tap up");
+    }
+
+    #[tokio::test]
+    async fn test_a_vmm_that_dies_takes_its_snapshot_files_unless_an_operation_holds_them() {
+        for held in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().to_str().unwrap().to_string();
+            let dir = format!("{}/instances/vm-1", data_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            snapshot_files(&dir);
+            let vmm = FakeVmm::spawn(&data_dir, "vm-1");
+            let mgr = mgr_for(data_dir.clone());
+            mgr.inner.lock().await.vms.push(running_vm("vm-1", vmm.pid()));
+            let op = if held { Some(mgr.begin_op("vm-1", OpKind::Sleep).await.unwrap()) } else { None };
+
+            let pid = vmm.pid();
+            drop(vmm); // the Firecracker dies
+            mgr.sweep_dead().await;
+            // FLU-4 S7' changed this on purpose: while an operation holds the
+            // VM, the record is that operation's to settle too (it used to go
+            // to `error` here, with the files left).
+            let want = if held { (VmState::Running, Some(pid)) } else { (VmState::Error, None) };
+            assert_eq!(record_of(&mgr, "vm-1").await, Some(want), "held={held}");
+            assert!(!marker_of(&mgr, "vm-1").await);
+            let left = exists(&format!("{}/vmstate.bin", dir)) && exists(&format!("{}/mem.bin", dir));
+            assert_eq!(left, held, "held={held}");
+            drop(op);
+            // Whatever the operation left, the next sweep settles.
+            mgr.sweep_dead().await;
+            assert_eq!(record_of(&mgr, "vm-1").await, Some((VmState::Error, None)), "held={held}");
+            assert!(!exists(&format!("{}/vmstate.bin", dir)) && !exists(&format!("{}/mem.bin", dir)), "held={held}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mem_bin_is_kept_while_a_live_vmm_of_the_instance_maps_it() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let data_dir = base.join("data").to_str().unwrap().to_string();
+        let proc_root = base.join("proc");
+        let dir = format!("{}/instances/vm-1", data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = proc_root.join("4000");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("cmdline"), format!("firecracker\0--api-sock\0{}/fc.sock\0", dir)).unwrap();
+        let mgr = Manager::with_proc_root(
+            data_dir.clone(),
+            false,
+            Cidr { base: 0x0AE7_0000, prefix: 24 },
+            0,
+            "http://cp".into(),
+            "tok".into(),
+            proc_root,
+        );
+        let mem = format!("{}/mem.bin", dir);
+        for (maps, kept) in [("mapped", true), ("other", false), ("unreadable", true)] {
+            snapshot_files(&dir);
+            let st = std::fs::metadata(&mem).unwrap();
+            let (ma, mi) = dev_major_minor(st.dev());
+            let _ = std::fs::remove_dir_all(p.join("maps"));
+            let _ = std::fs::remove_file(p.join("maps"));
+            match maps {
+                "mapped" => std::fs::write(
+                    p.join("maps"),
+                    format!("7f0000000000-7f0010000000 rw-p 00000000 {:02x}:{:02x} {} {}\n", ma, mi, st.ino(), mem),
+                )
+                .unwrap(),
+                "other" => std::fs::write(
+                    p.join("maps"),
+                    format!("7f0000000000-7f0010000000 rw-p 00000000 {:02x}:{:02x} {} /elsewhere\n", ma, mi, st.ino() + 1),
+                )
+                .unwrap(),
+                _ => std::fs::create_dir_all(p.join("maps")).unwrap(), // EISDIR: cannot tell
+            }
+            mgr.discard_snapshot_files("vm-1", "vm-1");
+            assert!(!exists(&format!("{}/vmstate.bin", dir)), "{maps}");
+            assert_eq!(exists(&mem), kept, "{maps}");
+        }
+    }
+
+    #[test]
+    fn test_maps_lines_are_read_by_device_and_inode() {
+        let maps = "\
+55d0c0a00000-55d0c0b00000 r-xp 00000000 fd:01 1048577                    /usr/bin/firecracker
+7f1000000000-7f1100000000 rw-p 00000000 fd:01 2097153                    /srv/felucca/instances/sb 1/mem.bin (deleted)
+7f2000000000-7f2100000000 rw-p 00000000 103:02 12345                     /srv/my data/instances/sb-2/mem.bin
+7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0                          [stack]
+";
+        // A path with spaces, a "(deleted)" suffix: only device and inode count.
+        assert_eq!(maps_contain(maps, 0xfd, 0x01, 2_097_153), Some(true));
+        assert_eq!(maps_contain(maps, 0x103, 0x02, 12345), Some(true));
+        // Same inode on another device, or another inode: not this file.
+        assert_eq!(maps_contain(maps, 0xfd, 0x02, 2_097_153), Some(false));
+        assert_eq!(maps_contain(maps, 0xfd, 0x01, 2_097_154), Some(false));
+        assert_eq!(maps_contain("", 0xfd, 0x01, 1), Some(false));
+        // A line that does not parse: cannot tell.
+        assert_eq!(maps_contain("garbage\n", 0xfd, 0x01, 1), None);
+        assert_eq!(maps_contain("a-b rw-p 0 zz:01 5 /x\n", 0xfd, 0x01, 5), None);
+        // st_dev as glibc encodes it.
+        let makedev = |major: u64, minor: u64| {
+            ((major & 0xffff_f000) << 32) | ((major & 0x0fff) << 8) | ((minor & 0xffff_ff00) << 12) | (minor & 0x00ff)
+        };
+        assert_eq!(dev_major_minor(0xfd01), (0xfd, 0x01));
+        for (major, minor) in [(0xfd, 0x01), (0x103, 0x12345), (0x1_2345, 0xab)] {
+            assert_eq!(dev_major_minor(makedev(major, minor)), (major, minor));
+        }
+    }
+}
+
+/// Unit tests: a stand-in for `HostRules`, so the rule rebuilds and delete's
+/// tap removal can be watched and made to fail without touching the host.
+/// Here, after `mod tests`, because several tests there read everything
+/// above the first `#[cfg(test)]` of this file as its production half.
+#[cfg(test)]
+pub(crate) mod rule_fake {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// One call the manager made, with the guest slots that were free at
+    /// that moment.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum RuleCall {
+        /// The isolation members' addresses, sorted.
+        Isolation { ips: Vec<String>, free_slots: Vec<u32> },
+        Ingress { members: Vec<(u16, String, u16)>, free_slots: Vec<u32> },
+        RemoveTap { tap: String, free_slots: Vec<u32> },
+        PinTap { tap: String },
+    }
+
+    #[derive(Default)]
+    pub(crate) struct FakeRules {
+        calls: std::sync::Mutex<Vec<RuleCall>>,
+        pub(crate) fail_isolation: AtomicBool,
+        pub(crate) fail_ingress: AtomicBool,
+        pub(crate) fail_pin: AtomicBool,
+        mgr: std::sync::OnceLock<std::sync::Weak<Manager>>,
+        /// FLU-8: the in-memory kernel the rulesets land in.
+        pub(crate) kernel: std::sync::Mutex<FakeKernel>,
+        /// Every kernel operation, in order ("route …", "apply <chain>",
+        /// "list <family> <table>", "link <dev> up|down", "write <path>").
+        ops: std::sync::Mutex<Vec<String>>,
+        /// Every look answers "could not look".
+        pub(crate) fail_looks: AtomicBool,
+        /// A ruleset whose text contains one of these is rejected.
+        pub(crate) reject: std::sync::Mutex<Vec<String>>,
+        /// Switch writes fail.
+        pub(crate) fail_switch_write: AtomicBool,
+        /// The next apply first removes this link (a delete racing a tick).
+        pub(crate) vanish_before_apply: std::sync::Mutex<Option<String>>,
+        /// `remove_tap` calls made without the rule lock held.
+        pub(crate) unlocked_tap_removals: std::sync::atomic::AtomicUsize,
+        /// `fences_ready` answers false.
+        pub(crate) fences_down: AtomicBool,
+        /// The outcomes of the next ingress rebuilds, in order (true =
+        /// fail); once empty, `fail_ingress` decides.
+        pub(crate) ingress_script: std::sync::Mutex<std::collections::VecDeque<bool>>,
+        /// Run once, inside the SECOND `remove_tap` call, before it removes
+        /// anything (two overlapping deletes).
+        #[allow(clippy::type_complexity)]
+        pub(crate) on_second_remove_tap: std::sync::Mutex<Option<Box<dyn FnOnce(&FakeRules, &Manager) + Send>>>,
+        /// FLU-8 r7. A ruleset containing one of these gets no answer (the
+        /// repair's outcome is unknown); nothing is applied.
+        pub(crate) no_answer: std::sync::Mutex<Vec<String>>,
+        /// Once an apply has been made, every look answers "could not look"
+        /// (a second look that cannot be made).
+        pub(crate) looks_fail_after_apply: AtomicBool,
+        applied_once: AtomicBool,
+        /// Every listing takes this long (the tick's budget).
+        pub(crate) slow_list_ms: std::sync::atomic::AtomicU64,
+        /// The next listing panics (a tick that panics).
+        pub(crate) panic_on_list: AtomicBool,
+        /// Rewrites every listing (a kernel that prints differently).
+        #[allow(clippy::type_complexity)]
+        pub(crate) rewrite_listing: std::sync::Mutex<Option<Box<dyn Fn(String) -> String + Send>>>,
+        /// Tables listed as `flags dormant`. A transaction with a plain `add
+        /// table` clears the flag, as on the lab (X14) — unless
+        /// `dormant_sticky`.
+        pub(crate) dormant: std::sync::Mutex<std::collections::BTreeSet<(String, String)>>,
+        pub(crate) dormant_sticky: AtomicBool,
+        /// What `pin_adopted_tap` answers (None: it pins).
+        pub(crate) adopted_pin_fails: std::sync::Mutex<Option<PinFailure>>,
+        /// Tables whose listing answers "could not look" (one table only).
+        pub(crate) unknown_tables: std::sync::Mutex<std::collections::BTreeSet<(String, String)>>,
+        /// Routes installed while the watch's mutex was held (X8).
+        pub(crate) route_under_watch_lock: std::sync::atomic::AtomicUsize,
+        /// Run once inside the next ingress rebuild (X9).
+        #[allow(clippy::type_complexity)]
+        pub(crate) on_ingress_rebuild: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    /// One chain: its spec, its rules as `nft list` prints them.
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct FakeChain {
+        spec: String,
+        pub(crate) rules: Vec<String>,
+    }
+
+    /// One link: up or down, held by a process (carrier when up), a port of
+    /// the guest bridge.
+    #[derive(Clone, Debug)]
+    pub(crate) struct FakeLink {
+        pub(crate) up: bool,
+        pub(crate) held: bool,
+        pub(crate) port: bool,
+    }
+
+    /// The parts of a kernel the agent touches.
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct FakeKernel {
+        /// (family, table) -> chain name -> chain.
+        pub(crate) tables: BTreeMap<(String, String), BTreeMap<String, FakeChain>>,
+        pub(crate) links: BTreeMap<String, FakeLink>,
+        pub(crate) switches: BTreeMap<String, String>,
+        pub(crate) paths: std::collections::BTreeSet<String>,
+        pub(crate) routes: Vec<String>,
+    }
+
+    impl FakeKernel {
+        /// Apply one `nft -f -` file, all or nothing.
+        fn apply(&mut self, ruleset: &str) -> bool {
+            let mut next = self.clone();
+            for line in ruleset.lines().filter(|l| !l.trim().is_empty()) {
+                if !next.apply_line(line) {
+                    return false;
+                }
+            }
+            *self = next;
+            true
+        }
+
+        fn apply_line(&mut self, line: &str) -> bool {
+            let w: Vec<&str> = line.splitn(6, ' ').collect();
+            let key = |i: usize| (w.get(i).copied().unwrap_or("").to_string(), w.get(i + 1).copied().unwrap_or("").to_string());
+            match (w.first().copied(), w.get(1).copied()) {
+                (Some("add"), Some("table")) => {
+                    self.tables.entry(key(2)).or_default();
+                    true
+                }
+                (Some("add" | "flush"), Some("set" | "element")) => self.tables.contains_key(&key(2)),
+                (Some("add"), Some("chain")) => {
+                    let spec = line.split_once('{').map(|(_, s)| s.trim_end_matches('}').trim().to_string()).unwrap_or_default();
+                    // A netdev chain names its device; nft resolves it at load.
+                    if let Some(dev) = spec.split("device \"").nth(1).and_then(|s| s.split('"').next()) {
+                        if !self.links.contains_key(dev) {
+                            return false;
+                        }
+                    }
+                    let Some(t) = self.tables.get_mut(&key(2)) else { return false };
+                    let name = w.get(4).copied().unwrap_or("").to_string();
+                    t.entry(name).or_insert(FakeChain { spec, rules: Vec::new() });
+                    true
+                }
+                (Some("flush"), Some("chain")) => {
+                    match self.tables.get_mut(&key(2)).and_then(|t| t.get_mut(w.get(4).copied().unwrap_or(""))) {
+                        Some(c) => {
+                            c.rules.clear();
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                (Some("delete"), Some("chain")) => {
+                    self.tables.get_mut(&key(2)).and_then(|t| t.remove(w.get(4).copied().unwrap_or(""))).is_some()
+                }
+                (Some("add"), Some("rule")) => {
+                    let Some(c) = self.tables.get_mut(&key(2)).and_then(|t| t.get_mut(w.get(4).copied().unwrap_or(""))) else {
+                        return false;
+                    };
+                    let rule = w.get(5).copied().unwrap_or("");
+                    // nft lists a counter with its values.
+                    let listed = match rule.strip_prefix("counter ") {
+                        Some(rest) => format!("counter packets 0 bytes 0 {}", rest),
+                        None => rule.to_string(),
+                    };
+                    c.rules.push(listed);
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        /// `nft list table`, as nft prints it.
+        pub(crate) fn listing(&self, family: &str, table: &str) -> Option<String> {
+            let t = self.tables.get(&(family.to_string(), table.to_string()))?;
+            let mut s = format!("table {} {} {{\n", family, table);
+            for (name, c) in t {
+                s.push_str(&format!("\tchain {} {{\n\t\t{}\n", name, c.spec));
+                for r in &c.rules {
+                    s.push_str(&format!("\t\t{}\n", r));
+                }
+                s.push_str("\t}\n");
+            }
+            s.push_str("}\n");
+            Some(s)
+        }
+
+        pub(crate) fn chain_mut(&mut self, family: &str, table: &str, chain: &str) -> Option<&mut FakeChain> {
+            self.tables.get_mut(&(family.to_string(), table.to_string()))?.get_mut(chain)
+        }
+    }
+
+    impl FakeRules {
+        fn op(&self, s: String) {
+            lock_std(&self.ops).push(s);
+        }
+
+        pub(crate) fn ops(&self) -> Vec<String> {
+            lock_std(&self.ops).clone()
+        }
+
+        pub(crate) fn k(&self) -> std::sync::MutexGuard<'_, FakeKernel> {
+            lock_std(&self.kernel)
+        }
+
+        /// A tap enslaved to the guest bridge, up, held by a VMM or not.
+        pub(crate) fn add_port(&self, tap: &str, held: bool) {
+            self.k().links.insert(tap.into(), FakeLink { up: true, held, port: true });
+        }
+
+        /// What the kernel shows at the head of a chain (`net::chain_marker`).
+        pub(crate) fn marker(&self, family: &str, table: &str, chain: &str) -> Option<Option<String>> {
+            net::chain_marker(&self.k().listing(family, table)?, chain)
+        }
+
+        pub(crate) fn link_up(&self, dev: &str) -> Option<bool> {
+            self.k().links.get(dev).map(|l| l.up)
+        }
+
+        /// Forget the applies made so far (`looks_fail_after_apply`).
+        pub(crate) fn reset_applied(&self) {
+            self.applied_once.store(false, Ordering::SeqCst);
+        }
+        pub(crate) fn calls(&self) -> Vec<RuleCall> {
+            lock_std(&self.calls).clone()
+        }
+
+        pub(crate) fn clear(&self) {
+            lock_std(&self.calls).clear();
+        }
+
+        /// The free guest slots, read off the manager's allocator. The
+        /// manager makes these calls with `inner` released; one made while
+        /// holding it panics here.
+        ///
+        /// CONSTRAINT: `try_lock`, not a wait — it is called from inside the
+        /// (synchronous) rule calls, where awaiting is impossible and a
+        /// blocking wait would deadlock the one runtime thread. It therefore
+        /// also panics when ANOTHER task holds `inner` at that moment, which
+        /// cannot happen on the current-thread runtime `#[tokio::test]` uses
+        /// (the caller is the only task running), but can on a multi-thread
+        /// one. Tests that use this fake must stay on the current-thread
+        /// runtime; a test that needs another task holding `inner` must not
+        /// make rule calls meanwhile.
+        pub(crate) fn free_slots(&self) -> Vec<u32> {
+            let Some(mgr) = self.mgr.get().and_then(|w| w.upgrade()) else { return Vec::new() };
+            let mut g = mgr.inner.try_lock().expect("a rule call was made while holding `inner`");
+            let Some(a) = g.allocator.as_mut() else { return Vec::new() };
+            let mut free = Vec::new();
+            while let Some(s) = a.claim() {
+                free.push(s);
+            }
+            for s in &free {
+                a.free(*s);
+            }
+            free
+        }
+    }
+
+    impl RuleOps for FakeRules {
+        fn active(&self, _net_on: bool) -> bool {
+            true
+        }
+        fn rebuild_isolation(&self, members: &[(String, String)]) -> (net::Applied, bool) {
+            let mut ips: Vec<String> = members.iter().map(|m| m.1.clone()).collect();
+            ips.sort();
+            let free_slots = self.free_slots();
+            lock_std(&self.calls).push(RuleCall::Isolation { ips, free_slots });
+            let outcome = if self.fail_isolation.load(Ordering::SeqCst) {
+                net::Applied::Refused("Error: the fake refuses isolation".into())
+            } else {
+                net::Kernel::apply(self, &net::isolation_ruleset(members))
+            };
+            let ok = outcome.ok();
+            (outcome, ok)
+        }
+        fn rebuild_ingress(&self, members: &[(u16, String, u16)]) -> net::Applied {
+            let mut sorted = members.to_vec();
+            sorted.sort();
+            let free_slots = self.free_slots();
+            lock_std(&self.calls).push(RuleCall::Ingress { members: sorted, free_slots });
+            let hook = lock_std(&self.on_ingress_rebuild).take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            let fail = lock_std(&self.ingress_script).pop_front().unwrap_or(self.fail_ingress.load(Ordering::SeqCst));
+            if fail {
+                return net::Applied::Refused("Error: the fake refuses ingress".into());
+            }
+            net::Kernel::apply(self, &net::ingress_ruleset(members))
+        }
+        fn remove_tap(&self, tap: &str) {
+            let free_slots = self.free_slots();
+            let earlier = lock_std(&self.calls).iter().filter(|c| matches!(c, RuleCall::RemoveTap { .. })).count();
+            if let Some(mgr) = self.mgr.get().and_then(|w| w.upgrade()) {
+                if mgr.ruleset_lock.try_lock().is_ok() {
+                    self.unlocked_tap_removals.fetch_add(1, Ordering::SeqCst);
+                }
+                if earlier == 1 {
+                    let hook = lock_std(&self.on_second_remove_tap).take();
+                    if let Some(hook) = hook {
+                        hook(self, &mgr);
+                    }
+                }
+            }
+            lock_std(&self.calls).push(RuleCall::RemoveTap { tap: tap.to_string(), free_slots });
+            let mut k = self.k();
+            if let Some(t) = k.tables.get_mut(&("netdev".to_string(), "felucca".to_string())) {
+                t.remove(&format!("as_{}", tap.replace('-', "_")));
+            }
+            k.links.remove(tap);
+        }
+        fn pin_tap(&self, tap: &str, ip: Option<&str>, mac: &net::GuestMac) -> bool {
+            lock_std(&self.calls).push(RuleCall::PinTap { tap: tap.to_string() });
+            if self.fail_pin.load(Ordering::SeqCst) {
+                return false;
+            }
+            // As `ensure_pinned_tap`: the tap first (no VMM holds it yet),
+            // then its chain, then up.
+            self.k().links.entry(tap.to_string()).or_insert(FakeLink { up: false, held: false, port: true });
+            let pinned = match ip.and_then(|ip| net::antispoof_ruleset(tap, ip, mac)) {
+                Some(rs) => net::Kernel::apply(self, &rs).ok(),
+                None => false,
+            };
+            if pinned {
+                if let Some(l) = self.k().links.get_mut(tap) {
+                    l.up = true;
+                }
+            }
+            pinned
+        }
+        fn pin_adopted_tap(&self, tap: &str, ip: &str, mac: &net::GuestMac) -> Result<(), PinFailure> {
+            lock_std(&self.calls).push(RuleCall::PinTap { tap: tap.to_string() });
+            if let Some(why) = *lock_std(&self.adopted_pin_fails) {
+                if why == PinFailure::Unpinned {
+                    if let Some(l) = self.k().links.get_mut(tap) {
+                        l.up = false;
+                    }
+                }
+                return Err(why);
+            }
+            match net::antispoof_ruleset(tap, ip, mac).map(|rs| net::Kernel::apply(self, &rs).ok()) {
+                Some(true) => Ok(()),
+                _ => Err(PinFailure::Unpinned),
+            }
+        }
+        fn ensure_bridge(&self, _cidr: Cidr) -> (bool, bool) {
+            self.op("bridge".into());
+            (true, true)
+        }
+        fn note_host_fences(&self, _ok: bool) {}
+        fn fences_ready(&self) -> bool {
+            !self.fences_down.load(Ordering::SeqCst)
+        }
+        fn kernel(&self) -> &dyn net::Kernel {
+            self
+        }
+    }
+
+    impl net::Kernel for FakeRules {
+        fn apply(&self, ruleset: &str) -> net::Applied {
+            let what = ruleset
+                .lines()
+                .find(|l| l.starts_with("add chain "))
+                .map(|l| l.split_whitespace().take(5).skip(2).collect::<Vec<_>>().join(" "))
+                .unwrap_or_default();
+            self.op(format!("apply {}", what));
+            self.applied_once.store(true, Ordering::SeqCst);
+            if let Some(dev) = lock_std(&self.vanish_before_apply).take() {
+                self.k().links.remove(&dev);
+            }
+            if lock_std(&self.no_answer).iter().any(|r| ruleset.contains(r.as_str())) {
+                return net::Applied::Unknown;
+            }
+            if lock_std(&self.reject).iter().any(|r| ruleset.contains(r.as_str())) {
+                return net::Applied::Refused("Error: Could not process rule: the fake refuses it".into());
+            }
+            if self.k().apply(ruleset) {
+                // X14: a plain `add table` clears a table's dormant flag.
+                if !self.dormant_sticky.load(Ordering::SeqCst) {
+                    let mut d = lock_std(&self.dormant);
+                    for l in ruleset.lines() {
+                        let w: Vec<&str> = l.split_whitespace().collect();
+                        if w.len() == 4 && w[0] == "add" && w[1] == "table" {
+                            d.remove(&(w[2].to_string(), w[3].to_string()));
+                        }
+                    }
+                }
+                net::Applied::Committed
+            } else {
+                // nft's answer for a device that does not exist, a rule for a
+                // missing chain, and the like.
+                net::Applied::Refused("Error: No such file or directory".into())
+            }
+        }
+        fn list_table(&self, family: &str, table: &str) -> net::Listing {
+            self.op(format!("list {} {}", family, table));
+            if self.panic_on_list.swap(false, Ordering::SeqCst) {
+                panic!("the fake kernel panics in a listing");
+            }
+            let ms = self.slow_list_ms.load(Ordering::SeqCst);
+            if ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+            if self.fail_looks.load(Ordering::SeqCst)
+                || (self.looks_fail_after_apply.load(Ordering::SeqCst) && self.applied_once.load(Ordering::SeqCst))
+                || lock_std(&self.unknown_tables).contains(&(family.to_string(), table.to_string()))
+            {
+                return net::Listing::Unknown;
+            }
+            let listed = self.k().listing(family, table);
+            match listed {
+                Some(mut l) => {
+                    if lock_std(&self.dormant).contains(&(family.to_string(), table.to_string())) {
+                        l = l.replacen(" {\n", " {\n\tflags dormant\n", 1);
+                    }
+                    if let Some(f) = lock_std(&self.rewrite_listing).as_ref() {
+                        l = f(l);
+                    }
+                    net::Listing::Listed(l)
+                }
+                None => net::Listing::Missing,
+            }
+        }
+        fn bridge_ports(&self) -> Option<Vec<net::Port>> {
+            if self.fail_looks.load(Ordering::SeqCst) {
+                return None;
+            }
+            Some(
+                self.k()
+                    .links
+                    .iter()
+                    .filter(|(_, l)| l.port)
+                    .map(|(n, l)| net::Port { name: n.clone(), carrier: l.up && l.held, up: l.up })
+                    .collect(),
+            )
+        }
+        fn read_switch(&self, path: &str) -> net::Switch {
+            if self.fail_looks.load(Ordering::SeqCst) {
+                return net::Switch::Unknown;
+            }
+            match self.k().switches.get(path) {
+                Some(v) => net::Switch::Value(v.clone()),
+                None => net::Switch::Missing,
+            }
+        }
+        fn write_switch(&self, path: &str, value: &str) -> bool {
+            self.op(format!("write {}", path));
+            if self.fail_switch_write.load(Ordering::SeqCst) {
+                return false;
+            }
+            match self.k().switches.get_mut(path) {
+                Some(v) => {
+                    *v = value.to_string();
+                    true
+                }
+                None => false,
+            }
+        }
+        fn path_exists(&self, path: &str) -> bool {
+            self.k().paths.contains(path)
+        }
+        fn set_link(&self, dev: &str, up: bool) -> bool {
+            self.op(format!("link {} {}", dev, if up { "up" } else { "down" }));
+            match self.k().links.get_mut(dev) {
+                Some(l) => {
+                    l.up = up;
+                    true
+                }
+                None => false,
+            }
+        }
+        fn link_exists(&self, dev: &str) -> Option<bool> {
+            if self.fail_looks.load(Ordering::SeqCst) {
+                return None;
+            }
+            Some(self.k().links.contains_key(dev))
+        }
+        fn link_up(&self, dev: &str) -> Option<bool> {
+            self.k().links.get(dev).map(|l| l.up)
+        }
+        fn guest_route(&self, cidr: &str) -> bool {
+            if let Some(mgr) = self.mgr.get().and_then(|w| w.upgrade()) {
+                if mgr.watch.try_lock().is_err() {
+                    self.route_under_watch_lock.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            self.op(format!("route {}", cidr));
+            self.k().routes.push(cidr.to_string());
+            true
+        }
+    }
+
+    /// Give a fresh `mgr` a `FakeRules` and the guest-slot allocator that
+    /// `setup_host` gives a node with the network on (nothing is brought up).
+    /// The fake kernel starts as a healthy worker's: the guest bridge, both
+    /// switches on, and the host fence loaded.
+    pub(crate) fn install(mgr: &mut Arc<Manager>) -> Arc<FakeRules> {
+        let fake = Arc::new(FakeRules::default());
+        {
+            let mut k = fake.k();
+            k.links.insert(net::BRIDGE_NAME.into(), FakeLink { up: true, held: false, port: false });
+            k.switches.insert(net::BR_NF_SWITCH.into(), "1".into());
+            k.switches.insert(net::bridge_v6_switch(), "1".into());
+            k.paths.insert(net::IPV6_ROOT.into());
+            let host = ("inet".to_string(), "felucca_host".to_string());
+            k.tables.entry(host).or_default().insert(
+                "input".into(),
+                FakeChain {
+                    spec: "type filter hook input priority filter; policy accept;".into(),
+                    rules: vec![format!("iifname \"{}\" drop", net::BRIDGE_NAME)],
+                },
+            );
+        }
+        let m = Arc::get_mut(mgr).expect("a fresh manager");
+        m.rules = fake.clone();
+        let cidr = m.cidr;
+        m.inner.get_mut().allocator = Some(Allocator::new(cidr));
+        fake.mgr.set(Arc::downgrade(mgr)).expect("installed once");
+        fake
+    }
+
+    /// Add a stopped sandbox holding guest slot `slot` (reserved, when there
+    /// is an allocator) and its address, with its directory, as start-up
+    /// leaves one. Returns the address.
+    pub(crate) async fn add_vm(mgr: &Manager, id: &str, slot: u32, tenant: &str) -> String {
+        std::fs::create_dir_all(format!("{}/instances/{}", mgr.data_dir, id)).unwrap();
+        let ip = crate::ipalloc::fmt_ip(mgr.cidr.host_at(slot));
+        let mut g = mgr.inner.lock().await;
+        Manager::reserve_slot(&mut g, slot);
+        g.vms.push(Vm {
+            id: id.into(),
+            name: id.into(),
+            dir_id: id.into(),
+            vcpus: 1,
+            mem_mib: 256,
+            state: VmState::Stopped,
+            pid: None,
+            slot: Some(slot),
+            ip: Some(ip.clone()),
+            vsock: false,
+            tenant_id: Some(tenant.into()),
+            exposes: Vec::new(),
+            image: DEFAULT_IMAGE.into(),
+            image_sha256: None,
+            disk_gb: 0,
+            snapshot_valid: false,
+        });
+        ip
+    }
+
+    /// Hold the lock every rule rebuild takes, so a rebuild waits.
+    pub(crate) async fn hold_rule_lock(mgr: &Manager) -> tokio::sync::MutexGuard<'_, ()> {
+        mgr.ruleset_lock.lock().await
+    }
+
+    /// `id`'s mappings, (guest port, node port).
+    pub(crate) async fn exposes_of(mgr: &Manager, id: &str) -> Vec<(u16, u16)> {
+        let g = mgr.inner.lock().await;
+        g.vms
+            .iter()
+            .find(|v| v.id == id)
+            .map(|v| v.exposes.iter().map(|e| (e.guest_port, e.node_port)).collect())
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::rule_fake::{add_vm, exposes_of, hold_rule_lock, install, FakeRules, RuleCall};
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::Ordering;
+
+    fn mgr_with_rules(data_dir: &str) -> (Arc<Manager>, Arc<FakeRules>) {
+        let mut mgr = Manager::new(
+            data_dir.to_string(),
+            false,
+            Cidr { base: 0x0AE7_0000, prefix: 24 },
+            0,
+            "http://cp".into(),
+            "tok".into(),
+        );
+        let fake = install(&mut mgr);
+        (mgr, fake)
+    }
+
+    fn exposes_on_disk(data_dir: &str, id: &str) -> Vec<(u16, u16)> {
+        let written = std::fs::read_to_string(format!("{}/instances/{}/meta.json", data_dir, id)).unwrap();
+        let m: Meta = serde_json::from_str(&written).expect("meta.json must parse");
+        m.exposes.iter().map(|e| (e.guest_port, e.node_port)).collect()
+    }
+
+    fn none() -> HashSet<u16> {
+        HashSet::new()
+    }
+
+    async fn set_cursor(mgr: &Manager, at: u16) {
+        mgr.inner.lock().await.node_port_cursor = at;
+    }
+
+    // ---- FLU-6: expose ----
+
+    #[tokio::test]
+    async fn test_the_idempotent_expose_answer_ignores_avoid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _rules) = mgr_with_rules(tmp.path().to_str().unwrap());
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        let p = mgr.expose("vm-a", 8080, &none(), None).await.unwrap();
+        // An avoid list that names it and every other port, and a prefer
+        // elsewhere: the mapping that exists is still the answer.
+        let all: HashSet<u16> = (NODE_PORT_MIN..=NODE_PORT_MAX).collect();
+        assert_eq!(mgr.expose("vm-a", 8080, &all, Some(20000)).await, Ok(p));
+        assert_eq!(exposes_of(&mgr, "vm-a").await, vec![(8080, p)]);
+    }
+
+    #[tokio::test]
+    async fn test_two_exposes_get_different_ports_and_a_released_one_is_not_next() {
+        // Was: lowest free — the port vm-a released went to vm-b at once.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _rules) = mgr_with_rules(tmp.path().to_str().unwrap());
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        add_vm(&mgr, "vm-b", 1, "t2").await;
+        let p1 = mgr.expose("vm-a", 80, &none(), None).await.unwrap();
+        let p2 = mgr.expose("vm-a", 81, &none(), None).await.unwrap();
+        assert_ne!(p1, p2);
+        mgr.unexpose("vm-a", 80).await.unwrap();
+        let p3 = mgr.expose("vm-b", 80, &none(), None).await.unwrap();
+        assert_ne!(p3, p1, "the port just released went straight to another sandbox");
+        assert_ne!(p3, p2);
+        // Round-robin: each one the port after the previous one.
+        let after = |p: u16| if p == NODE_PORT_MAX { NODE_PORT_MIN } else { p + 1 };
+        assert_eq!((p2, p3), (after(p1), after(p2)));
+    }
+
+    #[tokio::test]
+    async fn test_expose_respects_avoid_and_prefer_across_sandboxes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _rules) = mgr_with_rules(tmp.path().to_str().unwrap());
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        add_vm(&mgr, "vm-b", 1, "t2").await;
+        set_cursor(&mgr, 20000).await;
+        let avoid: HashSet<u16> = [20000, 20001].into_iter().collect();
+        assert_eq!(mgr.expose("vm-a", 80, &avoid, None).await, Ok(20002));
+        // vm-b does not get vm-a's port, avoided or not.
+        set_cursor(&mgr, 20002).await;
+        let avoid: HashSet<u16> = [20003].into_iter().collect();
+        assert_eq!(mgr.expose("vm-b", 80, &avoid, None).await, Ok(20004));
+        // A prefer that another sandbox here holds is not honoured...
+        assert_eq!(mgr.expose("vm-b", 81, &none(), Some(20002)).await, Ok(20005));
+        // ...one that is free is, although it is in avoid,
+        let avoid: HashSet<u16> = [21000].into_iter().collect();
+        assert_eq!(mgr.expose("vm-b", 82, &avoid, Some(21000)).await, Ok(21000));
+        // and the cursor did not move for it.
+        assert_eq!(mgr.expose("vm-b", 83, &none(), None).await, Ok(20006));
+        // Nothing left: 409 as before, and nothing recorded.
+        let all: HashSet<u16> = (NODE_PORT_MIN..=NODE_PORT_MAX).collect();
+        assert_eq!(mgr.expose("vm-a", 90, &all, None).await, Err(ExposeError::Exhausted));
+        assert_eq!(exposes_of(&mgr, "vm-a").await, vec![(80, 20002)]);
+    }
+
+    #[tokio::test]
+    async fn test_an_expose_whose_rule_is_not_installed_is_taken_back_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let (mgr, rules) = mgr_with_rules(&data_dir);
+        let ip = add_vm(&mgr, "vm-a", 0, "t1").await;
+        let p1 = mgr.expose("vm-a", 80, &none(), None).await.unwrap();
+        assert_eq!(exposes_on_disk(&data_dir, "vm-a"), vec![(80, p1)]);
+
+        // Was: the rule's result was ignored and the port answered anyway.
+        rules.fail_ingress.store(true, Ordering::SeqCst);
+        assert_eq!(mgr.expose("vm-a", 81, &none(), None).await, Err(ExposeError::RuleFailed));
+        assert_eq!(exposes_of(&mgr, "vm-a").await, vec![(80, p1)]);
+        assert_eq!(exposes_on_disk(&data_dir, "vm-a"), vec![(80, p1)]);
+        // The idempotent answer does not rebuild, so it is not affected.
+        assert_eq!(mgr.expose("vm-a", 80, &none(), None).await, Ok(p1));
+
+        rules.fail_ingress.store(false, Ordering::SeqCst);
+        let p2 = mgr.expose("vm-a", 81, &none(), None).await.unwrap();
+        assert_eq!(exposes_on_disk(&data_dir, "vm-a"), vec![(80, p1), (81, p2)]);
+        let mut want = vec![(p1, ip.clone(), 80), (p2, ip, 81)];
+        want.sort();
+        match rules.calls().last() {
+            Some(RuleCall::Ingress { members, .. }) => assert_eq!(members, &want),
+            other => panic!("the last call must be the ingress rebuild: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_an_unexpose_whose_rebuild_fails_still_answers_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let (mgr, rules) = mgr_with_rules(&data_dir);
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        mgr.expose("vm-a", 80, &none(), None).await.unwrap();
+        rules.fail_ingress.store(true, Ordering::SeqCst);
+        // The mapping is gone; a retry finds nothing and answers the same.
+        assert_eq!(mgr.unexpose("vm-a", 80).await, Ok(()));
+        assert_eq!(mgr.unexpose("vm-a", 80).await, Ok(()));
+        assert!(exposes_of(&mgr, "vm-a").await.is_empty());
+        assert!(exposes_on_disk(&data_dir, "vm-a").is_empty());
+        assert_eq!(mgr.unexpose("vm-nope", 80).await, Err(ExposeError::NotFound));
+    }
+
+    // ---- FLU-6 R7: the order of a delete ----
+
+    #[tokio::test]
+    async fn test_delete_takes_the_sandbox_out_of_the_rules_before_it_frees_its_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let (mgr, rules) = mgr_with_rules(&data_dir);
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        let ip_b = add_vm(&mgr, "vm-b", 1, "t1").await;
+        mgr.expose("vm-a", 80, &none(), None).await.unwrap();
+        let pb = mgr.expose("vm-b", 80, &none(), None).await.unwrap();
+        let reserved = rules.free_slots();
+        assert!(!reserved.contains(&0) && !reserved.contains(&1));
+        rules.clear();
+
+        mgr.delete("vm-a").await.unwrap();
+        // Was: tap and slot first, then the directory, the record, and the
+        // two rebuilds last — the address was free while rules still named
+        // it. Now: both rebuilds without vm-a while its slot is still
+        // reserved, then its tap,
+        assert_eq!(
+            rules.calls(),
+            vec![
+                RuleCall::Isolation { ips: vec![ip_b.clone()], free_slots: reserved.clone() },
+                RuleCall::Ingress { members: vec![(pb, ip_b, 80)], free_slots: reserved.clone() },
+                RuleCall::RemoveTap { tap: net::tap_name(0), free_slots: reserved },
+            ]
+        );
+        // then the slot.
+        let free = rules.free_slots();
+        assert!(free.contains(&0) && !free.contains(&1));
+        assert!(mgr.inner.lock().await.vms.iter().all(|v| v.id != "vm-a"));
+        assert!(!Path::new(&format!("{}/instances/vm-a", data_dir)).exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_keeps_the_slot_reserved_when_a_rebuild_fails() {
+        for which in ["isolation", "ingress"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().to_str().unwrap().to_string();
+            let (mgr, rules) = mgr_with_rules(&data_dir);
+            add_vm(&mgr, "vm-a", 0, "t1").await;
+            mgr.expose("vm-a", 80, &none(), None).await.unwrap();
+            let flag = if which == "isolation" { &rules.fail_isolation } else { &rules.fail_ingress };
+            flag.store(true, Ordering::SeqCst);
+            rules.clear();
+
+            mgr.delete("vm-a").await.unwrap();
+            let calls = rules.calls();
+            // Both rebuilds were made, without vm-a, whichever one failed,
+            // and the guest's tap went (the guest is gone)...
+            assert!(
+                matches!(
+                    calls.as_slice(),
+                    [
+                        RuleCall::Isolation { ips, .. },
+                        RuleCall::Ingress { members, .. },
+                        RuleCall::RemoveTap { tap, .. },
+                    ] if ips.is_empty() && members.is_empty() && *tap == net::tap_name(0)
+                ),
+                "{which}: {calls:?}"
+            );
+            // ...but its address does not go to the next sandbox.
+            assert!(!rules.free_slots().contains(&0), "{which}: slot 0 was freed");
+            // The record and the directory go as before.
+            assert!(mgr.inner.lock().await.vms.is_empty(), "{which}");
+            assert!(!Path::new(&format!("{}/instances/vm-a", data_dir)).exists(), "{which}");
+
+            // A second delete stays idempotent and touches no tap.
+            rules.clear();
+            mgr.delete("vm-a").await.unwrap();
+            let calls = rules.calls();
+            assert!(calls.iter().all(|c| !matches!(c, RuleCall::RemoveTap { .. })), "{which}: {calls:?}");
+            assert!(!rules.free_slots().contains(&0), "{which}: slot 0 was freed by the second delete");
+        }
+    }
+
+    /// A sandbox `id` in slot `slot`, as `add_vm` makes one, put straight
+    /// into the manager from inside a (synchronous) rule call, with its tap
+    /// held by a VMM and pinned.
+    fn create_inside_rule_call(rules: &FakeRules, mgr: &Manager, id: &str, slot: u32) {
+        let ip = crate::ipalloc::fmt_ip(mgr.cidr.host_at(slot));
+        {
+            let mut g = mgr.inner.try_lock().expect("inner is free inside a rule call");
+            assert!(Manager::claim_slot(&mut g) == Ok(slot), "slot {slot} must be the lowest free one by now");
+            g.vms.push(Vm {
+                id: id.into(),
+                name: id.into(),
+                dir_id: id.into(),
+                vcpus: 1,
+                mem_mib: 256,
+                state: VmState::Running,
+                pid: None,
+                slot: Some(slot),
+                ip: Some(ip.clone()),
+                vsock: false,
+                tenant_id: Some("t9".into()),
+                exposes: Vec::new(),
+                image: DEFAULT_IMAGE.into(),
+                image_sha256: None,
+                disk_gb: 0,
+                snapshot_valid: false,
+            });
+        }
+        let (tap, mac) = tap_pin_for_slot(slot);
+        rules.k().links.insert(tap.clone(), super::rule_fake::FakeLink { up: true, held: true, port: true });
+        assert!(net::Kernel::apply(rules, &net::antispoof_ruleset(&tap, &ip, &mac).unwrap()).ok());
+    }
+
+    #[tokio::test]
+    async fn test_two_overlapping_deletes_free_the_slot_once() {
+        // RQ-1: both deletes read the slot at entry. The second one to finish
+        // removed the tap and pin of a sandbox created in between (it had got
+        // the slot, the lowest free) and freed its slot again.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, rules) = mgr_with_rules(tmp.path().to_str().unwrap());
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        // Slot 0 must be the lowest free one once vm-a's goes.
+        rules.clear();
+        // If a second tap removal happens, a create gets in just before it.
+        *lock_std(&rules.on_second_remove_tap) = Some(Box::new(|r: &FakeRules, m: &Manager| {
+            create_inside_rule_call(r, m, "vm-new", 0)
+        }));
+        let held = hold_rule_lock(&mgr).await;
+        let d1 = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.delete("vm-a").await })
+        };
+        let d2 = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.delete("vm-a").await })
+        };
+        // Both past their first step, parked at the rule lock.
+        sleep(Duration::from_millis(50)).await;
+        drop(held);
+        d1.await.unwrap().unwrap();
+        d2.await.unwrap().unwrap();
+        let removals: Vec<RuleCall> =
+            rules.calls().into_iter().filter(|c| matches!(c, RuleCall::RemoveTap { .. })).collect();
+        assert_eq!(removals.len(), 1, "the tap was removed twice: {removals:?}");
+        // The sandbox created afterwards (or in between) keeps its slot,
+        // its tap and its chain.
+        if mgr.inner.lock().await.vms.iter().all(|v| v.id != "vm-new") {
+            create_inside_rule_call(&rules, &mgr, "vm-new", 0);
+        }
+        assert!(!rules.free_slots().contains(&0), "vm-new's slot was freed");
+        assert!(rules.k().links.contains_key("hth-0"), "vm-new lost its tap");
+        assert!(matches!(rules.marker("netdev", "felucca", "as_hth_0"), Some(Some(_))), "vm-new lost its pin");
+        assert!(mgr.inner.lock().await.held_slots.is_empty());
+
+        // The same with the rebuilds failing: held exactly once, freed once.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, rules) = mgr_with_rules(tmp.path().to_str().unwrap());
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        rules.fail_isolation.store(true, Ordering::SeqCst);
+        let held = hold_rule_lock(&mgr).await;
+        let (m1, m2) = (Arc::clone(&mgr), Arc::clone(&mgr));
+        let d1 = tokio::spawn(async move { m1.delete("vm-a").await });
+        let d2 = tokio::spawn(async move { m2.delete("vm-a").await });
+        sleep(Duration::from_millis(50)).await;
+        drop(held);
+        d1.await.unwrap().unwrap();
+        d2.await.unwrap().unwrap();
+        assert_eq!(mgr.inner.lock().await.held_slots.iter().copied().collect::<Vec<_>>(), vec![0]);
+        rules.fail_isolation.store(false, Ordering::SeqCst);
+        assert!(mgr.refresh_isolation().await);
+        assert!(rules.free_slots().contains(&0));
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_expose_writes_nothing_and_leaves_no_rule() {
+        // RQ-13: the mapping was written to meta.json before the rule was
+        // known to be in; a roll-back write that did not land before a
+        // restart brought it back.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap().to_string();
+        let (mgr, rules) = mgr_with_rules(&data_dir);
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        let p1 = mgr.expose("vm-a", 80, &none(), None).await.unwrap();
+        let meta = format!("{}/instances/vm-a/meta.json", data_dir);
+        let before = std::fs::read(&meta).unwrap();
+        rules.fail_ingress.store(true, Ordering::SeqCst);
+        set_cursor(&mgr, 21000).await;
+        assert_eq!(mgr.expose("vm-a", 81, &none(), None).await, Err(ExposeError::RuleFailed));
+        // Nothing written: what a restart reads is what was there before.
+        assert_eq!(std::fs::read(&meta).unwrap(), before, "meta.json was written for a failed expose");
+        assert_eq!(exposes_on_disk(&data_dir, "vm-a"), vec![(80, p1)]);
+        assert_eq!(exposes_of(&mgr, "vm-a").await, vec![(80, p1)]);
+        // And no rule for it.
+        rules.fail_ingress.store(false, Ordering::SeqCst);
+        let ingress = rules.k().listing("ip", "felucca").unwrap();
+        assert!(!ingress.contains("dport 21000"), "{ingress}");
+        // The rebuild without it ran after the failure.
+        let last_two: Vec<RuleCall> = rules.calls().into_iter().rev().take(2).collect();
+        assert!(matches!(&last_two[0], RuleCall::Ingress { members, .. } if members.iter().all(|m| m.0 != 21000)), "{last_two:?}");
+    }
+
+    #[tokio::test]
+    async fn test_a_concurrent_rebuild_cannot_install_a_failing_exposes_rule() {
+        // RQ-13: another sandbox's rebuild, run between the push of the new
+        // mapping and its own failed rebuild, installed the doomed rule.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, rules) = mgr_with_rules(tmp.path().to_str().unwrap());
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        add_vm(&mgr, "vm-b", 1, "t2").await;
+        set_cursor(&mgr, 22000).await;
+        // The other sandbox's rebuild succeeds; this expose's fails.
+        lock_std(&rules.ingress_script).extend([false, true]);
+        let held = hold_rule_lock(&mgr).await;
+        let other = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.refresh_ingress().await })
+        };
+        sleep(Duration::from_millis(20)).await;
+        let doomed = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.expose("vm-a", 80, &HashSet::new(), None).await })
+        };
+        sleep(Duration::from_millis(20)).await;
+        drop(held);
+        assert!(other.await.unwrap());
+        assert_eq!(doomed.await.unwrap(), Err(ExposeError::RuleFailed));
+        let ingress = rules.k().listing("ip", "felucca").unwrap();
+        assert!(!ingress.contains("dport 22000"), "the doomed rule is in the kernel: {ingress}");
+        // Not even for a moment: only the expose's own rebuild saw it.
+        let saw: Vec<RuleCall> = rules
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, RuleCall::Ingress { members, .. } if members.iter().any(|m| m.0 == 22000)))
+            .collect();
+        assert_eq!(saw.len(), 1, "another rebuild carried the doomed mapping: {saw:?}");
+    }
+
+    #[tokio::test]
+    async fn test_an_expose_of_a_sandbox_being_deleted_answers_no_ip() {
+        // While the rules are rebuilt the record is on its way out: no
+        // address, no exposes. An expose arriving then must not add a
+        // mapping (and a rule) for an address about to be freed.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _rules) = mgr_with_rules(tmp.path().to_str().unwrap());
+        add_vm(&mgr, "vm-a", 0, "t1").await;
+        let held = hold_rule_lock(&mgr).await;
+        let deleting = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.delete("vm-a").await })
+        };
+        let mut out = false;
+        for _ in 0..1000 {
+            if mgr.inner.lock().await.vms.iter().any(|v| v.id == "vm-a" && v.ip.is_none()) {
+                out = true;
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(out, "the delete never took the sandbox out of the membership");
+        assert_eq!(mgr.expose("vm-a", 80, &none(), None).await, Err(ExposeError::NoIp));
+        assert!(exposes_of(&mgr, "vm-a").await.is_empty());
+        drop(held);
+        deleting.await.unwrap().unwrap();
     }
 }

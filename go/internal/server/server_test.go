@@ -486,7 +486,7 @@ func TestUnknownRoute(t *testing.T) {
 		method, path string
 	}{
 		{"GET", "/api/v1/unknown"},
-		{"POST", "/api/v1/nodes"},      // wrong method on known path → 404 (no 405)
+		{"POST", "/api/v1/nodes"},       // wrong method on known path → 404 (no 405)
 		{"DELETE", "/api/v1/sandboxes"}, // wrong method → 404
 		{"PUT", "/api/v1/sandboxes"},
 	}
@@ -848,12 +848,12 @@ func TestMIMETypes(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := &config.Config{UIDir: tmp, StatePath: filepath.Join(tmp, "state.json")}
 	files := map[string]string{
-		"app.js":   "application/javascript",
+		"app.js":    "application/javascript",
 		"style.css": "text/css",
 		"data.json": "application/json",
-		"img.svg":  "image/svg+xml",
-		"img.png":  "image/png",
-		"file.bin": "application/octet-stream",
+		"img.svg":   "image/svg+xml",
+		"img.png":   "image/png",
+		"file.bin":  "application/octet-stream",
 	}
 	for name := range files {
 		os.WriteFile(filepath.Join(tmp, name), []byte("x"), 0o644)
@@ -1293,10 +1293,11 @@ func TestNoDialPathCanCarryTheAdminToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("glob package sources: %v", err)
 	}
-	dialFuncs := []string{"Request", "ExecVM", "ExecVMStream"}
+	dialFuncs := []string{"Request", "RequestWithin", "ExecVM", "ExecVMStream"}
 	// The choke point, and nothing else.
 	allowedDial := map[string]bool{
 		"nodeDial.do": true, "nodeDial.exec": true, "nodeDial.execStream": true,
+		"nodeDial.doWithin": true, // do with a shorter limit (expose.go)
 	}
 	allowedToken := map[string]bool{
 		// The inbound check, and the grandfathered legacy-node fallback inside

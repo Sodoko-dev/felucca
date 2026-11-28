@@ -8,6 +8,7 @@
   "pool_size": 2,
   "net": "on",
   "net_cidr": "10.231.0.0/24",
+  "isolation_watch": "enforce",
   "join_url": "",
   "join_token": ""
 }

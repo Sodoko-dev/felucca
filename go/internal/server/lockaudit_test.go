@@ -51,7 +51,7 @@ import (
 // same panic exposure until they are. They are recorded rather than fixed so the
 // audit can be enforcing from the moment it lands.
 var unlocksByHand = map[string]string{
-	"exposeCommon":       "expose.go: resolves under the lock, unlocks, then calls the agent to install a DNAT rule, then re-locks to record the row",
+	"exposeCommon":       "expose.go: resolves and checks under the lock, unlocks by hand on each answer, then acquireNodePort (closure-scoped locks) calls the agent and records the row",
 	"reExposeFork":       "expose.go: locks once per parent expose inside a loop, with the agent call between iterations",
 	"unexposeSandbox":    "expose.go: same shape as exposeCommon, in reverse",
 	"listRoutes":         "expose.go: snapshots under the lock and formats the response body outside it",

@@ -17,7 +17,7 @@ use crate::config::authorized_either;
 use crate::registration::NodeToken;
 use crate::vm::{
     image, valid_vm_id, CreateSpec, ExecOutcome, ExecStreamOutcome, ExposeError, Manager,
-    PoolSpec, RootfsError, DEFAULT_IMAGE,
+    OpError, PoolSpec, RootfsError, DEFAULT_IMAGE, STOP_GAVE_UP,
 };
 use tracing::warn;
 
@@ -47,6 +47,34 @@ fn json_response(status: StatusCode, body: &str) -> Response {
 /// document. Same reasoning as put_pools' validation errors.
 fn error_response(status: StatusCode, msg: &str) -> Response {
     json_response(status, &serde_json::json!({ "error": msg }).to_string())
+}
+
+/// `{"error":"busy"}`: another lifecycle operation holds the sandbox, or it
+/// is being stopped or deleted. No `state`: nothing was decided, try again.
+fn busy_response() -> Response {
+    json_response(StatusCode::CONFLICT, "{\"error\":\"busy\"}")
+}
+
+/// The answer to a lifecycle operation that did not do what it was asked.
+/// A refusal for the state the sandbox is in carries that state, under the
+/// key `state`: the control plane records it (a contract).
+fn op_error_response(e: &OpError) -> Response {
+    match e {
+        OpError::Busy => busy_response(),
+        OpError::InvalidState { msg, state } => json_response(
+            StatusCode::CONFLICT,
+            &serde_json::json!({ "error": msg, "state": state.as_str() }).to_string(),
+        ),
+        OpError::Other(msg) => error_response(StatusCode::INTERNAL_SERVER_ERROR, msg),
+    }
+}
+
+/// `op_error_response`, with an unknown id answered 404 (sleep and wake).
+fn op_error_response_404(e: &OpError) -> Response {
+    match e {
+        OpError::Other(msg) if msg == "NotFound" => error_response(StatusCode::NOT_FOUND, msg),
+        _ => op_error_response(e),
+    }
 }
 
 fn empty_response(status: StatusCode) -> Response {
@@ -225,14 +253,15 @@ async fn create_vm(State(state): State<AppState>, req: Request) -> Response {
 /// under a record that still names it. On its own task the operation always
 /// runs to its end; only the answer is lost. `create_vm` and `fork_vm` have
 /// done this from the start.
-async fn detached<T, F>(op: F) -> Result<T, String>
+async fn detached<T, E, F>(op: F) -> Result<T, E>
 where
-    F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    F: std::future::Future<Output = Result<T, E>> + Send + 'static,
     T: Send + 'static,
+    E: From<String> + Send + 'static,
 {
     match tokio::spawn(op).await {
         Ok(result) => result,
-        Err(e) => Err(format!("operation task: {}", e)),
+        Err(e) => Err(E::from(format!("operation task: {}", e))),
     }
 }
 
@@ -250,9 +279,7 @@ async fn sleep_vm(
     let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
     match detached(async move { mgr.sleep_vm(&vm).await }).await {
         Ok(_) => json_response(StatusCode::OK, "{\"ok\":true}"),
-        Err(e) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
-        }
+        Err(e) => op_error_response_404(&e),
     }
 }
 
@@ -273,9 +300,7 @@ async fn wake_vm(
             let body = format!("{{\"ok\":true,\"wake_ms\":{}}}", ms);
             json_response(StatusCode::OK, &body)
         }
-        Err(e) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
-        }
+        Err(e) => op_error_response_404(&e),
     }
 }
 
@@ -318,18 +343,29 @@ async fn fork_vm(
     // abandon a half-built child record.
     let mgr = Arc::clone(&state.mgr);
     let (pid2, cid2, cname2) = (parent_id.clone(), child_id.clone(), child_name.clone());
-    let result = match tokio::spawn(async move { mgr.fork(&pid2, &cid2, &cname2).await }).await {
+    let result = match tokio::spawn(async move { mgr.fork_answer(&pid2, &cid2, &cname2).await }).await {
         Ok(r) => r,
-        Err(e) => Err(format!("fork task: {}", e)),
+        Err(e) => Err(OpError::Other(format!("fork task: {}", e))),
     };
+    fork_response(result)
+}
+
+/// The answer to a fork. A refusal for the parent's state carries that
+/// state under `state`, as sleep, wake, stop and start do (the control plane
+/// records it); `busy` and `AlreadyExists` carry none.
+fn fork_response(result: Result<Option<String>, OpError>) -> Response {
     match result {
         Ok(ip) => {
             let body = serde_json::json!({ "ok": true, "ip": ip }).to_string();
             json_response(StatusCode::CREATED, &body)
         }
-        Err(e) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
-        }
+        // The parent is held by another lifecycle operation; or the parent
+        // is in a state that cannot be forked.
+        Err(e @ (OpError::Busy | OpError::InvalidState { .. })) => op_error_response(&e),
+        // The child id, or a directory of that name, is taken; nothing was
+        // written.
+        Err(OpError::Other(e)) if e == "AlreadyExists" => error_response(StatusCode::CONFLICT, &e),
+        Err(OpError::Other(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
 }
 
@@ -462,6 +498,59 @@ async fn parse_guest_port(req: Request) -> Result<u16, Response> {
     }
 }
 
+/// Largest expose body accepted. `avoid` may name every port of the node-port
+/// range (10 000 entries of up to six bytes each); this leaves room for
+/// spacing around them.
+const EXPOSE_BODY_LIMIT: usize = 128 * 1024;
+
+/// Most `avoid` entries accepted: the size of the node-port range.
+const MAX_AVOID: usize = 10_000;
+
+/// A parsed expose request.
+#[derive(Debug, PartialEq, Eq)]
+struct ExposeBody {
+    guest_port: u16,
+    /// Node ports not to hand out (FLU-6 R3). Absent or null: none.
+    avoid: std::collections::HashSet<u16>,
+    /// The port this sandbox and guest port held last. Absent or null: none.
+    prefer: Option<u16>,
+}
+
+/// Parse `{"guest_port": n, "avoid": [n, ...], "prefer": n}`. Err carries the
+/// body of the 400 answer. guest_port as `parse_guest_port`. `avoid` and
+/// `prefer` are optional (null counts as absent); a value that is there but
+/// malformed — not an array of integers, an entry or `prefer` outside
+/// 0..=65535, more than `MAX_AVOID` entries — is refused, not ignored: an
+/// avoid list the agent half-read would hand out a port it was told not to.
+/// Other keys are ignored.
+fn parse_expose_body(body: &[u8]) -> Result<ExposeBody, &'static str> {
+    let body_str = std::str::from_utf8(body).map_err(|_| "{\"error\":\"bad request\"}")?;
+    let json: serde_json::Value =
+        serde_json::from_str(body_str).map_err(|_| "{\"error\":\"bad json\"}")?;
+    let guest_port = match json.get("guest_port").and_then(|v| v.as_u64()) {
+        Some(p) if (1..=65535).contains(&p) => p as u16,
+        _ => return Err("{\"error\":\"guest_port required\"}"),
+    };
+    let port = |v: &serde_json::Value| v.as_u64().filter(|p| *p <= 65535).map(|p| p as u16);
+    let avoid = match json.get("avoid") {
+        None | Some(serde_json::Value::Null) => std::collections::HashSet::new(),
+        Some(serde_json::Value::Array(arr)) if arr.len() > MAX_AVOID => {
+            return Err("{\"error\":\"avoid too long\"}")
+        }
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .map(port)
+            .collect::<Option<_>>()
+            .ok_or("{\"error\":\"invalid avoid\"}")?,
+        Some(_) => return Err("{\"error\":\"invalid avoid\"}"),
+    };
+    let prefer = match json.get("prefer") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(port(v).ok_or("{\"error\":\"invalid prefer\"}")?),
+    };
+    Ok(ExposeBody { guest_port, avoid, prefer })
+}
+
 async fn expose_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -473,22 +562,41 @@ async fn expose_vm(
     if let Some(resp) = reject_bad_id(&id) {
         return resp;
     }
-    let guest_port = match parse_guest_port(req).await {
-        Ok(p) => p,
-        Err(resp) => return resp,
+    let body_bytes = match axum::body::to_bytes(req.into_body(), EXPOSE_BODY_LIMIT).await {
+        Ok(b) => b,
+        Err(_) => return json_response(StatusCode::BAD_REQUEST, "{\"error\":\"bad request\"}"),
     };
-    match state.mgr.expose(&id, guest_port).await {
-        Ok(node_port) => {
-            let body = format!("{{\"node_port\":{}}}", node_port);
+    let ExposeBody { guest_port, avoid, prefer } = match parse_expose_body(&body_bytes) {
+        Ok(b) => b,
+        Err(body) => return json_response(StatusCode::BAD_REQUEST, body),
+    };
+    // Detached (FLU-6 R8): between "port recorded" and "rule installed" a
+    // dropped request left a mapping on the record with no rule behind it.
+    let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
+    let result = detached(async move {
+        Ok::<_, String>(mgr.expose(&vm, guest_port, &avoid, prefer).await)
+    })
+    .await;
+    match result {
+        // `avoid_honored` tells the control plane that this agent read
+        // `avoid` and `prefer` (an older one ignores them, and its answer
+        // lacks the key). Literals only, so the body is built by hand.
+        Ok(Ok(node_port)) => {
+            let body = format!("{{\"node_port\":{},\"avoid_honored\":true}}", node_port);
             json_response(StatusCode::OK, &body)
         }
-        Err(ExposeError::NotFound) => {
+        Ok(Err(ExposeError::NotFound)) => {
             json_response(StatusCode::NOT_FOUND, "{\"error\":\"not found\"}")
         }
-        Err(ExposeError::NoIp) => json_response(StatusCode::CONFLICT, "{\"error\":\"no ip\"}"),
-        Err(ExposeError::Exhausted) => {
+        Ok(Err(ExposeError::NoIp)) => json_response(StatusCode::CONFLICT, "{\"error\":\"no ip\"}"),
+        Ok(Err(ExposeError::Exhausted)) => {
             json_response(StatusCode::CONFLICT, "{\"error\":\"ports exhausted\"}")
         }
+        Ok(Err(ExposeError::RuleFailed)) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{\"error\":\"ingress rule not installed\"}",
+        ),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
 }
 
@@ -507,15 +615,19 @@ async fn unexpose_vm(
         Ok(p) => p,
         Err(resp) => return resp,
     };
-    match state.mgr.unexpose(&id, guest_port).await {
+    // Detached (FLU-6 R8), like expose: the mapping leaves the record before
+    // the rules are rebuilt.
+    let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
+    match detached(async move { Ok::<_, String>(mgr.unexpose(&vm, guest_port).await) }).await {
         // Missing entry is OK (idempotent) — only an unknown VM is 404.
-        Ok(()) => json_response(StatusCode::OK, "{\"ok\":true}"),
-        Err(ExposeError::NotFound) => {
+        Ok(Ok(())) => json_response(StatusCode::OK, "{\"ok\":true}"),
+        Ok(Err(ExposeError::NotFound)) => {
             json_response(StatusCode::NOT_FOUND, "{\"error\":\"not found\"}")
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("{:?}", e))
         }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
 }
 
@@ -533,12 +645,7 @@ async fn vm_pause(
     let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
     match detached(async move { mgr.pause(&vm).await }).await {
         Ok(_) => empty_response(StatusCode::OK),
-        Err(e) if e.starts_with("InvalidState") => {
-            error_response(StatusCode::CONFLICT, &e)
-        }
-        Err(e) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
-        }
+        Err(e) => op_error_response(&e),
     }
 }
 
@@ -556,12 +663,7 @@ async fn vm_resume(
     let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
     match detached(async move { mgr.resume(&vm).await }).await {
         Ok(_) => empty_response(StatusCode::OK),
-        Err(e) if e.starts_with("InvalidState") => {
-            error_response(StatusCode::CONFLICT, &e)
-        }
-        Err(e) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
-        }
+        Err(e) => op_error_response(&e),
     }
 }
 
@@ -579,9 +681,7 @@ async fn vm_stop(
     let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
     match detached(async move { mgr.stop(&vm).await }).await {
         Ok(_) => empty_response(StatusCode::OK),
-        Err(e) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
-        }
+        Err(e) => op_error_response(&e),
     }
 }
 
@@ -600,13 +700,8 @@ async fn vm_start(
     match detached(async move { mgr.start(&vm).await }).await {
         Ok(_) => empty_response(StatusCode::OK),
         // Wrong lifecycle state (e.g. start on a paused VM) → 409, matching
-        // the exec contract's 409 "not running" convention.
-        Err(e) if e.starts_with("InvalidState") => {
-            error_response(StatusCode::CONFLICT, &e)
-        }
-        Err(e) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
-        }
+        // the exec contract's 409 "not running" convention, with the state.
+        Err(e) => op_error_response(&e),
     }
 }
 
@@ -630,6 +725,12 @@ async fn delete_vm(
     let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
     match detached(async move { mgr.delete(&vm).await }).await {
         Ok(()) => empty_response(StatusCode::NO_CONTENT),
+        // An operation in progress did not let go in time: retry. The VM is
+        // `stopped` by then (delete stops it first), and the answer says so.
+        Err(e) if e == STOP_GAVE_UP => json_response(
+            StatusCode::CONFLICT,
+            &serde_json::json!({ "error": e, "state": "stopped" }).to_string(),
+        ),
         Err(e) if e.starts_with("InvalidState") => error_response(StatusCode::CONFLICT, &e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
@@ -906,6 +1007,98 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_healthz_and_the_heartbeat_carry_the_watch_verdict() {
+        // FLU-8 N9': the same value in both, in every state; the healthz
+        // body byte-identical to before for true and false.
+        use crate::config::IsolationWatch;
+        use std::sync::atomic::Ordering;
+        let w = crate::vm::watch::tests::worker().await;
+        let state = AppState {
+            mgr: Arc::clone(&w.mgr),
+            token: "t".into(),
+            node_token: Arc::new(std::sync::RwLock::new(String::new())),
+        };
+        let check = |want: bool| {
+            let state = state.clone();
+            async move {
+                let resp = healthz(State(state.clone())).await;
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+                assert_eq!(std::str::from_utf8(&bytes).unwrap(), format!("{{\"ok\":true,\"isolation\":{}}}", want));
+                let hb = crate::registration::heartbeat_body("n1", 1, 2, 0, state.mgr.isolation_ok());
+                assert!(hb.ends_with(&format!("\"isolation_ok\":{}}}", want)), "{hb}");
+            }
+        };
+        // Before the first tick: start-up's verdict, either way.
+        check(true).await;
+        w.rules.fences_down.store(true, Ordering::SeqCst);
+        check(false).await;
+        // After a tick: the watch's.
+        w.mgr.watch_tick(IsolationWatch::Enforce).await.unwrap();
+        check(true).await;
+        // The host fence missing.
+        let fence = std::mem::take(&mut w.rules.k().chain_mut("inet", "felucca_host", "input").unwrap().rules);
+        w.mgr.watch_tick(IsolationWatch::Enforce).await.unwrap();
+        check(false).await;
+        w.rules.k().chain_mut("inet", "felucca_host", "input").unwrap().rules = fence;
+        w.mgr.watch_tick(IsolationWatch::Enforce).await.unwrap();
+        check(true).await;
+        // A fence that cannot be put back.
+        w.rules.k().tables.get_mut(&("ip".to_string(), "felucca".to_string())).unwrap().remove("forward");
+        w.rules.reject.lock().unwrap().push("ip felucca forward".into());
+        w.mgr.watch_tick(IsolationWatch::Enforce).await.unwrap();
+        check(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_every_fork_refusal_answers_its_status_and_the_parents_state() {
+        // Fix list items 6 and 7: each fork refusal for the parent's state is
+        // a 409 carrying `state`, like sleep, wake, stop and start; `busy` and
+        // `AlreadyExists` carry none; and no answer names a path.
+        use crate::vm::meta::VmState;
+        use crate::vm::{FORK_REFUSED_FORKED_BEFORE, WAKE_REFUSED_FORKED_BEFORE};
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let mgr = Manager::new(data_dir.clone(), false, crate::ipalloc::Cidr { base: 0x0AE7_0000, prefix: 24 }, 0, "http://cp".into(), "tok".into());
+        // A parent in a state that cannot be forked, refused by the manager.
+        crate::vm::rule_fake::add_vm(&mgr, "vm-1", 0, "t1").await;
+        let refused = mgr.fork_answer("vm-1", "vm-2", "c").await;
+        let cases: Vec<(Result<Option<String>, OpError>, StatusCode, serde_json::Value)> = vec![
+            (
+                refused,
+                StatusCode::CONFLICT,
+                serde_json::json!({"error": "InvalidState: stopped (only a running, paused or sleeping VM can be forked)", "state": "stopped"}),
+            ),
+            (
+                Err(OpError::InvalidState { msg: FORK_REFUSED_FORKED_BEFORE.into(), state: VmState::Sleeping }),
+                StatusCode::CONFLICT,
+                serde_json::json!({"error": FORK_REFUSED_FORKED_BEFORE, "state": "sleeping"}),
+            ),
+            (
+                Err(OpError::InvalidState { msg: FORK_REFUSED_FORKED_BEFORE.into(), state: VmState::Running }),
+                StatusCode::CONFLICT,
+                serde_json::json!({"error": FORK_REFUSED_FORKED_BEFORE, "state": "running"}),
+            ),
+            (Err(OpError::Busy), StatusCode::CONFLICT, serde_json::json!({"error": "busy"})),
+            (Err(OpError::Other("AlreadyExists".into())), StatusCode::CONFLICT, serde_json::json!({"error": "AlreadyExists"})),
+        ];
+        for (result, status, body) in cases {
+            let resp = fork_response(result);
+            assert_eq!(resp.status(), status, "{body}");
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap().to_string();
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap(), body);
+            assert!(!text.contains('/') && !text.contains(&data_dir), "a path in the answer: {text}");
+        }
+        // The wake refusal of the same kind names no path either.
+        let resp = op_error_response(&OpError::InvalidState { msg: WAKE_REFUSED_FORKED_BEFORE.into(), state: VmState::Stopped });
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(!text.contains('/'), "{text}");
+        assert!(text.contains("\"state\":\"stopped\""), "{text}");
+    }
+
     // ---- inbound credentials ----
 
     fn auth_state(dir: &std::path::Path, shared: &str, node: &str) -> AppState {
@@ -1056,5 +1249,295 @@ mod tests {
             .unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         assert_eq!(len, bytes.len());
+    }
+
+    // ---- FLU-4: lifecycle refusals carry the state ----
+
+    #[tokio::test]
+    async fn test_op_error_bodies() {
+        let resp = op_error_response(&OpError::Busy);
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        // No state: nothing was decided.
+        assert_eq!(body_of(resp).await, serde_json::json!({ "error": "busy" }));
+
+        let resp = op_error_response(&OpError::InvalidState {
+            msg: "InvalidState: paused (use resume)".into(),
+            state: crate::vm::meta::VmState::Paused,
+        });
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_of(resp).await,
+            serde_json::json!({ "error": "InvalidState: paused (use resume)", "state": "paused" })
+        );
+
+        let resp = op_error_response(&OpError::Other("FcError: boom".into()));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_of(resp).await, serde_json::json!({ "error": "FcError: boom" }));
+        // NotFound is 404 for sleep and wake, and stays 500 for the others.
+        assert_eq!(op_error_response_404(&OpError::Other("NotFound".into())).status(), StatusCode::NOT_FOUND);
+        assert_eq!(op_error_response(&OpError::Other("NotFound".into())).status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// An agent whose data dir holds the given records (`id` → state), each
+    /// with a complete snapshot beside it, loaded the way start-up loads them.
+    async fn state_with(records: &[(&str, &str)]) -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        for (id, st) in records {
+            let d = dir.path().join("instances").join(id);
+            std::fs::create_dir_all(&d).unwrap();
+            let mark = if *st == "sleeping" { r#","snapshot_valid":true"# } else { "" };
+            std::fs::write(
+                d.join("meta.json"),
+                format!(
+                    r#"{{"id":"{id}","name":"{id}","dir_id":"{id}","vcpus":1,"mem_mib":256,"pid":null,"slot":null,"ip":null,"state":"{st}"{mark}}}"#
+                ),
+            )
+            .unwrap();
+            std::fs::write(d.join("vmstate.bin"), b"state").unwrap();
+            std::fs::write(d.join("mem.bin"), b"mem").unwrap();
+        }
+        let state = auth_state(dir.path(), "t", "");
+        state.mgr.reconcile().await;
+        (dir, state)
+    }
+
+    fn authed() -> Request {
+        Request::builder().header("authorization", "Bearer t").body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_refusals_answer_409_with_the_state() {
+        let (_dir, state) = state_with(&[("vm-stopped", "stopped"), ("vm-error", "error"), ("vm-asleep", "sleeping")]).await;
+        let id = |s: &str| Path(s.to_string());
+        let cases: Vec<(&str, Response, &str)> = vec![
+            ("sleep stopped", sleep_vm(State(state.clone()), id("vm-stopped"), authed()).await, "stopped"),
+            ("sleep error", sleep_vm(State(state.clone()), id("vm-error"), authed()).await, "error"),
+            ("wake stopped", wake_vm(State(state.clone()), id("vm-stopped"), authed()).await, "stopped"),
+            ("wake error", wake_vm(State(state.clone()), id("vm-error"), authed()).await, "error"),
+            ("start asleep", vm_start(State(state.clone()), id("vm-asleep"), authed()).await, "sleeping"),
+            ("pause stopped", vm_pause(State(state.clone()), id("vm-stopped"), authed()).await, "stopped"),
+            ("pause asleep", vm_pause(State(state.clone()), id("vm-asleep"), authed()).await, "sleeping"),
+            ("resume stopped", vm_resume(State(state.clone()), id("vm-stopped"), authed()).await, "stopped"),
+        ];
+        for (what, resp, want) in cases {
+            assert_eq!(resp.status(), StatusCode::CONFLICT, "{what}");
+            let body = body_of(resp).await;
+            assert_eq!(body["state"], serde_json::json!(want), "{what}: {body}");
+            assert!(body["error"].as_str().unwrap().starts_with("InvalidState"), "{what}: {body}");
+        }
+        // An unknown id: 404 from sleep and wake.
+        for resp in [
+            sleep_vm(State(state.clone()), id("vm-nope"), authed()).await,
+            wake_vm(State(state.clone()), id("vm-nope"), authed()).await,
+        ] {
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+        // Sleeping already: still a success.
+        let resp = sleep_vm(State(state.clone()), id("vm-asleep"), authed()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ---- FLU-70: a fork onto a taken id ----
+
+    #[tokio::test]
+    async fn test_fork_onto_a_taken_id_or_directory_answers_409() {
+        let (dir, state) = state_with(&[("vm-asleep", "sleeping"), ("vm-other", "stopped")]).await;
+        // A directory no record owns (its meta.json did not load).
+        std::fs::create_dir_all(dir.path().join("instances").join("vm-stray")).unwrap();
+        for child in ["vm-other", "vm-stray"] {
+            let req = Request::builder()
+                .header("authorization", "Bearer t")
+                .body(Body::from(format!(r#"{{"id":"{child}"}}"#)))
+                .unwrap();
+            let resp = fork_vm(State(state.clone()), Path("vm-asleep".to_string()), req).await;
+            assert_eq!(resp.status(), StatusCode::CONFLICT, "{child}");
+            assert_eq!(body_of(resp).await, serde_json::json!({ "error": "AlreadyExists" }), "{child}");
+        }
+    }
+
+    // ---- FLU-6: the expose request and answer ----
+
+    fn parsed(body: &str) -> ExposeBody {
+        parse_expose_body(body.as_bytes()).unwrap_or_else(|_| panic!("{body} must parse"))
+    }
+
+    /// The answer the handler gives for a body the parser refuses.
+    async fn refused(body: &str) -> (StatusCode, String) {
+        let resp = json_response(StatusCode::BAD_REQUEST, parse_expose_body(body.as_bytes()).expect_err(body));
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn set(p: &[u16]) -> std::collections::HashSet<u16> {
+        p.iter().copied().collect()
+    }
+
+    #[test]
+    fn test_expose_body_avoid_and_prefer_are_optional() {
+        let none = ExposeBody { guest_port: 80, avoid: set(&[]), prefer: None };
+        // Absent, null (what Go sends for a nil slice or pointer) and empty.
+        assert_eq!(parsed(r#"{"guest_port":80}"#), none);
+        assert_eq!(parsed(r#"{"guest_port":80,"avoid":null,"prefer":null}"#), none);
+        assert_eq!(parsed(r#"{"guest_port":80,"avoid":[]}"#), none);
+        // Present; duplicates and ports outside the node-port range are
+        // accepted (they are harmless); other keys are ignored.
+        assert_eq!(
+            parsed(r#"{"guest_port":80,"avoid":[20000,20001,20000,80,0,65535],"prefer":21000,"other":"x"}"#),
+            ExposeBody { guest_port: 80, avoid: set(&[20000, 20001, 80, 0, 65535]), prefer: Some(21000) }
+        );
+        assert_eq!(parsed(r#"{"guest_port":80,"prefer":8080}"#).prefer, Some(8080));
+        // Exactly the most entries allowed.
+        let full: Vec<u16> = (20000..30000).collect();
+        let body = serde_json::json!({ "guest_port": 80, "avoid": full }).to_string();
+        assert_eq!(parsed(&body).avoid.len(), 10_000);
+    }
+
+    #[tokio::test]
+    async fn test_expose_body_malformed_fields_are_refused() {
+        let bad_avoid = (StatusCode::BAD_REQUEST, r#"{"error":"invalid avoid"}"#.to_string());
+        for body in [
+            r#"{"guest_port":80,"avoid":"20000"}"#,
+            r#"{"guest_port":80,"avoid":20000}"#,
+            r#"{"guest_port":80,"avoid":{}}"#,
+            r#"{"guest_port":80,"avoid":[20000,"20001"]}"#,
+            r#"{"guest_port":80,"avoid":[-1]}"#,
+            r#"{"guest_port":80,"avoid":[65536]}"#,
+            r#"{"guest_port":80,"avoid":[20000.5]}"#,
+            r#"{"guest_port":80,"avoid":[null]}"#,
+            r#"{"guest_port":80,"avoid":[true]}"#,
+        ] {
+            assert_eq!(refused(body).await, bad_avoid, "{body}");
+        }
+        let bad_prefer = (StatusCode::BAD_REQUEST, r#"{"error":"invalid prefer"}"#.to_string());
+        for body in [
+            r#"{"guest_port":80,"prefer":"21000"}"#,
+            r#"{"guest_port":80,"prefer":-1}"#,
+            r#"{"guest_port":80,"prefer":65536}"#,
+            r#"{"guest_port":80,"prefer":21000.5}"#,
+            r#"{"guest_port":80,"prefer":true}"#,
+            r#"{"guest_port":80,"prefer":[21000]}"#,
+        ] {
+            assert_eq!(refused(body).await, bad_prefer, "{body}");
+        }
+        // One entry more than the range holds.
+        let long: Vec<u32> = (20000..30001).collect();
+        let body = serde_json::json!({ "guest_port": 80, "avoid": long }).to_string();
+        assert_eq!(refused(&body).await, (StatusCode::BAD_REQUEST, r#"{"error":"avoid too long"}"#.to_string()));
+        // guest_port as before.
+        assert_eq!(
+            refused(r#"{"avoid":[]}"#).await,
+            (StatusCode::BAD_REQUEST, r#"{"error":"guest_port required"}"#.to_string())
+        );
+        assert_eq!(refused("not json").await, (StatusCode::BAD_REQUEST, r#"{"error":"bad json"}"#.to_string()));
+    }
+
+    /// An agent with one stopped sandbox `vm-1` that holds an address, and
+    /// rules made by a stand-in.
+    async fn expose_state() -> (tempfile::TempDir, AppState, Arc<crate::vm::rule_fake::FakeRules>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = Manager::new(
+            dir.path().to_str().unwrap().to_string(),
+            false,
+            crate::ipalloc::Cidr { base: 0x0AE7_0000, prefix: 24 },
+            0,
+            "http://cp".into(),
+            "t".into(),
+        );
+        let rules = crate::vm::rule_fake::install(&mut mgr);
+        crate::vm::rule_fake::add_vm(&mgr, "vm-1", 0, "t1").await;
+        let state = AppState { mgr, token: "t".into(), node_token: Arc::new(std::sync::RwLock::new(String::new())) };
+        (dir, state, rules)
+    }
+
+    fn authed_with(body: impl Into<Body>) -> Request {
+        Request::builder().header("authorization", "Bearer t").body(body.into()).unwrap()
+    }
+
+    async fn text_of(resp: Response) -> (StatusCode, String) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_expose_answer_bytes_and_body_limit() {
+        let (_dir, state, rules) = expose_state().await;
+        let expose = |body: String| expose_vm(State(state.clone()), Path("vm-1".to_string()), authed_with(body));
+        // Every port avoided but one: the answer is that one, byte for byte.
+        let avoid: Vec<u16> = (20000..30000).filter(|p| *p != 25000).collect();
+        let body = serde_json::json!({ "guest_port": 8080, "avoid": avoid }).to_string();
+        assert_eq!(text_of(expose(body).await).await, (StatusCode::OK, r#"{"node_port":25000,"avoid_honored":true}"#.to_string()));
+        // The idempotent answer, whatever avoid says.
+        let body = r#"{"guest_port":8080,"avoid":[25000]}"#.to_string();
+        assert_eq!(text_of(expose(body).await).await, (StatusCode::OK, r#"{"node_port":25000,"avoid_honored":true}"#.to_string()));
+        // Nothing left for a new mapping.
+        let all: Vec<u16> = (20000..30000).collect();
+        let body = serde_json::json!({ "guest_port": 8081, "avoid": all }).to_string();
+        assert_eq!(text_of(expose(body).await).await, (StatusCode::CONFLICT, r#"{"error":"ports exhausted"}"#.to_string()));
+        // A rule that is not installed.
+        rules.fail_ingress.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            text_of(expose(r#"{"guest_port":8082}"#.to_string()).await).await,
+            (StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"ingress rule not installed"}"#.to_string())
+        );
+        rules.fail_ingress.store(false, std::sync::atomic::Ordering::SeqCst);
+        // A full avoid list with generous spacing (about 100 KiB) is read...
+        let spaced: Vec<String> = (20000..30000u16).map(|p| p.to_string()).collect();
+        let body = format!(r#"{{"guest_port":8083,"prefer":21000,"avoid":[{}]}}"#, spaced.join(",     "));
+        assert!(body.len() > 100 * 1024 && body.len() <= EXPOSE_BODY_LIMIT, "{}", body.len());
+        assert_eq!(text_of(expose(body).await).await, (StatusCode::OK, r#"{"node_port":21000,"avoid_honored":true}"#.to_string()));
+        // ...a longer body is refused.
+        let body = format!(r#"{{"guest_port":8084,"avoid":[{}]}}{}"#, "20000", " ".repeat(EXPOSE_BODY_LIMIT));
+        assert_eq!(text_of(expose(body).await).await, (StatusCode::BAD_REQUEST, r#"{"error":"bad request"}"#.to_string()));
+        // A malformed field reaches the caller as 400 through the handler too.
+        let body = r#"{"guest_port":8085,"avoid":"x"}"#.to_string();
+        assert_eq!(text_of(expose(body).await).await, (StatusCode::BAD_REQUEST, r#"{"error":"invalid avoid"}"#.to_string()));
+    }
+
+    async fn ingress_rebuilt_with(rules: &crate::vm::rule_fake::FakeRules, has: impl Fn(&[(u16, String, u16)]) -> bool) -> bool {
+        for _ in 0..500 {
+            let found = rules.calls().iter().any(|c| {
+                matches!(c, crate::vm::rule_fake::RuleCall::Ingress { members, .. } if has(members))
+            });
+            if found {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn test_expose_and_unexpose_run_to_their_end_when_the_caller_hangs_up() {
+        // Was: the handler future did the work, so a caller that gave up
+        // between "port recorded" and "rule installed" left a mapping on the
+        // record with no rule (or, for unexpose, a rule with no mapping).
+        let (_dir, state, rules) = expose_state().await;
+        let id = || Path("vm-1".to_string());
+
+        let held = crate::vm::rule_fake::hold_rule_lock(&state.mgr).await;
+        let call = expose_vm(State(state.clone()), id(), authed_with(r#"{"guest_port":8080}"#));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), call).await.is_err(), "the rebuild was held");
+        drop(held);
+        assert!(
+            ingress_rebuilt_with(&rules, |m| m.iter().any(|e| e.2 == 8080)).await,
+            "the expose stopped when its caller hung up: {:?}",
+            rules.calls()
+        );
+        let mapped = crate::vm::rule_fake::exposes_of(&state.mgr, "vm-1").await;
+        assert_eq!(mapped.len(), 1, "{mapped:?}");
+
+        rules.clear();
+        let held = crate::vm::rule_fake::hold_rule_lock(&state.mgr).await;
+        let call = unexpose_vm(State(state.clone()), id(), authed_with(r#"{"guest_port":8080}"#));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), call).await.is_err(), "the rebuild was held");
+        drop(held);
+        assert!(
+            ingress_rebuilt_with(&rules, |m| m.is_empty()).await,
+            "the unexpose stopped when its caller hung up: {:?}",
+            rules.calls()
+        );
+        assert!(crate::vm::rule_fake::exposes_of(&state.mgr, "vm-1").await.is_empty());
     }
 }
