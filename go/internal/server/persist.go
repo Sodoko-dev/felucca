@@ -488,11 +488,50 @@ func (srv *Server) UsageFlushLoop(stop <-chan struct{}) {
 				slog.Warn("usage: exec rows not written, kept for the next flush", "err", err)
 			}
 		case <-stop:
-			if err := srv.flushExecUsage(); err != nil {
-				slog.Error("usage: final exec flush failed", "err", err)
+			srv.finalExecFlush()
+			return
+		}
+	}
+}
+
+// finalFlushRetry is the pause between attempts of the final exec flush.
+const finalFlushRetry = time.Second
+
+// defaultFinalFlushFor bounds the final flush when no deadline was set.
+const defaultFinalFlushFor = 10 * time.Second
+
+// SetFinalFlushDeadline bounds the final exec flush (cmd/feluccad: just inside
+// the stop's hard limit, so the flush can say what it lost before the process
+// is ended).
+func (srv *Server) SetFinalFlushDeadline(t time.Time) { srv.finalFlushUntil.Store(t.UnixNano()) }
+
+// finalExecFlush is the flush at the stop. A database held locked fails one
+// attempt after its busy time-out; one attempt only lost every queued row with
+// the process. It is tried again every finalFlushRetry until it succeeds or
+// the deadline passes; then one ERROR says how many rows are lost.
+func (srv *Server) finalExecFlush() {
+	until := time.Now().Add(defaultFinalFlushFor)
+	if d := srv.finalFlushUntil.Load(); d != 0 {
+		until = time.Unix(0, d)
+	}
+	for attempt := 1; ; attempt++ {
+		err := srv.flushExecUsage()
+		if err == nil {
+			if attempt > 1 {
+				slog.Info("usage: final exec flush written", "attempts", attempt)
 			}
 			return
 		}
+		if time.Now().Add(finalFlushRetry).After(until) {
+			srv.execUsage.mu.Lock()
+			lost := len(srv.execUsage.rows)
+			srv.execUsage.mu.Unlock()
+			slog.Error("usage: final exec flush failed; the queued exec usage rows are lost",
+				"rows", lost, "attempts", attempt, "err", err)
+			return
+		}
+		slog.Warn("usage: final exec flush failed, trying again", "attempt", attempt, "err", err)
+		time.Sleep(finalFlushRetry)
 	}
 }
 

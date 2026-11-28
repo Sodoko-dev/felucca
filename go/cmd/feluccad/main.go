@@ -296,10 +296,13 @@ var (
 // keep the process until SIGKILL, and an operator's second Ctrl-C means now.
 func stopOnSignal(sigs <-chan os.Signal, servers []*http.Server, srv *server.Server, stop chan<- struct{}, flushed <-chan struct{}, exit func(int)) {
 	sig := <-sigs
+	// The limit is read once, here: everything below runs on this copy.
+	hardLimit := stopHardLimit
+	flushUntil := time.Now().Add(hardLimit - time.Second)
 	slog.Info("stopping: draining the requests in flight, then flushing the exec usage rows",
-		"signal", sig.String(), "drain", stopDrain, "hard_limit", stopHardLimit)
-	hard := time.AfterFunc(stopHardLimit, func() {
-		slog.Error("stop did not finish in time: exiting now", "hard_limit", stopHardLimit)
+		"signal", sig.String(), "drain", stopDrain, "hard_limit", hardLimit)
+	hard := time.AfterFunc(hardLimit, func() {
+		slog.Error("stop did not finish in time: exiting now", "hard_limit", hardLimit)
 		exit(1)
 	})
 	defer hard.Stop()
@@ -331,6 +334,9 @@ func stopOnSignal(sigs <-chan os.Signal, servers []*http.Server, srv *server.Ser
 			slog.Warn("closing a listener", "addr", s.Addr, "err", err)
 		}
 	}
+	// The final flush retries until just inside the hard limit, so it can say
+	// what it lost before the process is ended.
+	srv.SetFinalFlushDeadline(flushUntil)
 	close(stop)
 	<-flushed
 	srv.StopBackground()

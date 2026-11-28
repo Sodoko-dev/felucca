@@ -144,6 +144,8 @@ type Server struct {
 	// seedPending: the legacy credential seed failed at start-up and runs
 	// again when the store recovers.
 	seedPending atomic.Bool
+	// finalFlushUntil bounds the final exec flush (unix ns; 0: the default).
+	finalFlushUntil atomic.Int64
 	// unfencedWarnAt is when warnUnfencedPlacement last warned (unix s).
 	unfencedWarnAt atomic.Int64
 	// unansweredDrops are the sweep's drops of dynamic exposes whose worker
@@ -2091,6 +2093,72 @@ func (srv *Server) warnUnfencedPlacement(now int64, addr string) {
 		"node", addr)
 }
 
+// addressLookupTimeout bounds missingAddress's worker call.
+const addressLookupTimeout = 5 * time.Second
+
+// missingAddress returns the guest address the worker holds for sandbox id,
+// when feluccad's record has none; "" when it has one, or when the worker does
+// not answer or does not list the VM (logged; the request's own answer does
+// not change). feluccad learns an address only from the answer to a create or
+// a fork; a create whose answer was lost with the process that sent it (the
+// record comes back as error after the restart) would otherwise stay without
+// an address for ever after its start: no expose, no route. The worker's list
+// (GET /v1/vms) is the one route that carries it: the answers to start, wake
+// and resume do not, and there is no single-record route. Called off the state
+// lock.
+func (srv *Server) missingAddress(id, reqID string) string {
+	var agentAddr string
+	func() {
+		srv.st.Lock()
+		defer srv.st.Unlock()
+		sb := srv.st.FindSandbox(id)
+		if sb == nil || sb.IP != nil || sb.NodeID == nil {
+			return
+		}
+		if node := srv.st.FindNode(*sb.NodeID); node != nil {
+			agentAddr = node.Addr
+		}
+	}()
+	if agentAddr == "" {
+		return ""
+	}
+	resp, err := srv.dialNode(agentAddr).doWithin(addressLookupTimeout, http.MethodGet, "/v1/vms", nil, reqID)
+	if err != nil || resp.Status != 200 {
+		status := 0
+		if resp != nil {
+			status = resp.Status
+		}
+		slog.Warn("sandbox has no address and its worker's list could not be read: the address stays unset",
+			"sandbox", id, "node", agentAddr, "request_id", reqID, "status", status, "err", err)
+		return ""
+	}
+	var list struct {
+		VMs []struct {
+			ID string  `json:"id"`
+			IP *string `json:"ip"`
+		} `json:"vms"`
+	}
+	if err := json.Unmarshal(resp.Body, &list); err == nil {
+		for _, vm := range list.VMs {
+			if vm.ID == id && vm.IP != nil && *vm.IP != "" {
+				slog.Info("sandbox had no address: taken from its worker", "sandbox", id, "ip", *vm.IP, "request_id", reqID)
+				return *vm.IP
+			}
+		}
+	}
+	slog.Warn("sandbox has no address and its worker does not list one for it: the address stays unset",
+		"sandbox", id, "node", agentAddr, "request_id", reqID)
+	return ""
+}
+
+// setAddressLocked sets sb's address to ip when sb has none and ip is not
+// empty. Caller holds the state lock.
+func setAddressLocked(sb *model.Sandbox, ip string) {
+	if sb.IP == nil && ip != "" {
+		sb.IP = &ip
+	}
+}
+
 // agentBusy reports whether a worker's 409 body is {"error":"busy"}: the
 // sandbox has another lifecycle operation in progress there (FLU-4 S4).
 func agentBusy(body []byte) bool {
@@ -2226,6 +2294,10 @@ func (srv *Server) adoptRefusedState(id string, from model.SandboxState, body []
 		return body
 	}
 	adopted := false
+	var ip string
+	if to == model.StateRunning {
+		ip = srv.missingAddress(id, reqID) // see sandboxAction
+	}
 	func() {
 		srv.st.Lock()
 		defer srv.st.Unlock()
@@ -2235,6 +2307,9 @@ func (srv *Server) adoptRefusedState(id string, from model.SandboxState, body []
 		}
 		now := time.Now().Unix()
 		sb.State = to
+		if to == model.StateRunning {
+			setAddressLocked(sb, ip)
+		}
 		switch to {
 		case model.StateSleeping:
 			sb.SleptAt = now // the auto-delete TTL clock, as the sleep handler sets it
@@ -2318,11 +2393,19 @@ func (srv *Server) sandboxAction(w http.ResponseWriter, r *http.Request, id, act
 		newState = model.StateRunning
 	}
 	if newState != "" {
+		// A record without an address (a create whose answer was lost with
+		// the process that sent it) learns it from the worker now, in the same
+		// save as the state.
+		var ip string
+		if newState == model.StateRunning {
+			ip = srv.missingAddress(id, reqID(r.Context()))
+		}
 		func() {
 			srv.st.Lock()
 			defer srv.st.Unlock()
 			if sb := srv.st.FindSandbox(id); sb != nil {
 				sb.State = newState
+				setAddressLocked(sb, ip)
 				srv.queueUsageLocked(sb, usageEvent)
 			}
 		}()
@@ -2517,6 +2600,7 @@ func (srv *Server) wakeSandbox(w http.ResponseWriter, r *http.Request, id, tenan
 	srv.st.RecordWake(wakeMs)
 
 	var sbJSON []byte
+	ip := srv.missingAddress(id, reqID(r.Context())) // see sandboxAction
 	if !func() bool {
 		srv.st.Lock()
 		defer srv.st.Unlock()
@@ -2525,6 +2609,7 @@ func (srv *Server) wakeSandbox(w http.ResponseWriter, r *http.Request, id, tenan
 			return false
 		}
 		sb.State = model.StateRunning
+		setAddressLocked(sb, ip)
 		// A wake is activity: restart the idle clock, stop the TTL clock (v4 P5.2).
 		sb.LastActivity = time.Now().Unix()
 		sb.SleptAt = 0

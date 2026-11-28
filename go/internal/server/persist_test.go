@@ -47,8 +47,10 @@ type faultStore struct {
 	createKeyErr bool
 	// batchHold, when set, makes the next exec batch write wait until it is
 	// closed; batchHeld closes once it waits.
-	batchHold    chan struct{}
-	batchHeld    chan struct{}
+	batchHold chan struct{}
+	batchHeld chan struct{}
+	// batchFails fails that many exec batch writes, then lets them through.
+	batchFails   int
 	templateRace bool
 	saveCalls    int
 }
@@ -154,6 +156,10 @@ func (f *faultStore) AppendUsageBatch(events []store.UsageEvent) error {
 	f.mu.Lock()
 	fail, hold, held := f.batchErr, f.batchHold, f.batchHeld
 	f.batchHold, f.batchHeld = nil, nil
+	if f.batchFails > 0 {
+		f.batchFails--
+		fail = true
+	}
 	f.mu.Unlock()
 	if hold != nil {
 		close(held)
@@ -188,7 +194,12 @@ type fsWorker struct {
 	// fork / the VM delete answers.
 	forkRefusal   string
 	deleteRefusal string
-	port          int
+	// list / listStatus answer GET /v1/vms (default: the generic ok body).
+	list       string
+	listStatus int
+	// startRefusal, when not "", is the body of a 409 the start answers.
+	startRefusal string
+	port         int
 	// onCreate, when set, runs once before a create is answered.
 	onCreate func()
 }
@@ -200,6 +211,8 @@ func (f *fsWorker) handler() http.HandlerFunc {
 		f.calls = append(f.calls, r.Method+" "+p)
 		failCreate, failFork, forkBusy, delay := f.failCreate, f.failFork, f.forkBusy, f.deleteDelay
 		forkRefusal, deleteRefusal := f.forkRefusal, f.deleteRefusal
+		list, listStatus := f.list, f.listStatus
+		startRefusal := f.startRefusal
 		onCreate := f.onCreate
 		if r.Method == http.MethodPost && p == "/v1/vms" {
 			f.onCreate = nil
@@ -214,6 +227,15 @@ func (f *fsWorker) handler() http.HandlerFunc {
 		}
 		ok := func(body string) { w.WriteHeader(200); _, _ = w.Write([]byte(body)) }
 		switch {
+		case r.Method == http.MethodGet && p == "/v1/vms" && (list != "" || listStatus != 0):
+			if listStatus != 0 {
+				w.WriteHeader(listStatus)
+				return
+			}
+			ok(list)
+		case r.Method == http.MethodPost && strings.HasSuffix(p, "/start") && startRefusal != "":
+			w.WriteHeader(409)
+			_, _ = w.Write([]byte(startRefusal))
 		case r.Method == http.MethodPost && p == "/v1/vms":
 			if failCreate {
 				w.WriteHeader(500)

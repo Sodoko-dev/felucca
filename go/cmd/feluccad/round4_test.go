@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -30,6 +31,11 @@ func TestBootSettlesARecordLeftCreating(t *testing.T) {
 		mu.Lock()
 		calls = append(calls, r.Method+" "+r.URL.Path)
 		mu.Unlock()
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/vms" {
+			// The worker finished the create on its own and holds the address.
+			_, _ = w.Write([]byte(`{"vms":[{"id":"sb-left","ip":"10.231.0.42"}]}`))
+			return
+		}
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	t.Cleanup(ts.Close)
@@ -58,10 +64,13 @@ func TestBootSettlesARecordLeftCreating(t *testing.T) {
 		t.Errorf("start of the settled record: %d %s, want 200", w.Code, w.Body)
 	}
 	mu.Lock()
-	started := len(calls) == 1 && calls[0] == "POST /v1/vms/sb-left/start"
+	started := len(calls) == 2 && calls[0] == "POST /v1/vms/sb-left/start" && calls[1] == "GET /v1/vms"
 	mu.Unlock()
 	if !started {
-		t.Errorf("worker calls: %v, want the start", calls)
+		t.Errorf("worker calls: %v, want the start, then the list for the address the lost create answer carried", calls)
+	}
+	if w := req(h, "GET", "/api/v1/sandboxes/sb-left", ""); !strings.Contains(w.Body.String(), `"ip":"10.231.0.42"`) {
+		t.Errorf("record after the start: %s, want the worker's address", w.Body)
 	}
 	if w := req(h, "DELETE", "/api/v1/sandboxes/sb-left", ""); w.Code != 204 {
 		t.Errorf("delete of the settled record: %d %s, want 204", w.Code, w.Body)
