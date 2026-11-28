@@ -212,13 +212,19 @@ pub fn build_snapshot_create(vmstate_path: &str, mem_path: &str) -> String {
     )
 }
 
-/// PUT /snapshot/load {snapshot_path, mem_backend, resume_vm:true, network_overrides?, vsock_override?}
+/// PUT /snapshot/load {snapshot_path, mem_backend, network_overrides?, vsock_override?, resume_vm}
 ///
 /// `vsock_uds` (v3 fork): when the snapshotted VM had a vsock device, the
 /// baked uds_path is the PARENT's absolute path. FC v1.16 re-binds that path on
 /// restore, which collides with a still-running parent (EADDRINUSE). Passing a
 /// `vsock_override` rebinds the device to the child's own UDS path. (Validated
 /// on FC v1.16: load+vsock_override -> 204, child binds its own v.sock.)
+///
+/// `resume_vm` false leaves the restored guest `Paused` until a
+/// `PATCH /vm {"state":"Resumed"}` (wake: the record must say `running` on
+/// disk before the guest executes again). Lab-verified on FC 1.16: the load
+/// answers 204 with no network or vsock activity, and after the resume both
+/// work at once.
 pub async fn put_snapshot_load(
     sock: &str,
     vmstate_path: &str,
@@ -226,8 +232,9 @@ pub async fn put_snapshot_load(
     net_on: bool,
     slot: Option<u32>,
     vsock_uds: Option<&str>,
+    resume_vm: bool,
 ) -> Result<()> {
-    let body = build_snapshot_load(vmstate_path, mem_path, net_on, slot, vsock_uds);
+    let body = build_snapshot_load(vmstate_path, mem_path, net_on, slot, vsock_uds, resume_vm);
     let (status, resp_body) = request_uds(sock, Method::PUT, "/snapshot/load", &body).await?;
     if status >= 300 {
         return Err(FcError(format!("snapshot/load -> {}: {}", status, resp_body)));
@@ -242,6 +249,7 @@ pub fn build_snapshot_load(
     net_on: bool,
     slot: Option<u32>,
     vsock_uds: Option<&str>,
+    resume_vm: bool,
 ) -> String {
     let mut body = format!(
         "{{\"snapshot_path\":{},\"mem_backend\":{{\"backend_path\":{},\"backend_type\":\"File\"}}",
@@ -263,7 +271,7 @@ pub fn build_snapshot_load(
             json_str(uds)
         ));
     }
-    body.push_str(",\"resume_vm\":true}");
+    body.push_str(&format!(",\"resume_vm\":{}}}", resume_vm));
     body
 }
 
@@ -389,6 +397,7 @@ mod tests {
             true,
             Some(3),
             None,
+            true,
         );
         assert_eq!(
             body,
@@ -404,6 +413,7 @@ mod tests {
             false,
             None,
             None,
+            true,
         );
         assert_eq!(
             body,
@@ -420,6 +430,7 @@ mod tests {
             true,
             None,
             None,
+            true,
         );
         assert_eq!(
             body,
@@ -446,6 +457,7 @@ mod tests {
             true,
             Some(3),
             Some("/srv/ignis/instances/child-1/v.sock"),
+            true,
         );
         assert_eq!(
             body,
@@ -461,10 +473,21 @@ mod tests {
             false,
             None,
             Some("/a/v.sock"),
+            true,
         );
         assert_eq!(
             body,
             r#"{"snapshot_path":"/a/vmstate.bin","mem_backend":{"backend_path":"/a/mem.bin","backend_type":"File"},"vsock_override":{"guest_cid":3,"uds_path":"/a/v.sock"},"resume_vm":true}"#
+        );
+    }
+
+    #[test]
+    fn test_build_snapshot_load_without_resume() {
+        // Wake loads paused and resumes only once the record says `running`.
+        let body = build_snapshot_load("/a/vmstate.bin", "/a/mem.bin", true, Some(3), None, false);
+        assert_eq!(
+            body,
+            r#"{"snapshot_path":"/a/vmstate.bin","mem_backend":{"backend_path":"/a/mem.bin","backend_type":"File"},"network_overrides":[{"iface_id":"eth0","host_dev_name":"hth-3"}],"resume_vm":false}"#
         );
     }
 }

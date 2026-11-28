@@ -16,7 +16,7 @@ use super::procscan::{Identity, ProcTable};
 use super::{valid_vm_id, Vm, VmState};
 use crate::ipalloc::Allocator;
 use crate::vm::meta::Meta;
-use std::path::Path;
+use std::time::SystemTime;
 use tracing::{error, warn};
 
 /// What start-up found under `instances/`.
@@ -41,11 +41,27 @@ pub struct Reconciled {
     /// never handed to a tenant: the caller removes it, or it keeps its slot,
     /// its tap and a rootfs copy forever.
     pub dead_pool: Vec<String>,
+    /// Ids whose state start-up changed (FLU-4: a VMM that is gone, a
+    /// snapshot that is incomplete or older than the disk). The caller writes
+    /// these records — only when it holds the data-dir lock.
+    pub rewrite: Vec<String>,
+    /// Ids of `sleeping` records whose snapshot files could not be examined.
+    /// Nothing is decided about them on this start, and nothing in their
+    /// directory is touched.
+    pub undecided: Vec<String>,
+}
+
+/// What loading one record found besides the record itself.
+#[derive(Debug, Default)]
+struct Found {
+    /// A pool VM that lost its VMM.
+    dead_pool: bool,
+    rewrite: bool,
+    undecided: bool,
 }
 
 enum Loaded {
-    /// A record, and whether it is a pool VM that lost its VMM.
-    Vm(Vm, bool),
+    Vm(Vm, Found),
     Unreadable,
     Metaless,
 }
@@ -75,9 +91,15 @@ pub fn reconcile(data_dir: &str, mut alloc: Option<&mut Allocator>, procs: &Proc
             continue;
         }
         match reconcile_one(data_dir, &dir_name, alloc.as_deref_mut(), procs) {
-            Loaded::Vm(vm, dead_pool) => {
-                if dead_pool {
+            Loaded::Vm(vm, found) => {
+                if found.dead_pool {
                     out.dead_pool.push(vm.id.clone());
+                }
+                if found.rewrite {
+                    out.rewrite.push(vm.id.clone());
+                }
+                if found.undecided {
+                    out.undecided.push(vm.id.clone());
                 }
                 out.vms.push(vm);
             }
@@ -150,6 +172,9 @@ fn reconcile_one(
     let mut state: VmState = meta.state.clone();
     let mut pid: Option<i32> = None;
     let mut dead_pool = false;
+    let mut rewrite = false;
+    let mut undecided = false;
+    let mut snapshot_valid = meta.snapshot_valid;
 
     // A state that implies a running VMM: is the recorded pid still it?
     if matches!(state, VmState::Running | VmState::Paused | VmState::Pooled) {
@@ -176,19 +201,53 @@ fn reconcile_one(
             state = VmState::Stopped;
             dead_pool = true;
         } else {
-            // Process gone. If a snapshot exists → sleeping; else stopped.
-            let vmstate_path = format!("{}/instances/{}/vmstate.bin", data_dir, dir_name);
-            if Path::new(&vmstate_path).exists() {
-                state = VmState::Sleeping;
-            } else {
-                state = VmState::Stopped;
-            }
+            // The VMM is gone, and the guest's memory with it: stopped,
+            // whatever files are lying beside the record (FLU-4). A
+            // `vmstate.bin` here is from an earlier sleep of a guest that has
+            // run since — this used to be read as `sleeping`, and waking it
+            // restored that old memory over a disk that had moved on,
+            // corrupting the guest's file system without a word.
+            state = VmState::Stopped;
+            rewrite = true;
         }
     } else if matches!(state, VmState::Error | VmState::Stopped) && never_claimed_pool_vm(&meta) {
         // A pool VM that died while an agent was watching (`error`), or one
         // that agent was in the middle of removing (`stopped`). It is as much
         // use as one that was still `pooled` when its VMM went: none.
         dead_pool = true;
+    } else if state == VmState::Sleeping {
+        let dir = format!("{}/instances/{}", data_dir, dir_name);
+        match judge_sleeper(&dir, snapshot_valid) {
+            Sleeper::Keep => {}
+            Sleeper::Incomplete(missing) => {
+                warn!(vm = %id, file = missing,
+                    "reconcile: a sleeping VM's snapshot is incomplete; it is stopped, and what is left of the snapshot is removed");
+                state = VmState::Stopped;
+                rewrite = true;
+            }
+            Sleeper::Outrun { disk, snapshot } => {
+                warn!(vm = %id, rootfs_mtime = %epoch(disk), vmstate_mtime = %epoch(snapshot),
+                    "reconcile: this sleeping VM's disk was written after its snapshot was taken (the guest ran \
+                     since, under an agent that did not record it); waking it would restore old memory over a \
+                     newer disk. It is stopped and the snapshot is removed");
+                state = VmState::Stopped;
+                rewrite = true;
+            }
+            Sleeper::CannotTell(why) => {
+                error!(vm = %id, err = %why,
+                    "reconcile: could not examine a sleeping VM's snapshot files; it is left as it is on this start");
+                undecided = true;
+            }
+        }
+    }
+    // The marker belongs to `sleeping` alone.
+    if state != VmState::Sleeping && snapshot_valid {
+        snapshot_valid = false;
+        rewrite = true;
+    }
+    // A pool VM without its VMM is removed, not written.
+    if dead_pool {
+        rewrite = false;
     }
 
     // Reserve the slot so it is not handed to a new VM.
@@ -211,8 +270,76 @@ fn reconcile_one(
         image: meta.image.clone().unwrap_or_else(|| super::DEFAULT_IMAGE.to_string()),
         image_sha256: meta.image_sha256.clone(),
         disk_gb: meta.disk_gb.unwrap_or(0),
+        snapshot_valid,
     };
-    Loaded::Vm(vm, dead_pool)
+    Loaded::Vm(vm, Found { dead_pool, rewrite, undecided })
+}
+
+/// What start-up makes of a `sleeping` record's snapshot files.
+#[derive(Debug, PartialEq, Eq)]
+enum Sleeper {
+    Keep,
+    /// This file of the two is not there.
+    Incomplete(&'static str),
+    /// `rootfs.ext4` was modified after `vmstate.bin`: the guest ran after
+    /// that snapshot was taken.
+    Outrun { disk: SystemTime, snapshot: SystemTime },
+    /// A file could not be examined.
+    CannotTell(String),
+}
+
+/// Judge the snapshot of a `sleeping` record in `dir` (FLU-4).
+///
+/// Both files must be there. A record with the marker was written by a sleep
+/// that had finished its snapshot, and nothing touches the files while the
+/// VM is asleep, so that is all. A record without it was written by an older
+/// agent, which also wrote `sleeping` for a VM whose snapshot the guest had
+/// since outrun — the case is told apart by the disk image: after a clean
+/// sleep `rootfs.ext4` is older than `vmstate.bin` (by 0.05 to 2.2 s on the
+/// lab), and a woken guest writes its disk within seconds. Strictly later, at
+/// the file system's own precision, means the guest ran after the snapshot.
+/// Such a record keeps no marker: the same check is repeated at every start,
+/// on inputs that do not change while it sleeps.
+fn judge_sleeper(dir: &str, marker: bool) -> Sleeper {
+    let look = |name: &'static str| match std::fs::metadata(format!("{}/{}", dir, name)) {
+        Ok(m) => Ok(Some(m)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {}", name, e)),
+    };
+    let (vmstate, mem) = match (look("vmstate.bin"), look("mem.bin")) {
+        (Ok(v), Ok(m)) => (v, m),
+        (Err(e), _) | (_, Err(e)) => return Sleeper::CannotTell(e),
+    };
+    let Some(vmstate) = vmstate else {
+        return Sleeper::Incomplete("vmstate.bin");
+    };
+    if mem.is_none() {
+        return Sleeper::Incomplete("mem.bin");
+    }
+    if marker {
+        return Sleeper::Keep;
+    }
+    let snapshot = match vmstate.modified() {
+        Ok(t) => t,
+        Err(e) => return Sleeper::CannotTell(format!("vmstate.bin: {}", e)),
+    };
+    let disk = match std::fs::metadata(format!("{}/rootfs.ext4", dir)).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(e) => return Sleeper::CannotTell(format!("rootfs.ext4: {}", e)),
+    };
+    if disk > snapshot {
+        Sleeper::Outrun { disk, snapshot }
+    } else {
+        Sleeper::Keep
+    }
+}
+
+/// A modification time as seconds.nanoseconds since the epoch, for a log line.
+fn epoch(t: SystemTime) -> String {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => format!("{}.{:09}", d.as_secs(), d.subsec_nanos()),
+        Err(_) => format!("{:?}", t),
+    }
 }
 
 /// The `slot` of a record that does not load as a `Meta`, when its text still
@@ -248,6 +375,7 @@ mod tests {
     use super::*;
     use crate::ipalloc::{Allocator, Cidr};
     use std::fs;
+    use std::path::Path;
 
     fn make_temp_dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
@@ -346,7 +474,9 @@ mod tests {
         let rec = reconcile(data_dir, None, &ProcTable::at(&proc_root, data_dir));
         let by_id = |id: &str| rec.vms.iter().find(|v| v.id == id).unwrap_or_else(|| panic!("{id} not loaded"));
         assert_eq!((by_id("vm-a").state.clone(), by_id("vm-a").pid), (VmState::Stopped, None));
-        assert_eq!((by_id("vm-b").state.clone(), by_id("vm-b").pid), (VmState::Sleeping, None));
+        // FLU-4: a dead VMM is `stopped` whatever lies beside it (was
+        // `sleeping`, from the vmstate.bin of an earlier sleep).
+        assert_eq!((by_id("vm-b").state.clone(), by_id("vm-b").pid), (VmState::Stopped, None));
         assert_eq!((by_id("vm-c").state.clone(), by_id("vm-c").pid), (VmState::Stopped, None));
     }
 
@@ -400,7 +530,11 @@ mod tests {
     }
 
     #[test]
-    fn test_dead_pid_with_vmstate_becomes_sleeping() {
+    fn test_dead_pid_with_vmstate_becomes_stopped() {
+        // FLU-4. Was `test_dead_pid_with_vmstate_becomes_sleeping`: a VM whose
+        // VMM died under a `running` record was taken for asleep whenever a
+        // vmstate.bin lay beside it — the leftover of an earlier sleep, which
+        // a wake then restored over a disk that had moved on since.
         let tmp = make_temp_dir();
         let data_dir = tmp.path().to_str().unwrap();
         let instances_dir = tmp.path().join("instances");
@@ -409,15 +543,15 @@ mod tests {
         // A running VM with a dead pid (1 is always alive but let's use 999999 which should be dead).
         let meta = r#"{"id":"vm-1","name":"vm-1","dir_id":"vm-1","vcpus":1,"mem_mib":256,"pid":999999,"slot":null,"ip":null,"state":"running"}"#;
         write_meta(&instances_dir, "vm-1", meta);
-        // Write vmstate.bin so it maps to sleeping.
         write_vmstate(&instances_dir, "vm-1");
 
-        let vms = load(data_dir, None);
-        let vm = vms.iter().find(|v| v.id == "vm-1").expect("vm-1");
-        // pid 999999 is almost certainly dead → sleeping (vmstate.bin present).
-        assert_eq!(vm.state, VmState::Sleeping, "should be sleeping with vmstate.bin");
+        let rec = reconcile(data_dir, None, &ProcTable::for_data_dir(data_dir));
+        let vm = rec.vms.iter().find(|v| v.id == "vm-1").expect("vm-1");
+        assert_eq!(vm.state, VmState::Stopped, "a dead VMM is stopped, whatever files are there");
         assert_eq!(vm.pid, None);
         assert_eq!(vm.tenant_id, None);
+        // And the caller is told to write it.
+        assert_eq!(rec.rewrite, vec!["vm-1"]);
     }
 
     #[test]
@@ -483,13 +617,18 @@ mod tests {
         let instances_dir = tmp.path().join("instances");
         fs::create_dir_all(&instances_dir).unwrap();
 
-        let meta = r#"{"id":"vm-sl","name":"vm-sl","dir_id":"vm-sl","vcpus":1,"mem_mib":256,"pid":null,"slot":1,"ip":"10.231.0.3","state":"sleeping"}"#;
+        let meta = r#"{"id":"vm-sl","name":"vm-sl","dir_id":"vm-sl","vcpus":1,"mem_mib":256,"pid":null,"slot":1,"ip":"10.231.0.3","state":"sleeping","snapshot_valid":true}"#;
         write_meta(&instances_dir, "vm-sl", meta);
+        // FLU-4: a sleeping record stays asleep only with both snapshot files
+        // beside it (this test used to have none).
+        write_vmstate(&instances_dir, "vm-sl");
+        fs::write(instances_dir.join("vm-sl").join("mem.bin"), b"fake").unwrap();
 
         let vms = load(data_dir, None);
         let vm = vms.iter().find(|v| v.id == "vm-sl").expect("vm-sl");
         assert_eq!(vm.state, VmState::Sleeping);
         assert_eq!(vm.pid, None);
+        assert!(vm.snapshot_valid);
     }
 
     #[test]
@@ -654,5 +793,115 @@ mod tests {
         assert_eq!(dead, vec!["pool-err".to_string(), "pool-stop".to_string()]);
         // Reported, not dropped: the caller removes them, slot and directory too.
         assert_eq!(rec.vms.len(), 4);
+    }
+
+    // ---- FLU-4: a sandbox is asleep only when its record says so ----
+
+    fn set_mtime(path: &Path, t: SystemTime) {
+        fs::File::options().write(true).open(path).unwrap().set_modified(t).unwrap();
+    }
+
+    #[test]
+    fn test_start_up_decides_sleep_by_the_record_and_its_snapshot() {
+        use std::time::Duration;
+        let tmp = make_temp_dir();
+        let data_dir = tmp.path().to_str().unwrap();
+        let inst = tmp.path().join("instances");
+        fs::create_dir_all(&inst).unwrap();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        // (dir, state, marker, vmstate.bin, mem.bin, rootfs mtime relative to vmstate's in ns)
+        type Case = (&'static str, &'static str, bool, bool, bool, Option<i64>);
+        let cases: &[Case] = &[
+            // A VMM that is gone (pid 999999): stopped, files or not.
+            ("run-bare", "running", false, false, false, None),
+            ("run-snap", "running", false, true, true, Some(5_000_000_000)),
+            ("pau-bare", "paused", false, false, false, None),
+            ("pau-snap", "paused", false, true, true, Some(-1)),
+            // With the marker: both files are all it takes.
+            ("sl-valid", "sleeping", true, true, true, Some(5_000_000_000)),
+            ("sl-valid-nomem", "sleeping", true, true, false, None),
+            ("sl-valid-nostate", "sleeping", true, false, true, None),
+            // Without (an older agent's): the disk must not be newer.
+            ("sl-old-ok", "sleeping", false, true, true, Some(-50_000_000)),
+            ("sl-old-same", "sleeping", false, true, true, Some(0)),
+            ("sl-old-outrun", "sleeping", false, true, true, Some(1)),
+            ("sl-old-nomem", "sleeping", false, true, false, None),
+        ];
+        for (dir, state, marker, vmstate, mem, disk) in cases {
+            let pid = if *state == "sleeping" { "null" } else { "999999" };
+            let mark = if *marker { r#","snapshot_valid":true"# } else { "" };
+            write_meta(
+                &inst,
+                dir,
+                &format!(
+                    r#"{{"id":"{dir}","name":"{dir}","dir_id":"{dir}","vcpus":1,"mem_mib":256,"pid":{pid},"slot":null,"ip":null,"state":"{state}"{mark}}}"#
+                ),
+            );
+            let d = inst.join(dir);
+            fs::write(d.join("rootfs.ext4"), b"disk").unwrap();
+            if *vmstate {
+                fs::write(d.join("vmstate.bin"), b"state").unwrap();
+                set_mtime(&d.join("vmstate.bin"), t0);
+            }
+            if *mem {
+                fs::write(d.join("mem.bin"), b"mem").unwrap();
+            }
+            if let Some(ns) = disk {
+                let t = if *ns >= 0 {
+                    t0 + Duration::from_nanos(*ns as u64)
+                } else {
+                    t0 - Duration::from_nanos(ns.unsigned_abs())
+                };
+                set_mtime(&d.join("rootfs.ext4"), t);
+            }
+        }
+
+        let mut rec = reconcile(data_dir, None, &ProcTable::for_data_dir(data_dir));
+        let got = |id: &str| {
+            let v = rec.vms.iter().find(|v| v.id == id).unwrap_or_else(|| panic!("{id} not loaded"));
+            (v.state.clone(), v.snapshot_valid)
+        };
+        for id in ["run-bare", "run-snap", "pau-bare", "pau-snap"] {
+            assert_eq!(got(id), (VmState::Stopped, false), "{id}");
+        }
+        assert_eq!(got("sl-valid"), (VmState::Sleeping, true), "the marker is not put through the disk check");
+        assert_eq!(got("sl-valid-nomem"), (VmState::Stopped, false));
+        assert_eq!(got("sl-valid-nostate"), (VmState::Stopped, false));
+        // An older agent's sleeper stays without the marker; it is judged again next start.
+        assert_eq!(got("sl-old-ok"), (VmState::Sleeping, false));
+        assert_eq!(got("sl-old-same"), (VmState::Sleeping, false), "only strictly later is outrun");
+        assert_eq!(got("sl-old-outrun"), (VmState::Stopped, false), "one nanosecond later is later");
+        assert_eq!(got("sl-old-nomem"), (VmState::Stopped, false));
+        // Every changed record, and only those, is handed back to be written.
+        rec.rewrite.sort();
+        assert_eq!(
+            rec.rewrite,
+            vec![
+                "pau-bare", "pau-snap", "run-bare", "run-snap", "sl-old-nomem", "sl-old-outrun",
+                "sl-valid-nomem", "sl-valid-nostate",
+            ]
+        );
+        assert!(rec.undecided.is_empty());
+        // Deciding is all this does: no file is removed here.
+        assert!(inst.join("run-snap").join("vmstate.bin").exists());
+        assert!(inst.join("sl-old-outrun").join("mem.bin").exists());
+    }
+
+    #[test]
+    fn test_a_snapshot_that_cannot_be_examined_decides_nothing() {
+        let tmp = make_temp_dir();
+        let data_dir = tmp.path().to_str().unwrap();
+        let inst = tmp.path().join("instances");
+        fs::create_dir_all(&inst).unwrap();
+        write_meta(&inst, "vm-q", &meta_json("vm-q", "vm-q", None, "sleeping"));
+        fs::write(inst.join("vm-q").join("mem.bin"), b"mem").unwrap();
+        // stat fails with ELOOP: neither "there" nor "not there".
+        std::os::unix::fs::symlink("vmstate.bin", inst.join("vm-q").join("vmstate.bin")).unwrap();
+
+        let rec = reconcile(data_dir, None, &ProcTable::for_data_dir(data_dir));
+        let vm = rec.vms.iter().find(|v| v.id == "vm-q").expect("vm-q");
+        assert_eq!(vm.state, VmState::Sleeping);
+        assert_eq!(rec.undecided, vec!["vm-q"]);
+        assert!(rec.rewrite.is_empty());
     }
 }

@@ -17,7 +17,7 @@ use crate::config::authorized_either;
 use crate::registration::NodeToken;
 use crate::vm::{
     image, valid_vm_id, CreateSpec, ExecOutcome, ExecStreamOutcome, ExposeError, Manager,
-    PoolSpec, RootfsError, DEFAULT_IMAGE,
+    OpError, PoolSpec, RootfsError, BUSY, DEFAULT_IMAGE,
 };
 use tracing::warn;
 
@@ -47,6 +47,34 @@ fn json_response(status: StatusCode, body: &str) -> Response {
 /// document. Same reasoning as put_pools' validation errors.
 fn error_response(status: StatusCode, msg: &str) -> Response {
     json_response(status, &serde_json::json!({ "error": msg }).to_string())
+}
+
+/// `{"error":"busy"}`: another lifecycle operation holds the sandbox, or it
+/// is being stopped or deleted. No `state`: nothing was decided, try again.
+fn busy_response() -> Response {
+    json_response(StatusCode::CONFLICT, "{\"error\":\"busy\"}")
+}
+
+/// The answer to a lifecycle operation that did not do what it was asked.
+/// A refusal for the state the sandbox is in carries that state, under the
+/// key `state`: the control plane records it (a contract).
+fn op_error_response(e: &OpError) -> Response {
+    match e {
+        OpError::Busy => busy_response(),
+        OpError::InvalidState { msg, state } => json_response(
+            StatusCode::CONFLICT,
+            &serde_json::json!({ "error": msg, "state": state.as_str() }).to_string(),
+        ),
+        OpError::Other(msg) => error_response(StatusCode::INTERNAL_SERVER_ERROR, msg),
+    }
+}
+
+/// `op_error_response`, with an unknown id answered 404 (sleep and wake).
+fn op_error_response_404(e: &OpError) -> Response {
+    match e {
+        OpError::Other(msg) if msg == "NotFound" => error_response(StatusCode::NOT_FOUND, msg),
+        _ => op_error_response(e),
+    }
 }
 
 fn empty_response(status: StatusCode) -> Response {
@@ -225,14 +253,15 @@ async fn create_vm(State(state): State<AppState>, req: Request) -> Response {
 /// under a record that still names it. On its own task the operation always
 /// runs to its end; only the answer is lost. `create_vm` and `fork_vm` have
 /// done this from the start.
-async fn detached<T, F>(op: F) -> Result<T, String>
+async fn detached<T, E, F>(op: F) -> Result<T, E>
 where
-    F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    F: std::future::Future<Output = Result<T, E>> + Send + 'static,
     T: Send + 'static,
+    E: From<String> + Send + 'static,
 {
     match tokio::spawn(op).await {
         Ok(result) => result,
-        Err(e) => Err(format!("operation task: {}", e)),
+        Err(e) => Err(E::from(format!("operation task: {}", e))),
     }
 }
 
@@ -250,9 +279,7 @@ async fn sleep_vm(
     let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
     match detached(async move { mgr.sleep_vm(&vm).await }).await {
         Ok(_) => json_response(StatusCode::OK, "{\"ok\":true}"),
-        Err(e) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
-        }
+        Err(e) => op_error_response_404(&e),
     }
 }
 
@@ -273,9 +300,7 @@ async fn wake_vm(
             let body = format!("{{\"ok\":true,\"wake_ms\":{}}}", ms);
             json_response(StatusCode::OK, &body)
         }
-        Err(e) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
-        }
+        Err(e) => op_error_response_404(&e),
     }
 }
 
@@ -327,6 +352,8 @@ async fn fork_vm(
             let body = serde_json::json!({ "ok": true, "ip": ip }).to_string();
             json_response(StatusCode::CREATED, &body)
         }
+        // The parent is held by another lifecycle operation.
+        Err(e) if e == BUSY => busy_response(),
         Err(e) => {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
         }
@@ -533,12 +560,7 @@ async fn vm_pause(
     let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
     match detached(async move { mgr.pause(&vm).await }).await {
         Ok(_) => empty_response(StatusCode::OK),
-        Err(e) if e.starts_with("InvalidState") => {
-            error_response(StatusCode::CONFLICT, &e)
-        }
-        Err(e) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
-        }
+        Err(e) => op_error_response(&e),
     }
 }
 
@@ -556,12 +578,7 @@ async fn vm_resume(
     let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
     match detached(async move { mgr.resume(&vm).await }).await {
         Ok(_) => empty_response(StatusCode::OK),
-        Err(e) if e.starts_with("InvalidState") => {
-            error_response(StatusCode::CONFLICT, &e)
-        }
-        Err(e) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
-        }
+        Err(e) => op_error_response(&e),
     }
 }
 
@@ -579,9 +596,7 @@ async fn vm_stop(
     let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
     match detached(async move { mgr.stop(&vm).await }).await {
         Ok(_) => empty_response(StatusCode::OK),
-        Err(e) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
-        }
+        Err(e) => op_error_response(&e),
     }
 }
 
@@ -600,13 +615,8 @@ async fn vm_start(
     match detached(async move { mgr.start(&vm).await }).await {
         Ok(_) => empty_response(StatusCode::OK),
         // Wrong lifecycle state (e.g. start on a paused VM) → 409, matching
-        // the exec contract's 409 "not running" convention.
-        Err(e) if e.starts_with("InvalidState") => {
-            error_response(StatusCode::CONFLICT, &e)
-        }
-        Err(e) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e)
-        }
+        // the exec contract's 409 "not running" convention, with the state.
+        Err(e) => op_error_response(&e),
     }
 }
 
@@ -630,6 +640,8 @@ async fn delete_vm(
     let (mgr, vm) = (Arc::clone(&state.mgr), id.clone());
     match detached(async move { mgr.delete(&vm).await }).await {
         Ok(()) => empty_response(StatusCode::NO_CONTENT),
+        // An operation in progress did not let go in time: retry.
+        Err(e) if e == BUSY => busy_response(),
         Err(e) if e.starts_with("InvalidState") => error_response(StatusCode::CONFLICT, &e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
@@ -1056,5 +1068,91 @@ mod tests {
             .unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         assert_eq!(len, bytes.len());
+    }
+
+    // ---- FLU-4: lifecycle refusals carry the state ----
+
+    #[tokio::test]
+    async fn test_op_error_bodies() {
+        let resp = op_error_response(&OpError::Busy);
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        // No state: nothing was decided.
+        assert_eq!(body_of(resp).await, serde_json::json!({ "error": "busy" }));
+
+        let resp = op_error_response(&OpError::InvalidState {
+            msg: "InvalidState: paused (use resume)".into(),
+            state: crate::vm::meta::VmState::Paused,
+        });
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_of(resp).await,
+            serde_json::json!({ "error": "InvalidState: paused (use resume)", "state": "paused" })
+        );
+
+        let resp = op_error_response(&OpError::Other("FcError: boom".into()));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_of(resp).await, serde_json::json!({ "error": "FcError: boom" }));
+        // NotFound is 404 for sleep and wake, and stays 500 for the others.
+        assert_eq!(op_error_response_404(&OpError::Other("NotFound".into())).status(), StatusCode::NOT_FOUND);
+        assert_eq!(op_error_response(&OpError::Other("NotFound".into())).status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// An agent whose data dir holds the given records (`id` → state), each
+    /// with a complete snapshot beside it, loaded the way start-up loads them.
+    async fn state_with(records: &[(&str, &str)]) -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        for (id, st) in records {
+            let d = dir.path().join("instances").join(id);
+            std::fs::create_dir_all(&d).unwrap();
+            let mark = if *st == "sleeping" { r#","snapshot_valid":true"# } else { "" };
+            std::fs::write(
+                d.join("meta.json"),
+                format!(
+                    r#"{{"id":"{id}","name":"{id}","dir_id":"{id}","vcpus":1,"mem_mib":256,"pid":null,"slot":null,"ip":null,"state":"{st}"{mark}}}"#
+                ),
+            )
+            .unwrap();
+            std::fs::write(d.join("vmstate.bin"), b"state").unwrap();
+            std::fs::write(d.join("mem.bin"), b"mem").unwrap();
+        }
+        let state = auth_state(dir.path(), "t", "");
+        state.mgr.reconcile().await;
+        (dir, state)
+    }
+
+    fn authed() -> Request {
+        Request::builder().header("authorization", "Bearer t").body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_refusals_answer_409_with_the_state() {
+        let (_dir, state) = state_with(&[("vm-stopped", "stopped"), ("vm-error", "error"), ("vm-asleep", "sleeping")]).await;
+        let id = |s: &str| Path(s.to_string());
+        let cases: Vec<(&str, Response, &str)> = vec![
+            ("sleep stopped", sleep_vm(State(state.clone()), id("vm-stopped"), authed()).await, "stopped"),
+            ("sleep error", sleep_vm(State(state.clone()), id("vm-error"), authed()).await, "error"),
+            ("wake stopped", wake_vm(State(state.clone()), id("vm-stopped"), authed()).await, "stopped"),
+            ("wake error", wake_vm(State(state.clone()), id("vm-error"), authed()).await, "error"),
+            ("start asleep", vm_start(State(state.clone()), id("vm-asleep"), authed()).await, "sleeping"),
+            ("pause stopped", vm_pause(State(state.clone()), id("vm-stopped"), authed()).await, "stopped"),
+            ("pause asleep", vm_pause(State(state.clone()), id("vm-asleep"), authed()).await, "sleeping"),
+            ("resume stopped", vm_resume(State(state.clone()), id("vm-stopped"), authed()).await, "stopped"),
+        ];
+        for (what, resp, want) in cases {
+            assert_eq!(resp.status(), StatusCode::CONFLICT, "{what}");
+            let body = body_of(resp).await;
+            assert_eq!(body["state"], serde_json::json!(want), "{what}: {body}");
+            assert!(body["error"].as_str().unwrap().starts_with("InvalidState"), "{what}: {body}");
+        }
+        // An unknown id: 404 from sleep and wake.
+        for resp in [
+            sleep_vm(State(state.clone()), id("vm-nope"), authed()).await,
+            wake_vm(State(state.clone()), id("vm-nope"), authed()).await,
+        ] {
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+        // Sleeping already: still a success.
+        let resp = sleep_vm(State(state.clone()), id("vm-asleep"), authed()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
