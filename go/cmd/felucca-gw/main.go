@@ -61,54 +61,86 @@ func envOr(key, def string) string {
 	return def
 }
 
+// options are felucca-gw's command-line settings.
+type options struct {
+	listen, feluccad, token, domain, limitsPath string
+	refresh                                     uint
+	autoWake                                    bool
+}
+
+// defineFlags registers the flags on fs. A flag whose value can be a secret
+// takes NO default from the environment: flag prints defaults in --help, and
+// the admin token would be printed with them. Those are read from the
+// environment in resolveEnv, after parsing.
+func defineFlags(fs *flag.FlagSet) *options {
+	o := &options{}
+	fs.StringVar(&o.listen, "listen", envOr("FELUCCA_GW_LISTEN", "0.0.0.0:8088"), "address to serve ingress on")
+	fs.StringVar(&o.feluccad, "feluccad", envOr("FELUCCA_GW_FELUCCAD", "http://127.0.0.1:8080"), "feluccad base URL (route table source)")
+	fs.StringVar(&o.token, "token", "", "feluccad admin token (routes are admin-only); default: $FELUCCA_TOKEN")
+	fs.StringVar(&o.domain, "domain", envOr("FELUCCA_GW_DOMAIN", ""), "wildcard ingress zone, e.g. sb.example.com")
+	fs.UintVar(&o.refresh, "refresh", 5, "route table refresh interval (seconds)")
+	fs.StringVar(&o.limitsPath, "tenant-limits", envOr("FELUCCA_GW_TENANT_LIMITS", ""), "optional JSON file: {\"<tenant-id>\":{\"enabled\":true,\"rps\":10,\"auto_wake\":true}}")
+	fs.BoolVar(&o.autoWake, "auto-wake", envOr("FELUCCA_GW_AUTO_WAKE", "1") != "0", "wake sleeping sandboxes on request instead of serving the 503 page")
+	return o
+}
+
+// resolveEnv fills, after parsing, the flags that were not given on the
+// command line from the environment (flag beats env; env beats default).
+func (o *options) resolveEnv(fs *flag.FlagSet) error {
+	given := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { given[f.Name] = true })
+	if !given["token"] {
+		o.token = os.Getenv("FELUCCA_TOKEN")
+	}
+	return nil
+}
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	listen := flag.String("listen", envOr("FELUCCA_GW_LISTEN", "0.0.0.0:8088"), "address to serve ingress on")
-	feluccad := flag.String("feluccad", envOr("FELUCCA_GW_FELUCCAD", "http://127.0.0.1:8080"), "feluccad base URL (route table source)")
-	token := flag.String("token", envOr("FELUCCA_TOKEN", ""), "feluccad admin token (routes are admin-only)")
-	domain := flag.String("domain", envOr("FELUCCA_GW_DOMAIN", ""), "wildcard ingress zone, e.g. sb.example.com")
-	refresh := flag.Uint("refresh", 5, "route table refresh interval (seconds)")
-	limitsPath := flag.String("tenant-limits", envOr("FELUCCA_GW_TENANT_LIMITS", ""), "optional JSON file: {\"<tenant-id>\":{\"enabled\":true,\"rps\":10,\"auto_wake\":true}}")
-	autoWake := flag.Bool("auto-wake", envOr("FELUCCA_GW_AUTO_WAKE", "1") != "0", "wake sleeping sandboxes on request instead of serving the 503 page")
+	o := defineFlags(flag.CommandLine)
 	flag.Parse()
+	if err := o.resolveEnv(flag.CommandLine); err != nil {
+		slog.Error("felucca-gw: " + err.Error())
+		os.Exit(1)
+	}
 
-	if *domain == "" {
+	if o.domain == "" {
 		slog.Error("felucca-gw: --domain is required (the wildcard zone ingress hostnames live under)")
 		os.Exit(1)
 	}
-	if *token == "" {
+	if o.token == "" {
 		slog.Error("felucca-gw: --token is required (the route table is admin-only)")
 		os.Exit(1)
 	}
 
 	limits := map[string]gateway.TenantLimit{}
-	if *limitsPath != "" {
-		data, err := os.ReadFile(*limitsPath)
+	if o.limitsPath != "" {
+		data, err := os.ReadFile(o.limitsPath)
 		if err != nil {
 			slog.Error("felucca-gw: tenant limits", "err", err)
 			os.Exit(1)
 		}
 		if err := json.Unmarshal(data, &limits); err != nil {
-			slog.Error("felucca-gw: tenant limits", "path", *limitsPath, "err", err)
+			slog.Error("felucca-gw: tenant limits", "path", o.limitsPath, "err", err)
 			os.Exit(1)
 		}
 	}
 
 	gw := gateway.New(gateway.Config{
-		Domain:       *domain,
-		FeluccadURL:  *feluccad,
-		Token:        *token,
-		Refresh:      time.Duration(*refresh) * time.Second,
+		Domain:       o.domain,
+		FeluccadURL:  o.feluccad,
+		Token:        o.token,
+		Refresh:      time.Duration(o.refresh) * time.Second,
 		TenantLimits: limits,
-		AutoWake:     *autoWake,
+		AutoWake:     o.autoWake,
 	})
 
 	stop := make(chan struct{})
 	go gw.Run(stop)
 
 	srv := &http.Server{
-		Addr:              *listen,
+		Addr:              o.listen,
 		Handler:           gw,
 		MaxHeaderBytes:    maxHeaderBytes,
 		ReadHeaderTimeout: readHeaderTimeout,
@@ -125,7 +157,7 @@ func main() {
 		ReadTimeout:  0,
 		WriteTimeout: 0,
 	}
-	slog.Info("felucca-gw listening", "addr", *listen, "domain", *domain, "feluccad", *feluccad)
+	slog.Info("felucca-gw listening", "addr", o.listen, "domain", o.domain, "feluccad", o.feluccad)
 	if err := srv.ListenAndServe(); err != nil {
 		slog.Error("listen", "err", err)
 		os.Exit(1)
