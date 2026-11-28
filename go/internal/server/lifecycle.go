@@ -270,6 +270,14 @@ func (srv *Server) autoSleep(id, tenant string, now int64, unreachable map[nodeT
 	// sandbox scheduled to a node I control" a 20-second recovery of the fleet
 	// admin key — see nodeDial.
 	resp, err := srv.dialNode(agentAddr).do(http.MethodPost, "/v1/vms/"+id+"/sleep", nil, sweepID)
+	if err == nil && resp.Status == 409 {
+		// The worker refused: when it names the state it holds, the record
+		// takes it, so a sandbox the worker holds as stopped is not put to
+		// sleep again every pass (FLU-4 S10). There is no caller to answer.
+		srv.adoptRefusedState(id, state, resp.Body, sweepID)
+		slog.Warn("lifecycle: auto-sleep refused by the worker", "sandbox", id, "request_id", sweepID)
+		return
+	}
 	if err != nil || resp.Status >= 300 {
 		nodeUnreachable(unreachable, agentAddr, tenant, err)
 		slog.Warn("lifecycle: auto-sleep agent call failed", "sandbox", id)

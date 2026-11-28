@@ -2003,8 +2003,90 @@ func (srv *Server) unsaveCreated(id string) {
 	srv.queueUsageLocked(sb, "stopped")
 }
 
+// refusedStateEvents is FLU-4 S10's table: each state the agent can name in a
+// 409 that feluccad records, and the usage event that records the move into
+// it. error closes the running interval like stopped. The agent's creating and
+// pooled are not here: they are its own bookkeeping, not a state of a sandbox
+// feluccad has handed out.
+var refusedStateEvents = map[model.SandboxState]string{
+	model.StateStopped:  "stopped",
+	model.StateSleeping: "slept",
+	model.StatePaused:   "paused",
+	model.StateRunning:  "started",
+	model.StateError:    "stopped",
+}
+
+// maxRefusalBody bounds the agent 409 body feluccad relays and reads. The
+// agent client reads whole bodies; a refusal is one short JSON object, so a
+// longer body is not one the contract describes.
+const maxRefusalBody = 64 << 10
+
+// adoptRefusedState is FLU-4 S10: the agent refused a lifecycle request with a
+// 409, and when the body names the state the agent holds, feluccad records it.
+// Without this a record the agent no longer agrees with stays wrong for ever:
+// after a worker reboot the agent holds every sandbox that was running as
+// stopped, and a sleeping record would get a failing wake on every request.
+//
+// from is the state the record held when the request started. The worker's
+// answer describes that moment, so it is recorded only over that same state:
+// a record that changed meanwhile carries newer news. The state, its clocks
+// and its usage event change in one critical section; then a save, whose
+// failure is logged (the save marks the store failing and the recovery loop
+// writes what memory holds) and does not change the answer.
+//
+// It returns the body to relay: the agent's, verbatim, unless it is over
+// maxRefusalBody. A body without one of the five states records nothing.
+func (srv *Server) adoptRefusedState(id string, from model.SandboxState, body []byte, reqID string) []byte {
+	if len(body) > maxRefusalBody {
+		slog.Warn("agent 409 body too large to relay", "sandbox", id, "request_id", reqID, "bytes", len(body))
+		return []byte(`{"error":"agent refused the request"}`)
+	}
+	var refusal struct {
+		State string `json:"state"`
+	}
+	if json.Unmarshal(body, &refusal) != nil {
+		return body
+	}
+	to := model.SandboxState(refusal.State)
+	event, known := refusedStateEvents[to]
+	if !known {
+		return body
+	}
+	adopted := false
+	func() {
+		srv.st.Lock()
+		defer srv.st.Unlock()
+		sb := srv.st.FindSandbox(id)
+		if sb == nil || sb.State != from || sb.State == to {
+			return
+		}
+		now := time.Now().Unix()
+		sb.State = to
+		switch to {
+		case model.StateSleeping:
+			sb.SleptAt = now // the auto-delete TTL clock, as the sleep handler sets it
+		case model.StateRunning:
+			sb.LastActivity = now // as the wake handler: idle clock restarted, TTL clock stopped
+			sb.SleptAt = 0
+		}
+		srv.queueUsageLocked(sb, event)
+		adopted = true
+	}()
+	if !adopted {
+		return body
+	}
+	slog.Warn("worker holds the sandbox in another state: recorded what it holds",
+		"sandbox", id, "request_id", reqID, "was", from, "now", to)
+	if err := srv.save(nil); err != nil {
+		slog.Error("worker's state recorded but not saved (the recovery loop will write it)",
+			"sandbox", id, "request_id", reqID, "state", to, "err", err)
+	}
+	return body
+}
+
 func (srv *Server) sandboxAction(w http.ResponseWriter, r *http.Request, id, action, tenant string) {
 	var agentAddr string
+	var from model.SandboxState
 	if status, body := func() (int, string) {
 		srv.st.Lock()
 		defer srv.st.Unlock()
@@ -2020,6 +2102,7 @@ func (srv *Server) sandboxAction(w http.ResponseWriter, r *http.Request, id, act
 			return 409, `{"error":"node gone"}`
 		}
 		agentAddr = node.Addr
+		from = sb.State
 		return 0, ""
 	}(); status != 0 {
 		writeJSON(w, status, []byte(body))
@@ -2034,8 +2117,9 @@ func (srv *Server) sandboxAction(w http.ResponseWriter, r *http.Request, id, act
 	}
 	if resp.Status == 409 {
 		// Lifecycle conflict from the agent (e.g. start on a paused VM):
-		// forward status and body so the caller learns why.
-		writeJSON(w, 409, resp.Body)
+		// forward status and body so the caller learns why, and record the
+		// state the agent names.
+		writeJSON(w, 409, srv.adoptRefusedState(id, from, resp.Body, reqID(r.Context())))
 		return
 	}
 	if resp.Status >= 300 {
@@ -2156,7 +2240,7 @@ func (srv *Server) deleteSandbox(w http.ResponseWriter, r *http.Request, id stri
 }
 
 func (srv *Server) sleepSandbox(w http.ResponseWriter, r *http.Request, id, tenant string) {
-	agentAddr, ok := srv.resolveAgent(w, r, id, tenant)
+	agentAddr, from, ok := srv.resolveAgent(w, r, id, tenant)
 	if !ok {
 		return
 	}
@@ -2164,6 +2248,10 @@ func (srv *Server) sleepSandbox(w http.ResponseWriter, r *http.Request, id, tena
 	resp, err := srv.dialNode(agentAddr).do(http.MethodPost, agentPath, nil, reqID(r.Context()))
 	if err != nil {
 		writeJSON(w, 502, []byte(`{"error":"agent unreachable"}`))
+		return
+	}
+	if resp.Status == 409 {
+		writeJSON(w, 409, srv.adoptRefusedState(id, from, resp.Body, reqID(r.Context())))
 		return
 	}
 	if resp.Status >= 300 {
@@ -2197,7 +2285,7 @@ func (srv *Server) sleepSandbox(w http.ResponseWriter, r *http.Request, id, tena
 }
 
 func (srv *Server) wakeSandbox(w http.ResponseWriter, r *http.Request, id, tenant string) {
-	agentAddr, ok := srv.resolveAgent(w, r, id, tenant)
+	agentAddr, from, ok := srv.resolveAgent(w, r, id, tenant)
 	if !ok {
 		return
 	}
@@ -2206,6 +2294,10 @@ func (srv *Server) wakeSandbox(w http.ResponseWriter, r *http.Request, id, tenan
 	resp, err := srv.dialNode(agentAddr).do(http.MethodPost, agentPath, nil, reqID(r.Context()))
 	if err != nil {
 		writeJSON(w, 502, []byte(`{"error":"agent unreachable"}`))
+		return
+	}
+	if resp.Status == 409 {
+		writeJSON(w, 409, srv.adoptRefusedState(id, from, resp.Body, reqID(r.Context())))
 		return
 	}
 	if resp.Status >= 300 {
@@ -2698,24 +2790,26 @@ func (srv *Server) execSandboxStream(w http.ResponseWriter, r *http.Request, id,
 // resolveAgent returns the agent address for a sandbox's node, writing a 404
 // if the sandbox or its agent is not found — or if the tenant context does
 // not own the sandbox (no cross-tenant existence leak).
-func (srv *Server) resolveAgent(w http.ResponseWriter, r *http.Request, id, tenant string) (string, bool) {
+// resolveAgent also returns the state the record holds now: the state the
+// request starts from, for adoptRefusedState.
+func (srv *Server) resolveAgent(w http.ResponseWriter, r *http.Request, id, tenant string) (string, model.SandboxState, bool) {
 	srv.st.Lock()
 	defer srv.st.Unlock()
 	sb := srv.st.FindSandbox(id)
 	if sb == nil || !tenantOwns(tenant, sb) {
 		writeJSON(w, 404, []byte(`{"error":"not found"}`))
-		return "", false
+		return "", "", false
 	}
 	if sb.NodeID == nil {
 		writeJSON(w, 404, []byte(`{"error":"not found"}`))
-		return "", false
+		return "", "", false
 	}
 	node := srv.st.FindNode(*sb.NodeID)
 	if node == nil {
 		writeJSON(w, 404, []byte(`{"error":"not found"}`))
-		return "", false
+		return "", "", false
 	}
-	return node.Addr, true
+	return node.Addr, sb.State, true
 }
 
 // ---- Metrics ----
