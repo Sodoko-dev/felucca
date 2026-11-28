@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestUsageNeverPrintsTheToken: --help printed the admin token, because -token
@@ -40,6 +41,7 @@ func parseWith(t *testing.T, args ...string) (*options, error) {
 // The token still comes from the environment when the flag is absent, and the
 // flag still beats the environment.
 func TestTokenFlagBeatsEnvBeatsDefault(t *testing.T) {
+	t.Setenv("FELUCCA_GW_MAX_STALE", "")
 	t.Setenv("FELUCCA_TOKEN", "from-env")
 	if o, err := parseWith(t); err != nil || o.token != "from-env" {
 		t.Errorf("env only: token=%q err=%v, want from-env", o.token, err)
@@ -50,5 +52,34 @@ func TestTokenFlagBeatsEnvBeatsDefault(t *testing.T) {
 	t.Setenv("FELUCCA_TOKEN", "")
 	if o, err := parseWith(t); err != nil || o.token != "" {
 		t.Errorf("neither: token=%q err=%v, want empty", o.token, err)
+	}
+}
+
+func TestMaxStaleFromEnvAndBounds(t *testing.T) {
+	t.Setenv("FELUCCA_GW_MAX_STALE", "")
+	if o, err := parseWith(t); err != nil || o.maxStale != 600*time.Second {
+		t.Errorf("default: max-stale=%v err=%v, want 10m", o.maxStale, err)
+	}
+	t.Setenv("FELUCCA_GW_MAX_STALE", "45s")
+	if o, err := parseWith(t); err != nil || o.maxStale != 45*time.Second {
+		t.Errorf("env: max-stale=%v err=%v, want 45s", o.maxStale, err)
+	}
+	if o, err := parseWith(t, "-max-stale", "60s"); err != nil || o.maxStale != 60*time.Second {
+		t.Errorf("flag over env: max-stale=%v err=%v, want 60s", o.maxStale, err)
+	}
+	t.Setenv("FELUCCA_GW_MAX_STALE", "soon")
+	if _, err := parseWith(t); err == nil {
+		t.Error("malformed FELUCCA_GW_MAX_STALE accepted")
+	}
+	t.Setenv("FELUCCA_GW_MAX_STALE", "")
+	for _, args := range [][]string{
+		{"-max-stale", "29s"},  // below 2 x 5s + 20s
+		{"-max-stale", "601s"}, // above the ceiling
+		{"-refresh", "0"},
+		{"-refresh", "61"},
+	} {
+		if _, err := parseWith(t, args...); err == nil {
+			t.Errorf("%v: accepted, want refused", args)
+		}
 	}
 }

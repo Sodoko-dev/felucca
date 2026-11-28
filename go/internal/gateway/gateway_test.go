@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -12,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/alpham/infra-saas/felucca/internal/ingress"
 )
 
 // testEnv wires a fake feluccad (route table + ensure + wake) and two fake
@@ -27,6 +30,7 @@ type testEnv struct {
 	conns    atomic.Int64 // connections accepted by backend (not backend2)
 	fetches  atomic.Int64 // GET /api/v1/routes served
 	wakes    atomic.Int64 // POST .../wake served
+	skew     atomic.Int64 // added to the gateway's clock (time.Duration)
 
 	hmu     sync.Mutex
 	onFetch func(n int64)                        // runs after the table is read, before it is sent
@@ -140,6 +144,8 @@ func newTestEnv(t *testing.T, limits map[string]TenantLimit) *testEnv {
 		Refresh:      time.Hour, // tests refresh explicitly
 		TenantLimits: limits,
 	})
+	// The real clock plus a skew a test can move: tables age without sleeping.
+	env.gw.now = func() time.Time { return time.Now().Add(time.Duration(env.skew.Load())) }
 	return env
 }
 
@@ -315,11 +321,269 @@ func TestRefreshSurvivesFeluccadOutage(t *testing.T) {
 	env := newTestEnv(t, nil)
 	env.setRoutes(env.backendRoute("odoo--sb-1", "sb-1", "t-1", "running"))
 
-	// feluccad goes away; the stale-but-working table keeps serving.
+	// feluccad goes away; the old-but-working table keeps serving while it is
+	// younger than max-stale...
 	env.feluccad.Close()
 	env.gw.refresh()
 	if w := doHost(t, env.gw, "odoo--sb-1.sb.lab.test", "/"); w.Code != 200 {
 		t.Errorf("after outage: got %d, want 200 from cached route", w.Code)
+	}
+	env.skew.Store(int64(599 * time.Second))
+	env.gw.refresh()
+	if w := doHost(t, env.gw, "odoo--sb-1.sb.lab.test", "/"); w.Code != 200 {
+		t.Errorf("outage inside max-stale: got %d, want 200 from cached route", w.Code)
+	}
+	// ...and fails closed beyond it: its node ports may belong to others now.
+	env.skew.Store(int64(601 * time.Second))
+	env.gw.refresh()
+	assertTableUnavailable(t, doHost(t, env.gw, "odoo--sb-1.sb.lab.test", "/"))
+}
+
+func assertTableUnavailable(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	if w.Code != 503 || w.Header().Get("Retry-After") != "5" || !strings.Contains(w.Body.String(), `{"error":"route table unavailable"}`) {
+		t.Errorf("got %d Retry-After=%q %q, want 503 route table unavailable with Retry-After: 5",
+			w.Code, w.Header().Get("Retry-After"), w.Body.String())
+	}
+}
+
+// TestOldTableFailsClosed: a table older than max-stale, or none at all,
+// answers 503 for every sandbox request; /readyz follows, /healthz does not.
+func TestOldTableFailsClosed(t *testing.T) {
+	env := newTestEnv(t, nil)
+	host := "odoo--sb-1.sb.lab.test"
+	ready := func() int { return doHost(t, env.gw, "gw.lab.test", "/readyz").Code }
+	healthy := func() *httptest.ResponseRecorder { return doHost(t, env.gw, "gw.lab.test", "/healthz") }
+	checkHealthz := func(when string) {
+		t.Helper()
+		if w := healthy(); w.Code != 200 || w.Body.String() != "ok\n" {
+			t.Errorf("%s: healthz got %d %q, want 200 ok", when, w.Code, w.Body.String())
+		}
+	}
+
+	// Before the first fetch: 503, not 404.
+	assertTableUnavailable(t, doHost(t, env.gw, host, "/"))
+	if c := ready(); c != 503 {
+		t.Errorf("before first fetch: readyz %d, want 503", c)
+	}
+	checkHealthz("before first fetch")
+
+	env.setRoutes(env.backendRoute("odoo--sb-1", "sb-1", "t-1", "running"))
+	if w := doHost(t, env.gw, host, "/"); w.Code != 200 {
+		t.Errorf("fresh: got %d", w.Code)
+	}
+	if w := doHost(t, env.gw, "gw.lab.test", "/readyz"); w.Code != 200 || w.Body.String() != "ok\n" {
+		t.Errorf("fresh: readyz %d %q, want 200 ok", w.Code, w.Body.String())
+	}
+	checkHealthz("fresh")
+
+	env.skew.Store(int64(599 * time.Second))
+	if w := doHost(t, env.gw, host, "/"); w.Code != 200 {
+		t.Errorf("599s old: got %d, want 200", w.Code)
+	}
+	if c := ready(); c != 200 {
+		t.Errorf("599s old: readyz %d, want 200", c)
+	}
+
+	env.skew.Store(int64(601 * time.Second))
+	assertTableUnavailable(t, doHost(t, env.gw, host, "/"))
+	assertTableUnavailable(t, doHost(t, env.gw, "web--sb-9.sb.lab.test", "/")) // unknown label too
+	if c := ready(); c != 503 {
+		t.Errorf("601s old: readyz %d, want 503", c)
+	}
+	checkHealthz("stale")
+
+	// A later successful fetch serves again.
+	env.gw.refresh()
+	if w := doHost(t, env.gw, host, "/"); w.Code != 200 {
+		t.Errorf("after a fresh fetch: got %d, want 200", w.Code)
+	}
+	if c := ready(); c != 200 {
+		t.Errorf("after a fresh fetch: readyz %d, want 200", c)
+	}
+	checkHealthz("fresh again")
+}
+
+// TestOldTableWallClockAge: with times that carry no monotonic reading (the
+// wall clock, as after a host suspend), a table older than max-stale still
+// fails closed, and a fetch afterwards serves again.
+func TestOldTableWallClockAge(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.gw.now = func() time.Time { return time.Now().Round(0).Add(time.Duration(env.skew.Load())) }
+	host := "odoo--sb-1.sb.lab.test"
+	env.setRoutes(env.backendRoute("odoo--sb-1", "sb-1", "t-1", "running"))
+	if w := doHost(t, env.gw, host, "/"); w.Code != 200 {
+		t.Errorf("fresh: got %d, want 200", w.Code)
+	}
+	env.skew.Store(int64(601 * time.Second))
+	assertTableUnavailable(t, doHost(t, env.gw, host, "/"))
+	if c := doHost(t, env.gw, "gw.lab.test", "/readyz").Code; c != 503 {
+		t.Errorf("wall-clock stale: readyz %d, want 503", c)
+	}
+	env.gw.refresh()
+	if w := doHost(t, env.gw, host, "/"); w.Code != 200 {
+		t.Errorf("after a fresh fetch: got %d, want 200", w.Code)
+	}
+}
+
+func TestTableAgeTakesTheLargerClock(t *testing.T) {
+	for _, c := range []struct {
+		name            string
+		mono, wall, age time.Duration
+	}{
+		{"frozen host: monotonic stopped, wall kept counting", 10 * time.Second, 700 * time.Second, 700 * time.Second},
+		{"wall clock stepped back", 700 * time.Second, -5 * time.Second, 700 * time.Second},
+		{"clocks agree", 30 * time.Second, 30 * time.Second, 30 * time.Second},
+	} {
+		if got := tableAge(c.mono, c.wall); got != c.age {
+			t.Errorf("%s: tableAge(%v, %v) = %v, want %v", c.name, c.mono, c.wall, got, c.age)
+		}
+	}
+}
+
+// TestOlderFetchNeverReplacesNewerTable: a fetch that started first but
+// finished last must not put its (older) table back.
+func TestOlderFetchNeverReplacesNewerTable(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.routes.Store([]Route{env.backendRoute("old--sb-1", "sb-1", "t-1", "running")})
+	slowStarted, release := make(chan struct{}), make(chan struct{})
+	env.setOnFetch(func(n int64) {
+		if n == 1 { // the slow one: it has already read the OLD table
+			close(slowStarted)
+			<-release
+		}
+	})
+	done := make(chan struct{})
+	go func() { env.gw.refresh(); close(done) }()
+	<-slowStarted
+
+	env.skew.Store(int64(time.Second)) // the second fetch starts strictly later
+	env.routes.Store([]Route{env.backendRoute("new--sb-2", "sb-2", "t-1", "running")})
+	env.gw.refresh()
+	close(release)
+	<-done
+
+	if w := doHost(t, env.gw, "new--sb-2.sb.lab.test", "/"); w.Code != 200 {
+		t.Errorf("newer table: got %d, want 200", w.Code)
+	}
+	if w := doHost(t, env.gw, "old--sb-1.sb.lab.test", "/"); w.Code != 404 {
+		t.Errorf("older table came back: old route got %d, want 404", w.Code)
+	}
+}
+
+func TestValidateTimings(t *testing.T) {
+	for _, c := range []struct {
+		refresh, maxStale time.Duration
+		ok                bool
+		names             string // a bound the message must name
+	}{
+		{5 * time.Second, 600 * time.Second, true, ""},
+		{5 * time.Second, 30 * time.Second, true, ""},
+		{5 * time.Second, 29 * time.Second, false, "30s"},
+		{5 * time.Second, 601 * time.Second, false, "10m0s"},
+		{1 * time.Second, 22 * time.Second, true, ""},
+		{500 * time.Millisecond, 600 * time.Second, false, "1s"},
+		{0, 600 * time.Second, false, "1s"},
+		{60 * time.Second, 140 * time.Second, true, ""},
+		{60 * time.Second, 139 * time.Second, false, "2m20s"},
+		{61 * time.Second, 600 * time.Second, false, "1m0s"},
+	} {
+		err := ValidateTimings(c.refresh, c.maxStale)
+		if (err == nil) != c.ok {
+			t.Errorf("refresh=%v max-stale=%v: err=%v, want ok=%v", c.refresh, c.maxStale, err, c.ok)
+			continue
+		}
+		if err != nil && !strings.Contains(err.Error(), c.names) {
+			t.Errorf("refresh=%v max-stale=%v: %q does not name the bound %s", c.refresh, c.maxStale, err, c.names)
+		}
+	}
+}
+
+func TestTransportIdleTimeoutIsTheQuarantineConstant(t *testing.T) {
+	gw := New(Config{Domain: "sb.lab.test"})
+	if gw.transport.IdleConnTimeout != ingress.UpstreamIdleTimeout {
+		t.Errorf("IdleConnTimeout %v, want ingress.UpstreamIdleTimeout %v", gw.transport.IdleConnTimeout, ingress.UpstreamIdleTimeout)
+	}
+	if gw.cfg.MaxStale != ingress.GatewayMaxStaleCeiling {
+		t.Errorf("default MaxStale %v, want %v", gw.cfg.MaxStale, ingress.GatewayMaxStaleCeiling)
+	}
+}
+
+// ---- FLU-6 R9: upstream connections are pooled per sandbox ----
+
+// TestUpstreamConnectionNotReusedForAnotherSandbox: the same node:port moves
+// from sandbox A to sandbox B; B's request must open a new connection, not
+// ride A's pooled one (which the worker may still pin to A).
+func TestUpstreamConnectionNotReusedForAnotherSandbox(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.setRoutes(env.backendRoute("web--sb-a", "sb-a", "t-1", "running"))
+	if w := doHost(t, env.gw, "web--sb-a.sb.lab.test", "/"); w.Code != 200 {
+		t.Fatalf("A: got %d", w.Code)
+	}
+	if c := env.conns.Load(); c != 1 {
+		t.Fatalf("after A: %d connections, want 1", c)
+	}
+
+	env.setRoutes(env.backendRoute("web--sb-b", "sb-b", "t-2", "running")) // same node:port
+	if w := doHost(t, env.gw, "web--sb-b.sb.lab.test", "/"); w.Code != 200 {
+		t.Fatalf("B: got %d", w.Code)
+	}
+	if c := env.conns.Load(); c != 2 {
+		t.Errorf("after B: %d connections, want 2 (B must not reuse A's)", c)
+	}
+
+	// A left the table, so its upstream address is gone with it.
+	env.gw.umu.Lock()
+	_, kept := env.gw.upstreams[upstreamAuthority(Route{SandboxID: "sb-a", GuestPort: 8069})]
+	n := len(env.gw.upstreams)
+	env.gw.umu.Unlock()
+	if kept || n != 1 {
+		t.Errorf("upstream map: A kept=%v size=%d, want A dropped and size 1", kept, n)
+	}
+}
+
+// Control: requests for one sandbox do reuse the pooled connection (keep-alive
+// is on; only the key changed).
+func TestUpstreamConnectionReusedForSameSandbox(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.setRoutes(env.backendRoute("web--sb-a", "sb-a", "t-1", "running"))
+	for i := 0; i < 3; i++ {
+		if w := doHost(t, env.gw, "web--sb-a.sb.lab.test", "/"); w.Code != 200 {
+			t.Fatalf("request %d: got %d", i, w.Code)
+		}
+	}
+	if c := env.conns.Load(); c != 1 {
+		t.Errorf("%d connections for three requests to one sandbox, want 1", c)
+	}
+}
+
+// TestUpgradeThroughProxy: an Upgrade request still switches protocols through
+// the gateway and carries bytes both ways.
+func TestUpgradeThroughProxy(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.setRoutes(env.backendRoute("ws--sb-1", "sb-1", "t-1", "running"))
+	front := httptest.NewServer(env.gw)
+	defer front.Close()
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(front.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	fmt.Fprint(conn, "GET / HTTP/1.1\r\nHost: ws--sb-1.sb.lab.test\r\nConnection: Upgrade\r\nUpgrade: echo-test\r\n\r\n")
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 101 {
+		t.Fatalf("upgrade: got %d, want 101", resp.StatusCode)
+	}
+	fmt.Fprint(conn, "ping\n")
+	line, err := br.ReadString('\n')
+	if err != nil || line != "echo:ping\n" {
+		t.Errorf("after upgrade: read %q err=%v, want echo:ping", line, err)
 	}
 }
 
@@ -327,7 +591,7 @@ func TestRefreshSurvivesFeluccadOutage(t *testing.T) {
 
 // sleepingPair is one sandbox with two services on two different backends.
 // They differ in guest port, as two exposes of one sandbox always do: the
-// node port is per (sandbox, guest port).
+// upstream pool (and node port) is per (sandbox, guest port).
 func (env *testEnv) sleepingPair(state string) []Route {
 	b := routeTo(env.backend2, "b--sb-w", "sb-w", "t-1", state)
 	b.GuestPort = 3000

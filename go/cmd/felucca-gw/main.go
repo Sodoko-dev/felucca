@@ -12,12 +12,14 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"time"
 
 	"github.com/alpham/infra-saas/felucca/internal/gateway"
+	"github.com/alpham/infra-saas/felucca/internal/ingress"
 )
 
 // Listener bounds for the ingress server. This process is the INTERNET-FACING
@@ -65,34 +67,45 @@ func envOr(key, def string) string {
 type options struct {
 	listen, feluccad, token, domain, limitsPath string
 	refresh                                     uint
+	maxStale                                    time.Duration
 	autoWake                                    bool
 }
 
 // defineFlags registers the flags on fs. A flag whose value can be a secret
 // takes NO default from the environment: flag prints defaults in --help, and
 // the admin token would be printed with them. Those are read from the
-// environment in resolveEnv, after parsing.
+// environment in resolveEnv, after parsing. --max-stale is resolved there too,
+// so that a malformed FELUCCA_GW_MAX_STALE is an error rather than a panic.
 func defineFlags(fs *flag.FlagSet) *options {
 	o := &options{}
 	fs.StringVar(&o.listen, "listen", envOr("FELUCCA_GW_LISTEN", "0.0.0.0:8088"), "address to serve ingress on")
 	fs.StringVar(&o.feluccad, "feluccad", envOr("FELUCCA_GW_FELUCCAD", "http://127.0.0.1:8080"), "feluccad base URL (route table source)")
 	fs.StringVar(&o.token, "token", "", "feluccad admin token (routes are admin-only); default: $FELUCCA_TOKEN")
 	fs.StringVar(&o.domain, "domain", envOr("FELUCCA_GW_DOMAIN", ""), "wildcard ingress zone, e.g. sb.example.com")
-	fs.UintVar(&o.refresh, "refresh", 5, "route table refresh interval (seconds)")
+	fs.UintVar(&o.refresh, "refresh", 5, "route table refresh interval (seconds, 1 to 60)")
+	fs.DurationVar(&o.maxStale, "max-stale", ingress.GatewayMaxStaleCeiling, "oldest route table to serve from; older answers 503 (2 x refresh + 20s to 600s; env FELUCCA_GW_MAX_STALE)")
 	fs.StringVar(&o.limitsPath, "tenant-limits", envOr("FELUCCA_GW_TENANT_LIMITS", ""), "optional JSON file: {\"<tenant-id>\":{\"enabled\":true,\"rps\":10,\"auto_wake\":true}}")
 	fs.BoolVar(&o.autoWake, "auto-wake", envOr("FELUCCA_GW_AUTO_WAKE", "1") != "0", "wake sleeping sandboxes on request instead of serving the 503 page")
 	return o
 }
 
 // resolveEnv fills, after parsing, the flags that were not given on the
-// command line from the environment (flag beats env; env beats default).
+// command line from the environment (flag beats env; env beats default), and
+// checks the timings.
 func (o *options) resolveEnv(fs *flag.FlagSet) error {
 	given := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { given[f.Name] = true })
 	if !given["token"] {
 		o.token = os.Getenv("FELUCCA_TOKEN")
 	}
-	return nil
+	if v := os.Getenv("FELUCCA_GW_MAX_STALE"); v != "" && !given["max-stale"] {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("FELUCCA_GW_MAX_STALE: %v", err)
+		}
+		o.maxStale = d
+	}
+	return gateway.ValidateTimings(time.Duration(o.refresh)*time.Second, o.maxStale)
 }
 
 func main() {
@@ -132,6 +145,7 @@ func main() {
 		FeluccadURL:  o.feluccad,
 		Token:        o.token,
 		Refresh:      time.Duration(o.refresh) * time.Second,
+		MaxStale:     o.maxStale,
 		TenantLimits: limits,
 		AutoWake:     o.autoWake,
 	})
